@@ -15,3 +15,4 @@ SYSTEM_PROMPT = (
     "Keep replies short, natural, and spoken out loud. "
     "One or two sentences max. No markdown. No lists."
 )
+VISION_ENABLED = True

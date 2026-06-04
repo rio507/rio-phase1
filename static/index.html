@@ -1,160 +1,110 @@
-<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
-<html>
+<!DOCTYPE html>
+
+<html lang="en">
 <head>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-  <meta http-equiv="Content-Style-Type" content="text/css">
-  <title></title>
-  <meta name="Generator" content="Cocoa HTML Writer">
-  <meta name="CocoaVersion" content="2575.7">
-  <style type="text/css">
-    p.p1 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Helvetica}
-    p.p2 {margin: 0.0px 0.0px 0.0px 0.0px; font: 12.0px Helvetica; min-height: 14.0px}
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RIO</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 20px; background: #0e0e10; color: #eee; }
+  h1 { font-size: 28px; }
+  button { font-size: 18px; padding: 14px 28px; margin: 8px 4px; border-radius: 12px; border: none; cursor: pointer; }
+  #mic { background: #b91c1c; color: white; }
+  #mic.recording { background: #16a34a; }
+  #frame { background: #2563eb; color: white; }
+  #observation { background: #1f1f23; padding: 16px; border-radius: 12px; margin-top: 20px; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
+  audio { display: block; margin-top: 20px; width: 100%; }
+</style>
 </head>
+<button id="frame" style="position:fixed;bottom:20px;right:20px;padding:14px 24px;background:#2563eb;color:white;border:none;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Send Frame</button>
+<script>
+document.getElementById('frame').addEventListener('click', async () => {
+  const obs = document.getElementById('observation');
+  obs.style.display = 'block';
+  obs.textContent = 'Capturing...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    const video = document.createElement('video');
+    video.srcObject = stream;
+    await video.play();
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    stream.getTracks().forEach(t => t.stop());
+    canvas.toBlob(async blob => {
+      obs.textContent = 'Analyzing...';
+      const fd = new FormData();
+      fd.append('image', blob, 'frame.jpg');
+      const r = await fetch('/observe', { method: 'POST', body: fd });
+      const j = await r.json();
+      obs.textContent = j.observation || '(empty)';
+    }, 'image/jpeg', 0.85);
+  } catch (e) { obs.textContent = 'Error: ' + e.message; }
+});
+</script>
 <body>
-<p class="p1">&lt;!DOCTYPE html&gt;</p>
-<p class="p1">&lt;html&gt;</p>
-<p class="p1">&lt;head&gt;</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;title&gt;RIO Phase 1&lt;/title&gt;</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;meta name="viewport" content="width=device-width, initial-scale=1"&gt;</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;style&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>body {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>background: #050505;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>color: white;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>font-family: -apple-system, BlinkMacSystemFont, sans-serif;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>display: flex;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>align-items: center;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>justify-content: center;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>min-height: 100vh;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>margin: 0;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>.wrap {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>text-align: center;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>max-width: 420px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>padding: 24px;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>h1 {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>font-size: 48px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>letter-spacing: -2px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>margin-bottom: 8px;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>p {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>opacity: 0.65;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>line-height: 1.5;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>button {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>margin-top: 28px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>width: 160px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>height: 160px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>border-radius: 999px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>border: 1px solid rgba(255,255,255,0.2);</p>
-<p class="p1"><span class="Apple-converted-space">      </span>background: radial-gradient(circle at top, #222, #000);</p>
-<p class="p1"><span class="Apple-converted-space">      </span>color: white;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>font-size: 18px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>cursor: pointer;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>button.recording {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>background: radial-gradient(circle at top, #7a1010, #200000);</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>audio {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>margin-top: 24px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>width: 100%;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>#status {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>margin-top: 20px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>font-size: 14px;</p>
-<p class="p1"><span class="Apple-converted-space">      </span>opacity: 0.7;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;/style&gt;</p>
-<p class="p1">&lt;/head&gt;</p>
-<p class="p1">&lt;body&gt;</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;div class="wrap"&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>&lt;h1&gt;RIO&lt;/h1&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>&lt;p&gt;Your AI driving companion. Press and hold to talk.&lt;/p&gt;</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>&lt;button id="recordBtn"&gt;Hold to Talk&lt;/button&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>&lt;div id="status"&gt;Idle&lt;/div&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>&lt;audio id="audio" controls autoplay&gt;&lt;/audio&gt;</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;/div&gt;</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;script&gt;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>let mediaRecorder;</p>
-<p class="p1"><span class="Apple-converted-space">    </span>let chunks = [];</p>
-<p class="p1"><span class="Apple-converted-space">    </span>let stream;</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>const btn = document.getElementById("recordBtn");</p>
-<p class="p1"><span class="Apple-converted-space">    </span>const status = document.getElementById("status");</p>
-<p class="p1"><span class="Apple-converted-space">    </span>const audio = document.getElementById("audio");</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>async function initMic() {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>stream = await navigator.mediaDevices.getUserMedia({ audio: true });</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>async function startRecording() {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>if (!stream) {</p>
-<p class="p1"><span class="Apple-converted-space">        </span>await initMic();</p>
-<p class="p1"><span class="Apple-converted-space">      </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">      </span>chunks = [];</p>
-<p class="p1"><span class="Apple-converted-space">      </span>mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">      </span>mediaRecorder.ondataavailable = e =&gt; {</p>
-<p class="p1"><span class="Apple-converted-space">        </span>if (e.data.size &gt; 0) chunks.push(e.data);</p>
-<p class="p1"><span class="Apple-converted-space">      </span>};</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">      </span>mediaRecorder.onstop = async () =&gt; {</p>
-<p class="p1"><span class="Apple-converted-space">        </span>status.innerText = "Thinking...";</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">        </span>const blob = new Blob(chunks, { type: "audio/webm" });</p>
-<p class="p1"><span class="Apple-converted-space">        </span>const formData = new FormData();</p>
-<p class="p1"><span class="Apple-converted-space">        </span>formData.append("audio", blob, "audio.webm");</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">        </span>const response = await fetch("/talk", {</p>
-<p class="p1"><span class="Apple-converted-space">          </span>method: "POST",</p>
-<p class="p1"><span class="Apple-converted-space">          </span>body: formData</p>
-<p class="p1"><span class="Apple-converted-space">        </span>});</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">        </span>const audioBlob = await response.blob();</p>
-<p class="p1"><span class="Apple-converted-space">        </span>const url = URL.createObjectURL(audioBlob);</p>
-<p class="p1"><span class="Apple-converted-space">        </span>audio.src = url;</p>
-<p class="p1"><span class="Apple-converted-space">        </span>await audio.play();</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">        </span>status.innerText = "Idle";</p>
-<p class="p1"><span class="Apple-converted-space">      </span>};</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">      </span>mediaRecorder.start();</p>
-<p class="p1"><span class="Apple-converted-space">      </span>btn.classList.add("recording");</p>
-<p class="p1"><span class="Apple-converted-space">      </span>status.innerText = "Listening...";</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>function stopRecording() {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>if (mediaRecorder &amp;&amp; mediaRecorder.state === "recording") {</p>
-<p class="p1"><span class="Apple-converted-space">        </span>mediaRecorder.stop();</p>
-<p class="p1"><span class="Apple-converted-space">      </span>}</p>
-<p class="p1"><span class="Apple-converted-space">      </span>btn.classList.remove("recording");</p>
-<p class="p1"><span class="Apple-converted-space">    </span>}</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>btn.addEventListener("mousedown", startRecording);</p>
-<p class="p1"><span class="Apple-converted-space">    </span>btn.addEventListener("mouseup", stopRecording);</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>btn.addEventListener("touchstart", e =&gt; {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>e.preventDefault();</p>
-<p class="p1"><span class="Apple-converted-space">      </span>startRecording();</p>
-<p class="p1"><span class="Apple-converted-space">    </span>});</p>
-<p class="p2"><br></p>
-<p class="p1"><span class="Apple-converted-space">    </span>btn.addEventListener("touchend", e =&gt; {</p>
-<p class="p1"><span class="Apple-converted-space">      </span>e.preventDefault();</p>
-<p class="p1"><span class="Apple-converted-space">      </span>stopRecording();</p>
-<p class="p1"><span class="Apple-converted-space">    </span>});</p>
-<p class="p1"><span class="Apple-converted-space">  </span>&lt;/script&gt;</p>
-<p class="p1">&lt;/body&gt;</p>
-<p class="p1">&lt;/html&gt;</p>
+<h1>RIO</h1>
+<button id="mic">Hold to talk</button>
+<video id="video" autoplay playsinline muted style="display:none;"></video>
+<audio id="player" controls autoplay></audio>
+<div id="observation">No observation yet.</div>
+
+<script>
+const micBtn = document.getElementById('mic');
+const frameBtn = document.getElementById('frame');
+const player = document.getElementById('player');
+const obs = document.getElementById('observation');
+let recorder, chunks;
+
+async function startRec() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  recorder = new MediaRecorder(stream);
+  chunks = [];
+  recorder.ondataavailable = e => chunks.push(e.data);
+  recorder.onstop = async () => {
+    const blob = new Blob(chunks, { type: 'audio/webm' });
+    const fd = new FormData();
+    fd.append('audio', blob, 'rec.webm');
+    const r = await fetch('/talk', { method: 'POST', body: fd });
+    player.src = URL.createObjectURL(await r.blob());
+    stream.getTracks().forEach(t => t.stop());
+  };
+  recorder.start();
+  micBtn.classList.add('recording');
+  micBtn.textContent = 'Release to send';
+}
+function stopRec() {
+  if (recorder && recorder.state === 'recording') {
+    recorder.stop();
+    micBtn.classList.remove('recording');
+    micBtn.textContent = 'Hold to talk';
+  }
+}
+micBtn.addEventListener('mousedown', startRec);
+micBtn.addEventListener('mouseup', stopRec);
+micBtn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
+micBtn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+
+frameBtn.addEventListener('click', async () => {
+  obs.textContent = 'Capturing...';
+  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+  const video = document.createElement('video');
+  video.srcObject = stream;
+  await video.play();
+  const canvas = document.createElement('canvas');
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  canvas.getContext('2d').drawImage(video, 0, 0);
+  stream.getTracks().forEach(t => t.stop());
+  canvas.toBlob(async blob => {
+    obs.textContent = 'Analyzing...';
+    const fd = new FormData();
+    fd.append('image', blob, 'frame.jpg');
+    const r = await fetch('/observe', { method: 'POST', body: fd });
+    const j = await r.json();
+    obs.textContent = j.observation || '(empty)';
+  }, 'image/jpeg', 0.85);
+});
+</script>
 </body>
 </html>

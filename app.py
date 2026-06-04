@@ -1,3 +1,5 @@
+
+
 import time
 from dotenv import load_dotenv
 
@@ -10,6 +12,7 @@ from openai import OpenAI
 import config
 import voice
 import llm_interface
+import vision
 
 app = FastAPI()
 client = OpenAI()
@@ -83,10 +86,13 @@ def index():
 <body>
   <div class="wrap">
     <h1>RIO</h1>
-    <p>Your AI driving companion. Press and hold to talk.</p>
+    <p>Your AI driving companion. Press and 
+hold to talk.</p>
 
     <button id="recordBtn">Hold to Talk</button>
-    <div id="status">Idle</div>
+<button id="frameBtn" style="position:fixed;bottom:20px;right:20px;padding:14px 24px;background:#2563eb;color:white;border:none;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Send Frame</button>
+<video id="video" autoplay playsinline muted style="display:none;"></video>
+<div id="observation" style="position:fixed;bottom:80px;right:20px;max-width:380px;background:#1f1f23;color:#eee;padding:12px;border-radius:8px;font-size:12px;font-family:monospace;display:none;white-space:pre-wrap;z-index:9999;"></div> <div id="status">Idle</div>
     <audio id="audio" controls autoplay></audio>
   </div>
 
@@ -159,7 +165,56 @@ def index():
       e.preventDefault();
       stopRecording();
     });
-  </script>
+const frameBtn = document.getElementById('frameBtn');
+const observationBox = document.getElementById('observation');
+
+if (frameBtn) {
+  frameBtn.addEventListener('click', async () => {
+    try {
+      observationBox.style.display = 'block';
+      observationBox.textContent = 'Opening camera...';
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const video = document.getElementById('video');
+      video.srcObject = stream;
+
+      await video.play();
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      observationBox.textContent = 'Capturing frame...';
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      stream.getTracks().forEach(t => t.stop());
+
+      canvas.toBlob(async (blob) => {
+        observationBox.textContent = 'Analyzing...';
+
+        const fd = new FormData();
+        fd.append('image', blob, 'frame.jpg');
+
+        const r = await fetch('/observe', {
+          method: 'POST',
+          body: fd
+        });
+
+        const j = await r.json();
+
+        observationBox.textContent = j.observation || JSON.stringify(j, null, 2);
+      }, 'image/jpeg', 0.85);
+
+    } catch (err) {
+      console.error(err);
+      observationBox.style.display = 'block';
+      observationBox.textContent = 'Frame error: ' + err.message;
+    }
+  });
+} 
+ </script>
 </body>
 </html>
     """
@@ -209,3 +264,11 @@ async def talk(audio: UploadFile):
                 yield chunk
 
     return StreamingResponse(streamer(), media_type="audio/mpeg")
+
+from fastapi import File
+
+@app.post("/observe")
+async def observe(image: UploadFile = File(...)):
+    image_bytes = await image.read()
+    observation = vision.observe(image_bytes)
+    return {"observation": observation}
