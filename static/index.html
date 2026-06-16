@@ -16,32 +16,7 @@
   audio { display: block; margin-top: 20px; width: 100%; }
 </style>
 </head>
-<button id="frame" style="position:fixed;bottom:20px;right:20px;padding:14px 24px;background:#2563eb;color:white;border:none;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Send Frame</button>
-<script>
-document.getElementById('frame').addEventListener('click', async () => {
-  const obs = document.getElementById('observation');
-  obs.style.display = 'block';
-  obs.textContent = 'Capturing...';
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-    const video = document.createElement('video');
-    video.srcObject = stream;
-    await video.play();
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    stream.getTracks().forEach(t => t.stop());
-    canvas.toBlob(async blob => {
-      obs.textContent = 'Analyzing...';
-      const fd = new FormData();
-      fd.append('image', blob, 'frame.jpg');
-      const r = await fetch('/observe', { method: 'POST', body: fd });
-      const j = await r.json();
-      obs.textContent = j.observation || '(empty)';
-    }, 'image/jpeg', 0.85);
-  } catch (e) { obs.textContent = 'Error: ' + e.message; }
-});
-</script>
+
 <body>
 <h1>RIO</h1>
 <button id="mic">Hold to talk</button>
@@ -49,7 +24,9 @@ document.getElementById('frame').addEventListener('click', async () => {
 <audio id="player" controls autoplay></audio>
 <div id="observation">No observation yet.</div>
 
+
 <script>
+document.addEventListener('DOMContentLoaded', () => {
 const micBtn = document.getElementById('mic');
 const frameBtn = document.getElementById('frame');
 const player = document.getElementById('player');
@@ -104,6 +81,74 @@ frameBtn.addEventListener('click', async () => {
     const j = await r.json();
     obs.textContent = j.observation || '(empty)';
   }, 'image/jpeg', 0.85);
+});
+});
+</script>
+
+<button id="frame" style="position:fixed;bottom:20px;right:20px;padding:14px 24px;background:#2563eb;color:white;border:none;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Send Webcam Frame</button>
+<label for="upload" style="position:fixed;bottom:20px;right:230px;padding:14px 24px;background:#16a34a;color:white;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Upload Image/Video</label>
+<input type="file" id="upload" accept="image/*,video/*" style="display:none">
+<video id="preview" style="position:fixed;bottom:160px;right:20px;max-width:380px;max-height:240px;display:none;z-index:9999;background:#000;" controls></video>
+<button id="grab" style="position:fixed;bottom:120px;right:20px;padding:10px 18px;background:#dc2626;color:white;border:none;border-radius:10px;cursor:pointer;font-size:14px;display:none;z-index:9999;">Grab This Frame</button>
+<div id="observation" style="position:fixed;bottom:80px;right:20px;max-width:380px;background:#1f1f23;color:#eee;padding:12px;border-radius:8px;font-size:12px;font-family:monospace;display:none;white-space:pre-wrap;z-index:9999;"></div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const upload = document.getElementById('upload');
+  const preview = document.getElementById('preview');
+  const grabBtn = document.getElementById('grab');
+  const obs = document.getElementById('observation');
+
+  async function sendFrame(blob) {
+    obs.style.display = 'block';
+    obs.textContent = 'Analyzing...';
+    const fd = new FormData();
+    fd.append('image', blob, 'frame.jpg');
+    const r = await fetch('/observe', { method: 'POST', body: fd });
+    const j = await r.json();
+    obs.textContent = j.observation || '(empty)';
+  }
+
+  upload.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.type.startsWith('image/')) {
+      sendFrame(file);
+      preview.style.display = 'none';
+      grabBtn.style.display = 'none';
+    } else if (file.type.startsWith('video/')) {
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = 'block';
+      grabBtn.style.display = 'block';
+    }
+  });
+
+  grabBtn.addEventListener('click', () => {
+    const cv = document.createElement('canvas');
+    cv.width = preview.videoWidth;
+    cv.height = preview.videoHeight;
+    cv.getContext('2d').drawImage(preview, 0, 0);
+    cv.toBlob(b => sendFrame(b), 'image/jpeg', 0.85);
+  });
+
+  let watcher = null;
+  let inflight = false;
+  preview.addEventListener('play', () => {
+    if (watcher) clearInterval(watcher);
+    watcher = setInterval(() => {
+      if (preview.paused || preview.ended || inflight) return;
+      inflight = true;
+      const cv = document.createElement('canvas');
+      cv.width = preview.videoWidth;
+      cv.height = preview.videoHeight;
+      cv.getContext('2d').drawImage(preview, 0, 0);
+      cv.toBlob(async b => {
+        try { await sendFrame(b); } finally { inflight = false; }
+      }, 'image/jpeg', 0.85);
+    }, 1500);
+  });
+  preview.addEventListener('pause', () => { if (watcher) clearInterval(watcher); });
+  preview.addEventListener('ended', () => { if (watcher) clearInterval(watcher); });
 });
 </script>
 </body>

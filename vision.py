@@ -11,18 +11,9 @@ import config
 
 MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-TEACHER_PROMPT = """You are an autonomous-vehicle vision system reviewing a single forward-facing camera frame. Return ONLY a JSON object with this exact schema, no markdown:
+TEACHER_PROMPT = """Look at this driving frame. Reply in one short sentence describing what RIO would notice. Be terse."""
 
-{
-  "scene": "1-2 sentences",
-  "objects_of_interest": [{"type": "...", "position": "left/center/right", "motion": "stopped/moving/approaching", "urgency": 0-3}],
-  "should_speak": true | false,
-  "urgency": 0 | 1 | 2 | 3,
-  "suggested_topic": null | "lane_change_advice" | "hazard_alert" | "scenic_note" | "navigation" | "small_talk_opportunity",
-  "reasoning": "1-2 sentences"
-}
 
-Urgency: 0=nothing, 1=mild, 2=notable, 3=immediate. Be selective."""
 
 _processor = None
 _model = None
@@ -57,7 +48,7 @@ def observe(image_bytes: bytes) -> str:
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
         ).to(_model.device)
-        out = _model.generate(**inputs, max_new_tokens=250, do_sample=False)
+        out = _model.generate(**inputs, max_new_tokens=60, do_sample=False)
         text = _processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
