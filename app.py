@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, Query, Body
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from openai import OpenAI
 
@@ -28,7 +28,7 @@ def health():
 
 
 @app.post("/talk")
-async def talk(audio: UploadFile):
+async def talk(audio: UploadFile, session_id: str = Query(default=None)):
     t0 = time.time()
 
     audio_bytes = await audio.read()
@@ -68,9 +68,48 @@ async def talk(audio: UploadFile):
     return StreamingResponse(streamer(), media_type="audio/mpeg")
 
 from fastapi import File
+import sessions
 
 @app.post("/observe")
-async def observe(image: UploadFile = File(...)):
+async def observe(image: UploadFile = File(...), session_id: str = Query(default=None)):
+    import time as _t
+    _t0 = _t.time()
     image_bytes = await image.read()
     observation = vision.observe(image_bytes)
+    sessions.log_observe(session_id, len(image_bytes), observation, (_t.time() - _t0) * 1000)
     return {"observation": observation}
+
+# --- Phase 2.5 session endpoints ---
+
+@app.post("/session/start")
+def session_start_endpoint(metadata: dict = Body(default=None, embed=True)):
+    sid = sessions.start_session(metadata=metadata)
+    return {"session_id": sid}
+
+
+@app.post("/session/end")
+def session_end_endpoint(session_id: str = Query(...)):
+    closed = sessions.end_session(session_id)
+    return {"closed": closed}
+
+
+@app.post("/session/mark")
+def session_mark_endpoint(session_id: str = Query(...), tag: str = Query(...), note: str = Query(default="")):
+    sessions.mark(session_id, tag, {"note": note} if note else None)
+    return {"marked": tag}
+
+
+@app.get("/session/{session_id}")
+def session_view_endpoint(session_id: str):
+    import json as _json
+    path = sessions.SESSIONS_DIR / f"{session_id}.jsonl"
+    if not path.exists():
+        return {"error": "not found", "session_id": session_id}
+    events = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            try:
+                events.append(_json.loads(line))
+            except Exception:
+                pass
+    return {"session_id": session_id, "events": events, "active": sessions.is_active(session_id)}

@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+app.py.bak
+app.py.embedfix.bak
+*.bak
+uvicorn.log
+training_data/
