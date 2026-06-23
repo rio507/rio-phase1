@@ -1,18 +1,17 @@
 import os
 
-OPENAI_CHAT_MODEL = "gpt-4o"
+# RIO prompts now sourced from rio_prompts.py (compiled from behavior bible v1)
+from rio_prompts import RIO_SYSTEM_PROMPT
+
+OPENAI_CHAT_MODEL = "gpt-5.5"
 OPENAI_STT_MODEL = "whisper-1"
 
-OPENAI_TEMPERATURE = 0.7
+OPENAI_TEMPERATURE = 1
 OPENAI_MAX_TOKENS = 120
 
 VOICE_BACKEND = "elevenlabs"
 ELEVENLABS_MODEL = "eleven_flash_v2_5"
 
-SYSTEM_PROMPT = (
-    "You are RIO, a calm, observant AI driving companion. "
-    "You speak like a relaxed enthusiast riding shotgun. "
-    "Keep replies short, natural, and spoken out loud. "
-    "One or two sentences max. No markdown. No lists."
-)
+SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
+
 VISION_ENABLED = True

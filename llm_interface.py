@@ -30,7 +30,7 @@ Use the current camera observation as RIO's visual context. If the driver asks w
         model=config.OPENAI_CHAT_MODEL,
         messages=history,
         temperature=config.OPENAI_TEMPERATURE,
-        max_tokens=config.OPENAI_MAX_TOKENS,
+        max_completion_tokens=config.OPENAI_MAX_TOKENS,
         stream=True,
     )
 

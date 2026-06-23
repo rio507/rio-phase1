@@ -8,11 +8,13 @@ import torch
 from PIL import Image
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 import config
+from rio_prompts import OBSERVER_PROMPT
 
 MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-TEACHER_PROMPT = """Look at this driving frame. Reply in one short sentence describing what RIO would notice. Be terse."""
-
+# Sourced from rio_prompts.py (compiled from behavior bible v1).
+# The observer is NOT RIO. It produces a short factual note that RIO reads.
+TEACHER_PROMPT = OBSERVER_PROMPT
 
 
 _processor = None
@@ -59,4 +61,3 @@ def observe(image_bytes: bytes) -> str:
 def get_observation() -> str:
     """Called by llm_interface on each user turn. Returns the cached observation."""
     return _last_observation if config.VISION_ENABLED else ""
-
