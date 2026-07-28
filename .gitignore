@@ -6,6 +6,6 @@ __pycache__/
 app.py.bak
 app.py.embedfix.bak
 *.bak
-uvicorn.log
+uvicorn.log*
 training_data/
 runs/
