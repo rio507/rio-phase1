@@ -1,25 +1,27 @@
-"""Spec-compliance checks for the deterministic core.
+"""Spec-compliance checks for the v2 deterministic core.
 
     python -m headway.selftest
 
-The synthetic clip exercises the happy path (a clean escalation ladder and back
-down). These cover the branches it never reaches -- cut-in, occlusion, DEGRADED
-suppression, confirmation asymmetry, hysteresis, threshold modulation -- each
-asserted against the specific clause of docs/headway_design.md it implements.
+Each check names the clause of docs/warning_logic_v2.md it enforces. The
+synthetic clips exercise whole trajectories; this covers the branches and
+boundaries they don't reach, plus every cell of the §4 voice-policy table.
 
-No GPU, no models, no video: pure state/filter logic, so it runs in ~1 s and can
-gate a commit.
+No GPU, no models, no video -- pure state/filter logic, ~1 s, so it can gate a
+commit.
 """
 import math
 
 from .filter import HeadwayFilter, MAX_CONSEC_REJECTS
-from .state import (COMFORTABLE, MONITOR, CLOSE, WARNING, URGENT, LOST, DEGRADED,
+from . import state as S
+from .state import (COMFORTABLE, NORMAL, GETTING_UNSAFE, UNSAFE, CRITICAL,
+                    LOST, DEGRADED, SUPPRESSED_LOW_SPEED, URGENT,
                     INCREASING, STABLE, SLOWLY_SHRINKING, RAPIDLY_SHRINKING,
-                    Context, Measurement, Thresholds, WarningStateMachine,
-                    classify_trend, compute_confidence, compute_tau, compute_ttc,
-                    dead_band, modulate)
+                    Context, Measurement, WarningStateMachine,
+                    classify_tau, classify_trend, compute_confidence,
+                    compute_tau, compute_ttc, trend_bands)
 
 _results = []
+DT = 1.0 / 12.0          # v2 targets a 12 Hz loop
 
 
 def check(name, condition, detail=""):
@@ -27,237 +29,429 @@ def check(name, condition, detail=""):
     print(f"  [{'PASS' if condition else 'FAIL'}] {name}" + (f"  -- {detail}" if detail else ""))
 
 
-def _measure(**kw):
-    base = dict(d=50.0, d_dot=0.0, confidence=0.9, depth_conf=0.9,
-                track_quality=0.9, trend=STABLE, tau=2.0, ttc=float("inf"))
+def measure(**kw):
+    base = dict(d=50.0, d_dot=0.0, tau=3.0, ttc=float("inf"), trend=STABLE,
+                confidence=0.9, depth_conf=0.9, track_quality=0.9)
     base.update(kw)
-    ctx = base.pop("ctx", Context(v_host=25.0))
+    ctx = base.pop("ctx", None) or Context(v_host=25.0)
     return Measurement(ctx=ctx, **base)
 
 
+def run(sm, m, n, t0=0.0, dt=DT):
+    """Tick n times with the same measurement; return the tick dicts."""
+    return [sm.tick(m, t=t0 + i * dt, dt=dt) for i in range(n)]
+
+
+def settled(band=None, **kw):
+    """A machine past COACH_WARMUP_S, optionally parked in a band."""
+    sm = WarningStateMachine(rate_hz=12.0, **kw)
+    sm.tick(measure(new_lead=True), t=0.0, dt=DT)      # init, starts warmup
+    run(sm, measure(), int(S.COACH_WARMUP_S / DT) + 3, t0=DT)
+    if band is not None:
+        sm.tau_band = band
+    sm.voice_log.clear()
+    return sm
+
+
+def voice_clips(sm):
+    return [v["action"].get("clip") or v["action"].get("kind") for v in sm.voice_log]
+
+
+# ---------------------------------------------------------------------------
+def test_bands():
+    print("\n§1 -- five tau bands")
+    for tau, want in ((3.0, COMFORTABLE), (2.5, COMFORTABLE), (2.4, NORMAL),
+                      (2.0, NORMAL), (1.9, GETTING_UNSAFE), (1.5, GETTING_UNSAFE),
+                      (1.4, UNSAFE), (1.0, UNSAFE), (0.9, CRITICAL), (0.2, CRITICAL)):
+        got = classify_tau(tau, None)
+        check(f"tau={tau} -> {want}", got == want, f"got {got}")
+    check("infinite tau -> COMFORTABLE", classify_tau(float("inf"), None) == COMFORTABLE)
+
+
+def test_hysteresis():
+    print("\n§2 -- 0.2 s exit hysteresis")
+    # enter GETTING_UNSAFE at 2.0, exit back to NORMAL only above 2.2
+    check("holds GETTING_UNSAFE at tau=2.1",
+          classify_tau(2.1, GETTING_UNSAFE) == GETTING_UNSAFE)
+    check("exits GETTING_UNSAFE at tau=2.25",
+          classify_tau(2.25, GETTING_UNSAFE) == NORMAL)
+    check("holds UNSAFE at tau=1.6", classify_tau(1.6, UNSAFE) == UNSAFE)
+    check("exits UNSAFE at tau=1.75", classify_tau(1.75, UNSAFE) == GETTING_UNSAFE)
+    check("holds CRITICAL at tau=1.1", classify_tau(1.1, CRITICAL) == CRITICAL)
+    check("exits CRITICAL at tau=1.25", classify_tau(1.25, CRITICAL) == UNSAFE)
+    check("entry is NOT hysteretic (2.0 from NORMAL enters immediately)",
+          classify_tau(1.99, NORMAL) == GETTING_UNSAFE)
+
+
 def test_maths():
-    print("\n§3 -- tau / TTC / trend")
+    print("\n§3/§9 -- tau, TTC, trend")
     check("tau = d / v_host", abs(compute_tau(50.0, 25.0) - 2.0) < 1e-9)
-    check("tau guards v_host -> max(v,0.5)", math.isinf(compute_tau(50.0, 0.0)),
-          "below 2 m/s headway is suppressed as meaningless")
-    check("tau suppressed under 2 m/s", math.isinf(compute_tau(50.0, 1.9)))
+    check("tau guards div-by-zero", math.isfinite(compute_tau(50.0, 0.0)))
     check("TTC infinite when not closing", math.isinf(compute_ttc(50.0, +2.0)))
-    check("TTC infinite below 0.2 m/s closing", math.isinf(compute_ttc(50.0, -0.1)))
     check("TTC = d / -d_dot", abs(compute_ttc(50.0, -10.0) - 5.0) < 1e-9)
 
-    check("trend INCREASING above +0.3", classify_trend(+0.5, 10.0) == INCREASING)
-    check("trend STABLE inside dead-band", classify_trend(0.0, 10.0) == STABLE)
-    check("trend SLOWLY_SHRINKING", classify_trend(-0.8, 10.0) == SLOWLY_SHRINKING)
-    check("trend RAPIDLY_SHRINKING below -1.5", classify_trend(-2.0, 10.0) == RAPIDLY_SHRINKING)
-    check("dead-band widens to +-0.5 at highway speed",
-          abs(dead_band(30.0) - 0.5) < 1e-9 and abs(dead_band(5.0) - 0.3) < 1e-9)
+    check("trend INCREASING above +0.3", classify_trend(+0.5, 20.0) == INCREASING)
+    check("trend STABLE in dead-band", classify_trend(0.1, 20.0) == STABLE)
+    check("trend SLOWLY_SHRINKING", classify_trend(-0.8, 20.0) == SLOWLY_SHRINKING)
+    check("trend RAPIDLY_SHRINKING below -1.5", classify_trend(-2.0, 20.0) == RAPIDLY_SHRINKING)
 
-    # §3 asks for hysteresis so classes don't flicker on a boundary.
-    at_edge = -0.30
-    stays = classify_trend(at_edge, 10.0, current=STABLE)
-    flips = classify_trend(-0.45, 10.0, current=STABLE)
-    check("hysteresis holds class exactly on the boundary", stays == STABLE)
-    check("hysteresis still yields past the boundary", flips == SLOWLY_SHRINKING)
+    dead_lo, rapid_lo = trend_bands(20.0)
+    dead_hi, rapid_hi = trend_bands(30.0)
+    check("trend bands x1.5 above 25 m/s",
+          abs(dead_hi - dead_lo * 1.5) < 1e-9 and abs(rapid_hi - rapid_lo * 1.5) < 1e-9,
+          f"dead {dead_lo}->{dead_hi}, rapid {rapid_lo}->{rapid_hi}")
+    check("-2.0 m/s is only SLOWLY at highway speed",
+          classify_trend(-2.0, 30.0) == SLOWLY_SHRINKING, "rapid bar is -2.25 there")
 
-
-def test_modulation():
-    print("\n§6 -- threshold modulation")
-    base = Thresholds()
-    dry = modulate(base, Context(v_host=20.0))
-    check("no modulation in clear conditions", dry.tau_close == 1.5)
-
-    rain = modulate(base, Context(v_host=20.0, rain=True))
-    check("rain scales thresholds by 1.25", abs(rain.tau_comfort - 3.75) < 1e-9,
-          f"tau_comfort {base.tau_comfort} -> {rain.tau_comfort}")
-    night = modulate(base, Context(v_host=20.0, night=True))
-    check("night scales thresholds by 1.25", abs(night.ttc_urgent - 3.125) < 1e-9)
-
-    fast = modulate(base, Context(v_host=30.0))
-    check("v_host > 25 overrides tau_close to 1.8", abs(fast.tau_close - 1.8) < 1e-9)
-    # Spec order matters: the override lands after the scale, so it is absolute.
-    both = modulate(base, Context(v_host=30.0, rain=True))
-    check("override applies after scaling (absolute, not scaled)",
-          abs(both.tau_close - 1.8) < 1e-9,
-          "rain alone would give 1.875; the override tightens it back to 1.8")
+    # Estimate-significance gate (not in v2; see TREND_SIGNIFICANCE_SIGMA).
+    check("unconverged d_dot reads STABLE",
+          classify_trend(-0.53, 25.0, None, d_dot_sigma=1.56) == STABLE,
+          "0.34 sigma -- filter does not yet know the closing speed")
+    check("converged d_dot is believed",
+          classify_trend(-0.53, 25.0, None, d_dot_sigma=0.10) == SLOWLY_SHRINKING)
 
 
 def test_confidence():
-    print("\n§4 -- confidence")
-    ctx = Context(v_host=25.0, v_host_source="CAN")
-    hi = compute_confidence(0.9, 0.9, 0.0, 0.0, ctx)
-    check("good inputs -> high confidence", hi > 0.7, f"{hi:.3f}")
-    check("bad track suppresses", compute_confidence(0.9, 0.05, 0.0, 0.0, ctx) < 0.4,
-          "product, not average -- one bad input must suppress")
-    check("stale anchor penalised",
-          compute_confidence(0.9, 0.9, 12.0, 0.0, ctx) < hi)
-    check("coasting decays confidence to 0 by 1.0 s",
-          compute_confidence(0.9, 0.9, 0.0, 1.0, ctx) == 0.0)
-    check("GPS trusted less than CAN",
-          compute_confidence(0.9, 0.9, 0.0, 0.0, Context(v_host_source="GPS")) <
-          compute_confidence(0.9, 0.9, 0.0, 0.0, Context(v_host_source="CAN")))
+    print("\n§8 -- confidence as a weighted sum")
+    check("all-perfect inputs -> 1.0",
+          abs(compute_confidence(1.0, 0.0, 1.0, 0.0, 0.0) - 1.0) < 1e-9)
+    w = compute_confidence(1.0, 0.0, 0.0, 0.0, 0.0)
+    check("dropping track costs exactly its 0.25 weight", abs(w - 0.75) < 1e-9, f"{w}")
+    w2 = compute_confidence(0.0, 1.0, 1.0, 0.0, 0.0)
+    check("depth terms carry 0.60 combined", abs(w2 - 0.40) < 1e-9, f"{w2}")
+    check("sum, not product: one zero input does not zero the score",
+          compute_confidence(1.0, 0.0, 0.0, 12.0, 0.0) > 0.0,
+          "v1 multiplied these; v2 §8 specifies a weighted sum")
+    check("coasting decays to zero by 1.0 s (headway_design §5)",
+          compute_confidence(1.0, 0.0, 1.0, 0.0, 1.0) == 0.0)
+    check("stale anchor costs its 0.15 weight",
+          compute_confidence(1.0, 0.0, 1.0, 99.0, 0.0) < 1.0)
+
+    print("\n§8 -- confidence tiers 0.4 / 0.7")
+    sm = settled(band=GETTING_UNSAFE)
+    r = sm.tick(measure(tau=1.8, confidence=0.35), t=10.0, dt=DT)
+    check("< 0.4 -> DEGRADED", r["state"] == DEGRADED)
+    sm = settled(band=GETTING_UNSAFE)
+    r = sm.tick(measure(tau=1.8, confidence=0.55), t=10.0, dt=DT)
+    check("0.4-0.7 -> coaching allowed", r["state"] != DEGRADED)
+    check("0.4-0.7 reported as 'reduced'", r["confidence_tier"] == "reduced")
+    sm = settled(band=GETTING_UNSAFE)
+    r = sm.tick(measure(tau=1.8, confidence=0.9), t=10.0, dt=DT)
+    check(">= 0.7 -> 'full'", r["confidence_tier"] == "full")
 
 
-def test_filter_cutin():
-    print("\n§4/§5 -- innovation gate and cut-in escape hatch")
+def test_confirmation():
+    print("\n§3 -- temporal confirmation")
+    sm = settled(band=NORMAL)
+    seq = [r["tau_band"] for r in run(sm, measure(tau=1.8), 5, t0=10.0)]
+    check("escalate one band takes 3 frames",
+          seq[1] == NORMAL and seq[2] == GETTING_UNSAFE, f"{seq}")
+
+    sm = settled(band=GETTING_UNSAFE)
+    seq = [r["tau_band"] for r in run(sm, measure(tau=3.0), 14, t0=10.0)]
+    first = next((i for i, b in enumerate(seq) if b != GETTING_UNSAFE), None)
+    check("de-escalate takes 12 frames", first == 11, f"dropped at index {first}")
+
+    print("\n§3 -- URGENT confirmation")
+    sm = settled(band=NORMAL)
+    urgent = measure(tau=2.2, ttc=1.5, trend=RAPIDLY_SHRINKING,
+                     confidence=0.9, depth_conf=0.9, track_quality=0.9)
+    seq = [r["urgent"] for r in run(sm, urgent, 3, t0=10.0)]
+    check("URGENT confirms in 2 frames at high confidence", seq[1] is True, f"{seq}")
+    check("URGENT never fires on one frame", seq[0] is False)
+
+    sm = settled(band=NORMAL)
+    weak = measure(tau=2.2, ttc=1.5, trend=RAPIDLY_SHRINKING,
+                   confidence=0.55, depth_conf=0.5, track_quality=0.5)
+    seq = [r["urgent"] for r in run(sm, weak, 4, t0=10.0)]
+    check("bypass disabled below 0.7 -> 3 frames", seq[1] is False and seq[2] is True,
+          f"{seq}")
+
+    sm = settled(band=NORMAL)
+    mid = measure(tau=2.2, ttc=2.3, trend=RAPIDLY_SHRINKING,
+                  confidence=0.9, depth_conf=0.9, track_quality=0.9)
+    seq = [r["urgent"] for r in run(sm, mid, 4, t0=10.0)]
+    check("TTC in [2.0, 2.5) -> 3 frames (retained §4 condition)",
+          seq[1] is False and seq[2] is True, f"{seq}")
+
+    print("\n§3 -- recovery from a system state takes 6 frames")
+    sm = settled(band=NORMAL)
+    sm.tick(measure(tau=2.2, confidence=0.2), t=10.0, dt=DT)
+    check("entered DEGRADED immediately", sm.state == DEGRADED)
+    seq = [r["state"] for r in run(sm, measure(tau=2.2), 8, t0=11.0)]
+    first = next((i for i, s in enumerate(seq) if s != DEGRADED), None)
+    check("leaves DEGRADED after 6 frames", first == 5, f"index {first}: {seq[:8]}")
+
+
+def test_urgent_orthogonal():
+    print("\n§0/§1 -- URGENT is orthogonal to the tau bands")
+    # The case v2 §0 Challenge 1 names: comfortable tau, lethal TTC.
+    sm = settled(band=COMFORTABLE)
+    m = measure(tau=2.6, ttc=1.8, trend=RAPIDLY_SHRINKING)
+    seq = run(sm, m, 4, t0=10.0)
+    check("URGENT fires from COMFORTABLE when TTC is low",
+          any(r["urgent"] for r in seq),
+          "tau 2.6 s with TTC 1.8 s -- the bands alone would miss this entirely")
+    check("tau band stays COMFORTABLE underneath", seq[-1]["tau_band"] == COMFORTABLE)
+    check("display state becomes URGENT", seq[-1]["state"] == URGENT)
+
+    sm = settled(band=NORMAL)
+    calm = measure(tau=2.2, ttc=1.5, trend=SLOWLY_SHRINKING)
+    check("URGENT requires RAPIDLY_SHRINKING, not just low TTC",
+          not any(r["urgent"] for r in run(sm, calm, 5, t0=10.0)))
+
+
+def test_low_speed():
+    print("\n§7 -- low-speed handling")
+    sm = settled(band=CRITICAL)
+    ctx = Context(v_host=3.0)
+    r = sm.tick(measure(tau=0.8, trend=STABLE, ctx=ctx), t=10.0, dt=DT)
+    check("v_host < 5 m/s -> SUPPRESSED_LOW_SPEED", r["state"] == SUPPRESSED_LOW_SPEED)
+    check("no tau coaching while suppressed", not r["voice_fired"])
+
+    sm = settled(band=COMFORTABLE)
+    ctx = Context(v_host=3.0)
+    m = measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING, ctx=ctx)
+    seq = run(sm, m, 4, t0=10.0)
+    check("TTC urgent path stays ARMED below 5 m/s",
+          any(r["urgent"] for r in seq), "v2 §7: only tau coaching is suppressed")
+
+    sm = settled(band=COMFORTABLE)
+    ctx = Context(v_host=6.0)
+    r = run(sm, measure(tau=2.3, ctx=ctx), 5, t0=10.0)[-1]
+    # tau 2.3 / 1.2 = 1.92 -> GETTING_UNSAFE, where unscaled it would be NORMAL.
+    check("5-8 m/s relaxes thresholds by 1.2", r["tau_band"] == GETTING_UNSAFE,
+          f"tau 2.3 scaled to {r['tau_scaled']} -> {r['tau_band']}")
+    check("low_speed_scale reported", abs(r["low_speed_scale"] - 1.2) < 1e-9)
+
+    sm = settled(band=NORMAL)
+    r = sm.tick(measure(tau=2.2, v_host_stale=True), t=10.0, dt=DT)
+    check("stale host speed -> DEGRADED", r["state"] == DEGRADED)
+
+
+def test_system_states():
+    print("\n§1 -- LOST / DEGRADED")
+    sm = settled(band=NORMAL)
+    r = sm.tick(measure(track_lost=True, coast_age=1.5), t=10.0, dt=DT)
+    check("track lost past 1.0 s coast -> LOST", r["state"] == LOST)
+    sm = settled(band=NORMAL)
+    r = sm.tick(measure(tau=2.2, track_lost=True, coast_age=0.5), t=10.0, dt=DT)
+    check("still coasting under 1.0 s is not LOST", r["state"] != LOST)
+
+    sm = settled(band=COMFORTABLE)
+    m = measure(tau=0.5, ttc=1.0, trend=RAPIDLY_SHRINKING, confidence=0.2)
+    seq = run(sm, m, 5, t0=10.0)
+    check("DEGRADED suppresses the urgent path entirely",
+          all(r["state"] == DEGRADED and not r["urgent"] for r in seq),
+          "v2 §8: low confidence suppresses, never warns cautiously")
+    check("DEGRADED fires no voice", not any(r["voice_fired"] for r in seq))
+
+
+def test_voice_policy():
+    print("\n§4 -- voice policy table")
+
+    # Row: tau > 2.0 -- silent in every trend column.
+    for trend in (INCREASING, STABLE, SLOWLY_SHRINKING, RAPIDLY_SHRINKING):
+        sm = settled(band=NORMAL)
+        run(sm, measure(tau=2.2, trend=trend), 20, t0=10.0)
+        check(f"NORMAL + {trend} -> silent", not voice_clips(sm), f"{voice_clips(sm)}")
+
+    # Row: GETTING_UNSAFE
+    sm = settled(band=GETTING_UNSAFE)
+    run(sm, measure(tau=1.8, trend=STABLE), 20, t0=10.0)
+    check("GETTING_UNSAFE + STABLE -> silent", not voice_clips(sm))
+
+    sm = settled(band=GETTING_UNSAFE)
+    run(sm, measure(tau=1.8, trend=SLOWLY_SHRINKING), 20, t0=10.0)
+    check("GETTING_UNSAFE + SLOWLY -> calm line",
+          any(v["action"]["line"] == S.LINE_CALM for v in sm.voice_log),
+          f"{[v['action'].get('line') for v in sm.voice_log]}")
+    check("calm line is live TTS, not a pre-rendered clip",
+          sm.voice_log and sm.voice_log[0]["action"]["kind"] == "rio_speak")
+
+    sm = settled(band=GETTING_UNSAFE)
+    run(sm, measure(tau=1.8, trend=RAPIDLY_SHRINKING, ttc=6.0), 20, t0=10.0)
+    check("GETTING_UNSAFE + RAPIDLY -> stronger line",
+          "closing_fast.wav" in voice_clips(sm), f"{voice_clips(sm)}")
+
+    # Row: UNSAFE
+    sm = settled(band=UNSAFE)
+    run(sm, measure(tau=1.2, trend=STABLE), 20, t0=10.0)
+    check("UNSAFE + STABLE -> silent (logs instead)", not voice_clips(sm))
+
+    sm = settled(band=UNSAFE)
+    run(sm, measure(tau=1.2, trend=SLOWLY_SHRINKING), 20, t0=10.0)
+    check("UNSAFE + SLOWLY -> stronger line",
+          "too_close.wav" in voice_clips(sm), f"{voice_clips(sm)}")
+
+    sm = settled(band=UNSAFE)
+    run(sm, measure(tau=1.2, trend=RAPIDLY_SHRINKING, ttc=5.0), 20, t0=10.0)
+    check("UNSAFE + RAPIDLY, TTC >= 4 -> stronger line only",
+          "too_close.wav" in voice_clips(sm) and "brake.wav" not in voice_clips(sm),
+          f"{voice_clips(sm)}")
+
+    sm = settled(band=UNSAFE)
+    run(sm, measure(tau=1.2, trend=RAPIDLY_SHRINKING, ttc=3.5), 20, t0=10.0)
+    check("UNSAFE + RAPIDLY, TTC < 4 -> urgent clip (TTC_UNSAFE_ASSIST)",
+          "brake.wav" in voice_clips(sm), f"{voice_clips(sm)}")
+
+    # Row: CRITICAL
+    sm = settled(band=CRITICAL)
+    ticks = run(sm, measure(tau=0.9, trend=STABLE), 20, t0=10.0)
+    check("CRITICAL + STABLE -> silent", not voice_clips(sm), f"{voice_clips(sm)}")
+    check("CRITICAL + STABLE logs persistent_tailgate",
+          any(r["persistent_tailgate"] for r in ticks))
+    check("CRITICAL arms the pre-cached urgent buffer",
+          ticks[-1]["urgent_buffer_armed"])
+
+    sm = settled(band=CRITICAL)
+    run(sm, measure(tau=0.9, trend=SLOWLY_SHRINKING), 20, t0=10.0)
+    check("CRITICAL + SLOWLY -> urgent-adjacent (never quieter than UNSAFE)",
+          voice_clips(sm), f"{voice_clips(sm)}")
+
+    sm = settled(band=CRITICAL)
+    run(sm, measure(tau=0.9, trend=RAPIDLY_SHRINKING, ttc=6.0), 20, t0=10.0)
+    check("CRITICAL + RAPIDLY -> brake, even with TTC above the urgent bar",
+          "brake.wav" in voice_clips(sm), f"{voice_clips(sm)}")
+
+    print("\n§4 note 1 -- stable tailgating never becomes a warning")
+    sm = settled(band=CRITICAL)
+    ticks = run(sm, measure(tau=0.9, trend=STABLE), 200, t0=10.0)
+    check("200 frames of stable tau=0.9 produce zero voice", not sm.voice_log,
+          "this is the case v2 §0 Challenge 1 exists for")
+    check("but every frame is logged",
+          sum(1 for r in ticks if r["persistent_tailgate"]) == 200)
+
+
+def test_cooldowns():
+    print("\n§6 -- voice cooldowns (voice only)")
+    # Strong line: 15 s, and re-entry required.
+    sm = settled(band=UNSAFE)
+    m = measure(tau=1.2, trend=SLOWLY_SHRINKING)
+    run(sm, m, 30, t0=10.0)
+    n_first = len(sm.voice_log)
+    run(sm, m, 30, t0=12.0)
+    check("stronger line does not repeat inside 15 s", len(sm.voice_log) == n_first,
+          f"{len(sm.voice_log)} events")
+
+    # Re-arm requires leaving the band, not merely waiting out the cooldown.
+    sm = settled(band=UNSAFE)
+    run(sm, m, 20, t0=10.0)
+    n = len(sm.voice_log)
+    run(sm, m, 20, t0=100.0)          # cooldown long expired, never left the band
+    check("re-entry required even after the cooldown expires",
+          len(sm.voice_log) == n, f"{len(sm.voice_log)} events")
+
+    sm = settled(band=UNSAFE)
+    run(sm, m, 20, t0=10.0)
+    n = len(sm.voice_log)
+    run(sm, measure(tau=3.0), 20, t0=40.0)            # leave the band
+    sm.tau_band = UNSAFE                              # and come back
+    run(sm, m, 20, t0=100.0)
+    check("fires again after leaving and re-entering", len(sm.voice_log) > n,
+          f"{n} -> {len(sm.voice_log)}")
+
+    print("\n§6 -- URGENT has no cooldown, only a 2.0 s min gap")
+    sm = settled(band=CRITICAL)
+    urgent = measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING)
+    run(sm, urgent, 12, t0=10.0)
+    first = len(sm.voice_log)
+    check("urgent fires", first >= 1)
+    run(sm, urgent, 6, t0=11.0)       # 1 s later -- inside the gap
+    check("urgent does not repeat inside 2.0 s", len(sm.voice_log) == first)
+    run(sm, urgent, 6, t0=12.5)       # 2.5 s later -- gap elapsed
+    check("urgent repeats after 2.0 s", len(sm.voice_log) > first,
+          f"{first} -> {len(sm.voice_log)}")
+
+
+def test_cutin_and_warmup():
+    print("\n§5 -- cut-in reset, and the coaching warm-up")
     f = HeadwayFilter()
     for _ in range(30):
-        f.step(50.0, 0.9, 1 / 15.0)
-    check("filter converges on a steady gap", abs(f.d - 50.0) < 1.0, f"d={f.d:.2f}")
-
-    # A car cuts in at 20 m: a discontinuity, not noise.
-    s1 = f.step(20.0, 0.9, 1 / 15.0)
-    check("first outlier is gated, not absorbed", not s1["accepted"], s1["reason"])
-    check("state barely moves after one outlier", abs(f.d - 50.0) < 2.0, f"d={f.d:.2f}")
-    s2 = f.step(20.0, 0.9, 1 / 15.0)
-    check("second outlier still gated", not s2["accepted"])
-    s3 = f.step(20.0, 0.9, 1 / 15.0)
+        f.step(50.0, 0.9, DT)
+    s1 = f.step(20.0, 0.9, DT)
+    check("first outlier gated, not absorbed", not s1["accepted"], s1["reason"])
+    f.step(20.0, 0.9, DT)
+    s3 = f.step(20.0, 0.9, DT)
     check(f"{MAX_CONSEC_REJECTS} consecutive rejects -> reset", s3["reason"] == "reset_new_lead")
-    check("NEW_LEAD flagged on reset", s3["new_lead"])
-    check("filter re-seeds at the new range", abs(f.d - 20.0) < 0.01, f"d={f.d:.2f}")
-    check("relative speed reset to unknown (0)", abs(f.d_dot) < 1e-9)
+    check("NEW_LEAD flagged", s3["new_lead"])
+    check("re-seeds at the new range", abs(f.d - 20.0) < 0.01, f"d={f.d:.2f}")
+
+    sm = settled(band=UNSAFE)
+    m = measure(tau=1.2, trend=SLOWLY_SHRINKING, new_lead=True)
+    r = sm.tick(m, t=10.0, dt=DT)
+    check("voice suppressed on the reset frame", not r["voice_fired"], str(r["voice"]))
+    check("hold window opened", r["new_lead_hold_frames"] > 0)
+
+    # Warm-up: coaching stays silent for COACH_WARMUP_S after a reset.
+    sm = WarningStateMachine(rate_hz=12.0)
+    sm.tick(measure(tau=1.2, trend=SLOWLY_SHRINKING, new_lead=True), t=0.0, dt=DT)
+    sm.tau_band = UNSAFE
+    early = run(sm, measure(tau=1.2, trend=SLOWLY_SHRINKING), 5, t0=DT)
+    check("no coaching inside the warm-up window",
+          not any(r["voice_fired"] for r in early),
+          f"{S.COACH_WARMUP_S}s after init the velocity estimate is still settling")
+    late = run(sm, measure(tau=1.2, trend=SLOWLY_SHRINKING), 12,
+               t0=S.COACH_WARMUP_S + 1.0)
+    check("coaching resumes after the warm-up", any(r["voice_fired"] for r in late))
+
+    # ... but URGENT is deliberately not warm-up gated.
+    sm = WarningStateMachine(rate_hz=12.0)
+    sm.tick(measure(new_lead=True), t=0.0, dt=DT)
+    seq = run(sm, measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING), 8, t0=DT)
+    check("URGENT is NOT blocked by the coaching warm-up",
+          any(r["urgent"] for r in seq),
+          "an emergency during warm-up is still an emergency")
 
 
-def test_filter_coast():
-    print("\n§5 -- occlusion coasting")
-    f = HeadwayFilter()
-    for _ in range(30):
-        f.step(50.0, 0.9, 1 / 15.0)
-    for _ in range(5):
-        s = f.step(None, 0.0, 1 / 15.0)
-    check("coasts on prediction when measurement is missing", s["d"] is not None)
-    check("coast_age accumulates", s["coast_age"] > 0.3, f"{s['coast_age']:.2f}s")
+def test_purity():
+    print("\n§9 -- LLM firewall")
+    import re
+    src = open(__file__.replace("selftest.py", "state.py")).read()
 
+    # Match real import statements only. A bare substring scan false-positives:
+    # "vision" is inside "provisional", which this module says a lot.
+    imported = set()
+    for line in src.splitlines():
+        mm = re.match(r"\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", line)
+        if mm:
+            imported.add((mm.group(1) or mm.group(2)).split(".")[0])
 
-def test_state_machine():
-    print("\n§6 -- state machine and §4 confirmation asymmetry")
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    m = _measure(tau=2.5, trend=STABLE)
-    for i in range(6):
-        sm.tick(m, t=i / 15.0)
-    check("MONITOR needs 6 frames", sm.state == MONITOR)
-
-    # Escalation: 3 frames.
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = CLOSE
-    m = _measure(tau=1.2, trend=SLOWLY_SHRINKING)
-    states = [sm.tick(m, t=i / 15.0)["state"] for i in range(4)]
-    check("WARNING escalates in exactly 3 frames",
-          states[1] == CLOSE and states[2] == WARNING, f"{states}")
-
-    # De-escalation: 12 frames, even though tick() asks for 6.
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = WARNING
-    calm = _measure(tau=2.5, trend=INCREASING)
-    seq = [sm.tick(calm, t=i / 15.0)["state"] for i in range(14)]
-    first_drop = next((i for i, s in enumerate(seq) if s != WARNING), None)
-    check("de-escalation takes 12 frames, not 6", first_drop == 11, f"dropped at index {first_drop}")
-
-    # URGENT bypass, §4 preconditions met.
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = WARNING
-    urgent = _measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING,
-                      depth_conf=0.9, track_quality=0.9)
-    seq = [sm.tick(urgent, t=i / 15.0)["state"] for i in range(3)]
-    check("URGENT confirms in 2 frames under high confidence", seq[1] == URGENT, f"{seq}")
-
-    # §4: never single-frame, even at extreme TTC.
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = WARNING
-    check("URGENT never fires on one frame",
-          sm.tick(urgent, t=0.0)["state"] != URGENT)
-
-    # Weak inputs -> the bypass is withdrawn, 3 frames instead of 2.
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = WARNING
-    weak = _measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING,
-                    depth_conf=0.45, track_quality=0.45, confidence=0.55)
-    seq = [sm.tick(weak, t=i / 15.0)["state"] for i in range(4)]
-    check("URGENT bypass withdrawn when confidence is weak", seq[1] != URGENT, f"{seq}")
-
-
-def test_suppression():
-    print("\n§4/§5 -- DEGRADED and LOST suppression")
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = COMFORTABLE
-    bad = _measure(tau=0.5, ttc=1.0, trend=RAPIDLY_SHRINKING, confidence=0.2)
-    check("low confidence -> DEGRADED immediately", sm.tick(bad, t=0.0)["state"] == DEGRADED)
-    check("DEGRADED wins over an URGENT-looking measurement", sm.state == DEGRADED,
-          "low confidence must SUPPRESS, never cautious-fire")
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    stale = _measure(v_host_stale=True)
-    check("stale host speed -> DEGRADED", sm.tick(stale, t=0.0)["state"] == DEGRADED)
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    lost = _measure(track_lost=True, coast_age=1.5)
-    check("track lost past 1.0 s coast -> LOST", sm.tick(lost, t=0.0)["state"] == LOST)
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    coasting = _measure(track_lost=True, coast_age=0.5, tau=2.5)
-    check("still coasting under 1.0 s is not yet LOST",
-          sm.tick(coasting, t=0.0)["state"] != LOST)
-
-
-def test_new_lead_hold():
-    print("\n§5 -- warnings re-confirm after a NEW_LEAD reset")
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = COMFORTABLE
-    m = _measure(tau=0.8, ttc=1.5, trend=RAPIDLY_SHRINKING, new_lead=True)
-    r = sm.tick(m, t=0.0)
-    check("URGENT is held on the reset frame", r["candidate"] != URGENT, r["reason"])
-    check("hold window opened", r["new_lead_hold_s"] > 0.0, f"{r['new_lead_hold_s']}s")
-
-
-def test_audio_policy():
-    print("\n§6/§0 -- transition audio policy")
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = MONITOR
-    m = _measure(tau=1.8, trend=STABLE)
-    for i in range(8):
-        sm.tick(m, t=i / 15.0)
-    tr = [t for t in sm.transitions if t["to"] == CLOSE]
-    check("CLOSE uses live TTS", tr and tr[0]["action"]["kind"] == "rio_speak")
-
-    sm = WarningStateMachine(rate_hz=15.0)
-    sm.state = WARNING
-    urgent = _measure(tau=0.5, ttc=1.2, trend=RAPIDLY_SHRINKING)
-    for i in range(3):
-        sm.tick(urgent, t=i / 15.0)
-    tr = [t for t in sm.transitions if t["to"] == URGENT]
-    check("URGENT uses pre-rendered local audio",
-          tr and tr[0]["action"]["kind"] == "play_local" and tr[0]["action"]["interrupts"],
-          "TTS round trip would be a crash narration, not a warning")
-    check("Stage 0 runs in shadow mode", tr and tr[0]["shadow_mode"])
-    check("transition carries a full snapshot",
-          tr and {"d", "tau", "ttc", "trend", "confidence"} <= set(tr[0]["snapshot"]))
+    for forbidden in ("transformers", "torch", "cv2", "requests", "numpy",
+                      "vision", "llm_interface", "app", "anchor", "depth", "tracker"):
+        check(f"state.py does not import {forbidden!r}", forbidden not in imported)
+    check("state.py imports only the stdlib",
+          imported <= {"math", "dataclasses"}, f"imports: {sorted(imported)}")
+    check("state.py performs no file I/O", "open(" not in src)
 
 
 def main():
-    print("=" * 68)
-    print("headway deterministic-core self-test (docs/headway_design.md)")
-    print("=" * 68)
+    print("=" * 70)
+    print("headway warning-logic v2 self-test (docs/warning_logic_v2.md)")
+    print("=" * 70)
+    test_bands()
+    test_hysteresis()
     test_maths()
-    test_modulation()
     test_confidence()
-    test_filter_cutin()
-    test_filter_coast()
-    test_state_machine()
-    test_suppression()
-    test_new_lead_hold()
-    test_audio_policy()
+    test_confirmation()
+    test_urgent_orthogonal()
+    test_low_speed()
+    test_system_states()
+    test_voice_policy()
+    test_cooldowns()
+    test_cutin_and_warmup()
+    test_purity()
 
     passed = sum(1 for ok, _, _ in _results if ok)
     total = len(_results)
-    print("\n" + "=" * 68)
+    print("\n" + "=" * 70)
     print(f"{passed}/{total} checks passed")
     if passed != total:
         print("\nFAILURES:")
         for ok, name, detail in _results:
             if not ok:
-                print(f"  - {name} {detail}")
-    print("=" * 68)
+                print(f"  - {name}  {detail}")
+    print("=" * 70)
     return 0 if passed == total else 1
 
 
