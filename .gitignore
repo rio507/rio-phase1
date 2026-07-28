@@ -8,3 +8,4 @@ app.py.embedfix.bak
 *.bak
 uvicorn.log
 training_data/
+runs/
