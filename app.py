@@ -1,6 +1,10 @@
 
 
 import time
+import uuid
+import threading
+from contextlib import asynccontextmanager
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,7 +18,28 @@ import voice
 import llm_interface
 import vision
 
-app = FastAPI()
+def _warm_vision():
+    t = time.time()
+    try:
+        vision.warm()
+        # flush: stdout is block-buffered when uvicorn is redirected to a log
+        # file, so without this the line can sit unseen for a long time.
+        print(f"[vision] warm complete in {time.time() - t:.1f}s", flush=True)
+    except Exception as e:
+        # Warming is an optimisation; a failure here must not stop the server.
+        # The first /observe will simply load the model the old way.
+        print(f"[vision] warm failed after {time.time() - t:.1f}s: {e}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm on a daemon thread so uvicorn reports ready immediately. vision._lock
+    # makes an early /observe wait for this load instead of starting a second one.
+    threading.Thread(target=_warm_vision, name="vision-warm", daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 client = OpenAI()
 
 
@@ -25,6 +50,27 @@ def index():
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "rio-phase1"}
+
+
+# Most recent completed talk turn, for the dashboard to pick up after playback.
+# RIO's reply text only exists once the LLM stream has finished, which is after
+# the response headers are already on the wire — so it cannot be a header.
+# Single-driver assumption: this holds one turn for the whole process.
+_last_talk = {
+    "talk_id": None,
+    "transcript": "",
+    "reply": "",
+    "session_id": None,
+    "audio_bytes": 0,
+    "latency_ms": 0.0,
+    "t": 0.0,
+}
+
+
+@app.get("/last_talk")
+def last_talk_endpoint():
+    """Latest finished talk turn. The dashboard polls this for RIO's reply text."""
+    return dict(_last_talk)
 
 
 @app.post("/talk")
@@ -50,22 +96,50 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
         "whisper_seconds": round(t1 - t0, 3),
     })
 
+    talk_id = uuid.uuid4().hex[:12]
+
     def streamer():
         buffer = ""
+        reply_parts = []
+        audio_len = 0
 
         for token in llm_interface.generate_stream(transcript):
             buffer += token
+            reply_parts.append(token)
 
             if any(buffer.rstrip().endswith(p) for p in [".", "!", "?"]):
                 for chunk in voice.synthesize_stream(buffer):
+                    audio_len += len(chunk)
                     yield chunk
                 buffer = ""
 
         if buffer.strip():
             for chunk in voice.synthesize_stream(buffer):
+                audio_len += len(chunk)
                 yield chunk
 
-    return StreamingResponse(streamer(), media_type="audio/mpeg")
+        # Stream is done: publish the turn for /last_talk and the session log.
+        reply = "".join(reply_parts).strip()
+        latency_ms = (time.time() - t0) * 1000
+        _last_talk.update({
+            "talk_id": talk_id,
+            "transcript": transcript,
+            "reply": reply,
+            "session_id": session_id,
+            "audio_bytes": audio_len,
+            "latency_ms": round(latency_ms, 1),
+            "t": time.time(),
+        })
+        sessions.log_talk(session_id, transcript, reply, audio_len, latency_ms)
+
+    # The transcript is known before streaming starts, so it can ride on a header.
+    # URL-encoded because headers are latin-1 only and transcripts are UTF-8.
+    headers = {
+        "X-Transcript": quote(transcript, safe=""),
+        "X-Talk-Id": talk_id,
+        "Access-Control-Expose-Headers": "X-Transcript, X-Talk-Id",
+    }
+    return StreamingResponse(streamer(), media_type="audio/mpeg", headers=headers)
 
 from fastapi import File
 import sessions

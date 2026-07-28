@@ -3,27 +3,817 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>RIO</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#020308" />
+<title>RIO // SPEED SUSPECTS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anta&family=JetBrains+Mono:wght@400;500&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: -apple-system, sans-serif; max-width: 680px; margin: 40px auto; padding: 0 20px; background: #0e0e10; color: #eee; }
-  h1 { font-size: 28px; }
-  button { font-size: 18px; padding: 14px 28px; margin: 8px 4px; border-radius: 12px; border: none; cursor: pointer; }
-  #mic { background: #b91c1c; color: white; }
-  #mic.recording { background: #16a34a; }
-  #frame { background: #2563eb; color: white; }
-  #observation { background: #1f1f23; padding: 16px; border-radius: 12px; margin-top: 20px; font-family: ui-monospace, monospace; font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
-  audio { display: block; margin-top: 20px; width: 100%; }
+  :root {
+    --bg-0: #020308; --bg-1: #04060c; --bg-2: #060a12; --bg-3: #0a0f18;
+    --surface: rgba(95,179,232,0.030); --surface-2: rgba(95,179,232,0.060); --surface-hover: rgba(95,179,232,0.100);
+    --border: rgba(95,179,232,0.22); --border-strong: rgba(95,179,232,0.55);
+    --text: #cfe8ff; --text-bright: #e8f4ff; --text-dim: rgba(180,215,246,0.65); --text-dimmer: rgba(120,165,205,0.45);
+    --green: #6ee7c7; --amber: #ffb84d; --red: #ff6b6b; --blue: #5fb3e8;
+    --accent: #5fb3e8; --accent-bright: #9bd6ff; --accent-glow: 0 0 14px rgba(95,179,232,0.65);
+    --radius-card: 0px; --radius-pill: 0px;
+
+    --font-display: 'Anta', 'Rajdhani', -apple-system, sans-serif;
+    --font-ui: 'Rajdhani', -apple-system, 'Helvetica Neue', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+    --miter: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+  }
+
+  * { box-sizing: border-box; }
+
+  html { background: var(--bg-0); }
+
+  body {
+    font-family: var(--font-ui);
+    max-width: 1600px; margin: 28px auto; padding: 0 20px 40px;
+    min-height: 100vh;
+    color: var(--text);
+    background:
+      radial-gradient(ellipse 130% 75% at 50% 0%, rgba(95,179,232,0.05) 0%, rgba(95,179,232,0) 62%),
+      linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 55%);
+    background-attachment: fixed;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- shared HUD primitives ---------- */
+
+  .bracketed { position: relative; }
+  .bracketed::before,
+  .bracketed::after {
+    content: ''; position: absolute; width: 12px; height: 12px;
+    border: 1.5px solid var(--accent); pointer-events: none;
+    filter: drop-shadow(0 0 4px rgba(95,179,232,0.75));
+    z-index: 2;
+  }
+  .bracketed::before { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+  .bracketed::after { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 14px;
+  }
+
+  .panel-label, .col-sublabel {
+    font-family: var(--font-mono);
+    font-size: 10.5px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    margin-bottom: 8px;
+  }
+
+  /* ---------- header ---------- */
+
+  .hud-header {
+    display: flex; align-items: center; gap: 12px;
+    padding-bottom: 14px; margin-bottom: 18px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo-mark {
+    width: 16px; height: 16px; flex: 0 0 16px;
+    transform: rotate(45deg);
+    border: 1.5px solid var(--accent);
+    background: radial-gradient(circle at 50% 50%, rgba(155,214,255,0.75) 0%, rgba(95,179,232,0.10) 70%);
+    box-shadow: var(--accent-glow), inset 0 0 6px rgba(155,214,255,0.65);
+  }
+
+  .wordmark { display: flex; flex-direction: column; gap: 2px; line-height: 1; }
+
+  .brand {
+    font-family: var(--font-display);
+    font-size: 19px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--text-bright);
+    text-shadow: 0 0 8px rgba(95,179,232,0.55);
+  }
+
+  .brand-sub {
+    font-family: var(--font-ui); font-weight: 600;
+    font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  .hud-header-meta {
+    margin-left: auto; text-align: right;
+    font-family: var(--font-mono); font-size: 10.5px;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--text-dimmer);
+  }
+
+  /* ---------- 4-column pipeline ---------- */
+
+  .pipeline {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr 1fr 1fr;
+    gap: 16px;
+    align-items: start;
+  }
+
+  .col { display: flex; flex-direction: column; min-width: 0; }
+
+  .col-head {
+    padding-bottom: 10px; margin-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .col-title {
+    font-family: var(--font-ui); font-weight: 700;
+    font-size: 15px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--text-bright);
+    text-shadow: 0 0 8px rgba(95,179,232,0.35);
+  }
+  .col-sub {
+    font-family: var(--font-mono);
+    font-size: 10.5px; letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    margin-top: 4px;
+  }
+
+  /* Stack in the same order on portrait / narrow screens. */
+  @media (max-width: 1000px), (orientation: portrait) {
+    .pipeline { grid-template-columns: 1fr; }
+  }
+
+  /* ---------- buttons ---------- */
+
+  button {
+    font-family: var(--font-ui);
+    border-radius: var(--radius-card);
+    cursor: pointer;
+    min-height: 60px;
+    -webkit-appearance: none; appearance: none;
+  }
+
+  #drive, #mic {
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: manipulation;
+  }
+
+  #drive {
+    position: relative;
+    display: block; width: 100%;
+    min-height: 64px; margin: 0 0 12px 0; padding: 14px 18px;
+    font-weight: 700; font-size: 18px;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent-bright);
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--accent-glow), inset 0 0 22px rgba(95,179,232,0.08);
+    clip-path: var(--miter);
+    transition: background 140ms linear, box-shadow 140ms linear, color 140ms linear;
+  }
+  #drive:hover { background: var(--surface-hover); }
+  #drive:disabled { opacity: 0.55; }
+  #drive.active {
+    color: #ffdede;
+    border-color: var(--red);
+    background: rgba(255,107,107,0.08);
+    box-shadow: 0 0 14px rgba(255,107,107,0.60), inset 0 0 22px rgba(255,107,107,0.10);
+    padding-left: 38px;
+  }
+  #drive.active::before {
+    content: ''; position: absolute;
+    left: 16px; top: 50%; margin-top: -3.5px;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--red);
+    box-shadow: 0 0 8px var(--red);
+    animation: livepulse 1.6s ease-in-out infinite;
+  }
+  @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+  .hud-btn {
+    font-family: var(--font-ui); font-weight: 600;
+    font-size: 12.5px; letter-spacing: 0.15em; text-transform: uppercase;
+    min-height: 60px; padding: 12px 16px; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--radius-card);
+    cursor: pointer;
+    clip-path: var(--miter);
+    color: var(--accent-bright);
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+  }
+  .upload-label {
+    color: var(--green);
+    background: rgba(110,231,199,0.07);
+    border: 1px solid rgba(110,231,199,0.45);
+  }
+  #grab {
+    color: #ffdede;
+    background: rgba(255,107,107,0.10);
+    border: 1px solid var(--red);
+  }
+
+  /* ---------- column 1: camera ---------- */
+
+  .cam-wrap {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border: 1px solid var(--border-strong);
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  /* The capture element is now genuinely visible, which also sidesteps the iOS
+     Safari quirk where a fully hidden <video> stops decoding frames. */
+  #video { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+  .cam-badge {
+    position: absolute; top: 8px; left: 8px;
+    display: none; align-items: center; gap: 6px;
+    padding: 4px 9px;
+    font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    color: #ffdede;
+    background: rgba(255,107,107,0.16);
+    border: 1px solid var(--red);
+    box-shadow: 0 0 10px rgba(255,107,107,0.5);
+    z-index: 3;
+  }
+  body.driving .cam-badge { display: flex; }
+  .cam-badge::before {
+    content: ''; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--red); box-shadow: 0 0 8px var(--red);
+    animation: livepulse 1.6s ease-in-out infinite;
+  }
+
+  .cam-nosignal {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    background: repeating-linear-gradient(
+      0deg, rgba(95,179,232,0.03) 0px, rgba(95,179,232,0.03) 1px, transparent 1px, transparent 4px);
+    z-index: 2;
+  }
+  body.driving .cam-nosignal { display: none; }
+  /* An upload or a manual capture is occupying the box. */
+  body.previewing .cam-nosignal { display: none; }
+
+  /* Uploaded stills / clips and manual captures share the camera box with the
+     live stream. Layered under the badge and status strip (z-index 3) so those
+     stay readable on top of whatever is showing. */
+  #campreview, #preview {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    background: #000;
+    z-index: 1;
+  }
+  #campreview { display: none; }
+
+  .cam-overlay {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; gap: 14px; flex-wrap: wrap;
+    padding: 7px 10px;
+    background: linear-gradient(180deg, rgba(2,3,8,0) 0%, rgba(2,3,8,0.88) 55%);
+    font-family: var(--font-mono); font-size: 10.5px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    z-index: 3;
+  }
+  .cam-overlay i { font-style: normal; color: var(--text-dimmer); margin-right: 5px; }
+  .cam-overlay b { font-weight: 500; color: var(--text); }
+
+  #drivestatus {
+    font-family: var(--font-mono);
+    font-size: 10.5px; line-height: 1.5;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--text);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    padding: 9px 12px;
+    margin-bottom: 12px;
+    min-height: 1.2em;
+    word-break: break-word;
+  }
+  #drivestatus::before { content: 'STATUS \0020 \25B8 \0020 '; color: var(--text-dimmer); }
+  #drivestatus:empty::after { content: 'STANDBY'; color: var(--text-dimmer); }
+
+  .manual-controls { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
+  /* #preview now lives inside .cam-wrap and is styled with #campreview above. */
+
+  /* ---------- column 2: perception ---------- */
+
+  #observation {
+    font-family: var(--font-mono);
+    font-size: 11.5px; line-height: 1.65;
+    color: var(--text);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-card);
+    padding: 14px;
+    white-space: pre-wrap; word-wrap: break-word;
+    margin-bottom: 14px;
+  }
+
+  .history { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; }
+  .history::-webkit-scrollbar { width: 4px; }
+  .history::-webkit-scrollbar-thumb { background: var(--border-strong); }
+
+  .hist-item {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.55;
+    padding: 8px 10px;
+    background: var(--bg-1);
+    border-left: 2px solid var(--border);
+    color: var(--text-dim);
+  }
+  /* Newest entry reads bright; the rest recede. */
+  .history .hist-item:first-child { color: var(--text); border-left-color: var(--accent); }
+  .hist-time {
+    display: block; margin-bottom: 4px;
+    font-size: 9.5px; letter-spacing: 0.18em; color: var(--text-dimmer);
+  }
+
+  /* ---------- column 3: dialogue ---------- */
+
+  .turn { padding: 10px 12px; background: var(--bg-1); border: 1px solid var(--border); margin-bottom: 10px; }
+  .turn-tag {
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.22em; text-transform: uppercase;
+    margin-bottom: 5px;
+  }
+  .turn-driver .turn-tag { color: var(--text-dimmer); }
+  .turn-rio .turn-tag { color: var(--accent); }
+  .turn-text { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text); }
+  .turn-rio .turn-text { color: var(--text-bright); }
+  .turn-empty { color: var(--text-dimmer); font-family: var(--font-mono); font-size: 11px; }
+
+  /* ---------- column 4: voice layer ---------- */
+
+  .ring-wrap { display: flex; justify-content: center; padding: 18px 0 14px; }
+  .ring {
+    position: relative;
+    width: 120px; height: 120px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    border: 2px solid rgba(95,179,232,0.30);
+    background: radial-gradient(circle at 50% 50%, rgba(95,179,232,0.06), transparent 70%);
+    transition: border-color 160ms linear, box-shadow 160ms linear;
+  }
+  .ring-state {
+    font-family: var(--font-mono); font-size: 10.5px;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--text-dimmer);
+  }
+  .ring.listening {
+    border-color: var(--red);
+    box-shadow: 0 0 22px rgba(255,107,107,0.55), inset 0 0 22px rgba(255,107,107,0.12);
+    animation: ringpulse 1.2s ease-in-out infinite;
+  }
+  .ring.listening .ring-state { color: #ffdede; }
+  @keyframes ringpulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+
+  .ring.speaking {
+    border-color: var(--accent-bright);
+    box-shadow: 0 0 26px rgba(95,179,232,0.70), inset 0 0 26px rgba(95,179,232,0.15);
+  }
+  .ring.speaking .ring-state { color: var(--accent-bright); }
+  .ring.speaking::before {
+    content: ''; position: absolute; inset: -7px;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg, transparent 0deg, rgba(95,179,232,0.85) 90deg, transparent 180deg);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    animation: ringspin 1.8s linear infinite;
+  }
+  @keyframes ringspin { to { transform: rotate(360deg); } }
+
+  .spoken {
+    font-family: var(--font-ui); font-style: italic;
+    font-size: 14px; line-height: 1.5; text-align: center;
+    color: var(--text-dim);
+    min-height: 3em; padding: 0 4px 14px;
+  }
+  .spoken.has-line { color: var(--text-bright); }
+
+  .chips { display: flex; gap: 8px; margin-bottom: 12px; }
+  .chip {
+    flex: 1; padding: 8px 10px;
+    background: var(--bg-1); border: 1px solid var(--border);
+    font-family: var(--font-mono);
+  }
+  .chip i {
+    display: block; font-style: normal;
+    font-size: 9.5px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--text-dimmer); margin-bottom: 3px;
+  }
+  .chip b { font-weight: 500; font-size: 13px; color: var(--text); }
+
+  .audio-panel { margin-top: auto; }
+  .audio-panel audio {
+    display: block; width: 100%;
+    filter: invert(92%) hue-rotate(175deg) saturate(0.85) brightness(1.05);
+  }
+
+  /* ---------- hold to talk ---------- */
+
+  #micbar { margin-top: 16px; }
+  #mic {
+    display: block; width: 100%;
+    padding: 14px 20px; margin: 0;
+    font-weight: 600; font-size: 18px;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--text-bright);
+    background: var(--surface);
+    border: 1px solid var(--border-strong);
+    box-shadow: 0 0 10px rgba(95,179,232,0.28), inset 0 0 26px rgba(95,179,232,0.05);
+    clip-path: var(--miter);
+    transition: background 120ms linear, box-shadow 120ms linear, border-color 120ms linear;
+  }
+  #mic:hover { background: var(--surface-hover); }
+  #mic.recording {
+    color: #ffe4e4;
+    border-color: var(--red);
+    background: rgba(255,107,107,0.10);
+    box-shadow: 0 0 18px rgba(255,107,107,0.62), inset 0 0 32px rgba(255,107,107,0.12);
+  }
+
+  /* While driving the mic pins to the bottom of the viewport so it can be hit
+     without looking, regardless of how far the columns have scrolled. */
+  body.driving { padding-bottom: 46dvh; }
+  body.driving #micbar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    margin: 0; padding: 8px 12px;
+    background: linear-gradient(180deg, rgba(2,3,8,0) 0%, rgba(2,3,8,0.92) 22%);
+    z-index: 9999;
+  }
+  body.driving #mic {
+    font-size: 30px; font-weight: 700;
+    height: 42vh;   /* fallback */
+    height: 42dvh;  /* honours iOS Safari's dynamic toolbars */
+    min-height: 40vh;
+  }
+  @media (orientation: landscape) and (max-height: 480px) {
+    body.driving #mic { height: 46vh; height: 46dvh; min-height: 40vh; font-size: 26px; }
+    body.driving .hud-header { display: none; }
+  }
+
+  @supports (padding: max(0px)) {
+    body {
+      padding-left: max(20px, env(safe-area-inset-left));
+      padding-right: max(20px, env(safe-area-inset-right));
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #drive.active::before, .cam-badge::before, .ring.listening, .ring.speaking::before { animation: none; }
+  }
 </style>
 </head>
 
 <body>
-<h1>RIO</h1>
-<button id="mic">Hold to talk</button>
-<video id="video" autoplay playsinline muted style="display:none;"></video>
-<audio id="player" controls autoplay></audio>
-<div id="observation">No observation yet.</div>
 
+<header class="hud-header">
+  <div class="logo-mark"></div>
+  <div class="wordmark">
+    <div class="brand">SPEED SUSPECTS</div>
+    <div class="brand-sub">RIO</div>
+  </div>
+  <div class="hud-header-meta">Radar Intercept<br>Officer</div>
+</header>
+
+<main class="pipeline">
+
+  <!-- ============ COLUMN 1 - CAMERA ============ -->
+  <section class="col panel bracketed">
+    <div class="col-head">
+      <div class="col-title">Camera</div>
+      <div class="col-sub">Visual Input &middot; Capture</div>
+    </div>
+
+    <button id="drive">Start Drive</button>
+
+    <div class="cam-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <img id="campreview" alt="">
+      <video id="preview" style="display:none;" controls playsinline muted autoplay></video>
+      <div class="cam-badge">Live</div>
+      <div class="cam-nosignal">No Signal</div>
+      <div class="cam-overlay">
+        <span><i>Frames</i><b id="statframes">0</b></span>
+        <span><i>Last</i><b id="statlast">--:--:--</b></span>
+        <span><i>Session</i><b id="statsession">&mdash;</b></span>
+      </div>
+    </div>
+
+    <div id="drivestatus"></div>
+
+    <div class="manual-controls">
+      <button id="frame" class="hud-btn">Send Webcam Frame</button>
+      <label for="upload" class="hud-btn upload-label">Upload Image/Video</label>
+      <input type="file" id="upload" accept="image/*,video/*" style="display:none">
+      <button id="grab" class="hud-btn" style="display:none;">Grab This Frame</button>
+    </div>
+  </section>
+
+  <!-- ============ COLUMN 2 - PERCEPTION ============ -->
+  <section class="col panel">
+    <div class="col-head">
+      <div class="col-title">Perception</div>
+      <div class="col-sub">Qwen2.5-VL-3B &middot; Seeing</div>
+    </div>
+
+    <div id="observation">No observation yet.</div>
+
+    <div class="col-sublabel">History &middot; Last 5</div>
+    <div class="history" id="obshistory"></div>
+  </section>
+
+  <!-- ============ COLUMN 3 - DIALOGUE ============ -->
+  <section class="col panel">
+    <div class="col-head">
+      <div class="col-title">RIO's Dialogue</div>
+      <div class="col-sub">GPT-5.5 &middot; Speaking</div>
+    </div>
+
+    <div class="turn turn-driver">
+      <div class="turn-tag">Driver</div>
+      <div class="turn-text turn-empty" id="turndriver">Awaiting input.</div>
+    </div>
+    <div class="turn turn-rio">
+      <div class="turn-tag">RIO</div>
+      <div class="turn-text turn-empty" id="turnrio">Standing by.</div>
+    </div>
+
+    <div class="col-sublabel">Session Transcript</div>
+    <div class="history" id="dialoghistory"></div>
+  </section>
+
+  <!-- ============ COLUMN 4 - VOICE LAYER ============ -->
+  <section class="col panel bracketed">
+    <div class="col-head">
+      <div class="col-title">Voice Layer</div>
+      <div class="col-sub">ElevenLabs &middot; Narrator</div>
+    </div>
+
+    <div class="ring-wrap">
+      <div class="ring" id="voicering">
+        <span class="ring-state" id="voicestate">Idle</span>
+      </div>
+    </div>
+
+    <div class="spoken" id="spokenline"></div>
+
+    <div class="chips">
+      <div class="chip"><i>Round Trip</i><b id="statrtt">&mdash;</b></div>
+      <div class="chip"><i>Audio</i><b id="statdur">&mdash;</b></div>
+    </div>
+
+    <div class="panel audio-panel">
+      <div class="panel-label">Voice Downlink</div>
+      <audio id="player" controls autoplay playsinline></audio>
+    </div>
+  </section>
+
+</main>
+
+<div id="micbar">
+  <button id="mic">Hold to talk</button>
+</div>
+
+<script>
+/* Shared drive state + helpers. Defined before the feature scripts so both
+   DOMContentLoaded blocks below can reach it. */
+window.RIO = (function () {
+  let sessionId = null;
+  let videoStream = null;
+
+  // iOS Safari only allows programmatic playback on an <audio> element that has
+  // already been played once inside a real user gesture. RIO's reply arrives
+  // after an await, so we "unlock" the element during the tap that starts the
+  // recording; the later .play() then succeeds.
+  let unlocked = false;
+  function silentWavUrl() {
+    const rate = 8000, n = 8;
+    const buf = new ArrayBuffer(44 + n);
+    const v = new DataView(buf);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVE');
+    w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+    w(36, 'data'); v.setUint32(40, n, true);
+    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128); // 8-bit silence
+    return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  }
+
+  return {
+    // --- session ---
+    get sessionId() { return sessionId; },
+    set sessionId(v) { sessionId = v; },
+    get driving() { return sessionId !== null; },
+
+    // Append ?session_id=<id> to any endpoint while a drive is active.
+    url(path) {
+      if (!sessionId) return path;
+      return path + (path.includes('?') ? '&' : '?') + 'session_id=' + encodeURIComponent(sessionId);
+    },
+
+    // --- audio gesture unlock (call from inside a tap handler) ---
+    unlockAudio(player) {
+      if (unlocked) return;
+      unlocked = true;
+      try {
+        player.src = silentWavUrl();
+        const p = player.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) { /* non-fatal: falls back to the controls */ }
+    },
+    playReply(player, blob) {
+      const old = player.src;
+      player.src = URL.createObjectURL(blob);
+      if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+      const p = player.play();
+      if (p && p.catch) p.catch(() => {}); // user can still hit the controls
+    },
+
+    // --- shared webcam ---
+    get videoStream() { return videoStream; },
+    set videoStream(s) { videoStream = s; },
+
+    // getUserMedia needs a secure context (HTTPS or localhost). Report that
+    // clearly instead of throwing an unhandled rejection.
+    mediaAvailable() {
+      return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    },
+    mediaError(e) {
+      if (!window.isSecureContext) {
+        return 'Camera/mic need HTTPS (or localhost). Open this page over https:// on the phone.';
+      }
+      return 'Media error: ' + (e && e.name ? e.name : e);
+    },
+
+    // Grab one JPEG from a live <video>. Shared by the manual button and the drive timer.
+    frameFromVideo(video, quality) {
+      return new Promise((resolve, reject) => {
+        if (!video.videoWidth || !video.videoHeight) return reject(new Error('video not ready'));
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        canvas.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')), 'image/jpeg', quality || 0.85);
+      });
+    }
+  };
+})();
+</script>
+
+<script>
+/* ---- HUD render layer. Pure presentation: every entry point is called by the
+   existing pipeline scripts below and none of them change control flow. ---- */
+window.RIO = window.RIO || {};
+RIO.ui = (function () {
+  const $ = id => document.getElementById(id);
+
+  let talkStart = null;       // performance.now() at fetch dispatch
+  let expectingReply = false; // true only between playReply() and playback end
+
+  function stamp() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function trim(container, max) {
+    while (container.children.length > max) container.removeChild(container.lastChild);
+  }
+
+  return {
+    // ----- column 1: camera -----
+    session(sid) {
+      const el = $('statsession');
+      if (el) el.textContent = sid ? sid.slice(0, 8) : '—';
+    },
+    frameSent(n) {
+      const f = $('statframes'), l = $('statlast');
+      if (f) f.textContent = n;
+      if (l) l.textContent = stamp();
+    },
+
+    // ----- column 2: perception -----
+    observation(text) {
+      if (!text) return;
+      const hist = $('obshistory');
+      if (!hist) return;
+      const item = document.createElement('div');
+      item.className = 'hist-item';
+      const t = document.createElement('span');
+      t.className = 'hist-time';
+      t.textContent = stamp();
+      const body = document.createElement('span');
+      body.textContent = text;
+      item.appendChild(t); item.appendChild(body);
+      hist.insertBefore(item, hist.firstChild);
+      trim(hist, 5);
+    },
+
+    // ----- column 3: dialogue -----
+    driver(text) {
+      const el = $('turndriver');
+      if (el && text) { el.textContent = text; el.classList.remove('turn-empty'); }
+    },
+    rio(text) {
+      const el = $('turnrio');
+      if (el && text) { el.textContent = text; el.classList.remove('turn-empty'); }
+      const sp = $('spokenline');
+      if (sp && text) { sp.textContent = '“' + text + '”'; sp.classList.add('has-line'); }
+    },
+    turnToHistory(driverText, rioText) {
+      const hist = $('dialoghistory');
+      if (!hist) return;
+      const item = document.createElement('div');
+      item.className = 'hist-item';
+      const t = document.createElement('span');
+      t.className = 'hist-time';
+      t.textContent = stamp();
+      item.appendChild(t);
+      if (driverText) {
+        const d = document.createElement('div');
+        d.textContent = 'DRIVER: ' + driverText;
+        item.appendChild(d);
+      }
+      if (rioText) {
+        const r = document.createElement('div');
+        r.style.color = 'var(--accent-bright)';
+        r.textContent = 'RIO: ' + rioText;
+        item.appendChild(r);
+      }
+      hist.insertBefore(item, hist.firstChild);
+      trim(hist, 20);
+    },
+
+    // ----- column 4: voice layer -----
+    voice(state) {
+      const ring = $('voicering'), label = $('voicestate');
+      if (!ring || !label) return;
+      ring.classList.remove('listening', 'speaking');
+      if (state === 'listening' || state === 'speaking') ring.classList.add(state);
+      label.textContent = state;
+    },
+    markTalkStart() { talkStart = performance.now(); expectingReply = true; },
+    get expectingReply() { return expectingReply; },
+    clearExpect() { expectingReply = false; },
+    playbackStarted() {
+      if (talkStart !== null) {
+        const el = $('statrtt');
+        if (el) el.textContent = Math.round(performance.now() - talkStart) + ' ms';
+        talkStart = null;
+      }
+    },
+    duration(secs) {
+      const el = $('statdur');
+      if (!el) return;
+      // Chunked MP3 from a streaming TTS often reports Infinity until fully buffered.
+      el.textContent = (secs && isFinite(secs)) ? secs.toFixed(1) + ' s' : '—';
+    },
+
+    // Ask the server for the reply text once the stream has finished.
+    // /talk streams audio, so RIO's words cannot ride on a response header.
+    async fetchReply(talkId, tries) {
+      tries = tries || 6;
+      for (let i = 0; i < tries; i++) {
+        try {
+          const r = await fetch('/last_talk', { cache: 'no-store' });
+          const j = await r.json();
+          if (j && j.reply && (!talkId || j.talk_id === talkId)) return j;
+        } catch (e) { /* retry */ }
+        await new Promise(res => setTimeout(res, 350));
+      }
+      return null;
+    }
+  };
+})();
+
+document.addEventListener('DOMContentLoaded', () => {
+  const player = document.getElementById('player');
+  if (!player) return;
+  // Ring follows real playback events so it can never lie about audio state.
+  player.addEventListener('playing', () => {
+    if (!RIO.ui.expectingReply) return;   // ignore the silent iOS unlock clip
+    RIO.ui.voice('speaking');
+    RIO.ui.playbackStarted();
+    RIO.ui.duration(player.duration);
+  });
+  player.addEventListener('loadedmetadata', () => {
+    if (RIO.ui.expectingReply) RIO.ui.duration(player.duration);
+  });
+  const toIdle = () => {
+    if (!RIO.ui.expectingReply) return;
+    RIO.ui.clearExpect();
+    RIO.ui.voice('idle');
+  };
+  player.addEventListener('ended', toIdle);
+  player.addEventListener('pause', toIdle);
+});
+</script>
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
@@ -34,7 +824,16 @@ const obs = document.getElementById('observation');
 let recorder, chunks;
 
 async function startRec() {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  // Unlock playback while we are still inside the tap gesture (iOS Safari).
+  RIO.unlockAudio(player);
+  if (!RIO.mediaAvailable()) { obs.textContent = RIO.mediaError(); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    obs.textContent = RIO.mediaError(e);
+    return;
+  }
   recorder = new MediaRecorder(stream);
   chunks = [];
   recorder.ondataavailable = e => chunks.push(e.data);
@@ -42,55 +841,243 @@ async function startRec() {
     const blob = new Blob(chunks, { type: 'audio/webm' });
     const fd = new FormData();
     fd.append('audio', blob, 'rec.webm');
-    const r = await fetch('/talk', { method: 'POST', body: fd });
-    player.src = URL.createObjectURL(await r.blob());
-    stream.getTracks().forEach(t => t.stop());
+    try {
+      RIO.ui.markTalkStart();
+      const r = await fetch(RIO.url('/talk'), { method: 'POST', body: fd });
+      // Headers first: the transcript is known before the audio stream starts.
+      let transcript = '';
+      const rawTx = r.headers.get('X-Transcript');
+      if (rawTx) { try { transcript = decodeURIComponent(rawTx); } catch (e) { transcript = rawTx; } }
+      const talkId = r.headers.get('X-Talk-Id');
+      if (transcript) RIO.ui.driver(transcript);
+      RIO.playReply(player, await r.blob());
+      // Reply text only exists once the stream finished; pick it up from /last_talk.
+      RIO.ui.fetchReply(talkId).then(j => {
+        if (!j) return;
+        RIO.ui.rio(j.reply);
+        RIO.ui.turnToHistory(j.transcript || transcript, j.reply);
+      });
+    } catch (e) {
+      obs.textContent = 'Talk failed: ' + e;
+      RIO.ui.clearExpect();
+      RIO.ui.voice('idle');
+    } finally {
+      stream.getTracks().forEach(t => t.stop());
+    }
   };
   recorder.start();
   micBtn.classList.add('recording');
   micBtn.textContent = 'Release to send';
+  RIO.ui.voice('listening');
 }
 function stopRec() {
   if (recorder && recorder.state === 'recording') {
     recorder.stop();
     micBtn.classList.remove('recording');
     micBtn.textContent = 'Hold to talk';
+    RIO.ui.voice('idle');
   }
 }
 micBtn.addEventListener('mousedown', startRec);
 micBtn.addEventListener('mouseup', stopRec);
 micBtn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
 micBtn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+// Without this a dragged-off or interrupted touch leaves the recorder running.
+micBtn.addEventListener('touchcancel', e => { e.preventDefault(); stopRec(); });
+micBtn.addEventListener('contextmenu', e => e.preventDefault());
 
 frameBtn.addEventListener('click', async () => {
   obs.textContent = 'Capturing...';
-  const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-  const video = document.createElement('video');
-  video.srcObject = stream;
-  await video.play();
-  const canvas = document.createElement('canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  canvas.getContext('2d').drawImage(video, 0, 0);
-  stream.getTracks().forEach(t => t.stop());
-  canvas.toBlob(async blob => {
-    obs.textContent = 'Analyzing...';
-    const fd = new FormData();
-    fd.append('image', blob, 'frame.jpg');
-    const r = await fetch('/observe', { method: 'POST', body: fd });
+  if (!RIO.mediaAvailable()) { obs.textContent = RIO.mediaError(); return; }
+  let blob, temp = null;
+  try {
+    if (RIO.videoStream) {
+      // A drive is running: reuse the live stream instead of re-prompting.
+      blob = await RIO.frameFromVideo(document.getElementById('video'));
+    } else {
+      temp = await navigator.mediaDevices.getUserMedia({ video: true });
+      const video = document.createElement('video');
+      video.srcObject = temp;
+      video.playsInline = true; video.muted = true;
+      await video.play();
+      blob = await RIO.frameFromVideo(video);
+    }
+  } catch (e) {
+    obs.textContent = RIO.mediaError(e);
+    return;
+  } finally {
+    if (temp) temp.getTracks().forEach(t => t.stop());
+  }
+  obs.textContent = 'Analyzing...';
+  const fd = new FormData();
+  fd.append('image', blob, 'frame.jpg');
+  try {
+    const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
     const j = await r.json();
     obs.textContent = j.observation || '(empty)';
-  }, 'image/jpeg', 0.85);
+    RIO.ui.observation(j.observation);
+  } catch (e) {
+    obs.textContent = 'Observe failed: ' + e;
+  }
 });
 });
 </script>
 
-<button id="frame" style="position:fixed;bottom:20px;right:20px;padding:14px 24px;background:#2563eb;color:white;border:none;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Send Webcam Frame</button>
-<label for="upload" style="position:fixed;bottom:20px;right:230px;padding:14px 24px;background:#16a34a;color:white;border-radius:12px;cursor:pointer;font-size:16px;z-index:9999;">Upload Image/Video</label>
-<input type="file" id="upload" accept="image/*,video/*" style="display:none">
-<video id="preview" style="position:fixed;bottom:160px;right:20px;max-width:380px;max-height:240px;display:none;z-index:9999;background:#000;" controls></video>
-<button id="grab" style="position:fixed;bottom:120px;right:20px;padding:10px 18px;background:#dc2626;color:white;border:none;border-radius:10px;cursor:pointer;font-size:14px;display:none;z-index:9999;">Grab This Frame</button>
-<div id="observation" style="position:fixed;bottom:80px;right:20px;max-width:380px;background:#1f1f23;color:#eee;padding:12px;border-radius:8px;font-size:12px;font-family:monospace;display:none;white-space:pre-wrap;z-index:9999;"></div>
+<script>
+/* --- Drive mode: session lifecycle + 5s auto-observe --- */
+document.addEventListener('DOMContentLoaded', () => {
+  const driveBtn = document.getElementById('drive');
+  const status = document.getElementById('drivestatus');
+  const video = document.getElementById('video');
+  const obs = document.getElementById('observation');
+  const player = document.getElementById('player');
+
+  const INTERVAL_MS = 5000;
+  let timer = null;
+  let inflight = false;
+  let busy = false;      // guards double-taps on the toggle itself
+  let wakeLock = null;
+  let frames = 0;
+
+  function say(msg) { status.textContent = msg; }
+
+  async function captureOnce() {
+    if (inflight || !RIO.driving) return;
+    inflight = true;
+    try {
+      const blob = await RIO.frameFromVideo(video);
+      const fd = new FormData();
+      fd.append('image', blob, 'frame.jpg');
+      const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
+      const j = await r.json();
+      obs.textContent = j.observation || '(empty)';
+      frames++;
+      RIO.ui.observation(j.observation);
+      RIO.ui.frameSent(frames);
+      say('Drive active - ' + frames + ' frames - session ' + RIO.sessionId.slice(0, 8));
+    } catch (e) {
+      // Never let one bad frame kill the drive loop.
+      say('Drive active - last capture failed (' + (e.name || e) + ')');
+    } finally {
+      inflight = false;
+    }
+  }
+
+  // Chained timeout, not setInterval: a slow /observe must not let calls stack up.
+  function schedule() {
+    timer = setTimeout(async () => {
+      await captureOnce();
+      if (RIO.driving) schedule();
+    }, INTERVAL_MS);
+  }
+
+  async function startDrive() {
+    // Unlock reply audio inside this tap, so /talk replies can autoplay later.
+    RIO.unlockAudio(player);
+
+    if (!RIO.mediaAvailable()) { say(RIO.mediaError()); return; }
+
+    say('Starting drive...');
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }, audio: false
+      });
+    } catch (e) {
+      say(RIO.mediaError(e));
+      return;
+    }
+
+    let sid;
+    try {
+      const r = await fetch('/session/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metadata: { source: 'dashboard', ua: navigator.userAgent } })
+      });
+      sid = (await r.json()).session_id;
+      if (!sid) throw new Error('no session_id in response');
+    } catch (e) {
+      stream.getTracks().forEach(t => t.stop());
+      say('Could not start session: ' + e);
+      return;
+    }
+
+    RIO.sessionId = sid;
+    RIO.videoStream = stream;
+    video.srcObject = stream;
+    try { await video.play(); } catch (e) { /* autoplay+muted should cover this */ }
+
+    // Keep the screen awake; a sleeping screen throttles the timer to nothing.
+    try {
+      if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+    } catch (e) { /* optional */ }
+
+    document.body.classList.add('driving');
+    driveBtn.classList.add('active');
+    driveBtn.textContent = 'End Drive';
+    frames = 0;
+    RIO.ui.session(sid);
+    RIO.ui.frameSent(0);
+    say('Drive active - session ' + sid.slice(0, 8));
+    schedule();
+  }
+
+  async function endDrive() {
+    const sid = RIO.sessionId;
+    if (timer) { clearTimeout(timer); timer = null; }
+
+    // Clear session first so in-flight captures stop tagging themselves.
+    RIO.sessionId = null;
+
+    if (RIO.videoStream) {
+      RIO.videoStream.getTracks().forEach(t => t.stop());
+      RIO.videoStream = null;
+    }
+    video.srcObject = null;
+
+    if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
+
+    document.body.classList.remove('driving');
+    driveBtn.classList.remove('active');
+    driveBtn.textContent = 'Start Drive';
+    RIO.ui.session(null);
+
+    try {
+      await fetch('/session/end?session_id=' + encodeURIComponent(sid), { method: 'POST' });
+      say('Drive ended - ' + frames + ' frames - session ' + sid.slice(0, 8));
+    } catch (e) {
+      say('Drive stopped locally, but /session/end failed: ' + e);
+    }
+  }
+
+  driveBtn.addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    driveBtn.disabled = true;
+    try {
+      if (RIO.driving) await endDrive(); else await startDrive();
+    } finally {
+      busy = false;
+      driveBtn.disabled = false;
+    }
+  });
+
+  // If the browser drops the wake lock (tab backgrounded), take it again on return.
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && RIO.driving && 'wakeLock' in navigator && !wakeLock) {
+      try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    }
+  });
+
+  // Best-effort session close if the page is closed mid-drive.
+  window.addEventListener('pagehide', () => {
+    if (RIO.driving && navigator.sendBeacon) {
+      navigator.sendBeacon('/session/end?session_id=' + encodeURIComponent(RIO.sessionId));
+    }
+  });
+});
+</script>
 
 <script>
 document.addEventListener('DOMContentLoaded', () => {
@@ -104,9 +1091,10 @@ document.addEventListener('DOMContentLoaded', () => {
     obs.textContent = 'Analyzing...';
     const fd = new FormData();
     fd.append('image', blob, 'frame.jpg');
-    const r = await fetch('/observe', { method: 'POST', body: fd });
+    const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
     const j = await r.json();
     obs.textContent = j.observation || '(empty)';
+    RIO.ui.observation(j.observation);
   }
 
   upload.addEventListener('change', (e) => {
@@ -149,6 +1137,92 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   preview.addEventListener('pause', () => { if (watcher) clearInterval(watcher); });
   preview.addEventListener('ended', () => { if (watcher) clearInterval(watcher); });
+});
+</script>
+
+<script>
+/* ---- Camera-box preview. Purely additive: this registers a SECOND listener on
+   the upload input and wraps RIO.frameFromVideo, so no existing handler and no
+   part of the drive loop is modified. Priority in the box is:
+   live drive stream > upload / manual capture > NO SIGNAL. ---- */
+document.addEventListener('DOMContentLoaded', () => {
+  const img = document.getElementById('campreview');
+  const preview = document.getElementById('preview');
+  const upload = document.getElementById('upload');
+  const body = document.body;
+  if (!img || !preview || !upload) return;
+
+  let objUrl = null;
+  function releaseUrl() {
+    if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+  }
+
+  function showImage(src) {
+    preview.style.display = 'none';
+    img.src = src;
+    img.style.display = 'block';
+    body.classList.add('previewing');
+  }
+
+  function showVideo() {
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    preview.style.display = 'block';
+    body.classList.add('previewing');
+    const p = preview.play();
+    if (p && p.catch) p.catch(() => {}); // muted+autoplay should satisfy iOS
+  }
+
+  function clearBox() {
+    try { preview.pause(); } catch (e) {}
+    preview.style.display = 'none';
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    body.classList.remove('previewing');
+    releaseUrl();
+  }
+
+  // --- uploads. The existing handler still does the /observe work; this one
+  // only paints the box, so both run off the same change event.
+  upload.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (RIO.driving) return;              // live stream owns the box mid-drive
+    if (file.type.startsWith('image/')) {
+      releaseUrl();
+      objUrl = URL.createObjectURL(file);
+      showImage(objUrl);
+    } else if (file.type.startsWith('video/')) {
+      // The existing handler already assigned preview.src for videos.
+      showVideo();
+    }
+  });
+
+  // --- manual "Send Webcam Frame". Wrapping the shared capture helper keeps
+  // the original promise contract intact and returns the same blob onward.
+  if (RIO && typeof RIO.frameFromVideo === 'function') {
+    const originalFrameFromVideo = RIO.frameFromVideo;
+    RIO.frameFromVideo = function (video, quality) {
+      return originalFrameFromVideo.call(RIO, video, quality).then((blob) => {
+        if (blob && !RIO.driving) {
+          releaseUrl();
+          objUrl = URL.createObjectURL(blob);
+          showImage(objUrl);
+        }
+        return blob;   // callers are unaffected
+      });
+    };
+  }
+
+  // --- drive takeover / release. Watching the body class means the drive loop
+  // itself needs no hook: it already adds and removes 'driving'.
+  let wasDriving = body.classList.contains('driving');
+  new MutationObserver(() => {
+    const driving = body.classList.contains('driving');
+    if (driving === wasDriving) return;
+    wasDriving = driving;
+    clearBox();   // drive start: stream takes over. drive end: back to NO SIGNAL.
+  }).observe(body, { attributes: true, attributeFilter: ['class'] });
 });
 </script>
 </body>

@@ -1,6 +1,32 @@
+# --- web / voice layer ---
 fastapi
 uvicorn[standard]
 openai>=1.0
 elevenlabs>=1.0
 python-dotenv
 python-multipart
+
+# --- ML stack (Qwen3-VL-8B observer) ---
+# Torch is NOT on PyPI in its CUDA build. Install the three torch packages from
+# the cu124 index first, then the rest of this file:
+#   pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+#       --index-url https://download.pytorch.org/whl/cu124
+# That resolves to the +cu124 local builds (torch 2.4.1+cu124 etc.). A plain
+# `pip install -r requirements.txt` pulls the CPU/default-CUDA wheels instead.
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+
+# 4.57.0 is the FLOOR, not a preference: Qwen3VLForConditionalGeneration and the
+# qwen3_vl model_type do not exist before it. 4.57 also wants only torch>=2.2,
+# so it does not force the pinned torch above off 2.4.1.
+transformers==4.57.0
+accelerate==1.14.0
+
+# Ranges transformers 4.57.0 itself declares — pinned here so a resolver cannot
+# quietly drift outside them and break tokenizer/model loading.
+tokenizers>=0.22.0,<=0.23.0
+huggingface_hub>=0.34.0,<1.0
+
+safetensors>=0.8.0
+Pillow>=10.0.1

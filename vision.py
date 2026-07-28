@@ -1,16 +1,19 @@
-"""Qwen2.5-VL-3B vision module for RIO.
+"""Qwen3-VL-8B vision module for RIO.
 Loads the model once at first use, caches the most recent observation
 so llm_interface.get_observation() can pull it cheaply per user turn.
+
+Upgraded from Qwen2.5-VL-3B. Qwen3-VL needs transformers >= 4.57.0 and a
+different model class; torch stays at 2.4.1+cu124 (4.57 only wants >= 2.2).
 """
 import io
 import threading
 import torch
 from PIL import Image
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
 from rio_prompts import OBSERVER_PROMPT
 
-MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
 # Sourced from rio_prompts.py (compiled from behavior bible v1).
 # The observer is NOT RIO. It produces a short factual note that RIO reads.
@@ -26,12 +29,13 @@ _last_observation = ""
 def _ensure_loaded():
     global _processor, _model
     if _model is None:
-        print("[vision] Loading Qwen2.5-VL-3B...")
+        print("[vision] Loading Qwen3-VL-8B...", flush=True)
         _processor = AutoProcessor.from_pretrained(MODEL_ID)
-        _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            MODEL_ID, torch_dtype=torch.bfloat16, device_map="auto"
+        # `dtype` replaces the deprecated `torch_dtype` kwarg in transformers 4.57.
+        _model = Qwen3VLForConditionalGeneration.from_pretrained(
+            MODEL_ID, dtype=torch.bfloat16, device_map="auto"
         )
-        print("[vision] Loaded.")
+        print("[vision] Loaded.", flush=True)
 
 
 def observe(image_bytes: bytes) -> str:
@@ -56,6 +60,35 @@ def observe(image_bytes: bytes) -> str:
         )[0].strip()
         _last_observation = text
         return text
+
+
+def warm() -> None:
+    """Preload weights and compile CUDA kernels so the first real /observe is fast.
+
+    Without this the first frame of a drive pays ~16s of cold-load while the
+    5s capture loop is already running.
+    """
+    if not config.VISION_ENABLED:
+        return
+    with _lock:
+        _ensure_loaded()
+        # One throwaway forward pass: loading the weights is most of the cost,
+        # but the first generate() also pays kernel warmup. Deliberately does
+        # NOT write _last_observation — RIO must not read a dummy frame as if
+        # it were the road ahead.
+        try:
+            pil = Image.new("RGB", (64, 64), (0, 0, 0))
+            msgs = [{"role": "user", "content": [
+                {"type": "image", "image": pil},
+                {"type": "text", "text": TEACHER_PROMPT},
+            ]}]
+            inputs = _processor.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt",
+            ).to(_model.device)
+            _model.generate(**inputs, max_new_tokens=1, do_sample=False)
+        except Exception as e:
+            print("[vision] warm inference skipped:", e)
 
 
 def get_observation() -> str:
