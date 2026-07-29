@@ -7,10 +7,11 @@ nothing more. Its box is validated against a geometric ego corridor before the
 tracker will accept it, and if the two disagree the corridor wins and we re-query.
 No Qwen output ever reaches the state machine.
 
-Stage 0 runs Qwen on the L40S. Note this loads a SECOND Qwen3-VL instance (~17 GB)
-if the live RIO app is already serving one -- both fit on a 46 GB L40S, but pass
-`use_qwen=False` and supply `--init-box` when you only need the deterministic path
-(e.g. the synthetic clip test).
+Stage 0 runs Qwen on the L40S. By default this loads its OWN Qwen3-VL instance
+(~17 GB); pass `use_qwen=False` with `--init-box` when you only need the
+deterministic path (e.g. the synthetic clip test). A host that already has the
+model resident can call `set_qwen_provider()` to lend it instead -- that is what
+the live app's /perceive does, so the two never hold two copies.
 """
 import json
 import re
@@ -159,6 +160,20 @@ _qwen_model = None
 _qwen_processor = None
 _qwen_lock = threading.Lock()
 
+# Optional injection point for an already-loaded Qwen3-VL. Set by the live app
+# (see perceive.py) so /perceive grounds boxes on the instance vision.py already
+# holds rather than loading a second ~17 GB copy -- the VRAM fits, but a second
+# 35 s load on a running service does not. Left None, this module keeps its
+# standalone behaviour and loads its own weights, so the Stage 0 clip tools are
+# unaffected and headway still imports nothing from the app.
+_qwen_provider = None
+
+
+def set_qwen_provider(provider) -> None:
+    """Supply a zero-arg callable returning (processor, model, lock)."""
+    global _qwen_provider
+    _qwen_provider = provider
+
 
 def _ensure_qwen():
     global _qwen_model, _qwen_processor
@@ -171,6 +186,19 @@ def _ensure_qwen():
     _qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
         QWEN_MODEL_ID, dtype=torch.bfloat16, device_map="auto"
     )
+
+
+def qwen_handles():
+    """(processor, model, lock) — the injected instance if there is one.
+
+    The lock travels with the handles on purpose: when the app injects its
+    model, /observe and /perceive are two threads holding one set of weights,
+    and they must serialise on the *same* lock rather than each on their own.
+    """
+    if _qwen_provider is not None:
+        return _qwen_provider()
+    _ensure_qwen()
+    return _qwen_processor, _qwen_model, _qwen_lock
 
 
 def _parse_boxes(text: str, width: int, height: int):
@@ -325,21 +353,21 @@ class LeadAnchor:
         import torch
         from PIL import Image
 
-        _ensure_qwen()
+        processor, model, lock = qwen_handles()
         pil = Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1]))  # BGR -> RGB
         msgs = [{"role": "user", "content": [
             {"type": "image", "image": pil},
             {"type": "text", "text": ANCHOR_PROMPT},
         ]}]
-        with _qwen_lock:
-            inputs = _qwen_processor.apply_chat_template(
+        with lock:
+            inputs = processor.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt",
-            ).to(_qwen_model.device)
+            ).to(model.device)
             with torch.inference_mode():
-                out = _qwen_model.generate(
+                out = model.generate(
                     **inputs, max_new_tokens=self.max_new_tokens, do_sample=False
                 )
-            return _qwen_processor.batch_decode(
+            return processor.batch_decode(
                 out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
             )[0].strip()

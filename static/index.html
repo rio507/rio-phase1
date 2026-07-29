@@ -302,6 +302,85 @@
   .manual-controls { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
   /* #preview now lives inside .cam-wrap and is styled with #campreview above. */
 
+  /* Perception overlay. Above the media (z-index 1) so boxes land on the
+     frame, below the badge and status strip (z-index 3) so those stay
+     readable on top of them. Never interactive: the canvas must not swallow
+     taps meant for the video underneath. */
+  #overlay {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    pointer-events: none;
+    z-index: 2;
+  }
+  body.layers-off #overlay { display: none; }
+
+  /* Fullscreen goes through the WRAP, never the bare <video>. Fullscreening a
+     video element promotes only that element, so the canvas -- a sibling --
+     is left behind on the normal page and the overlay vanishes. Promoting the
+     container takes the canvas along. */
+  #camfull {
+    position: absolute; top: 8px; right: 8px; z-index: 4;
+    padding: 5px 9px;
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--accent-bright);
+    background: rgba(6,10,18,0.55);
+    border: 1px solid var(--border-strong);
+    clip-path: var(--miter);
+    cursor: pointer;
+  }
+  #camfull::before { content: '⤡\00a0\00a0'; }
+  .cam-wrap.is-full #camfull::before { content: '⤢\00a0\00a0'; }
+
+  /* Both fullscreen paths drop the 16:9 lock and let the media letterbox
+     inside the real screen. object-fit becomes `contain`, which the overlay's
+     mapper reads from computed style on every redraw -- so the boxes follow
+     the letterbox instead of staying on the cropped `cover` geometry. */
+  .cam-wrap:fullscreen, .cam-wrap:-webkit-full-screen {
+    width: 100vw; height: 100vh; aspect-ratio: auto; border: none;
+  }
+  .cam-wrap:fullscreen #video, .cam-wrap:fullscreen #campreview,
+  .cam-wrap:fullscreen #preview,
+  .cam-wrap:-webkit-full-screen #video, .cam-wrap:-webkit-full-screen #campreview,
+  .cam-wrap:-webkit-full-screen #preview { object-fit: contain; }
+
+  /* iOS Safari has no Element.requestFullscreen, so the same effect is done
+     with a fixed-position promotion. Identical geometry, identical redraw
+     path, and the canvas stays a child either way. */
+  .cam-wrap.pseudo-full {
+    position: fixed; inset: 0; z-index: 9999;
+    width: 100vw; height: 100vh; aspect-ratio: auto;
+    margin: 0; border: none; background: #000;
+  }
+  .cam-wrap.pseudo-full #video, .cam-wrap.pseudo-full #campreview,
+  .cam-wrap.pseudo-full #preview { object-fit: contain; }
+
+  .col-head-row {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+  }
+
+  #layers {
+    font-family: var(--font-mono);
+    font-size: 9.5px; letter-spacing: 0.2em; text-transform: uppercase;
+    padding: 5px 9px; flex: none;
+    cursor: pointer;
+    color: var(--accent-bright);
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--accent-glow);
+    clip-path: var(--miter);
+    white-space: nowrap;
+  }
+  #layers::before { content: '\25C9\00a0\00a0'; }
+  #layers[aria-pressed="false"] {
+    color: var(--text-dimmer);
+    background: transparent;
+    border-color: var(--border);
+    box-shadow: none;
+  }
+  #layers[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
+
   /* ---------- column 2: perception ---------- */
 
   #observation {
@@ -486,8 +565,14 @@
   <!-- ============ COLUMN 1 - CAMERA ============ -->
   <section class="col panel bracketed">
     <div class="col-head">
-      <div class="col-title">Camera</div>
-      <div class="col-sub">Visual Input &middot; Capture</div>
+      <div class="col-head-row">
+        <div>
+          <div class="col-title">Camera</div>
+          <div class="col-sub">Visual Input &middot; Capture</div>
+        </div>
+        <button id="layers" type="button" aria-pressed="true"
+                title="Toggle the perception overlay">Layers</button>
+      </div>
     </div>
 
     <button id="drive">Start Drive</button>
@@ -495,7 +580,10 @@
     <div class="cam-wrap">
       <video id="video" autoplay playsinline muted></video>
       <img id="campreview" alt="">
-      <video id="preview" style="display:none;" controls playsinline muted autoplay></video>
+      <video id="preview" style="display:none;" controls playsinline muted autoplay
+             controlsList="nofullscreen" disablePictureInPicture></video>
+      <canvas id="overlay"></canvas>
+      <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
       <div class="cam-badge">Live</div>
       <div class="cam-nosignal">No Signal</div>
       <div class="cam-overlay">
@@ -909,12 +997,14 @@ frameBtn.addEventListener('click', async () => {
     if (temp) temp.getTracks().forEach(t => t.stop());
   }
   obs.textContent = 'Analyzing...';
+  if (RIO.overlay) RIO.overlay.clear();   // drop the previous frame's boxes
   const fd = new FormData();
   fd.append('image', blob, 'frame.jpg');
   try {
-    const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
+    const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
     const j = await r.json();
     obs.textContent = j.observation || '(empty)';
+    if (RIO.overlay) RIO.overlay.render(j);
     RIO.ui.observation(j.observation);
   } catch (e) {
     obs.textContent = 'Observe failed: ' + e;
@@ -948,9 +1038,13 @@ document.addEventListener('DOMContentLoaded', () => {
       const blob = await RIO.frameFromVideo(video);
       const fd = new FormData();
       fd.append('image', blob, 'frame.jpg');
-      const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
+      // /perceive returns the same caption /observe would, under the same
+      // `observation` key, plus the geometry the overlay draws. The Perception
+      // column is fed exactly as before.
+      const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
       const j = await r.json();
       obs.textContent = j.observation || '(empty)';
+      if (RIO.overlay) RIO.overlay.render(j, video);
       frames++;
       RIO.ui.observation(j.observation);
       RIO.ui.frameSent(frames);
@@ -1086,21 +1180,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const grabBtn = document.getElementById('grab');
   const obs = document.getElementById('observation');
 
-  async function sendFrame(blob) {
+  // Shared by upload-image, "Grab This Frame", and the playing-video watcher.
+  // `overlayEl` names the element the boxes belong on; left out, the overlay
+  // picks whichever element is currently filling the camera box.
+  async function sendFrame(blob, overlayEl) {
     obs.style.display = 'block';
     obs.textContent = 'Analyzing...';
     const fd = new FormData();
     fd.append('image', blob, 'frame.jpg');
-    const r = await fetch(RIO.url('/observe'), { method: 'POST', body: fd });
+    const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
     const j = await r.json();
     obs.textContent = j.observation || '(empty)';
+    if (RIO.overlay) RIO.overlay.render(j, overlayEl);
     RIO.ui.observation(j.observation);
   }
 
   upload.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    if (RIO.overlay) RIO.overlay.clear();   // stale boxes describe the old file
     if (file.type.startsWith('image/')) {
+      // The overlay element is left to the camera-box logic: #campreview is
+      // painted by the preview script off this same change event.
       sendFrame(file);
       preview.style.display = 'none';
       grabBtn.style.display = 'none';
@@ -1116,7 +1217,9 @@ document.addEventListener('DOMContentLoaded', () => {
     cv.width = preview.videoWidth;
     cv.height = preview.videoHeight;
     cv.getContext('2d').drawImage(preview, 0, 0);
-    cv.toBlob(b => sendFrame(b), 'image/jpeg', 0.85);
+    // The grabbed frame stays on screen in <video id="preview">, so that is the
+    // element the boxes must be mapped onto.
+    cv.toBlob(b => sendFrame(b, preview), 'image/jpeg', 0.85);
   });
 
   let watcher = null;
@@ -1131,7 +1234,7 @@ document.addEventListener('DOMContentLoaded', () => {
       cv.height = preview.videoHeight;
       cv.getContext('2d').drawImage(preview, 0, 0);
       cv.toBlob(async b => {
-        try { await sendFrame(b); } finally { inflight = false; }
+        try { await sendFrame(b, preview); } finally { inflight = false; }
       }, 'image/jpeg', 0.85);
     }, 1500);
   });
@@ -1223,6 +1326,304 @@ document.addEventListener('DOMContentLoaded', () => {
     wasDriving = driving;
     clearBox();   // drive start: stream takes over. drive end: back to NO SIGNAL.
   }).observe(body, { attributes: true, attributeFilter: ['class'] });
+});
+</script>
+
+<script>
+/* ---- Perception overlay. Draws /perceive output on a canvas laid over the
+   camera box. Purely presentational: it never captures and never fetches --
+   the three capture flows hand it a result and it renders. ---- */
+document.addEventListener('DOMContentLoaded', () => {
+  const wrap = document.querySelector('.cam-wrap');
+  const canvas = document.getElementById('overlay');
+  const toggle = document.getElementById('layers');
+  if (!wrap || !canvas) return;
+  const ctx = canvas.getContext('2d');
+
+  const VULNERABLE = ['pedestrian', 'person', 'cyclist', 'bicycle', 'motorcyclist'];
+  const CYAN = '#5fb3e8', AMBER = '#ffb84d', LEAD = '#9bd6ff';
+
+  let enabled = true;
+  let last = null;            // { result, el }
+
+  const dims = el => {
+    if (!el) return null;
+    const w = el.videoWidth || el.naturalWidth || 0;
+    const h = el.videoHeight || el.naturalHeight || 0;
+    return (w && h) ? { w, h } : null;
+  };
+
+  // Which element is actually showing right now. Same priority the camera box
+  // itself uses: live drive stream > upload/manual capture > nothing.
+  function mediaEl() {
+    const video = document.getElementById('video');
+    const preview = document.getElementById('preview');
+    const img = document.getElementById('campreview');
+    if (document.body.classList.contains('driving') && dims(video)) return video;
+    if (preview && preview.style.display !== 'none' && dims(preview)) return preview;
+    if (img && img.style.display !== 'none' && dims(img)) return img;
+    return dims(video) ? video : null;
+  }
+
+  /* Source-image pixels -> canvas CSS pixels, honouring the element's
+     object-fit. This is the whole correctness story of the overlay: `cover`
+     scales by the LARGER ratio and crops (offsets go negative), `contain`
+     scales by the smaller and letterboxes (offsets positive). Assuming a plain
+     stretch would misplace every box on any frame whose aspect ratio isn't
+     exactly the box's 16:9 — which is most phone cameras. The fit is read from
+     computed style rather than hardcoded so this stays correct if the CSS
+     changes. */
+  function mapper(el, imgW, imgH) {
+    const nat = dims(el);
+    if (!nat) return null;
+    const cw = wrap.clientWidth, ch = wrap.clientHeight;
+    if (!cw || !ch) return null;
+
+    const fit = (getComputedStyle(el).objectFit || 'fill').trim();
+    const rx = cw / nat.w, ry = ch / nat.h;
+    let sx, sy;
+    if (fit === 'contain')          { sx = sy = Math.min(rx, ry); }
+    else if (fit === 'none')        { sx = sy = 1; }
+    else if (fit === 'scale-down')  { sx = sy = Math.min(1, Math.min(rx, ry)); }
+    else if (fit === 'fill')        { sx = rx; sy = ry; }
+    else                            { sx = sy = Math.max(rx, ry); }   // cover
+
+    // object-position defaults to 50% 50%, so the overflow/letterbox splits
+    // evenly on both axes.
+    const dx = (cw - nat.w * sx) / 2;
+    const dy = (ch - nat.h * sy) / 2;
+
+    // The analysed frame and the displayed element are the same source today,
+    // but normalising through the reported image size means a mismatch would
+    // rescale cleanly instead of silently skewing every box.
+    const kx = nat.w / (imgW || nat.w), ky = nat.h / (imgH || nat.h);
+    return { x: v => dx + v * kx * sx, y: v => dy + v * ky * sy };
+  }
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const cw = wrap.clientWidth, ch = wrap.clientHeight;
+    if (!cw || !ch) return false;
+    const w = Math.round(cw * dpr), h = Math.round(ch * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+    }
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // draw in CSS pixels
+    return true;
+  }
+
+  function wipe() {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.restore();
+  }
+
+  function drawCorridor(m, pts) {
+    if (!pts || pts.length < 3) return;
+    ctx.save();
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+      const x = m.x(pts[i][0]), y = m.y(pts[i][1]);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(95,179,232,0.07)';      // well under the 15% ceiling
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(95,179,232,0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 5]);
+    ctx.shadowColor = 'rgba(95,179,232,0.6)';
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Outlined text rather than a backing panel: legible over a bright road
+  // scene without dropping an opaque block onto the frame.
+  function drawLabel(text, x, y, color) {
+    ctx.save();
+    ctx.font = '500 11px "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textBaseline = 'bottom';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(2,3,8,0.85)';
+    ctx.strokeText(text, x, y);
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = color;
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+
+  function drawBrackets(x1, y1, x2, y2, color) {
+    const len = Math.max(8, Math.min(26, Math.min(x2 - x1, y2 - y1) * 0.28));
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1 + len); ctx.lineTo(x1, y1); ctx.lineTo(x1 + len, y1);
+    ctx.moveTo(x2 - len, y1); ctx.lineTo(x2, y1); ctx.lineTo(x2, y1 + len);
+    ctx.moveTo(x2, y2 - len); ctx.lineTo(x2, y2); ctx.lineTo(x2 - len, y2);
+    ctx.moveTo(x1 + len, y2); ctx.lineTo(x1, y2); ctx.lineTo(x1, y2 - len);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawBox(m, b) {
+    const x1 = m.x(b.box[0]), y1 = m.y(b.box[1]);
+    const x2 = m.x(b.box[2]), y2 = m.y(b.box[3]);
+    const label = String(b.label || 'object').toLowerCase();
+    const color = b.lead ? LEAD : (VULNERABLE.indexOf(label) >= 0 ? AMBER : CYAN);
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = b.lead ? 1.5 : 1;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = b.lead ? 10 : 6;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.restore();
+
+    if (b.lead) drawBrackets(x1, y1, x2, y2, LEAD);
+
+    let text = label;
+    if (typeof b.distance_m === 'number') text += ' · ' + b.distance_m.toFixed(1) + 'm';
+    if (b.lead) text = '▸ ' + text;
+    // Above the box, unless that would clip off the top of the frame.
+    const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
+    drawLabel(text, Math.max(2, x1), ty, color);
+  }
+
+  function redraw() {
+    if (!resize()) return;
+    wipe();
+    if (!enabled || !last || !last.result) return;
+
+    const el = dims(last.el) ? last.el : mediaEl();
+    if (!el) return;
+    const img = last.result.image || {};
+    const m = mapper(el, img.w, img.h);
+    if (!m) return;
+
+    drawCorridor(m, last.result.corridor);
+    const boxes = last.result.boxes || [];
+    // Lead last so its brackets sit on top of any box it overlaps.
+    boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
+    boxes.forEach(b => { if (b.lead) drawBox(m, b); });
+  }
+
+  function render(result, el) {
+    if (!result) return;
+    last = { result: result, el: el || mediaEl() };
+    redraw();
+  }
+
+  function clear() { last = null; redraw(); }
+
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      enabled = !enabled;
+      toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      document.body.classList.toggle('layers-off', !enabled);
+      redraw();
+    });
+  }
+
+  /* ---- fullscreen ----------------------------------------------------
+     The canvas only survives if the element promoted to fullscreen is the
+     WRAP: fullscreening <video> hands the screen to that element alone and
+     every sibling, canvas included, stays behind on the page. Native
+     fullscreen where the browser has it, a fixed-position class where it
+     does not (iOS). Either way .cam-wrap ends up screen-sized, the
+     ResizeObserver below fires, and the boxes re-map to the new geometry. */
+  const fsBtn = document.getElementById('camfull');
+  const preview = document.getElementById('preview');
+
+  const nativeFs = () =>
+    (document.fullscreenElement || document.webkitFullscreenElement) === wrap;
+  const pseudoFs = () => wrap.classList.contains('pseudo-full');
+  const isFull = () => nativeFs() || pseudoFs();
+
+  function setPseudo(on) {
+    wrap.classList.toggle('pseudo-full', on);
+    syncFsState();
+  }
+
+  function syncFsState() {
+    wrap.classList.toggle('is-full', isFull());
+    if (fsBtn) fsBtn.setAttribute('aria-pressed', isFull() ? 'true' : 'false');
+    // The wrap's box changes on the next frame; redraw once it has.
+    redraw();
+    requestAnimationFrame(redraw);
+  }
+
+  function enterFull() {
+    const req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
+    if (req) {
+      try {
+        const p = req.call(wrap);
+        // Rejects when the gesture is not trusted or the browser refuses;
+        // fall back rather than leaving the user with a dead button.
+        if (p && p.catch) p.catch(() => setPseudo(true));
+        return;
+      } catch (e) { /* fall through */ }
+    }
+    setPseudo(true);
+  }
+
+  function exitFull() {
+    if (pseudoFs()) { setPseudo(false); return; }
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exit) { try { exit.call(document); } catch (e) { /* ignore */ } }
+  }
+
+  if (fsBtn) fsBtn.addEventListener('click', () => (isFull() ? exitFull() : enterFull()));
+
+  ['fullscreenchange', 'webkitfullscreenchange'].forEach(ev =>
+    document.addEventListener(ev, syncFsState));
+
+  /* iOS Safari ignores controlsList="nofullscreen" and always offers
+     fullscreen on the <video> itself. That is the exact path that orphans the
+     canvas, so bounce straight back out of it and promote the wrap instead. */
+  if (preview) {
+    preview.addEventListener('webkitbeginfullscreen', () => {
+      if (preview.webkitExitFullscreen) {
+        try { preview.webkitExitFullscreen(); } catch (e) { /* ignore */ }
+      }
+      enterFull();
+    });
+  }
+
+  // Any geometry change invalidates the mapping, so redraw rather than let the
+  // boxes drift off the objects: panel resize, entering/leaving fullscreen,
+  // rotation, DPR change on a monitor switch, and the media element learning
+  // its intrinsic size.
+  if (window.ResizeObserver) new ResizeObserver(redraw).observe(wrap);
+  window.addEventListener('resize', redraw);
+  window.addEventListener('orientationchange', redraw);
+  ['video', 'preview'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('loadedmetadata', redraw);
+  });
+  const camimg = document.getElementById('campreview');
+  if (camimg) camimg.addEventListener('load', redraw);
+
+  // Drive start/end swaps which element fills the box, so the previous frame's
+  // boxes no longer describe what is on screen.
+  let wasDriving = document.body.classList.contains('driving');
+  new MutationObserver(() => {
+    const driving = document.body.classList.contains('driving');
+    if (driving === wasDriving) return;
+    wasDriving = driving;
+    clear();
+  }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
+
+  window.RIO = window.RIO || {};
+  RIO.overlay = { render: render, clear: clear, redraw: redraw };
 });
 </script>
 </body>

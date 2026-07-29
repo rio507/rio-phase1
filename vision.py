@@ -94,3 +94,28 @@ def warm() -> None:
 def get_observation() -> str:
     """Called by llm_interface on each user turn. Returns the cached observation."""
     return _last_observation if config.VISION_ENABLED else ""
+
+
+def set_observation(text: str) -> None:
+    """Publish an observation produced by another path (e.g. /perceive).
+
+    Drive mode calls /perceive instead of /observe, so without this the cache
+    that get_observation() serves to RIO would never refresh and she would talk
+    about the road as if the last /observe frame were still current.
+    """
+    global _last_observation
+    if text:
+        _last_observation = text
+
+
+def get_handles():
+    """(processor, model, lock) for the one loaded Qwen3-VL instance.
+
+    Lets headway.anchor ground boxes on the model the app already has resident
+    instead of pulling a second ~17 GB copy. The load happens under `_lock` and
+    the lock is then released before returning: callers take it themselves
+    around generate(), and threading.Lock is not reentrant.
+    """
+    with _lock:
+        _ensure_loaded()
+    return _processor, _model, _lock

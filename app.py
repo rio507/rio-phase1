@@ -17,11 +17,16 @@ import config
 import voice
 import llm_interface
 import vision
+import perceive
 
 def _warm_vision():
     t = time.time()
     try:
         vision.warm()
+        # /perceive's second model (Depth Anything V2 Metric-Small). Warmed on
+        # the same thread, after Qwen, so the overlay's first frame does not pay
+        # the depth load while a drive is already running.
+        perceive.warm()
         # flush: stdout is block-buffered when uvicorn is redirected to a log
         # file, so without this the line can sit unseen for a long time.
         print(f"[vision] warm complete in {time.time() - t:.1f}s", flush=True)
@@ -152,6 +157,22 @@ async def observe(image: UploadFile = File(...), session_id: str = Query(default
     observation = vision.observe(image_bytes)
     sessions.log_observe(session_id, len(image_bytes), observation, (_t.time() - _t0) * 1000)
     return {"observation": observation}
+
+
+@app.post("/perceive")
+async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Query(default=None),
+                            debug: int = Query(default=0)):
+    """Structured perception for the dashboard overlay. /observe is unchanged.
+
+    Returns the same caption /observe would, plus boxes, per-object distance and
+    the ego corridor, so the Camera panel can draw what RIO is looking at.
+    """
+    import time as _t
+    _t0 = _t.time()
+    image_bytes = await image.read()
+    result = perceive.perceive(image_bytes, debug=bool(debug))
+    sessions.log_perceive(session_id, len(image_bytes), result, (_t.time() - _t0) * 1000)
+    return result
 
 # --- Phase 2.5 session endpoints ---
 

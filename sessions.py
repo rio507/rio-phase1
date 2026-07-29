@@ -56,6 +56,27 @@ def log_observe(session_id: Optional[str], frame_bytes_len: int, observation: st
     })
 
 
+def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, latency_ms: float) -> None:
+    """Structured perception event — boxes, distances, corridor, caption.
+
+    Kept as its own kind rather than folded into "observe": this is the labelled
+    geometry that makes a drive usable as training data, and a consumer reading
+    the JSONL should be able to select it without inspecting payload shape.
+    """
+    if not session_id:
+        return
+    _write(session_id, "perceive", {
+        "frame_bytes": frame_bytes_len,
+        "caption": result.get("caption", ""),
+        "boxes": result.get("boxes", []),
+        "corridor": result.get("corridor", []),
+        "image": result.get("image", {}),
+        "lead_range_m": result.get("lead_range_m"),
+        "timing_ms": result.get("timing_ms", {}),
+        "latency_ms": round(latency_ms, 1),
+    })
+
+
 def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes_len: int, latency_ms: float) -> None:
     if not session_id:
         return
