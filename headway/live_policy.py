@@ -94,6 +94,14 @@ ESCALATE_AFTER_S = 5.0
 V_MIN_COACH = 5.0        # below this, tau is a parking-lot artefact -> SUPPRESSED
 V_HOST_STALE_S = 2.0     # a fix older than this is not a speed -> UNKNOWN
 
+# --- how long a band entry stays actionable after the gates that suppressed it
+# clear. A band entry is one-shot, so a transient gate landing on exactly that
+# frame must defer it rather than delete it -- otherwise the whole occupancy is
+# silent no matter how long it lasts or how bad it gets. Bounded because an
+# entry the system could not judge for seconds is no longer news; the band is
+# still displayed throughout either way.
+PENDING_ENTRY_MAX_S = 3.0
+
 # --- coaching warm-up after any anchor reset / filter re-init (v2's
 # COACH_WARMUP_S, unchanged). The Kalman seeds d_dot at 0 with sd 5 m/s and
 # takes ~0.57 s to converge; coaching off an unconverged velocity is coaching
@@ -248,6 +256,7 @@ class LivePolicy:
         self._escalated = False       # calm-tier second line, once per occupancy
         self._back_off_fired = False  # sharper red line, once per occupancy
         self._unsafe_variant = 0      # alternates too_close / watch_distance
+        self._pending = None          # band entry awaiting a gate to clear
 
         self.voice_log = []
         self.transitions = []
@@ -345,6 +354,8 @@ class LivePolicy:
         """One-shot flags are per band *occupancy*, so they reset on every entry."""
         self._escalated = False
         self._back_off_fired = False
+        # Any entry still waiting on a gate describes the band we just left.
+        self._pending = None
 
     def _track_clear(self, t: float) -> None:
         """Record the moment a stretch of NORMAL becomes a genuine clear."""
@@ -365,59 +376,122 @@ class LivePolicy:
         so a suppression is always attributed to the *first* reason that applies
         rather than whichever branch happens to run last.
         """
+        # A band entry is a ONE-SHOT event, so a gate that suppresses it must
+        # defer it, not delete it. Latching first is what makes that possible:
+        # without it a transient gate on exactly the entry frame silences the
+        # whole band occupancy, however long it lasts and however bad it gets.
+        if entered:
+            self._pending = {"band": self.band, "prev": self.prev_band, "t": t}
+
         if self.band == UNKNOWN:
+            self._pending = None
             return None, R_NO_SPEED, None
         if self.band == SUPPRESSED:
+            self._pending = None
             return None, R_LOW_SPEED, None
         if new_lead or track_lost:
             return None, R_NEW_LEAD, None
-        # Warm-up: the filter's d_dot is still converging after any anchor reset,
-        # so both the trend and any line chosen from it would be noise.
-        if since_reset_s is not None and since_reset_s < COACH_WARMUP_S:
-            return None, R_WARMUP, None
         if confidence is None or confidence < CONF_FLOOR:
             return None, R_CONFIDENCE, None
 
+        # Warm-up neutralises the TREND, it does not silence the tier.
+        #
+        # This is v2's own device (state.py's `coach_trend = STABLE`), applied at
+        # the granularity v3 actually needs. The warm-up exists because the
+        # Kalman seeds d_dot at 0 with sd 5 m/s and reads its own settling
+        # residual as a ~-0.4 m/s closure for the first ~0.57 s -- it is a
+        # VELOCITY artefact. v2 could suppress the whole decision because v2's
+        # coaching was trend-gated, so neutralising the trend and silencing the
+        # tier were the same thing.
+        #
+        # v3's coaching is ENTRY-gated: it rests on tau, which is a position
+        # measurement the reset does not corrupt (the filter re-seeds d to the
+        # measured range directly), and which the 2-frame confirmation already
+        # protects against a single bad sample. Blanket-suppressing here
+        # silenced every cut-in outright: the reset lands ~0.5 s before the
+        # confirmation completes, so at 2 fps the entry ALWAYS fell inside the
+        # window. Neutralising the trend keeps the real protection -- no line
+        # may be *chosen* from an unconverged d_dot, so a warm-up entry gets
+        # "You're too close." rather than "Back off — now.", and neither the
+        # escalation nor the in-band collapse branch can fire.
+        warming = since_reset_s is not None and since_reset_s < COACH_WARMUP_S
+        if warming:
+            v2_trend = v2.STABLE
+
         rapid = (v2_trend == v2.RAPIDLY_SHRINKING)
         closing = (v2_trend in v2.SHRINKING)
+        quiet = R_WARMUP if warming else R_SILENT
+
+        # Act on a fresh entry, or on a latched one whose band still stands.
+        # `entry_prev` comes from the latch so the worsening test is applied to
+        # the transition that actually happened, not to wherever we are now.
+        entry_prev = self.prev_band
+        if (self._pending and self._pending["band"] == self.band
+                and (t - self._pending["t"]) <= PENDING_ENTRY_MAX_S):
+            entered = True
+            entry_prev = self._pending["prev"]
+        elif self._pending and self._pending["band"] != self.band:
+            self._pending = None
 
         # --- red tier ------------------------------------------------------
         if self.band == UNSAFE:
             if entered:
-                # Worsening out of GETTING_UNSAFE always speaks: the driver was
-                # already told once and it got worse anyway, which is precisely
-                # when a cooldown must not win.
+                self._pending = None
+                # Any confirmed entry into UNSAFE from a real tau band speaks,
+                # cooldown or not.
                 #
-                # Read literally, per spec: only amber -> red is "worsening".
-                # A jump straight from NORMAL to UNSAFE stays cooldown-gated,
-                # because the case the cooldown is protecting against is a
-                # driver oscillating across a band edge, and an ungated entry
-                # from any band would let that oscillation talk continuously.
-                worsening = self.prev_band == GETTING_UNSAFE
+                #   GETTING_UNSAFE -> UNSAFE   the driver was already told once
+                #                              and it got worse anyway
+                #   NORMAL         -> UNSAFE   a two-band jump: a cut-in
+                #                              collapsing tau from 4 s to 1.5 s
+                #                              is the clearest case there is for
+                #                              speaking, and it is exactly the
+                #                              one a cooldown would swallow
+                #
+                # SUPPRESSED and UNKNOWN are deliberately NOT worsening origins.
+                # Neither carries any tau information, and both are entered
+                # immediately with no confirmation, so a flaky GPS fix bouncing
+                # UNKNOWN <-> UNSAFE could fire the red tier every second or so.
+                # Coming out of them is a fresh classification, not a
+                # deterioration, and it stays cooldown-gated.
+                #
+                # What remains protected against oscillation is the single-band
+                # re-entry NORMAL <-> GETTING_UNSAFE, which is the flicker-prone
+                # boundary and is gated by the 30 s calm cooldown below.
+                worsening = _SEV.get(entry_prev, -1) >= _SEV[NORMAL]
                 line = LINE_BACK_OFF if rapid else self._next_unsafe_line()
-                spoke = self._fire(line, t, force=worsening,
-                                   reason=R_WORSENING if worsening else R_BAND_ENTRY)
-                if spoke[0] is not None and line == LINE_BACK_OFF:
+                if line == LINE_BACK_OFF:
+                    # Set whether or not the cooldown lets this through. The
+                    # flag means "back_off has been DECIDED for this occupancy",
+                    # not "back_off was heard": the in-band branch below exists
+                    # to catch a LATER deterioration, and must not become a
+                    # one-frame retry that walks straight around a cooldown
+                    # that just suppressed this very entry.
                     self._back_off_fired = True
-                return spoke
+                return self._fire(line, t, force=worsening,
+                                  reason=R_WORSENING if worsening else R_BAND_ENTRY)
 
-            # Already in UNSAFE and the gap starts collapsing. Same argument as
-            # the worsening rule -- conditions got worse inside the highest
-            # tier -- so it bypasses the cooldown, but only once per occupancy.
+            # Already settled in UNSAFE and the gap NOW starts collapsing --
+            # a deterioration inside the highest tier, which is the same
+            # argument as the worsening rule, so it bypasses the cooldown. Once
+            # per occupancy, and only when the entry itself was not already
+            # rapid (that case is handled above).
             if rapid and not self._back_off_fired:
                 spoke = self._fire(LINE_BACK_OFF, t, force=True, reason=R_WORSENING)
                 if spoke[0] is not None:
                     self._back_off_fired = True
                 return spoke
-            return None, R_SILENT, None
+            return None, quiet, None
 
         # --- amber tier ----------------------------------------------------
         if self.band == GETTING_UNSAFE:
             # Entry from a *better* band only. Arriving here by de-escalating
             # out of UNSAFE is the situation improving, and congratulating the
             # driver with a warning is how the feature gets muted.
-            if entered and _SEV.get(self.prev_band, -1) < _SEV[GETTING_UNSAFE]:
-                return self._fire(LINE_CALM, t, reason=R_BAND_ENTRY)
+            if entered:
+                self._pending = None
+                if _SEV.get(entry_prev, -1) < _SEV[GETTING_UNSAFE]:
+                    return self._fire(LINE_CALM, t, reason=R_BAND_ENTRY)
 
             if (closing and not self._escalated
                     and (t - self.band_entered_t) >= ESCALATE_AFTER_S):
@@ -431,9 +505,9 @@ class LivePolicy:
                 if spoke[0] is not None:
                     self._escalated = True
                 return spoke
-            return None, R_SILENT, None
+            return None, quiet, None
 
-        return None, R_SILENT, None
+        return None, quiet, None
 
     def _next_unsafe_line(self) -> str:
         """Alternate the two red-tier phrasings so a repeat is not word-for-word."""

@@ -204,11 +204,22 @@ def run_pipeline():
         check(r0["speak"]["reason"] == P.R_WORSENING,
               "amber -> red is logged as worsening", r0["speak"]["reason"])
 
-    head("A4 -- no voice during the coaching warm-up")
+    head("A4 -- coaching warm-up neutralises the trend, not the tier")
+    # The guarantee is NOT "warm-up frames are silent" -- that version silenced
+    # every cut-in, because the band entry always confirms inside the window
+    # (see B10). It is that no line may be CHOSEN from an unconverged d_dot.
     warm = [r for r in records if r["voice_reason"] == P.R_WARMUP]
+    trend_derived = {P.LINE_BACK_OFF, P.LINE_ESCALATE}
+    offenders = [r for r in records
+                 if r.get("speak") and r["speak"]["line"] in trend_derived
+                 and r["voice_reason"] == P.R_WARMUP]
+    check(not offenders, "no trend-derived line is ever chosen during warm-up",
+          f"{[(o['clip_t'], o['speak']['line']) for o in offenders]}")
     check(all(r.get("speak") is None for r in warm),
-          "every warm-up frame is silent", f"{len(warm)} warm-up frame(s)")
-    check(records[0].get("speak") is None, "first frame of a session never speaks")
+          "warm-up frames with no band entry stay silent",
+          f"{len(warm)} such frame(s)")
+    check(records[0].get("speak") is None,
+          "first frame of a session never speaks (nothing is confirmed yet)")
 
     head("A5 -- payload contract")
     keys = {"lead_box", "distance_m", "tau_s", "band", "trend", "urgency",
@@ -334,22 +345,53 @@ def run_policy():
           "the repeat uses the other phrasing, not the same words",
           f"{first[0][1]} then {lines3[0][1]}")
 
-    head("B4b -- a NON-worsening red repeat is still suppressed")
+    head("B4b -- a two-band jump NORMAL -> UNSAFE also overrides the cooldown")
     p = P.LivePolicy()
     recs = drive(p, [(1.5, v2.STABLE)] * 4)
     check(len(spoken_lines(recs)) == 1, "red tier fired once")
     # NORMAL for 3 s -- long enough to leave the band, far short of the 10 s
-    # genuine clear -- then straight back into UNSAFE without passing through a
-    # confirmed GETTING_UNSAFE. Nothing "got worse" relative to the warning the
-    # driver already had, so the 15 s cooldown must hold.
+    # genuine clear -- then tau collapses straight past GETTING_UNSAFE. This is
+    # the cut-in shape, and it is the case a cooldown must not be allowed to eat.
     drive(p, [(3.5, v2.STABLE)] * 6, t0=2.0)
-    recs = drive(p, [(1.5, v2.STABLE)] * 6, t0=5.0)
+    recs = drive(p, [(1.5, v2.RAPIDLY_SHRINKING)] * 6, t0=5.0)
     check(p.band == P.UNSAFE, "band re-entered UNSAFE", p.band)
+    lines = spoken_lines(recs)
+    check(len(lines) == 1, "red tier spoke despite the 15 s cooldown", f"{lines}")
+    if lines:
+        check(lines[0][2] == P.R_WORSENING, "attributed to worsening", lines[0][2])
+        check(lines[0][1] == P.LINE_BACK_OFF,
+              "and a rapidly closing cut-in gets the sharpest line", lines[0][1])
+    entry = next(r for r in recs if r.get("speak"))
+    check(entry["prev_band"] == P.NORMAL, "the jump really was NORMAL -> UNSAFE",
+          f"{entry['prev_band']} -> {entry['band']}")
+
+    head("B4c -- what stays cooldown-gated")
+    # Single-band amber re-entry: the flicker-prone boundary, still protected.
+    p = P.LivePolicy()
+    recs = drive(p, [(2.5, v2.STABLE)] * 4)
+    check(len(spoken_lines(recs)) == 1, "calm line fired on the first amber entry")
+    drive(p, [(3.5, v2.STABLE)] * 6, t0=2.0)
+    recs = drive(p, [(2.5, v2.STABLE)] * 6, t0=5.0)
+    check(p.band == P.GETTING_UNSAFE, "band re-entered GETTING_UNSAFE")
     check(not spoken_lines(recs),
-          "red re-entry from NORMAL inside the cooldown stays silent",
+          "single-band amber re-entry inside the cooldown stays silent",
           f"{spoken_lines(recs)}")
     check(any(r["voice_reason"] == P.R_COOLDOWN for r in recs),
           "and is logged as suppressed_by_cooldown")
+
+    # A system state is not a tau band, so leaving one is not a deterioration.
+    # Entered with no confirmation, a flaky fix could bounce this every second.
+    for label, v in (("UNKNOWN", None), ("SUPPRESSED", 3.0)):
+        p = P.LivePolicy()
+        recs = drive(p, [(1.5, v2.RAPIDLY_SHRINKING)] * 4)
+        check(len(spoken_lines(recs)) == 1, f"[{label}] red tier fired once")
+        drive(p, [(1.5, v2.RAPIDLY_SHRINKING, GOOD_CONF, v)] * 4, t0=2.0)
+        check(p.band == getattr(P, label), f"[{label}] entered the system state")
+        recs = drive(p, [(1.5, v2.RAPIDLY_SHRINKING)] * 6, t0=4.0)
+        check(p.band == P.UNSAFE, f"[{label}] came back to UNSAFE")
+        check(not spoken_lines(recs),
+              f"[{label}] -> UNSAFE is NOT worsening; cooldown holds",
+              f"{spoken_lines(recs)}")
 
     # -- B5 genuine clear re-arms -----------------------------------------
     head("B5 -- genuine clear (NORMAL > 10 s) re-arms the cooldown")
@@ -432,6 +474,30 @@ def run_policy():
     check(all(x["urgency"] == 0 for x in recs),
           "UNKNOWN never reports an urgency it cannot justify")
 
+    head("B8b -- a transient gate DEFERS a band entry, it does not delete one")
+    # A band entry is one-shot. Before the latch, a gate landing on exactly the
+    # entry frame silenced the whole occupancy however long it lasted.
+    p = P.LivePolicy()
+    # Confidence dips under the floor for precisely the two frames the entry
+    # needs to confirm, then recovers.
+    recs = drive(p, [(4.0, v2.STABLE)] * 2 + [(1.5, v2.STABLE, 0.2)] * 2
+                 + [(1.5, v2.STABLE, GOOD_CONF)] * 4)
+    check(p.band == P.UNSAFE, "band reached UNSAFE", p.band)
+    lines = spoken_lines(recs)
+    check(len(lines) == 1, "the deferred entry speaks once confidence recovers",
+          f"{lines}")
+    check(any(r["voice_reason"] == P.R_CONFIDENCE for r in recs),
+          "and the suppressed frames are still logged as suppressed_by_confidence")
+
+    head("B8c -- an entry deferred past the window is dropped, not hoarded")
+    p = P.LivePolicy()
+    recs = drive(p, [(4.0, v2.STABLE)] * 2 + [(1.5, v2.STABLE, 0.2)] * 10
+                 + [(1.5, v2.STABLE, GOOD_CONF)] * 4)
+    check(not spoken_lines(recs),
+          "a 5 s blind spell is no longer an 'entry' worth announcing",
+          f"{spoken_lines(recs)}")
+    check(p.band == P.UNSAFE, "the band is still displayed throughout", p.band)
+
     head("B9 -- de-escalating INTO amber does not fire the calm line")
     p = P.LivePolicy()
     drive(p, [(1.5, v2.STABLE)] * 4)                        # red
@@ -439,6 +505,63 @@ def run_policy():
     check(p.band == P.GETTING_UNSAFE, "band came back to GETTING_UNSAFE")
     calm = [l for l in spoken_lines(recs) if l[1] == P.LINE_CALM]
     check(not calm, "improving into the band is not a warning event", f"{calm}")
+
+    run_cutin()
+
+
+def run_cutin():
+    """B10 -- the cut-in, driven through the REAL filter at the live cadence.
+
+    The case the two-band worsening rule exists for, and the one that exposed
+    the swallowed-entry defect: a lead cuts in and tau collapses 4.0 s -> 1.5 s
+    in one step. The Kalman gates the discontinuity for 3 frames, re-seeds
+    (NEW_LEAD), and the band confirmation then completes INSIDE the 0.6 s
+    coaching warm-up -- so this is only silent-free if the warm-up neutralises
+    the trend rather than the tier.
+    """
+    from .filter import HeadwayFilter
+
+    head("B10 -- cut-in through the real filter (tau 4.0s -> 1.5s @ 2 fps)")
+    V, dt, T_CUT = 18.0, 0.5, 6.0
+    kf, pol, trend = HeadwayFilter(), P.LivePolicy(), v2.STABLE
+    t, reset_t, spoke, accepted_at = 0.0, 0.0, None, None
+
+    for _ in range(int(20 / dt)):
+        t += dt
+        cut = t >= T_CUT
+        snap = kf.step((1.5 if cut else 4.0) * V, 0.85, dt)
+        if cut and accepted_at is None and snap["accepted"]:
+            accepted_at = t
+        if snap["new_lead"]:
+            reset_t = t
+        pvv = snap.get("P_vv")
+        trend = v2.classify_trend(snap["d_dot"], V, trend,
+                                  d_dot_sigma=(math.sqrt(pvv) if pvv and pvv > 0 else None))
+        r = pol.tick(tau=v2.compute_tau(snap["d"], V), v2_trend=trend, confidence=0.9,
+                     v_host=V, v_host_stale=False, t=t, since_reset_s=(t - reset_t),
+                     new_lead=snap["new_lead"], track_lost=False)
+        if cut and spoke is None and r.get("speak"):
+            spoke = (t, r["speak"], r["prev_band"], r["band"])
+
+    check(pol.band == P.UNSAFE, "band reached UNSAFE after the cut-in", pol.band)
+    check(spoke is not None, "the cut-in produced a warning")
+    if spoke:
+        t_spoke, sp, prev, band = spoke
+        check(sp["tier"] == P.TIER_UNSAFE, "red tier", sp["tier"])
+        check(sp["reason"] == P.R_WORSENING,
+              "attributed to worsening (the two-band jump)", sp["reason"])
+        check(prev == P.NORMAL, "the transition really was NORMAL -> UNSAFE",
+              f"{prev} -> {band}")
+        # Chosen with the trend neutralised: we do not yet know it is collapsing,
+        # so the sharpest line would be a guess.
+        check(sp["line"] in (P.LINE_TOO_CLOSE, P.LINE_WATCH_DISTANCE),
+              "warm-up entry does not pick a line off an unconverged d_dot",
+              sp["line"])
+        lat = t_spoke - T_CUT
+        check(lat <= 2.0, f"warning within 2.0 s of the cut-in", f"{lat:.2f} s "
+              f"(filter accepted the new range at +{accepted_at - T_CUT:.2f} s)")
+        print(f"       cut-in -> filter accept {accepted_at - T_CUT:.2f} s "
+              f"-> voice {lat:.2f} s")
 
 
 # ===========================================================================

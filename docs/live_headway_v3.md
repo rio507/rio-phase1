@@ -79,11 +79,36 @@ The two red phrasings alternate, so a repeat is not word-for-word.
   satisfy that on a technicality. Per tier is strictly stronger and implies it.
 - **Genuine clear re-arms** — continuous NORMAL for > 10 s clears every cooldown.
   Danger that resolves and returns deserves a fresh warning.
-- **Worsening always speaks** — a confirmed GETTING_UNSAFE → UNSAFE transition
-  bypasses the cooldown entirely.
-- **Warm-up** — no voice in the first 0.6 s after any anchor reset or filter
-  re-init. Inherited from v2: the Kalman seeds ḋ at 0 with sd 5 m/s and takes
-  ~0.57 s to converge, so coaching before that is coaching off noise.
+- **Worsening always speaks** — **any** confirmed entry into UNSAFE from a real
+  τ band bypasses the cooldown: GETTING_UNSAFE → UNSAFE (already warned, got
+  worse anyway) *and* the two-band jump NORMAL → UNSAFE (a cut-in collapsing τ
+  from 4 s to 1.5 s, which is the clearest case there is for speaking and
+  exactly the one a cooldown would swallow).
+  SUPPRESSED and UNKNOWN are **not** worsening origins: neither carries any τ
+  information and both are entered with no confirmation, so a flaky GPS fix
+  bouncing UNKNOWN ↔ UNSAFE could otherwise fire the red tier every second.
+  What stays oscillation-protected is the single-band NORMAL ↔ GETTING_UNSAFE
+  re-entry, gated by the 30 s calm cooldown.
+- **Warm-up neutralises the trend, not the tier** — for 0.6 s after any anchor
+  reset or filter re-init, the trend is forced to STABLE. The warm-up exists
+  because the Kalman seeds ḋ at 0 with sd 5 m/s and reads its own settling
+  residual as a ~−0.4 m/s closure for ~0.57 s: it is a **velocity** artefact.
+  v2 could silence the whole decision because v2's coaching was trend-gated, so
+  the two were the same thing. v3's coaching is entry-gated and rests on τ — a
+  *position* measurement the reset does not corrupt, and one the 2-frame
+  confirmation already protects. Silencing the tier here made **every cut-in
+  silent**: the reset lands ~0.5 s before the confirmation completes, so at
+  2 fps the entry always fell inside the window. Neutralising the trend keeps
+  the real protection — no line may be *chosen* from an unconverged ḋ, so a
+  warm-up entry gets "You're too close." rather than "Back off — now.", and
+  neither the escalation nor the in-band collapse branch can fire.
+- **A transient gate defers an entry, it does not delete one** — a band entry is
+  a one-shot event, so a confidence dip (or a NEW_LEAD frame) landing on exactly
+  the entry frame would otherwise silence the entire occupancy however long it
+  lasted. The entry is latched and fires when the gate clears, judged against
+  the transition that actually happened. Bounded at `PENDING_ENTRY_MAX_S` = 3 s:
+  an entry the system could not judge for that long is no longer news. The band
+  displays throughout either way.
 - **Low speed** — below 5 m/s the band is SUPPRESSED. τ = d/v explodes as v → 0,
   and a 4 m gap in a parking queue reads as "getting unsafe".
 - **Confidence floor** — below 0.4 the band still displays but the voice is
@@ -159,7 +184,7 @@ warning channel cannot be turned into a general text-to-speech endpoint.
 
 ## 8. Verification
 
-- `python -m headway.live_selftest` — 80 checks. Full pipeline over the
+- `python -m headway.live_selftest` — 107 checks. Full pipeline over the
   shrinking-gap synthetic clip at 2 fps (ground-truth depth, for the reason
   below), plus scripted policy scenarios and the firewall audit.
 - `python -m tools.headway_bench --clip <mp4> --v-host <m/s>` — the real stack
@@ -181,6 +206,7 @@ real video validates the measurement.
 | Hysteresis | 0.2 s | band-flicker count per hour |
 | Confirm up / down | 0.5 s / 1.0 s (≥ 2 frames) | warning latency vs flicker |
 | Cooldowns | 30 s calm / 15 s unsafe | subjective nag factor |
+| Deferred-entry window | 3.0 s | how stale an entry may be and still be news |
 | Genuine clear | 10 s | how often a re-warning feels earned |
 | Escalation delay | 5 s | whether the second line lands as helpful or nagging |
 | Warm-up | 0.6 s | spurious lines right after a re-anchor |
@@ -191,12 +217,17 @@ real video validates the measurement.
 
 ## 10. Open questions for road testing
 
-1. **The worsening rule is read literally, and that is slightly inverted.** Only
-   GETTING_UNSAFE → UNSAFE bypasses the cooldown. A jump straight from NORMAL to
-   UNSAFE — a *bigger* τ collapse — stays cooldown-gated. The literal reading is
-   implemented because the case the cooldown protects against is a driver
-   oscillating across a band edge, and an ungated entry from any band would let
-   that oscillation talk continuously. Worth revisiting from real logs.
+1. **Cut-in latency is dominated by the Kalman gate, not by the policy.**
+   Measured end to end through the real filter at 2 fps (`B10`), a τ 4.0 s →
+   1.5 s cut-in produces a warning **1.5 s** after it happens: the innovation
+   gate rejects the discontinuity for `MAX_CONSEC_REJECTS = 3` frames before
+   re-seeding (**1.0 s** of that total), then the band confirms 0.5 s later.
+   That reject count is **frame-based**, so it costs 0.25 s at the Stage 0
+   12 Hz and 1.0 s at the live 2 fps — the same frames-vs-time mismatch already
+   fixed in the policy's confirmation. Making it time-based (or raising the
+   capture cadence, which the 44 ms p95 easily allows) would cut cut-in latency
+   by roughly two thirds. Not changed here: `filter.py` is v2 code shared with
+   the Stage 0 harness, and this is a tuning decision to take on real logs.
 2. **The escalation bypasses the calm cooldown by necessity.** It shares the calm
    tier with the entry line that fired 5 s earlier, so without the bypass the
    30 s cooldown would swallow it every time. It is one-shot per band occupancy,
