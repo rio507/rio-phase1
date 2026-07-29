@@ -175,6 +175,16 @@ def set_qwen_provider(provider) -> None:
     _qwen_provider = provider
 
 
+def has_qwen_provider() -> bool:
+    """True once someone has lent this module a resident Qwen3-VL.
+
+    Lets a caller check whether grounding would load a second copy of the
+    weights *before* it triggers one — headway.live uses it to install the
+    app's provider on any entry path that reaches it before perceive.py has.
+    """
+    return _qwen_provider is not None
+
+
 def _ensure_qwen():
     global _qwen_model, _qwen_processor
     if _qwen_model is not None:

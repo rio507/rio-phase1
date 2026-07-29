@@ -30,3 +30,10 @@ huggingface_hub>=0.34.0,<1.0
 
 safetensors>=0.8.0
 Pillow>=10.0.1
+
+# --- headway fast loop ---
+# CSRT lives in opencv-CONTRIB, not plain opencv-python, and the tracking API
+# moved namespaces in 5.x — headway/tracker.py probes the known homes but the
+# <5 pin is what keeps that probe from becoming a real portability problem.
+# headless: no GUI libs on a server, and the full build pulls in GTK/X11.
+opencv-contrib-python-headless<5

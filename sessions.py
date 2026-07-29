@@ -77,6 +77,53 @@ def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, 
     })
 
 
+def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> None:
+    """One live headway frame — the Stage 0 shadow log, recorded in-session.
+
+    This is the tuning data the whole v3 knob sheet is falsifiable from, so it
+    keeps the *decision* as well as the measurement: `voice_reason` records why
+    a frame did or did not speak (band entry / worsening / escalation /
+    suppressed-by-cooldown / suppressed-by-confidence / warm-up / low speed).
+    A silence with a reason is as informative as an utterance.
+
+    The corridor polygon and the raw anchor reply are deliberately dropped: at
+    ~2 Hz for a whole drive they would dominate the file, and neither is needed
+    to replay a decision.
+    """
+    if not session_id:
+        return
+    _write(session_id, "headway", {
+        "frame_idx": result.get("frame_idx"),
+        "t": result.get("t"),
+        "dt": result.get("dt"),
+        "lead_box": result.get("lead_box"),
+        "distance_m": result.get("distance_m"),
+        "d_dot_ms": result.get("d_dot_ms"),
+        "tau_s": result.get("tau_s"),
+        "ttc_s": result.get("ttc_s"),
+        "band": result.get("band"),
+        "band_entered": result.get("band_entered"),
+        "prev_band": result.get("prev_band"),
+        "trend": result.get("trend"),
+        "trend_detail": result.get("trend_detail"),
+        "urgency": result.get("urgency"),
+        "speak": result.get("speak"),
+        "voice_reason": result.get("voice_reason"),
+        "voice_line": result.get("voice_line"),
+        "confidence": result.get("confidence"),
+        "depth_conf": result.get("depth_conf"),
+        "track_quality": result.get("track_quality"),
+        "anchor_age_s": result.get("anchor_age_s"),
+        "anchored": result.get("anchored"),
+        "new_lead": result.get("new_lead"),
+        "track_lost": result.get("track_lost"),
+        "v_host": result.get("v_host"),
+        "v_host_stale": result.get("v_host_stale"),
+        "timing_ms": result.get("timing_ms", {}),
+        "latency_ms": round(latency_ms, 1),
+    })
+
+
 def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes_len: int, latency_ms: float) -> None:
     if not session_id:
         return

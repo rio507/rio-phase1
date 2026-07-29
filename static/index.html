@@ -381,6 +381,100 @@
   }
   #layers[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
 
+  /* ---------- live headway ---------- */
+
+  .head-toggles { display: flex; gap: 6px; flex: none; align-items: flex-start; }
+
+  /* Shares #layers' shape so the two toggles read as one control group, but
+     amber when armed: this one can talk, and that should look different from a
+     toggle that only draws. */
+  #headway {
+    font-family: var(--font-mono);
+    font-size: 9.5px; letter-spacing: 0.2em; text-transform: uppercase;
+    padding: 5px 9px; flex: none;
+    cursor: pointer;
+    color: #1a1206;
+    background: var(--amber);
+    border: 1px solid var(--amber);
+    box-shadow: 0 0 12px rgba(255,184,77,0.55);
+    clip-path: var(--miter);
+    white-space: nowrap;
+  }
+  #headway::before { content: '\25C9\00a0\00a0'; }
+  #headway[aria-pressed="false"] {
+    color: var(--text-dimmer);
+    background: transparent;
+    border-color: var(--border);
+    box-shadow: none;
+  }
+  #headway[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
+
+  /* Band/tau strip. Sits under the LIVE badge (top-left, z-index 3) so neither
+     covers the other, and stays out of #camfull's corner. */
+  #headwayhud {
+    position: absolute; top: 8px; left: 8px;
+    display: none; flex-direction: column; gap: 4px;
+    padding: 6px 10px;
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--text);
+    background: rgba(2,3,8,0.72);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--text-dimmer);
+    z-index: 3;
+    pointer-events: none;
+    min-width: 168px;
+    transition: border-left-color 120ms linear, box-shadow 120ms linear;
+  }
+  body.driving #headwayhud { top: 40px; }   /* clear the LIVE badge */
+  body.headway-on #headwayhud { display: flex; }
+  #headwayhud .hw-band { font-weight: 500; font-size: 12px; letter-spacing: 0.18em; }
+  #headwayhud .hw-line { color: var(--text-dim); font-size: 10px; }
+  #headwayhud .hw-line b { color: var(--text); font-weight: 500; }
+
+  /* One class per band. The colour IS the warning at a glance, so it drives the
+     rail, the label and the glow together. */
+  #headwayhud.hw-NORMAL         { border-left-color: var(--blue); }
+  #headwayhud.hw-NORMAL .hw-band { color: var(--blue); }
+  #headwayhud.hw-GETTING_UNSAFE { border-left-color: var(--amber); box-shadow: 0 0 14px rgba(255,184,77,0.28); }
+  #headwayhud.hw-GETTING_UNSAFE .hw-band { color: var(--amber); }
+  #headwayhud.hw-UNSAFE         { border-left-color: var(--red); box-shadow: 0 0 18px rgba(255,107,107,0.42); }
+  #headwayhud.hw-UNSAFE .hw-band { color: var(--red); }
+  #headwayhud.hw-SUPPRESSED .hw-band,
+  #headwayhud.hw-UNKNOWN .hw-band { color: var(--text-dimmer); }
+
+  .speed-row {
+    display: flex; align-items: stretch; gap: 8px;
+  }
+  .speed-row input {
+    flex: 1 1 auto; min-width: 0;
+    font-family: var(--font-mono); font-size: 12px;
+    padding: 10px 12px;
+    color: var(--text-bright);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 0;
+    -webkit-appearance: none; appearance: none;
+  }
+  .speed-row input:focus { outline: none; border-color: var(--border-strong); }
+  .speed-row button {
+    flex: 0 0 auto; min-height: 0; padding: 10px 12px;
+    font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: 0.15em; text-transform: uppercase;
+    color: var(--accent-bright);
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+  }
+  .speed-row button[aria-pressed="true"] {
+    color: #1a1206; background: var(--amber); border-color: var(--amber);
+  }
+  .speed-hint {
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    margin-top: -2px;
+  }
+
   /* ---------- column 2: perception ---------- */
 
   #observation {
@@ -570,8 +664,12 @@
           <div class="col-title">Camera</div>
           <div class="col-sub">Visual Input &middot; Capture</div>
         </div>
-        <button id="layers" type="button" aria-pressed="true"
-                title="Toggle the perception overlay">Layers</button>
+        <div class="head-toggles">
+          <button id="headway" type="button" aria-pressed="true"
+                  title="Live headway monitoring — 2 fps lead tracking with automatic voice">Headway</button>
+          <button id="layers" type="button" aria-pressed="true"
+                  title="Toggle the perception overlay">Layers</button>
+        </div>
       </div>
     </div>
 
@@ -586,6 +684,11 @@
       <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
       <div class="cam-badge">Live</div>
       <div class="cam-nosignal">No Signal</div>
+      <div id="headwayhud" class="hw-UNKNOWN">
+        <span class="hw-band" id="hwband">Standby</span>
+        <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
+        <span class="hw-line"><i>Gap</i> <b id="hwgap">--</b> &middot; <i>V</i> <b id="hwspeed">--</b></span>
+      </div>
       <div class="cam-overlay">
         <span><i>Frames</i><b id="statframes">0</b></span>
         <span><i>Last</i><b id="statlast">--:--:--</b></span>
@@ -600,6 +703,17 @@
       <label for="upload" class="hud-btn upload-label">Upload Image/Video</label>
       <input type="file" id="upload" accept="image/*,video/*" style="display:none">
       <button id="grab" class="hud-btn" style="display:none;">Grab This Frame</button>
+      <button id="runheadway" class="hud-btn" style="display:none;">Run Headway On Video</button>
+
+      <!-- Manual speed override. GPS has no speed on a desk, and tau is
+           meaningless without one, so a bench test needs to supply it. -->
+      <div class="speed-row">
+        <input id="speedval" type="number" inputmode="decimal" step="0.5" min="0"
+               placeholder="Speed override" aria-label="Manual host speed override">
+        <button id="speedunit" type="button" aria-pressed="false"
+                title="Toggle between m/s and mph">m/s</button>
+      </div>
+      <div class="speed-hint" id="speedhint">GPS speed &middot; override blank</div>
     </div>
   </section>
 
@@ -1022,12 +1136,23 @@ document.addEventListener('DOMContentLoaded', () => {
   const obs = document.getElementById('observation');
   const player = document.getElementById('player');
 
-  const INTERVAL_MS = 5000;
+  // Perception cadence. With live headway running, /perceive drops to a slow
+  // background tick: it costs a full Qwen generate (~1.5 s on this GPU) and
+  // would otherwise starve the 2 fps headway loop of the same GPU. Its job in
+  // headway mode is only to keep the Perception caption column alive.
+  const PERCEIVE_MS_SOLO = 5000;
+  const PERCEIVE_MS_HEADWAY = 15000;
+
   let timer = null;
+  let hwTimer = null;
   let inflight = false;
   let busy = false;      // guards double-taps on the toggle itself
   let wakeLock = null;
   let frames = 0;
+  let hwFrames = 0;
+
+  const headwayOn = () => !!(RIO.headway && RIO.headway.enabled);
+  const perceiveInterval = () => headwayOn() ? PERCEIVE_MS_HEADWAY : PERCEIVE_MS_SOLO;
 
   function say(msg) { status.textContent = msg; }
 
@@ -1062,12 +1187,43 @@ document.addEventListener('DOMContentLoaded', () => {
     timer = setTimeout(async () => {
       await captureOnce();
       if (RIO.driving) schedule();
-    }, INTERVAL_MS);
+    }, perceiveInterval());
+  }
+
+  // The headway loop. Same chained-timeout discipline as the perception loop,
+  // but the next delay is the cadence MINUS the time this frame took, so
+  // per-frame processing does not silently halve the frame rate.
+  function scheduleHeadway(delayMs) {
+    const cadence = (RIO.headway && RIO.headway.cadenceMs) || 500;
+    hwTimer = setTimeout(async () => {
+      if (!RIO.driving) return;
+      let spent = 0;
+      if (headwayOn()) {
+        const t0 = performance.now();
+        try {
+          const j = await RIO.headway.captureFromVideo(video);
+          if (j && j.ok !== false) {
+            hwFrames++;
+            say('Drive active - ' + frames + ' perceive / ' + hwFrames
+                + ' headway - session ' + RIO.sessionId.slice(0, 8));
+          }
+        } catch (e) {
+          // A dropped headway frame is survivable (camera not ready, a blip):
+          // the band simply does not advance and the loop keeps going.
+        }
+        spent = performance.now() - t0;
+      }
+      if (RIO.driving) scheduleHeadway(Math.max(0, cadence - spent));
+    }, delayMs === undefined ? cadence : delayMs);
   }
 
   async function startDrive() {
     // Unlock reply audio inside this tap, so /talk replies can autoplay later.
     RIO.unlockAudio(player);
+    // Same gesture, same reason: the warning clips and the TTS element each
+    // need their own unlock or iOS will refuse to play them from a timer.
+    // Must happen here, before any await, while the tap is still trusted.
+    if (RIO.headway) { RIO.headway.unlock(); RIO.headway.startWatch(); }
 
     if (!RIO.mediaAvailable()) { say(RIO.mediaError()); return; }
 
@@ -1111,15 +1267,19 @@ document.addEventListener('DOMContentLoaded', () => {
     driveBtn.classList.add('active');
     driveBtn.textContent = 'End Drive';
     frames = 0;
+    hwFrames = 0;
     RIO.ui.session(sid);
     RIO.ui.frameSent(0);
     say('Drive active - session ' + sid.slice(0, 8));
     schedule();
+    scheduleHeadway();
   }
 
   async function endDrive() {
     const sid = RIO.sessionId;
     if (timer) { clearTimeout(timer); timer = null; }
+    if (hwTimer) { clearTimeout(hwTimer); hwTimer = null; }
+    if (RIO.headway) { RIO.headway.stopWatch(); RIO.headway.resetHud(); }
 
     // Clear session first so in-flight captures stop tagging themselves.
     RIO.sessionId = null;
@@ -1228,6 +1388,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watcher) clearInterval(watcher);
     watcher = setInterval(() => {
       if (preview.paused || preview.ended || inflight) return;
+      // A headway run on this clip owns the GPU: a /perceive every 1.5 s is a
+      // full Qwen generate and would starve the 2 fps loop it is competing with.
+      if (RIO.headway && RIO.headway.videoRunning) return;
       inflight = true;
       const cv = document.createElement('canvas');
       cv.width = preview.videoWidth;
@@ -1330,6 +1493,321 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 
 <script>
+/* ---- Live headway monitoring. Owns four things and nothing else: the host
+   speed, the warning audio, the ~2 fps /headway_frame loop, and the HUD strip.
+   The drive loop calls in; the overlay is handed results to draw. All warning
+   policy is server-side and deterministic -- this file never decides to speak,
+   it only plays what /headway_frame told it to. ---- */
+document.addEventListener('DOMContentLoaded', () => {
+  const hud = document.getElementById('headwayhud');
+  const elBand = document.getElementById('hwband');
+  const elTau = document.getElementById('hwtau');
+  const elTrend = document.getElementById('hwtrend');
+  const elGap = document.getElementById('hwgap');
+  const elSpeed = document.getElementById('hwspeed');
+  const toggle = document.getElementById('headway');
+  const speedInput = document.getElementById('speedval');
+  const unitBtn = document.getElementById('speedunit');
+  const speedHint = document.getElementById('speedhint');
+  const runBtn = document.getElementById('runheadway');
+  const preview = document.getElementById('preview');
+  const spokenLine = document.getElementById('spokenline');
+
+  const CADENCE_MS = 500;                 // ~2 fps
+  const MPH_TO_MS = 0.44704;
+  const CLIP_IDS = ['too_close', 'watch_distance', 'back_off'];
+
+  let enabled = true;                     // on by default when driving
+  let videoRunning = false;
+
+  /* ---------------- audio -------------------------------------------------
+     The three red-tier clips are preloaded <audio> elements playing from
+     static/audio/, so firing one costs no network at all. The amber lines come
+     from /headway_voice, which is a normal TTS stream -- fine for coaching,
+     never for an alert. */
+  const clips = {};
+  CLIP_IDS.forEach(id => {
+    const a = new Audio('/static/audio/' + id + '.mp3');
+    a.preload = 'auto';
+    clips[id] = a;
+  });
+  const tts = new Audio();
+  tts.preload = 'auto';
+
+  // iOS Safari will only play an element programmatically once it has been
+  // played inside a real user gesture. Same pattern RIO.unlockAudio uses for
+  // the reply player; every warning element needs its own unlock, so this is
+  // called from the Start Drive tap and from the video-run tap.
+  let unlocked = false;
+  function unlock() {
+    if (unlocked) return;
+    unlocked = true;
+    const els = CLIP_IDS.map(id => clips[id]).concat([tts]);
+    els.forEach(a => {
+      try {
+        a.muted = true;
+        const p = a.play();
+        if (p && p.then) {
+          p.then(() => { a.pause(); a.currentTime = 0; a.muted = false; })
+           .catch(() => { a.muted = false; });
+        } else {
+          a.pause(); a.currentTime = 0; a.muted = false;
+        }
+      } catch (e) { a.muted = false; }
+    });
+  }
+
+  function speak(sp) {
+    if (!sp) return;
+    if (spokenLine) spokenLine.textContent = sp.text || '';
+    if (sp.audio === 'tts') {
+      try {
+        tts.src = '/headway_voice?line=' + encodeURIComponent(sp.line);
+        const p = tts.play();
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) { /* the warning still shows on the HUD */ }
+      return;
+    }
+    const a = clips[sp.audio];
+    if (!a) return;
+    // The red tier interrupts coaching: a calm line still playing while the gap
+    // has collapsed is worse than silence.
+    try { tts.pause(); } catch (e) {}
+    try {
+      a.currentTime = 0;
+      const p = a.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) { /* non-fatal */ }
+  }
+
+  /* ---------------- host speed -------------------------------------------
+     GPS first, manual override wins when it has a value. `age` is what lets the
+     server decide staleness: a fix older than 2 s is not a speed, and tau is
+     never classified without one. */
+  let gpsSpeed = null;
+  let gpsAt = 0;
+  let watchId = null;
+  let unit = 'ms';
+
+  function startWatch() {
+    if (watchId !== null || !navigator.geolocation) return;
+    try {
+      watchId = navigator.geolocation.watchPosition(
+        pos => {
+          // coords.speed is null on most desktops and on the first fixes of a
+          // phone; null is passed through as "no speed", never coerced to 0.
+          gpsSpeed = (pos.coords && typeof pos.coords.speed === 'number'
+                      && isFinite(pos.coords.speed)) ? pos.coords.speed : null;
+          gpsAt = performance.now();
+          paintHint();
+        },
+        () => { gpsSpeed = null; paintHint(); },
+        { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+      );
+    } catch (e) { watchId = null; }
+  }
+
+  function stopWatch() {
+    if (watchId === null) return;
+    try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
+    watchId = null;
+  }
+
+  function manualSpeed() {
+    if (!speedInput) return null;
+    const raw = speedInput.value.trim();
+    if (!raw) return null;
+    const n = parseFloat(raw);
+    if (!isFinite(n) || n < 0) return null;
+    return unit === 'mph' ? n * MPH_TO_MS : n;
+  }
+
+  function speed() {
+    const m = manualSpeed();
+    if (m !== null) return { v: m, age: 0, source: 'manual' };
+    if (gpsSpeed === null) return { v: null, age: 0, source: 'none' };
+    return { v: gpsSpeed, age: (performance.now() - gpsAt) / 1000, source: 'gps' };
+  }
+
+  function paintHint() {
+    if (!speedHint) return;
+    const s = speed();
+    if (s.source === 'manual') {
+      speedHint.textContent = 'Manual override · ' + s.v.toFixed(1) + ' m/s';
+    } else if (s.source === 'gps') {
+      speedHint.textContent = 'GPS ' + s.v.toFixed(1) + ' m/s · '
+        + s.age.toFixed(1) + 's old';
+    } else {
+      speedHint.textContent = 'No GPS speed · set an override to classify';
+    }
+  }
+
+  if (speedInput) speedInput.addEventListener('input', paintHint);
+  if (unitBtn) {
+    unitBtn.addEventListener('click', () => {
+      unit = (unit === 'ms') ? 'mph' : 'ms';
+      unitBtn.textContent = (unit === 'ms') ? 'm/s' : 'mph';
+      unitBtn.setAttribute('aria-pressed', unit === 'mph' ? 'true' : 'false');
+      paintHint();
+    });
+  }
+
+  /* ---------------- HUD --------------------------------------------------- */
+  const BAND_LABEL = {
+    NORMAL: 'Normal', GETTING_UNSAFE: 'Getting Unsafe', UNSAFE: 'Unsafe',
+    SUPPRESSED: 'Low Speed', UNKNOWN: 'No Speed',
+  };
+
+  function paintHud(j) {
+    if (!hud) return;
+    const band = (j && j.band) || 'UNKNOWN';
+    hud.className = 'hw-' + band;
+    elBand.textContent = BAND_LABEL[band] || band;
+    elTau.textContent = (j && typeof j.tau_s === 'number') ? j.tau_s.toFixed(1) + 's' : '--';
+    elTrend.textContent = (j && j.trend) || '--';
+    elGap.textContent = (j && typeof j.distance_m === 'number')
+      ? j.distance_m.toFixed(1) + ' m' : '--';
+    const s = speed();
+    elSpeed.textContent = (s.v === null) ? '--' : s.v.toFixed(1) + ' m/s';
+  }
+
+  function resetHud() {
+    if (!hud) return;
+    hud.className = 'hw-UNKNOWN';
+    elBand.textContent = 'Standby';
+    elTau.textContent = '--'; elTrend.textContent = '--';
+    elGap.textContent = '--'; elSpeed.textContent = '--';
+  }
+
+  /* ---------------- the frame call ---------------------------------------- */
+  async function sendFrame(blob, opts) {
+    opts = opts || {};
+    const s = speed();
+    const fd = new FormData();
+    fd.append('image', blob, 'frame.jpg');
+    // Empty string, not "0": the server distinguishes "no fix" from "stopped",
+    // and collapsing the two would coach in a car park or go silent at speed.
+    fd.append('v_host', s.v === null ? '' : String(s.v));
+    fd.append('v_host_age_s', String(s.age));
+    if (opts.frameT !== undefined && opts.frameT !== null) {
+      fd.append('frame_t', String(opts.frameT));
+    }
+    const r = await fetch(RIO.url('/headway_frame'), { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!j || j.ok === false) return j;
+    paintHud(j);
+    if (RIO.overlay && RIO.overlay.headway) RIO.overlay.headway(j, opts.el || null);
+    if (j.speak) speak(j.speak);
+    return j;
+  }
+
+  function frameFrom(el, quality) {
+    return new Promise((resolve, reject) => {
+      if (!el.videoWidth || !el.videoHeight) return reject(new Error('video not ready'));
+      const cv = document.createElement('canvas');
+      cv.width = el.videoWidth;
+      cv.height = el.videoHeight;
+      cv.getContext('2d').drawImage(el, 0, 0);
+      cv.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')),
+                'image/jpeg', quality || 0.8);
+    });
+  }
+
+  async function captureFromVideo(el) {
+    const blob = await frameFrom(el);
+    return sendFrame(blob, { el: el });
+  }
+
+  async function resetSession() {
+    try {
+      await fetch(RIO.url('/headway_reset'), { method: 'POST' });
+    } catch (e) { /* a stale tracker is recoverable; a failed reset is not fatal */ }
+  }
+
+  /* ---------------- video test mode --------------------------------------
+     The same /headway_frame path the live camera uses, driven off a playing
+     uploaded clip at the same ~2 fps, with the manual speed standing in for
+     GPS. frame_t is the media element's own currentTime, so the Kalman gets
+     the true spacing between the frames actually analysed rather than wall
+     clock inflated by network latency. */
+  async function runVideo() {
+    if (videoRunning) { videoRunning = false; return; }
+    if (!preview || !preview.videoWidth) return;
+    unlock();
+    if (manualSpeed() === null) {
+      if (speedHint) speedHint.textContent =
+        'Set a speed override first — no speed means no classification';
+    }
+    await resetSession();
+    videoRunning = true;
+    runBtn.textContent = 'Stop Headway Run';
+    if (preview.paused) { try { await preview.play(); } catch (e) {} }
+
+    while (videoRunning && !preview.ended) {
+      if (preview.paused) { await new Promise(r => setTimeout(r, 200)); continue; }
+      const t0 = performance.now();
+      try {
+        const blob = await frameFrom(preview);
+        await sendFrame(blob, { el: preview, frameT: preview.currentTime });
+      } catch (e) { /* one bad frame must not end the run */ }
+      // Pace to the cadence rather than sleeping a flat 500 ms, so processing
+      // time does not silently halve the frame rate.
+      const wait = Math.max(0, CADENCE_MS - (performance.now() - t0));
+      await new Promise(r => setTimeout(r, wait));
+    }
+    videoRunning = false;
+    runBtn.textContent = 'Run Headway On Video';
+  }
+
+  if (runBtn) runBtn.addEventListener('click', runVideo);
+  ['pause', 'ended'].forEach(ev =>
+    preview && preview.addEventListener(ev, () => { videoRunning = false; }));
+
+  // The Run button only makes sense once a clip is in the box.
+  const upload = document.getElementById('upload');
+  if (upload) {
+    upload.addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (runBtn) {
+        runBtn.style.display = (f && f.type.startsWith('video/')) ? 'flex' : 'none';
+      }
+    });
+  }
+
+  /* ---------------- toggle ------------------------------------------------ */
+  function apply() {
+    document.body.classList.toggle('headway-on', enabled);
+    if (toggle) toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    if (!enabled) resetHud();
+  }
+
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      enabled = !enabled;
+      if (enabled) { unlock(); startWatch(); } else { stopWatch(); }
+      apply();
+    });
+  }
+  apply();
+  paintHint();
+
+  window.RIO = window.RIO || {};
+  RIO.headway = {
+    get enabled() { return enabled; },
+    get videoRunning() { return videoRunning; },
+    unlock: unlock,
+    startWatch: startWatch,
+    stopWatch: stopWatch,
+    speed: speed,
+    captureFromVideo: captureFromVideo,
+    resetSession: resetSession,
+    resetHud: resetHud,
+    cadenceMs: CADENCE_MS,
+  };
+});
+</script>
+
+<script>
 /* ---- Perception overlay. Draws /perceive output on a canvas laid over the
    camera box. Purely presentational: it never captures and never fetches --
    the three capture flows hand it a result and it renders. ---- */
@@ -1344,7 +1822,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const CYAN = '#5fb3e8', AMBER = '#ffb84d', LEAD = '#9bd6ff';
 
   let enabled = true;
-  let last = null;            // { result, el }
+  let last = null;            // { result, el }  -- /perceive
+  let lastHw = null;          // { result, el }  -- /headway_frame
+
+  // Band -> colour. This is the warning at a glance, so it is the one thing on
+  // the canvas that must never be ambiguous.
+  const BAND_COLOR = {
+    NORMAL: 'rgba(95,179,232,0.75)',      // dim cyan: present, not shouting
+    GETTING_UNSAFE: '#ffb84d',            // amber
+    UNSAFE: '#ff5a5a',                    // red
+    SUPPRESSED: 'rgba(120,165,205,0.5)',
+    UNKNOWN: 'rgba(120,165,205,0.5)',
+  };
 
   const dims = el => {
     if (!el) return null;
@@ -1498,22 +1987,64 @@ document.addEventListener('DOMContentLoaded', () => {
     drawLabel(text, Math.max(2, x1), ty, color);
   }
 
+  /* The live headway layer: one box, coloured by band, with the tau readout.
+     Drawn over the /perceive layer because it updates ~7x more often and it is
+     the one the driver is being warned about. */
+  function drawHeadway(m, r, drewCorridor) {
+    const color = BAND_COLOR[r.band] || BAND_COLOR.UNKNOWN;
+    // /perceive only lands every ~15 s in headway mode, so if it has not drawn
+    // a corridor this frame the headway result supplies one. Drawing both would
+    // just double-stroke identical geometry.
+    if (!drewCorridor) drawCorridor(m, r.corridor);
+    if (!r.lead_box) return;
+
+    const x1 = m.x(r.lead_box[0]), y1 = m.y(r.lead_box[1]);
+    const x2 = m.x(r.lead_box[2]), y2 = m.y(r.lead_box[3]);
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = (r.band === 'UNSAFE') ? 2.5 : (r.band === 'GETTING_UNSAFE' ? 2 : 1.5);
+    ctx.shadowColor = color;
+    ctx.shadowBlur = (r.band === 'UNSAFE') ? 16 : 10;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.restore();
+    drawBrackets(x1, y1, x2, y2, color);
+
+    const bits = [];
+    if (typeof r.tau_s === 'number') bits.push('τ ' + r.tau_s.toFixed(1) + 's');
+    else bits.push('τ --');
+    if (r.trend) bits.push(r.trend);
+    if (typeof r.distance_m === 'number') bits.push(r.distance_m.toFixed(1) + 'm');
+    const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
+    drawLabel(bits.join(' · '), Math.max(2, x1), ty, color);
+  }
+
   function redraw() {
     if (!resize()) return;
     wipe();
-    if (!enabled || !last || !last.result) return;
+    if (!enabled) return;
 
-    const el = dims(last.el) ? last.el : mediaEl();
-    if (!el) return;
-    const img = last.result.image || {};
-    const m = mapper(el, img.w, img.h);
-    if (!m) return;
+    let drewCorridor = false;
+    if (last && last.result) {
+      const el = dims(last.el) ? last.el : mediaEl();
+      const img = last.result.image || {};
+      const m = el ? mapper(el, img.w, img.h) : null;
+      if (m) {
+        drawCorridor(m, last.result.corridor);
+        drewCorridor = !!(last.result.corridor && last.result.corridor.length);
+        const boxes = last.result.boxes || [];
+        // Lead last so its brackets sit on top of any box it overlaps.
+        boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
+        boxes.forEach(b => { if (b.lead) drawBox(m, b); });
+      }
+    }
 
-    drawCorridor(m, last.result.corridor);
-    const boxes = last.result.boxes || [];
-    // Lead last so its brackets sit on top of any box it overlaps.
-    boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
-    boxes.forEach(b => { if (b.lead) drawBox(m, b); });
+    if (lastHw && lastHw.result) {
+      const el = dims(lastHw.el) ? lastHw.el : mediaEl();
+      const img = lastHw.result.image || {};
+      const m = el ? mapper(el, img.w, img.h) : null;
+      if (m) drawHeadway(m, lastHw.result, drewCorridor);
+    }
   }
 
   function render(result, el) {
@@ -1522,7 +2053,12 @@ document.addEventListener('DOMContentLoaded', () => {
     redraw();
   }
 
-  function clear() { last = null; redraw(); }
+  function headway(result, el) {
+    lastHw = result ? { result: result, el: el || mediaEl() } : null;
+    redraw();
+  }
+
+  function clear() { last = null; lastHw = null; redraw(); }
 
   if (toggle) {
     toggle.addEventListener('click', () => {
@@ -1623,7 +2159,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
   window.RIO = window.RIO || {};
-  RIO.overlay = { render: render, clear: clear, redraw: redraw };
+  RIO.overlay = { render: render, headway: headway, clear: clear, redraw: redraw };
 });
 </script>
 </body>

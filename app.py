@@ -1,16 +1,19 @@
 
 
+import math
 import time
 import uuid
 import threading
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 from dotenv import load_dotenv
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, Query, Body
+from fastapi import FastAPI, UploadFile, Query, Body, Form
 from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 import config
@@ -18,6 +21,11 @@ import voice
 import llm_interface
 import vision
 import perceive
+# Import order matters: perceive lends vision's resident Qwen3-VL to
+# headway.anchor at import time, so headway.live's anchor path finds a provider
+# already installed and never pulls a second copy of the weights.
+from headway import live as headway_live
+from headway import live_policy
 
 def _warm_vision():
     t = time.time()
@@ -46,6 +54,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 client = OpenAI()
+
+# The pre-rendered red-tier clips live in static/audio/ and must be reachable
+# for the browser to preload them. "/" keeps serving index.html by hand so the
+# mount does not shadow it.
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.get("/")
@@ -174,6 +187,98 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
     sessions.log_perceive(session_id, len(image_bytes), result, (_t.time() - _t0) * 1000)
     return result
 
+# --- Live headway monitoring (v3) ---
+
+def _opt_float(v):
+    """Form scalars arrive as strings; '', 'null' and 'NaN' all mean 'no value'.
+
+    Distinguishing missing from zero matters here: 0 m/s is a real, meaningful
+    speed (stopped) and None means the browser has no fix. Coercing one into
+    the other would either coach in a parking lot or suppress at a red light.
+    """
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v) if math.isfinite(float(v)) else None
+    s = str(v).strip()
+    if not s or s.lower() in ("null", "none", "nan", "undefined"):
+        return None
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return f if math.isfinite(f) else None
+
+
+@app.post("/headway_frame")
+async def headway_frame_endpoint(
+    image: UploadFile = File(...),
+    session_id: str = Query(default=None),
+    v_host: str = Form(default=None),
+    v_host_age_s: str = Form(default=None),
+    frame_t: str = Form(default=None),
+):
+    """One live headway frame: track -> depth -> filter -> band -> voice.
+
+    NO Qwen call per frame. The lead box is carried by CSRT and re-anchored only
+    on session start, track loss, tracker drift, or anchor staleness — see
+    headway/live.py.
+
+    Runs in a threadpool because the work is a blocking GPU pass, and a
+    per-session non-blocking lock drops a frame rather than queueing it: at
+    ~2 fps a queued frame would be measured against a dt that has already
+    passed, which corrupts the very velocity estimate the warning rests on.
+    """
+    t0 = time.time()
+    image_bytes = await image.read()
+    key = session_id or "default"
+    session = headway_live.get_session(key, use_qwen=config.VISION_ENABLED)
+
+    if not session.lock.acquire(blocking=False):
+        return {"ok": False, "skipped": "busy", "band": session.policy.band}
+    try:
+        result = await run_in_threadpool(
+            session.process, image_bytes,
+            _opt_float(v_host), _opt_float(v_host_age_s), _opt_float(frame_t),
+        )
+    except Exception as e:
+        print(f"[headway] frame failed: {e}", flush=True)
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        session.lock.release()
+
+    sessions.log_headway(session_id, result, (time.time() - t0) * 1000)
+    return result
+
+
+@app.post("/headway_reset")
+def headway_reset_endpoint(session_id: str = Query(default=None)):
+    """Drop a session's tracker/filter/policy — used when a video test restarts."""
+    return {"reset": headway_live.reset_session(session_id or "default")}
+
+
+@app.get("/headway_sessions")
+def headway_sessions_endpoint():
+    return headway_live.active_sessions()
+
+
+@app.get("/headway_voice")
+def headway_voice_endpoint(line: str = Query(...)):
+    """Live TTS for the amber-tier lines.
+
+    Only the calm tier comes through here. The red tier is served as static
+    pre-rendered clips precisely so it never waits on this round-trip, and
+    allowing an arbitrary `line` would turn a deterministic warning channel into
+    a text-to-speech endpoint — so the key is looked up in the policy's own
+    table and anything else is refused.
+    """
+    if live_policy.LINE_AUDIO.get(line) != "tts":
+        return {"error": "unknown or non-TTS line", "line": line}
+    text = live_policy.LINE_TEXT[line]
+    return StreamingResponse(voice.synthesize_stream(text), media_type="audio/mpeg",
+                             headers={"Cache-Control": "no-store"})
+
+
 # --- Phase 2.5 session endpoints ---
 
 @app.post("/session/start")
@@ -185,6 +290,10 @@ def session_start_endpoint(metadata: dict = Body(default=None, embed=True)):
 @app.post("/session/end")
 def session_end_endpoint(session_id: str = Query(...)):
     closed = sessions.end_session(session_id)
+    # Drop the live headway state with the session. Without this a tracker,
+    # Kalman filter and cooldown table survive for every drive the process has
+    # ever seen, and a re-used session id would resume mid-warning.
+    headway_live.reset_session(session_id)
     return {"closed": closed}
 
 
