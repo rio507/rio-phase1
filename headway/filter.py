@@ -76,7 +76,31 @@ P0_V = 5.0 ** 2          # (m/s)² -- relative speed starts completely unknown
 
 # --- gating (§4) -------------------------------------------------------------
 GATE_SIGMA = 3.0
-MAX_CONSEC_REJECTS = 3   # 3 in a row is not noise -- the world changed
+
+# A RUN of rejected measurements is the world changing, not noise -- cut-in, new
+# lead, occlusion ending (§4, §5). How long that run must be is a TIME, not a
+# frame count: the old flat "3 frames" is 0.25 s at the Stage 0 harness's 12 Hz
+# but 1.5 s at the live loop's 2 fps, so the same constant meant two completely
+# different behaviours depending on who was calling. Same frames-vs-time
+# mismatch that live_policy.py fixes in its band confirmation, and it is fixed
+# the same way here: sized in seconds, so a cut-in takes the same wall time to
+# recognise at every cadence.
+REJECT_WINDOW_S = 0.5
+
+# Tolerance on the time term only, matching live_policy.CONFIRM_TOL_S and there
+# for the same reason: frame arrival jitters either side of the nominal cadence,
+# and without it a run landing a hair short of the window costs a whole extra
+# frame.
+REJECT_WINDOW_TOL_S = 0.1
+
+# Hard floor, whatever the cadence, and it is load-bearing rather than
+# decorative: at 2 fps a SINGLE rejected frame already spans 0.5 s and would
+# satisfy the time term on its own. One outlier depth sample must never re-seed
+# the gap -- telling a cut-in apart from a bad reading is the entire job of this
+# gate, and getting it wrong hands the filter a spurious range with full
+# confidence.
+MIN_CONSEC_REJECTS = 2
+
 MAX_COAST_S = 1.0        # §5: never warn from coasted data older than this
 
 
@@ -84,16 +108,19 @@ class HeadwayFilter:
     """Kalman on [d, ḋ] with a 3σ gate and a cut-in escape hatch."""
 
     def __init__(self, sigma_a=SIGMA_A, r_rel=R_REL_FRAC, r_abs=R_ABS_M,
-                 gate_sigma=GATE_SIGMA, max_consec_rejects=MAX_CONSEC_REJECTS):
+                 gate_sigma=GATE_SIGMA, min_consec_rejects=MIN_CONSEC_REJECTS,
+                 reject_window_s=REJECT_WINDOW_S):
         self.sigma_a = float(sigma_a)
         self.r_rel = float(r_rel)
         self.r_abs = float(r_abs)
         self.gate_sigma = float(gate_sigma)
-        self.max_consec_rejects = int(max_consec_rejects)
+        self.min_consec_rejects = int(min_consec_rejects)
+        self.reject_window_s = float(reject_window_s)
 
         self.x = None                # [d, ḋ]
         self.P = None
         self.consec_rejects = 0
+        self.reject_span = 0.0       # seconds of the current consecutive-reject run
         self.coast_age = 0.0         # seconds since the last accepted measurement
         self.new_lead = False        # latched for one step after a reset
         self.initialised = False
@@ -115,6 +142,7 @@ class HeadwayFilter:
         self.x = np.array([float(z), 0.0], dtype=float)
         self.P = np.diag([P0_D, P0_V]).astype(float)
         self.consec_rejects = 0
+        self.reject_span = 0.0
         self.coast_age = 0.0
         self.initialised = True
         self.n_updates = 0
@@ -174,8 +202,13 @@ class HeadwayFilter:
 
         if abs(innovation) > self.gate_sigma * sigma:
             self.consec_rejects += 1
+            self.reject_span += dt
             self.coast_age += dt
-            if self.consec_rejects >= self.max_consec_rejects:
+            # Both conditions, always: enough consecutive frames that this
+            # cannot be one bad sample, AND enough elapsed time that it cannot
+            # be a brief burst at a high frame rate.
+            if (self.consec_rejects >= self.min_consec_rejects
+                    and self.reject_span >= self.reject_window_s - REJECT_WINDOW_TOL_S):
                 # Three disagreements in a row is a world change, not noise:
                 # cut-in, new lead, or occlusion ending (§4, §5). Trust the
                 # measurement over the model and restart -- NEW_LEAD forces the
@@ -197,6 +230,7 @@ class HeadwayFilter:
         self.P = I_KH @ self.P @ I_KH.T + np.outer(K, K) * R
 
         self.consec_rejects = 0
+        self.reject_span = 0.0
         self.coast_age = 0.0
         self.n_updates += 1
         return self._snapshot(accepted=True, reason="updated", dt=dt, z=z,
@@ -216,6 +250,7 @@ class HeadwayFilter:
             "sigma": None if sigma is None else round(float(sigma), 4),
             "R": None if R is None else round(float(R), 5),
             "consec_rejects": int(self.consec_rejects),
+            "reject_span": round(float(self.reject_span), 4),
             "coast_age": round(float(self.coast_age), 4),
             "new_lead": bool(self.new_lead),
             "P_dd": None if self.P is None else round(float(self.P[0, 0]), 5),

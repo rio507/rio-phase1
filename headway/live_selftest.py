@@ -5,7 +5,7 @@
 Three parts, deliberately separated by what each one is able to prove:
 
   A. FULL PIPELINE on the shrinking-gap synthetic clip, at the live loop's real
-     2 fps cadence, through LiveSession.process() — the exact function
+     capture cadence (LIVE_FPS), through LiveSession.process() — the exact function
      /headway_frame calls. Depth and the anchor box are supplied from the clip's
      ground truth for the same reason run_clip.py offers `--depth gt`: the
      synthetic clip is a flat-shaded rectangle on a flat road, so DA-V2 has no
@@ -13,7 +13,7 @@ Three parts, deliberately separated by what each one is able to prove:
      is live — clock, anchor scheduling, CSRT on the real rendered pixels, the
      Kalman, the trend classifier, the policy, the response payload.
 
-  B. POLICY SCENARIOS, scripted at 2 Hz straight into LivePolicy. The policy is
+  B. POLICY SCENARIOS, scripted straight into LivePolicy. The policy is
      pure, so its edge cases can be driven exactly rather than hoped for out of
      a clip: cooldown suppression, worsening overriding that cooldown, the
      genuine-clear re-arm, the 5 s escalation, and every suppression gate.
@@ -63,7 +63,7 @@ def head(title):
 #   tau < 2.0 from t~7.2   UNSAFE           (d = 36 m)
 # which walks the whole v3 ladder and makes the amber->red step a *worsening*.
 SYNTH_V_HOST = 18.0
-LIVE_FPS = 2.0
+LIVE_FPS = 4.0
 
 
 class _GTDepth:
@@ -93,7 +93,7 @@ def run_pipeline():
     import cv2
     import json
 
-    head("A -- full live pipeline, shrinking-gap synthetic clip @ 2 fps")
+    head(f"A -- full live pipeline, shrinking-gap synthetic clip @ {LIVE_FPS:g} fps")
 
     tmp = tempfile.mkdtemp(prefix="headway-live-")
     clip = os.path.join(tmp, "synth_shrinking.mp4")
@@ -124,7 +124,7 @@ def run_pipeline():
         live_mod.reset_session("selftest")
         session = live_mod.get_session("selftest", use_qwen=True)
         cap = cv2.VideoCapture(path)
-        stride = int(round(30.0 / LIVE_FPS))       # every 15th frame -> 2 fps
+        stride = max(1, int(round(30.0 / LIVE_FPS)))   # subsample to the live cadence
         idx = 0
         while True:
             ok, frame = cap.read()
@@ -509,59 +509,76 @@ def run_policy():
     run_cutin()
 
 
-def run_cutin():
-    """B10 -- the cut-in, driven through the REAL filter at the live cadence.
-
-    The case the two-band worsening rule exists for, and the one that exposed
-    the swallowed-entry defect: a lead cuts in and tau collapses 4.0 s -> 1.5 s
-    in one step. The Kalman gates the discontinuity for 3 frames, re-seeds
-    (NEW_LEAD), and the band confirmation then completes INSIDE the 0.6 s
-    coaching warm-up -- so this is only silent-free if the warm-up neutralises
-    the trend rather than the tier.
-    """
+def _cutin_at(dt, v_host=18.0, t_cut=6.0):
+    """One cut-in run at a given cadence. Returns (policy, accept_lat, spoke)."""
     from .filter import HeadwayFilter
 
-    head("B10 -- cut-in through the real filter (tau 4.0s -> 1.5s @ 2 fps)")
-    V, dt, T_CUT = 18.0, 0.5, 6.0
     kf, pol, trend = HeadwayFilter(), P.LivePolicy(), v2.STABLE
     t, reset_t, spoke, accepted_at = 0.0, 0.0, None, None
-
     for _ in range(int(20 / dt)):
         t += dt
-        cut = t >= T_CUT
-        snap = kf.step((1.5 if cut else 4.0) * V, 0.85, dt)
+        cut = t >= t_cut
+        snap = kf.step((1.5 if cut else 4.0) * v_host, 0.85, dt)
         if cut and accepted_at is None and snap["accepted"]:
             accepted_at = t
         if snap["new_lead"]:
             reset_t = t
         pvv = snap.get("P_vv")
-        trend = v2.classify_trend(snap["d_dot"], V, trend,
+        trend = v2.classify_trend(snap["d_dot"], v_host, trend,
                                   d_dot_sigma=(math.sqrt(pvv) if pvv and pvv > 0 else None))
-        r = pol.tick(tau=v2.compute_tau(snap["d"], V), v2_trend=trend, confidence=0.9,
-                     v_host=V, v_host_stale=False, t=t, since_reset_s=(t - reset_t),
-                     new_lead=snap["new_lead"], track_lost=False)
+        r = pol.tick(tau=v2.compute_tau(snap["d"], v_host), v2_trend=trend,
+                     confidence=0.9, v_host=v_host, v_host_stale=False, t=t,
+                     since_reset_s=(t - reset_t), new_lead=snap["new_lead"],
+                     track_lost=False)
         if cut and spoke is None and r.get("speak"):
-            spoke = (t, r["speak"], r["prev_band"], r["band"])
+            spoke = (t - t_cut, r["speak"], r["prev_band"], r["band"])
+    return pol, (None if accepted_at is None else accepted_at - t_cut), spoke
 
-    check(pol.band == P.UNSAFE, "band reached UNSAFE after the cut-in", pol.band)
-    check(spoke is not None, "the cut-in produced a warning")
-    if spoke:
-        t_spoke, sp, prev, band = spoke
-        check(sp["tier"] == P.TIER_UNSAFE, "red tier", sp["tier"])
+
+def run_cutin():
+    """B10 -- the cut-in, driven through the REAL filter, at both cadences.
+
+    The case the two-band worsening rule exists for, and the one that exposed
+    the swallowed-entry defect: a lead cuts in and tau collapses 4.0 s -> 1.5 s
+    in one step. The Kalman gates the discontinuity until the reject run clears
+    REJECT_WINDOW_S, re-seeds (NEW_LEAD), and the band confirmation then
+    completes INSIDE the 0.6 s coaching warm-up -- so this is only silent-free
+    because the warm-up neutralises the trend rather than the tier.
+
+    Run at both cadences to show the total is now cadence-driven rather than
+    cadence-*dependent*: both stages are times, so the only thing 4 fps buys is
+    landing on those times sooner.
+    """
+    head("B10 -- cut-in through the real filter (tau 4.0s -> 1.5s)")
+    results = {}
+    for label, dt in (("2 fps", 0.5), ("4 fps", 0.25)):
+        pol, accept, spoke = _cutin_at(dt)
+        results[label] = (accept, spoke)
+        check(pol.band == P.UNSAFE, f"[{label}] band reached UNSAFE", pol.band)
+        check(spoke is not None, f"[{label}] the cut-in produced a warning")
+        if not spoke:
+            continue
+        lat, sp, prev, band = spoke
+        check(sp["tier"] == P.TIER_UNSAFE, f"[{label}] red tier", sp["tier"])
         check(sp["reason"] == P.R_WORSENING,
-              "attributed to worsening (the two-band jump)", sp["reason"])
-        check(prev == P.NORMAL, "the transition really was NORMAL -> UNSAFE",
+              f"[{label}] attributed to worsening (the two-band jump)", sp["reason"])
+        check(prev == P.NORMAL, f"[{label}] transition really was NORMAL -> UNSAFE",
               f"{prev} -> {band}")
-        # Chosen with the trend neutralised: we do not yet know it is collapsing,
-        # so the sharpest line would be a guess.
+        # Chosen with the trend neutralised: we do not yet know it is
+        # collapsing, so the sharpest line would be a guess.
         check(sp["line"] in (P.LINE_TOO_CLOSE, P.LINE_WATCH_DISTANCE),
-              "warm-up entry does not pick a line off an unconverged d_dot",
-              sp["line"])
-        lat = t_spoke - T_CUT
-        check(lat <= 2.0, f"warning within 2.0 s of the cut-in", f"{lat:.2f} s "
-              f"(filter accepted the new range at +{accepted_at - T_CUT:.2f} s)")
-        print(f"       cut-in -> filter accept {accepted_at - T_CUT:.2f} s "
-              f"-> voice {lat:.2f} s")
+              f"[{label}] no line chosen off an unconverged d_dot", sp["line"])
+        check(lat <= 1.6, f"[{label}] warning within 1.6 s of the cut-in",
+              f"{lat:.2f} s")
+
+    a2, s2 = results["2 fps"]
+    a4, s4 = results["4 fps"]
+    check(s4[0] < s2[0], "4 fps warns sooner than 2 fps",
+          f"{s4[0]:.2f} s vs {s2[0]:.2f} s")
+    print(f"\n  {'cadence':>8} {'filter accept':>14} {'band confirm':>14} "
+          f"{'voice':>9}")
+    for label, (acc, sp) in results.items():
+        print(f"  {label:>8} {acc:>13.2f}s {sp[0] - acc:>13.2f}s {sp[0]:>8.2f}s")
 
 
 # ===========================================================================

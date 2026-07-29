@@ -666,7 +666,7 @@
         </div>
         <div class="head-toggles">
           <button id="headway" type="button" aria-pressed="true"
-                  title="Live headway monitoring — 2 fps lead tracking with automatic voice">Headway</button>
+                  title="Live headway monitoring — 4 fps lead tracking with automatic voice">Headway</button>
           <button id="layers" type="button" aria-pressed="true"
                   title="Toggle the perception overlay">Layers</button>
         </div>
@@ -1138,7 +1138,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Perception cadence. With live headway running, /perceive drops to a slow
   // background tick: it costs a full Qwen generate (~1.5 s on this GPU) and
-  // would otherwise starve the 2 fps headway loop of the same GPU. Its job in
+  // would otherwise starve the 4 fps headway loop of the same GPU. Its job in
   // headway mode is only to keep the Perception caption column alive.
   const PERCEIVE_MS_SOLO = 5000;
   const PERCEIVE_MS_HEADWAY = 15000;
@@ -1389,7 +1389,7 @@ document.addEventListener('DOMContentLoaded', () => {
     watcher = setInterval(() => {
       if (preview.paused || preview.ended || inflight) return;
       // A headway run on this clip owns the GPU: a /perceive every 1.5 s is a
-      // full Qwen generate and would starve the 2 fps loop it is competing with.
+      // full Qwen generate and would starve the 4 fps loop it is competing with.
       if (RIO.headway && RIO.headway.videoRunning) return;
       inflight = true;
       const cv = document.createElement('canvas');
@@ -1494,7 +1494,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 <script>
 /* ---- Live headway monitoring. Owns four things and nothing else: the host
-   speed, the warning audio, the ~2 fps /headway_frame loop, and the HUD strip.
+   speed, the warning audio, the ~4 fps /headway_frame loop, and the HUD strip.
    The drive loop calls in; the overlay is handed results to draw. All warning
    policy is server-side and deterministic -- this file never decides to speak,
    it only plays what /headway_frame told it to. ---- */
@@ -1513,7 +1513,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const preview = document.getElementById('preview');
   const spokenLine = document.getElementById('spokenline');
 
-  const CADENCE_MS = 500;                 // ~2 fps
+  const CADENCE_MS = 250;                 // ~4 fps
   const MPH_TO_MS = 0.44704;
   const CLIP_IDS = ['too_close', 'watch_distance', 'back_off'];
 
@@ -1726,7 +1726,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   /* ---------------- video test mode --------------------------------------
      The same /headway_frame path the live camera uses, driven off a playing
-     uploaded clip at the same ~2 fps, with the manual speed standing in for
+     uploaded clip at the same ~4 fps, with the manual speed standing in for
      GPS. frame_t is the media element's own currentTime, so the Kalman gets
      the true spacing between the frames actually analysed rather than wall
      clock inflated by network latency. */

@@ -41,8 +41,8 @@ from .tracker import LeadTracker
 
 # --- anchor scheduling (v3 spec §1) ---------------------------------------
 # Qwen re-anchor when the anchor is older than this. The spec's number. v2 §7.4
-# wanted <= 5 s at 12 Hz; at 2 fps a Qwen call is ~1.5 s of the loop's own
-# budget, so 20 s is the concession that keeps the fast path fast. The tracker
+# wanted <= 5 s at 12 Hz; at 4 fps a Qwen call is ~1.3 s, i.e. five whole frame
+# slots, so 20 s is the concession that keeps the fast path fast. The tracker
 # quality gate below is what actually catches a bad box early -- staleness is
 # only the backstop.
 ANCHOR_MAX_AGE_S = 20.0
@@ -51,7 +51,7 @@ ANCHOR_MAX_AGE_S = 20.0
 TRACK_QUALITY_REANCHOR = 0.35
 
 # --- frame timing ---------------------------------------------------------
-NOMINAL_DT_S = 0.5           # the client's ~2 fps cadence; used for frame 1 only
+NOMINAL_DT_S = 0.25          # the client's ~4 fps cadence; used for frame 1 only
 MIN_DT_S = 0.02
 MAX_DT_S = 2.0
 # A gap longer than this means the session stopped and restarted (tab

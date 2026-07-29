@@ -11,7 +11,8 @@ commit.
 """
 import math
 
-from .filter import HeadwayFilter, MAX_CONSEC_REJECTS
+from .filter import (HeadwayFilter, MIN_CONSEC_REJECTS, REJECT_WINDOW_S,
+                     REJECT_WINDOW_TOL_S)
 from . import state as S
 from .state import (COMFORTABLE, NORMAL, GETTING_UNSAFE, UNSAFE, CRITICAL,
                     LOST, DEGRADED, SUPPRESSED_LOW_SPEED, URGENT,
@@ -371,11 +372,39 @@ def test_cutin_and_warmup():
         f.step(50.0, 0.9, DT)
     s1 = f.step(20.0, 0.9, DT)
     check("first outlier gated, not absorbed", not s1["accepted"], s1["reason"])
-    f.step(20.0, 0.9, DT)
-    s3 = f.step(20.0, 0.9, DT)
-    check(f"{MAX_CONSEC_REJECTS} consecutive rejects -> reset", s3["reason"] == "reset_new_lead")
-    check("NEW_LEAD flagged", s3["new_lead"])
-    check("re-seeds at the new range", abs(f.d - 20.0) < 0.01, f"d={f.d:.2f}")
+
+    # The reject run is a TIME window (REJECT_WINDOW_S) with a hard floor of
+    # MIN_CONSEC_REJECTS frames, so the frame COUNT varies with cadence while
+    # the wall time does not. A flat frame count meant 0.25 s at this 12 Hz
+    # harness and 1.5 s at the live loop's 2 fps -- two different behaviours
+    # from one constant.
+    for label, dt in (("12 Hz", 1.0 / 12.0), ("4 fps", 0.25), ("2 fps", 0.5)):
+        g = HeadwayFilter()
+        for _ in range(30):
+            g.step(50.0, 0.9, dt)
+        n, snap = 0, None
+        while n < 50:
+            n += 1
+            snap = g.step(20.0, 0.9, dt)
+            if snap["reason"] == "reset_new_lead":
+                break
+        span = n * dt
+        check(f"[{label}] resets on a run, never one frame", n >= MIN_CONSEC_REJECTS,
+              f"n={n}")
+        check(f"[{label}] run lasts ~{REJECT_WINDOW_S}s regardless of cadence",
+              abs(span - REJECT_WINDOW_S) <= REJECT_WINDOW_TOL_S + dt,
+              f"n={n} frames, span={span:.3f}s")
+        check(f"[{label}] NEW_LEAD flagged", bool(snap and snap["new_lead"]))
+        check(f"[{label}] re-seeds at the new range", abs(g.d - 20.0) < 0.01,
+              f"d={g.d:.2f}")
+
+    # The floor is load-bearing, not decorative: at 2 fps ONE rejected frame
+    # already spans 0.5 s and would clear the time term on its own.
+    h = HeadwayFilter()
+    for _ in range(30):
+        h.step(50.0, 0.9, 0.5)
+    check("a single outlier never resets the filter, even at 2 fps",
+          h.step(20.0, 0.9, 0.5)["reason"] == "gated")
 
     sm = settled(band=UNSAFE)
     m = measure(tau=1.2, trend=SLOWLY_SHRINKING, new_lead=True)

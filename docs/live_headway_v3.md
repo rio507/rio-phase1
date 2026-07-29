@@ -12,7 +12,8 @@ the three-band ladder.
 
 `warning_logic_v2.md` is **not** superseded as a whole. It still governs
 `headway/state.py` and the Stage 0 clip harness (`headway/run_clip.py`), which
-are unchanged and still pass their 109-check suite. v3 lives in its own module,
+keep their own suite (now 119 checks, extended to prove the reject
+window is cadence-independent). v3 lives in its own module,
 `headway/live_policy.py`.
 
 ## Why a separate module rather than a retune of state.py
@@ -71,7 +72,8 @@ The two red phrasings alternate, so a repeat is not word-for-word.
 ## 3. Anti-nag rules
 
 - **Confirmation** — a band entry needs ≥ 2 frames *and* ≥ 0.5 s of consistent
-  readings. De-escalation needs 1.0 s. Never single-frame.
+  readings (3 frames at the 4 fps capture rate). De-escalation needs 1.0 s.
+  Never single-frame.
 - **Hysteresis** — 0.2 s τ on exit, so boundary flicker cannot re-trigger entry.
 - **Cooldowns** — 30 s calm tier, 15 s unsafe tier, applied **per tier, not per
   line**. The spec says "same line not repeated within 30 s / 15 s"; per-line
@@ -117,21 +119,33 @@ The two red phrasings alternate, so a repeat is not word-for-word.
   never a guess. `v_host` is passed as an empty string rather than 0 when there
   is no fix, because 0 m/s is a real and different state (stopped).
 
-## 4. Cadence — why 0.5 s confirmation works at 2 fps
+## 4. Cadence — 4 fps, and why the timings are in seconds
 
-Confirmation is **time-based with a 2-frame floor**, not frame-count-based. v2
-used "3 frames @ 12 Hz", which *is* 0.25 s; the live loop runs at ~2 fps, where a
-frame count would mean a completely different latency.
+The capture loop runs at **4 fps** (`CADENCE_MS = 250`). Every temporal
+threshold in the stack is expressed as a **time with a minimum frame count**,
+never as a bare frame count, so the same constant means the same thing at every
+cadence:
 
-The spec's two constraints — "never single-frame" and "UNSAFE confirmation may
-not exceed 0.5 s" — meet exactly at 2 fps: two consecutive frames span 0.5 s, so
-a band entry confirms on the second frame and UNSAFE lands *on* its cap rather
-than over it. At any higher capture rate the time term dominates and more frames
-are required, which is the correct direction.
+| Stage | Window | @ 2 fps | @ 4 fps | @ 12 Hz |
+|---|---|---|---|---|
+| Kalman reject run (`REJECT_WINDOW_S`) | 0.5 s, floor 2 frames | 2 frames | 2 frames | 5 frames |
+| Band confirmation (`CONFIRM_S`) | 0.5 s, floor 2 frames | 2 frames | 3 frames | 6 frames |
 
-`CONFIRM_TOL_S = 0.1` absorbs frame-arrival jitter. Without it a second frame
-landing at 0.48 s would be pushed to a third and the red tier's latency would
-double for no gain in certainty.
+The old code had both as flat frame counts (3 rejects, 3 confirms), which is
+0.25 s at the Stage 0 harness's 12 Hz but 1.5 s at 2 fps — one constant, two
+completely different behaviours, and nothing in the code said which was meant.
+
+**The frame floor is load-bearing, not belt-and-braces.** At 2 fps a *single*
+rejected frame already spans 0.5 s and would satisfy the reject window on its
+own; only `MIN_CONSEC_REJECTS = 2` stops one outlier depth sample re-seeding the
+gap to a spurious range. Telling a cut-in apart from a bad reading is the whole
+job of that gate.
+
+`CONFIRM_TOL_S` / `REJECT_WINDOW_TOL_S` (0.1 s) absorb frame-arrival jitter:
+without them a run landing a hair short of the window costs a whole extra frame.
+
+Cadence is a free parameter, not a constraint — the measured steady-state cost
+is 33 ms/frame p95, i.e. ~30 fps sustainable. 4 fps spends 13% of the budget.
 
 ## 5. Architecture
 
@@ -141,7 +155,7 @@ POST /headway_frame   image + v_host + v_host_age_s + frame_t  (+ ?session_id)
 
 Per frame, in `headway/live.py`:
 
-1. `depth_map()` over the frame — DA-V2 Metric-Small, **~10 ms**
+1. `depth_map()` over the frame — DA-V2 Metric-Small, **~8 ms**
 2. re-anchor **only** if: first frame, track lost, tracker quality < 0.35, or
    anchor older than 20 s — Qwen3-VL, ~1.2 s, off the steady-state path
 3. `tracker.update()` — CSRT carries the box, ~2 ms
@@ -184,10 +198,10 @@ warning channel cannot be turned into a general text-to-speech endpoint.
 
 ## 8. Verification
 
-- `python -m headway.live_selftest` — 107 checks. Full pipeline over the
+- `python -m headway.live_selftest` — 115 checks. Full pipeline over the
   shrinking-gap synthetic clip at 2 fps (ground-truth depth, for the reason
   below), plus scripted policy scenarios and the firewall audit.
-- `python -m tools.headway_bench --clip <mp4> --v-host <m/s>` — the real stack
+- `python -m tools.headway_bench --clip <mp4> --v-host <m/s> --fps 4` — the real stack
   over HTTP: real DA-V2, real Qwen anchoring, real session logging, per-frame
   latency.
 
@@ -213,21 +227,25 @@ real video validates the measurement.
 | Confidence floor | 0.4 | DEGRADED % in night/rain clips |
 | V_MIN_COACH | 5 m/s | stop-and-go annoyance |
 | Anchor max age | 20 s | drift vs GPU budget |
-| Capture cadence | 2 fps | measured p95 is 44 ms, so ~23 fps is available |
+| Capture cadence | 4 fps | measured p95 is 33 ms, so ~30 fps is available |
+| Kalman reject window | 0.5 s, floor 2 frames | cut-in latency vs re-seeding on an outlier |
 
 ## 10. Open questions for road testing
 
-1. **Cut-in latency is dominated by the Kalman gate, not by the policy.**
-   Measured end to end through the real filter at 2 fps (`B10`), a τ 4.0 s →
-   1.5 s cut-in produces a warning **1.5 s** after it happens: the innovation
-   gate rejects the discontinuity for `MAX_CONSEC_REJECTS = 3` frames before
-   re-seeding (**1.0 s** of that total), then the band confirms 0.5 s later.
-   That reject count is **frame-based**, so it costs 0.25 s at the Stage 0
-   12 Hz and 1.0 s at the live 2 fps — the same frames-vs-time mismatch already
-   fixed in the policy's confirmation. Making it time-based (or raising the
-   capture cadence, which the 44 ms p95 easily allows) would cut cut-in latency
-   by roughly two thirds. Not changed here: `filter.py` is v2 code shared with
-   the Stage 0 harness, and this is a tuning decision to take on real logs.
+1. **Cut-in latency is now 0.75 s end to end** (was 1.50 s). Measured through
+   the real filter at 4 fps (`B10`), a τ 4.0 s → 1.5 s cut-in:
+
+   | Cadence | Filter accepts new range | Band confirms | Voice |
+   |---|---|---|---|
+   | 2 fps | +0.50 s | +0.50 s | **+1.00 s** |
+   | 4 fps | +0.25 s | +0.50 s | **+0.75 s** |
+
+   Both stages are now times rather than frame counts, so raising the cadence
+   only buys landing on those times sooner — it no longer changes what the
+   thresholds *mean*. The remaining floor is the two 0.5 s windows themselves,
+   and shortening either trades directly against re-seeding the filter on an
+   outlier or warning off a single frame. That is a call for real logs.
+
 2. **The escalation bypasses the calm cooldown by necessity.** It shares the calm
    tier with the entry line that fired 5 s earlier, so without the bypass the
    30 s cooldown would swallow it every time. It is one-shot per band occupancy,
