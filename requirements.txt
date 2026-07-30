@@ -31,6 +31,15 @@ huggingface_hub>=0.34.0,<1.0
 safetensors>=0.8.0
 Pillow>=10.0.1
 
+# The pod image sets HF_HUB_ENABLE_HF_TRANSFER=1 unconditionally, and
+# huggingface_hub treats that as a hard requirement: with the flag on and this
+# package absent, any download RAISES rather than falling back to the ordinary
+# transfer. It stayed invisible for a long time because every checkpoint was
+# already in HF_HOME, so nothing ever downloaded -- the first cold cache (a new
+# volume, a cleared cache, a model id that changes) is when it would have
+# surfaced, as a failed warm on a running service.
+hf_transfer>=0.1.9
+
 # --- headway fast loop ---
 # CSRT lives in opencv-CONTRIB, not plain opencv-python, and the tracking API
 # moved namespaces in 5.x — headway/tracker.py probes the known homes but the

@@ -2082,6 +2082,10 @@ document.addEventListener('DOMContentLoaded', () => {
       if (m) {
         drawCorridor(m, last.result.corridor);
         drewCorridor = !!(last.result.corridor && last.result.corridor.length);
+        // /perceive gates its lead on the same corridor headway does, so it
+        // carries the same lane lines. Drawn here for the frames between
+        // headway results.
+        drawLanes(m, last.result.lanes);
         const boxes = last.result.boxes || [];
         // Lead last so its brackets sit on top of any box it overlaps.
         boxes.forEach(b => { if (!b.lead) drawBox(m, b); });

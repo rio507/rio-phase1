@@ -42,15 +42,55 @@ DEFAULT_ANCHOR_INTERVAL = 60  # frames between Qwen re-anchors (§5, ≤5 s per 
 
 QWEN_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
-# Grounding prompt. Deliberately narrow: one box, ego lane only, strict JSON.
-# Asking for prose here would mean parsing prose, and §1 forbids Qwen having any
-# influence beyond "which pixels".
+# Only a vehicle can be the lead. A pedestrian or cyclist inside the corridor is
+# a hazard for the warning path, not a following target -- calling one "lead"
+# and computing a headway to it would be wrong. Same set as perceive.py's
+# LEAD_LABELS, restated here because headway imports nothing from the app.
+LEAD_LABELS = {"car", "truck", "bus", "van", "motorcycle"}
+
+# Cap on vehicles requested. Latency is ~13 decode tokens per compact object on
+# this GPU, and the corridor only ever keeps the nearest in-lane one, so a long
+# tail of far-off traffic costs time and buys nothing.
+MAX_ANCHOR_OBJECTS = 6
+
+# Decode budget for the anchor reply. The old single-box prompt needed almost
+# nothing; enumerating does. At ~13 tokens per compact object, six objects plus
+# the JSON scaffolding runs ~100, and the model does not always respect the cap
+# of six -- measured truncation at 128 on ordinary highway traffic. Truncation
+# is survivable now (repair_truncated_json) but a truncated list is still a
+# shorter candidate set, so the budget is set above the observed need.
+ANCHOR_MAX_NEW_TOKENS = 192
+
+# Grounding prompt. ENUMERATE, DO NOT SELECT.
+#
+# This asks for every vehicle in view and explicitly tells the model NOT to
+# decide which one we are following. That instruction is the whole point. The
+# previous prompt asked for "the single vehicle directly ahead in MY lane",
+# which handed Qwen the lane judgement and left the corridor able only to VETO
+# its pick -- never to substitute the right one, because the right one was
+# never in the candidate set. If Qwen named an adjacent-lane car and omitted
+# the true lead, geometry rejected the answer and we anchored nothing.
+#
+# That fails safe (silence, not a warning on the wrong car) but it is a silent
+# miss, and it put Qwen's lane judgement on the critical path, which is exactly
+# what §1's firewall exists to prevent. Now the model reports pixels and labels;
+# which of them is the lead is decided downstream by the corridor alone -- and
+# since UFLDv2 that corridor is measured lane paint, not a guessed trapezoid.
 ANCHOR_PROMPT = (
-    "Look at this forward-facing dashcam frame. Find the single vehicle directly "
-    "ahead in MY lane (the lane I am driving in). Ignore vehicles in other lanes, "
-    "oncoming traffic, and parked cars. Reply with ONLY this JSON and nothing else:\n"
-    '{"bbox_2d": [x1, y1, x2, y2], "label": "<vehicle type>"}\n'
-    'If there is no vehicle ahead in my lane, reply exactly: {"bbox_2d": null}'
+    "Look at this forward-facing dashcam frame. List every vehicle on the road "
+    "ahead, in ANY lane, including oncoming and parked ones.\n"
+    "Labels allowed: car, truck, bus, van, motorcycle.\n"
+    "Each vehicle is [label, x1, y1, x2, y2] using integer coordinates.\n"
+    # Same failure perceive.py hit: without this the model emits the label once
+    # and sends bare coordinate arrays after it, losing the class of every
+    # vehicle but the first.
+    "EVERY vehicle must begin with its label in quotes, even when the label "
+    "repeats.\n"
+    f"List at most {MAX_ANCHOR_OBJECTS} vehicles, closest (largest) first.\n"
+    "Do NOT decide which vehicle I am following. Just list what you see.\n"
+    "Reply with ONLY this JSON and nothing else:\n"
+    '{"o": [["car", x1, y1, x2, y2], ["truck", x1, y1, x2, y2]]}\n'
+    'If there are no vehicles, reply exactly: {"o": []}'
 )
 
 
@@ -377,6 +417,135 @@ def qwen_handles():
     return _qwen_processor, _qwen_model, _qwen_lock
 
 
+def strip_fence(text: str) -> str:
+    """Drop a ```-fenced wrapper the model sometimes adds around its JSON."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def repair_truncated_json(text: str):
+    """Recover a reply the token cap cut off mid-array. -> dict or None.
+
+    Truncation is NORMAL here, not exceptional: the cap is set to a latency
+    budget, not to the longest possible reply, so a busy frame routinely ends
+    part-way through an object. Dropping the partial tail and closing the
+    brackets keeps every object that did arrive.
+
+    Getting this wrong is not a lost frame, it is a WRONG frame. Without it a
+    truncated reply falls through to the bare-coordinate regex, which cannot
+    see labels at all -- so every recovered box arrives unlabelled and a road
+    sign is as eligible to be the lead as a lorry. Observed on real footage
+    before this existed.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    body = text[start:]
+    cut = body.rfind("]")
+    if cut < 0:
+        return None
+    stem = body[: cut + 1]
+    for suffix in ("]}", "}", "]]}"):
+        try:
+            obj = json.loads(stem + suffix)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _parse_vehicles(text: str, width: int, height: int):
+    """Qwen's reply -> [(label, (x1,y1,x2,y2)), ...] in frame pixels.
+
+    Accepts the enumerated form the prompt asks for, and still accepts the
+    single-`bbox_2d` shape the old prompt produced, so a checkpoint that
+    answers the old way degrades to one candidate instead of to none.
+
+    Coordinate rescaling goes through `_rescale`, which is the one place that
+    knows this checkpoint emits 0-1000 normalised coordinates. perceive.py has
+    its own JSON reader for a different payload (captioned, longer, needs
+    truncation repair) but delegates rescaling here for the same reason: the
+    shape of the JSON is cosmetic, the coordinate convention is not.
+    """
+    if not text:
+        return []
+
+    t = strip_fence(text)
+    obj = None
+    # Greedy span first: the whole reply should be one JSON object, and a lazy
+    # match stops at the first nested brace inside the vehicle list.
+    for pattern in (r"\{.*\}", r"\{.*?\}"):
+        m = re.search(pattern, t, re.S)
+        if not m:
+            continue
+        try:
+            cand = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(cand, dict):
+            obj = cand
+            break
+    if obj is None:
+        obj = repair_truncated_json(t)
+    if obj is None:
+        return [(None, b) for b in _parse_boxes(text, width, height)]
+
+    def _nums(seq):
+        if not all(isinstance(n, (int, float)) and not isinstance(n, bool)
+                   for n in seq):
+            return None
+        return [float(n) for n in seq]
+
+    raw = obj.get("o")
+    if not isinstance(raw, list):
+        raw = obj.get("objects")
+    if not isinstance(raw, list):
+        # Old single-box shape, or something else entirely -- let the legacy
+        # reader have a go rather than returning nothing.
+        return [(None, b) for b in _parse_boxes(text, width, height)]
+
+    out = []
+    for entry in raw:
+        label, nums = None, None
+        if isinstance(entry, (list, tuple)):
+            if len(entry) == 5 and isinstance(entry[0], str):
+                label, nums = entry[0].strip().lower(), _nums(entry[1:])
+            elif len(entry) == 4:
+                nums = _nums(entry)
+        elif isinstance(entry, dict):
+            for key in ("bbox_2d", "bbox", "box"):
+                if isinstance(entry.get(key), (list, tuple)) and len(entry[key]) == 4:
+                    nums = _nums(entry[key])
+                    break
+            lab = entry.get("label")
+            if isinstance(lab, str):
+                label = lab.strip().lower()
+        if not nums:
+            continue
+        x1, y1, x2, y2 = _rescale(nums, width, height)
+        if x2 - x1 >= 4 and y2 - y1 >= 4:
+            out.append((label, (x1, y1, x2, y2)))
+
+    # These models emit the label once and then send bare coordinate arrays for
+    # the rest -- the exact failure the prompt's "EVERY vehicle must begin with
+    # its label" line fights, and does not always win. An unlabelled entry
+    # alongside labelled ones is therefore of UNKNOWN class, and an unknown
+    # object must not be eligible to become the lead: that is how a gantry sign
+    # or a bridge parapet ends up with a headway computed to it. They are
+    # dropped, not guessed at, and not inherited from the previous entry.
+    #
+    # When NOTHING carried a label the reply is the old single-box shape (or the
+    # bare-coordinate fallback), where unlabelled is the only thing on offer --
+    # so those are kept, and the caller still range-gates them.
+    if any(lab for lab, _ in out):
+        out = [(lab, b) for lab, b in out if lab]
+    return out
+
+
 def _parse_boxes(text: str, width: int, height: int):
     """Pull [x1,y1,x2,y2] boxes out of Qwen's reply, whatever dialect it used.
 
@@ -462,7 +631,7 @@ class LeadAnchor:
     """Re-anchors the tracker on the lead vehicle every `interval` frames (§5)."""
 
     def __init__(self, width, height, interval=DEFAULT_ANCHOR_INTERVAL, use_qwen=True,
-                 corridor=None, max_new_tokens=128):
+                 corridor=None, max_new_tokens=ANCHOR_MAX_NEW_TOKENS):
         self.corridor = corridor or EgoCorridor(width, height)
         self.interval = int(interval)
         self.use_qwen = bool(use_qwen)
@@ -485,43 +654,63 @@ class LeadAnchor:
             return self.last_result
 
         raw = self._query_qwen(frame)
-        boxes = _parse_boxes(raw, self.width, self.height)
-        info = {"raw": (raw or "")[:300], "n_boxes": len(boxes)}
+        detected = _parse_vehicles(raw, self.width, self.height)
+        info = {"raw": (raw or "")[:300], "n_detected": len(detected),
+                "corridor_source": getattr(self.corridor, "source", "static")}
 
-        if not boxes:
+        if not detected:
             info["reason"] = "no_box_parsed"
             self.last_result = (None, info)
             return self.last_result
 
+        # A label the prompt did not offer means the model volunteered a
+        # non-vehicle (it does occasionally name a sign or a traffic light).
+        # `None` is kept: it is the legacy single-box shape or an unlabelled
+        # entry, and dropping those would silently disable the fallback path.
+        candidates = [(lab, b) for lab, b in detected
+                      if lab is None or lab in LEAD_LABELS]
+        info["n_vehicles"] = len(candidates)
+        if not candidates:
+            info["reason"] = "no_vehicle_labels"
+            info["labels"] = sorted({lab for lab, _ in detected if lab})
+            self.last_result = (None, info)
+            return self.last_result
+
         # §5.3-5.4: keep only candidates whose box-bottom-centre lands in the
-        # corridor, then take the nearest. Geometry, never Qwen's ranking.
-        validated = []
-        for box in boxes:
+        # corridor, then take the nearest. THE CORRIDOR DOES THE SELECTING --
+        # the prompt above deliberately declines to, so this is the only place
+        # "which vehicle am I following" is decided, and it is decided by
+        # geometry (measured lane paint when UFLDv2 is confident).
+        validated, rejected = [], []
+        for label, box in candidates:
             x1, y1, x2, y2 = box
             u, v = (x1 + x2) / 2.0, y2      # bottom-centre = where it meets the road
             inside, geo = self.corridor.contains(u, v)
-            if inside:
-                d = geo["forward_m"]
-                # Prefer measured depth over geometric range when we have it:
-                # geometry assumes a flat road and exact pitch, DA-V2 does not.
-                if depth is not None:
-                    from . import depth as depth_mod
-                    d_meas, conf, _ = depth_mod.roi_depth(depth, box)
-                    if np.isfinite(d_meas) and conf > 0.2:
-                        d = d_meas
-                validated.append((d, box, geo))
+            if not inside:
+                rejected.append({"label": label, **geo})
+                continue
+            d = geo["forward_m"]
+            # Prefer measured depth over geometric range when we have it:
+            # geometry assumes a flat road and exact pitch, DA-V2 does not.
+            if depth is not None:
+                from . import depth as depth_mod
+                d_meas, conf, _ = depth_mod.roi_depth(depth, box)
+                if np.isfinite(d_meas) and conf > 0.2:
+                    d = d_meas
+            validated.append((d, box, geo, label))
 
         if not validated:
             info["reason"] = "all_boxes_outside_corridor"
-            info["rejected"] = [
-                self.corridor.contains((b[0] + b[2]) / 2.0, b[3])[1] for b in boxes
-            ]
+            info["n_rejected"] = len(rejected)
+            info["rejected"] = rejected
             self.last_result = (None, info)
             return self.last_result
 
         validated.sort(key=lambda t: t[0])
-        d, box, geo = validated[0]
-        info.update({"reason": "ok", "range_m": round(float(d), 2), "geo": geo})
+        d, box, geo, label = validated[0]
+        info.update({"reason": "ok", "range_m": round(float(d), 2), "geo": geo,
+                     "label": label, "n_in_corridor": len(validated),
+                     "n_rejected": len(rejected)})
         self.last_result = (box, info)
         return self.last_result
 

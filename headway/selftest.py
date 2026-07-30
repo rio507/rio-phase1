@@ -676,6 +676,156 @@ def test_lane_drift():
           sum(fires) == 1, f"{sum(fires)} events in {len(fires)} frames")
 
 
+def test_anchor_enumerates_corridor_selects():
+    """Qwen enumerates; the corridor alone decides which vehicle is the lead."""
+    from . import anchor as A
+
+    # -- the prompt must not ask the model to choose -----------------------
+    p = A.ANCHOR_PROMPT.lower()
+    check("prompt asks for every vehicle in any lane",
+          "every vehicle" in p and "any lane" in p)
+    check("prompt explicitly declines to have the model pick the lead",
+          "do not decide which vehicle i am following" in p)
+    for banned in ("my lane", "the lane i am driving in", "single vehicle",
+                   "ignore vehicles in other lanes"):
+        check(f"prompt no longer says {banned!r}", banned not in p,
+              "that phrasing hands the lane judgement back to Qwen")
+
+    # -- parsing the enumerated reply --------------------------------------
+    W, H = 1280, 720
+    reply = ('{"o": [["car", 100, 300, 200, 400], ["truck", 480, 250, 530, 330],'
+             ' ["motorcycle", 700, 320, 740, 400]]}')
+    got = A._parse_vehicles(reply, W, H)
+    check("enumerated reply yields every vehicle with its label",
+          len(got) == 3 and [g[0] for g in got] == ["car", "truck", "motorcycle"],
+          str(got))
+    # 0-1000 normalised, per this checkpoint: x=480/1000*1280 = 614.4
+    check("coordinates go through _rescale",
+          abs(got[1][1][0] - 614.4) < 0.1, str(got[1][1]))
+
+    check("fenced JSON is accepted",
+          len(A._parse_vehicles('```json\n{"o": [["car",1,2,300,400]]}\n```', W, H)) == 1)
+    check("empty list parses as no vehicles",
+          A._parse_vehicles('{"o": []}', W, H) == [])
+    check("the old single-box reply still parses (one unlabelled candidate)",
+          [lab for lab, _ in A._parse_vehicles(
+              '{"bbox_2d": [100, 300, 200, 400]}', W, H)] == [None])
+    check("verbose per-object form is accepted",
+          len(A._parse_vehicles(
+              '{"o": [{"label": "bus", "bbox_2d": [10,20,300,400]}]}', W, H)) == 1)
+
+    # -- truncation, and the unlabelled-entry trap it used to spring ---------
+    # Verbatim from the live server before repair existed: the token cap cut
+    # the list mid-array, JSON parse failed, and the bare-coordinate fallback
+    # returned six UNLABELLED boxes -- one of which was then selected as the
+    # lead. An unknown object with a headway computed to it.
+    truncated = ('{"o": [["car", 785, 562, 953, 703], [153, 588, 188, 628], '
+                 '[323, 593, 341, 612], [346, 593, 357, 607], [515, 592, 527, '
+                 '607], [480, 592, 490, 603], [5')
+    got = A._parse_vehicles(truncated, W, H)
+    check("a truncated reply is repaired instead of falling back to regex",
+          [lab for lab, _ in got] == ["car"],
+          f"got {[lab for lab, _ in got]}")
+    check("the repaired box keeps its real coordinates",
+          abs(got[0][1][0] - 1004.8) < 0.5, str(got[0][1]))
+    check("token budget is above the length that truncated in the field",
+          A.ANCHOR_MAX_NEW_TOKENS >= 160
+          and A.LeadAnchor(W, H, use_qwen=False).max_new_tokens
+              == A.ANCHOR_MAX_NEW_TOKENS)
+
+    mixed = '{"o": [["car", 100, 300, 200, 400], [300, 300, 400, 400]]}'
+    check("an unlabelled entry beside labelled ones is dropped, not guessed",
+          [lab for lab, _ in A._parse_vehicles(mixed, W, H)] == ["car"],
+          "the label-repeat bug makes its class unknown")
+    check("an all-unlabelled reply is still usable (legacy shape)",
+          len(A._parse_vehicles('{"o": [[100,300,200,400],[300,300,400,400]]}',
+                                W, H)) == 2)
+
+    # -- selection is the corridor's, not the model's ----------------------
+    class _Anchor(A.LeadAnchor):
+        """LeadAnchor with the Qwen call replaced by a canned reply."""
+        def __init__(self, reply, **kw):
+            super().__init__(W, H, **kw)
+            self._reply = reply
+        def _query_qwen(self, frame):
+            return self._reply
+
+    base = A.EgoCorridor(W, H)
+    lane, _ = A.build_corridor(base, _lane_result(conf=0.9))
+
+    # Coordinates below are 0-1000 NORMALISED, which is what this checkpoint
+    # emits -- writing them as pixels is the mistake _rescale exists to absorb,
+    # and a test that wrote them as pixels would be testing a reply the model
+    # never sends. Helper keeps the intent readable in pixel terms.
+    def veh(label, u_px, v_px, w_px=80, h_px=110):
+        """A box whose bottom-centre is (u_px, v_px), expressed normalised."""
+        x1, x2 = (u_px - w_px / 2) / W * 1000, (u_px + w_px / 2) / W * 1000
+        y1, y2 = (v_px - h_px) / H * 1000, v_px / H * 1000
+        return f'["{label}", {x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]'
+
+    # At row 700 the synthetic ego lane runs x=312..967 (+112 px margin), so
+    # u=1150 is well outside and u=640 is dead centre. Qwen lists the
+    # adjacent-lane car FIRST (closest/largest, as the prompt asks) and the
+    # true in-lane lead second.
+    reply = '{"o": [' + veh("car", 1150, 700) + ', ' + veh("car", 640, 700) + ']}'
+    box, info = _Anchor(reply, corridor=lane).anchor(None, 0)
+    check("the adjacent-lane vehicle Qwen listed first is rejected",
+          info["reason"] == "ok" and info["n_rejected"] == 1
+          and info["n_in_corridor"] == 1, str(info))
+    check("the in-lane vehicle is selected even though it was listed second",
+          box is not None and abs((box[0] + box[2]) / 2 - 640) < 2
+          and abs(box[3] - 700) < 2, str(box))
+    check("the selected candidate's label is reported", info.get("label") == "car")
+
+    # Nearest in-corridor wins among several in-lane candidates. Lower in the
+    # image (larger v) is nearer.
+    reply2 = ('{"o": [' + veh("car", 640, 612) + ', '
+              + veh("truck", 640, 700) + ']}')
+    box, info = _Anchor(reply2, corridor=lane).anchor(None, 0)
+    check("among in-lane candidates the NEAREST is chosen",
+          info["n_in_corridor"] == 2 and abs(box[3] - 700) < 2
+          and info["label"] == "truck", f"{info} {box}")
+
+    # Non-vehicles never become a lead, however Qwen labels them.
+    box, info = _Anchor('{"o": [' + veh("pedestrian", 640, 700) + ']}',
+                        corridor=lane).anchor(None, 0)
+    check("a pedestrian in the corridor is never the lead",
+          box is None and info["reason"] == "no_vehicle_labels", str(info))
+
+    # Nothing in the lane -> no anchor, and the rejections are logged.
+    box, info = _Anchor('{"o": [' + veh("car", 1150, 700) + ']}',
+                        corridor=lane).anchor(None, 0)
+    check("no in-lane vehicle means no lead, with reasons recorded",
+          box is None and info["reason"] == "all_boxes_outside_corridor"
+          and len(info["rejected"]) == 1, str(info))
+
+    # The point of the whole change: the SAME reply resolves to a different
+    # lead depending only on the corridor. At this row the lane admits
+    # x=200..1079 and the trapezoid a far wider x=26..1254, so a car at u=1150
+    # is out of lane but inside the trapezoid -- and being nearer, it is what
+    # the trapezoid would hand the tracker.
+    both = '{"o": [' + veh("car", 1150, 700) + ', ' + veh("car", 640, 640) + ']}'
+    box_lane, info_lane = _Anchor(both, corridor=lane).anchor(None, 0)
+    box_trap, info_trap = _Anchor(both, corridor=base).anchor(None, 0)
+    check("geometry, not the model, decides which vehicle is the lead",
+          info_lane["n_in_corridor"] == 1 and info_trap["n_in_corridor"] == 2
+          and abs((box_lane[0] + box_lane[2]) / 2 - 640) < 2
+          and abs((box_trap[0] + box_trap[2]) / 2 - 1150) < 2,
+          f"lane picked u={(box_lane[0] + box_lane[2]) / 2:.0f}, "
+          f"trapezoid picked u={(box_trap[0] + box_trap[2]) / 2:.0f}")
+    box, info = _Anchor('{"o": []}', corridor=lane).anchor(None, 0)
+    check("an empty list is not an anchor", box is None
+          and info["reason"] == "no_box_parsed")
+
+    # The corridor that did the selecting is recorded on every anchor.
+    _, info = _Anchor(reply, corridor=lane).anchor(None, 0)
+    check("anchor records which corridor selected the lead",
+          info["corridor_source"] == "ufld", str(info.get("corridor_source")))
+    _, info = _Anchor(reply, corridor=base).anchor(None, 0)
+    check("...and says so when it was the trapezoid",
+          info["corridor_source"] == "static")
+
+
 def test_lead_corridor_check():
     """Only a lane corridor may invalidate a lead the tracker is holding."""
     from . import anchor as A
@@ -817,6 +967,7 @@ def main():
     test_cutin_and_warmup()
     test_purity()
     test_corridor_source()
+    test_anchor_enumerates_corridor_selects()
     test_lead_corridor_check()
     test_lane_drift()
     test_lane_confidence_contribution()

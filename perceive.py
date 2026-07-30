@@ -28,6 +28,7 @@ import config
 import vision
 from headway import anchor as anchor_mod
 from headway import depth as depth_mod
+from headway import lanes as lanes_mod
 
 # Lend the app's Qwen to headway. Import-time so any entry point into this
 # module (endpoint, warm, self-test) is covered before the first anchor call.
@@ -119,39 +120,13 @@ def _downscale(pil: Image.Image):
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
-def _strip_fence(text: str) -> str:
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-        t = re.sub(r"\s*```$", "", t)
-    return t.strip()
-
-
-def _repair(text: str):
-    """Recover a reply the token cap cut off mid-array.
-
-    Truncation is normal, not exceptional: the cap is set to the latency budget
-    rather than to the longest possible reply, so a busy frame routinely ends
-    part-way through an object. Dropping the partial tail and closing the
-    brackets keeps every object that did arrive, instead of losing the frame to
-    a JSONDecodeError.
-    """
-    start = text.find("{")
-    if start < 0:
-        return None
-    body = text[start:]
-    cut = body.rfind("]")
-    if cut < 0:
-        return None
-    stem = body[: cut + 1]
-    for suffix in ("]}", "}", "]]}"):
-        try:
-            obj = json.loads(stem + suffix)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
+# Both of these now live in headway.anchor, which needs them too: its enumerated
+# anchor prompt gets truncated by the same token cap and has to survive it the
+# same way. One implementation, imported in the direction that already exists
+# (perceive -> headway), so the two paths cannot drift apart on how a cut-off
+# reply is recovered.
+_strip_fence = anchor_mod.strip_fence
+_repair = anchor_mod.repair_truncated_json
 
 
 def _parse(text: str, width: int, height: int):
@@ -304,7 +279,23 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         print(f"[perceive] depth failed: {e}", flush=True)
     t_depth = time.time()
 
-    corridor = anchor_mod.EgoCorridor(width, height)
+    # The SAME corridor the headway loop uses this frame, not a second opinion.
+    # These two paths pick a lead independently -- headway to warn on, perceive
+    # to flag in the overlay -- and if they gate on different geometry they
+    # disagree exactly where it matters most: on a bend, where the static
+    # trapezoid projects straight off the road and the paint does not. The
+    # driver would see the overlay bracket one car while the warning tracked
+    # another. Lane detection costs ~2 ms against this endpoint's ~1 s Qwen
+    # call, so there is no reason for the cheaper path to be the stale one.
+    base_corridor = anchor_mod.EgoCorridor(width, height)
+    lane_result = None
+    try:
+        lane_result = lanes_mod.detect_lanes(frame_bgr)
+    except Exception as e:
+        # Same contract as headway.live: no lanes means the trapezoid, not a
+        # failed frame.
+        print(f"[perceive] lane detection unavailable: {e}", flush=True)
+    corridor, lane_info = anchor_mod.build_corridor(base_corridor, lane_result)
 
     boxes = []
     for label, box in parsed:
@@ -360,6 +351,10 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "boxes": boxes,
             "corridor": [[round(float(x), 1), round(float(y), 1)]
                          for x, y in corridor.polygon()],
+            "corridor_source": corridor.source,
+            "lane_conf": lane_info.get("lane_conf"),
+            "lanes": [[[round(float(x), 1), round(float(y), 1)] for x, y in pts]
+                      for pts in ((lane_result or {}).get("lanes") or [])],
             "caption": caption, "observation": caption,
             "image": {"w": width, "h": height},
             "lead_range_m": lead_range,
@@ -374,6 +369,10 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         "boxes": boxes,
         "corridor": [[round(float(x), 1), round(float(y), 1)]
                      for x, y in corridor.polygon()],
+        "corridor_source": corridor.source,
+        "lane_conf": lane_info.get("lane_conf"),
+        "lanes": [[[round(float(x), 1), round(float(y), 1)] for x, y in pts]
+                  for pts in ((lane_result or {}).get("lanes") or [])],
         "caption": caption,
         # Same text under the key the existing dashboard code already reads.
         "observation": caption,
