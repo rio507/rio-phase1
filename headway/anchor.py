@@ -705,13 +705,27 @@ class LeadAnchor:
         raw = self._query_qwen(frame)
         detected = _parse_vehicles(raw, self.width, self.height)
         self.last_detections = list(detected)
-        info = {"raw": (raw or "")[:300], "n_detected": len(detected),
+        box, info = self.select_from(detected, depth=depth)
+        info["raw"] = (raw or "")[:300]
+        self.last_result = (box, info)
+        return self.last_result
+
+    def select_from(self, detected, depth=None):
+        """Corridor-validate a list of detections and pick the lead.
+
+        Split out of anchor() so the SAME selection runs whoever supplied the
+        boxes -- Qwen's enumeration, or RF-DETR's. That matters more than the
+        saved duplication: this is the code that decides which vehicle a
+        following distance is computed to, and there should be exactly one of
+        it. `detected` is [(label, box)] or [(label, box, score)].
+        """
+        detected = [(d[0], d[1]) for d in detected]
+        info = {"n_detected": len(detected),
                 "corridor_source": getattr(self.corridor, "source", "static")}
 
         if not detected:
             info["reason"] = "no_box_parsed"
-            self.last_result = (None, info)
-            return self.last_result
+            return None, info
 
         # A label the prompt did not offer means the model volunteered a
         # non-vehicle (it does occasionally name a sign or a traffic light).
@@ -723,8 +737,7 @@ class LeadAnchor:
         if not candidates:
             info["reason"] = "no_vehicle_labels"
             info["labels"] = sorted({lab for lab, _ in detected if lab})
-            self.last_result = (None, info)
-            return self.last_result
+            return None, info
 
         # §5.3-5.4: keep only candidates whose box-bottom-centre lands in the
         # corridor, then take the nearest. THE CORRIDOR DOES THE SELECTING --
@@ -753,16 +766,14 @@ class LeadAnchor:
             info["reason"] = "all_boxes_outside_corridor"
             info["n_rejected"] = len(rejected)
             info["rejected"] = rejected
-            self.last_result = (None, info)
-            return self.last_result
+            return None, info
 
         validated.sort(key=lambda t: t[0])
         d, box, geo, label = validated[0]
         info.update({"reason": "ok", "range_m": round(float(d), 2), "geo": geo,
                      "label": label, "n_in_corridor": len(validated),
                      "n_rejected": len(rejected)})
-        self.last_result = (box, info)
-        return self.last_result
+        return box, info
 
     def _query_qwen(self, frame):
         import torch

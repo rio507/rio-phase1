@@ -69,7 +69,7 @@ frame ──► lanes.py    UFLDv2 finds the ego lane        (~2 ms, every frame
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 264 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 268 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -361,9 +361,12 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
 - **Depth is now the most expensive stage** (6.6 ms of a 19 ms frame), followed
   by RF-DETR (5.3 ms) and UFLDv2 (2.1 ms). Nothing on the path is near the
   budget; Stage 1's TensorRT work should start with DA-V2.
-- **`run_clip.py` still uses the Qwen anchor.** It is the offline Stage 0
-  harness with no latency budget, and a VLM that can be asked questions is the
-  right tool for annotating a clip. The LIVE path has no LLM in it at all.
+- **No LLM anywhere in the headway path, live or offline.** `run_clip.py`
+  defaults to `--anchor detr` too: RF-DETR + the corridor, through the same
+  `LeadAnchor.select_from()` the live loop uses. `--anchor qwen` is kept for
+  comparison, but the default no longer needs 17 GB of VLM resident to
+  annotate a clip, and it is deterministic — which for an offline harness
+  matters as much as the speed.
 - **Lane departure is logged, never spoken.** `lane_drift` events go to the
   session JSONL and stop there, by design, until real-drive logs justify a
   threshold. It is not steering guidance and must not become any.
@@ -380,7 +383,7 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
 ## Ready for a real dashcam clip
 
 ```bash
-python -m headway.run_clip your_dashcam.mp4 --v-host <actual m/s>
+python -m headway.run_clip your_dashcam.mp4 --v-host <actual m/s>   # RF-DETR by default
 ```
 
 Then check, in order:

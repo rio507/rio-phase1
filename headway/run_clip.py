@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 from . import anchor as anchor_mod
+from . import detect as detect_mod
 from . import state as state_mod
 from .filter import HeadwayFilter
 from .state import Context, Measurement, WarningStateMachine
@@ -397,7 +398,7 @@ def _draw_timeline(frame, timeline, total_frames, cur_frame):
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def run(video_path, v_host, out_dir=None, depth_source="dav2", anchor_source="qwen",
+def run(video_path, v_host, out_dir=None, depth_source="dav2", anchor_source="detr",
         anchor_interval=anchor_mod.DEFAULT_ANCHOR_INTERVAL, init_box=None,
         max_frames=None, no_video=False, show_corridor=True, gt_path=None):
     cap = cv2.VideoCapture(video_path)
@@ -477,6 +478,18 @@ def run(video_path, v_host, out_dir=None, depth_source="dav2", anchor_source="qw
                 box = tuple(g["box"]) if g else None
                 anchor_info = {"reason": "gt"}
                 lead_anchor.last_anchor_frame = idx
+            elif anchor_source == "detr":
+                # RF-DETR supplies the candidates; the corridor picks the lead
+                # through the SAME select_from() the Qwen path uses. Default
+                # because it is ~5 ms instead of ~1 s, needs no 17 GB of
+                # weights resident, and is deterministic -- for an offline
+                # annotation harness that reproducibility matters as much as
+                # the speed does.
+                depth_full = provider.frame_depth(frame)
+                dets = detect_mod.detect(frame)["detections"]
+                box, anchor_info = lead_anchor.select_from(dets, depth=depth_full)
+                lead_anchor.last_anchor_frame = idx
+                n_anchor_calls += 1
             elif anchor_source == "manual":
                 # Anchor once from --init-box, then let CSRT carry it.
                 box = tuple(init_box) if (init_box and not tracker.active) else None
@@ -641,7 +654,7 @@ def _summarise(timeline, transitions, n_frames, elapsed, fps, dt, innovations,
         "realtime_factor": round((n_frames / elapsed) / fps, 3) if elapsed > 0 and fps else None,
         "meets_10hz_target": bool(elapsed > 0 and (n_frames / elapsed) >= 10.0),
         "transition_count": len(transitions),
-        "qwen_anchor_calls": n_anchor_calls,
+        "anchor_calls": n_anchor_calls,
         "state_occupancy": occupancy,
         "state_timeline": runs,
         "tau_band_occupancy": _occupancy_of(band_timeline, dt),
@@ -722,7 +735,11 @@ def main():
                     help="fixed host speed in m/s (Stage 0 has no GPS/OBD)")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--depth", choices=("dav2", "gt"), default="dav2")
-    ap.add_argument("--anchor", choices=("qwen", "gt", "manual"), default="qwen")
+    ap.add_argument("--anchor", choices=("detr", "qwen", "gt", "manual"),
+                    default="detr",
+                    help="detr: RF-DETR + corridor (default). qwen: the Qwen3-VL "
+                         "enumeration, kept for comparison and for frames where "
+                         "you want to ask a VLM what it sees.")
     ap.add_argument("--anchor-interval", type=int, default=anchor_mod.DEFAULT_ANCHOR_INTERVAL)
     ap.add_argument("--init-box", default=None, help="x1,y1,x2,y2 for --anchor manual")
     ap.add_argument("--max-frames", type=int, default=None)

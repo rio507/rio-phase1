@@ -840,6 +840,42 @@ def test_anchor_enumerates_corridor_selects():
           info["corridor_source"] == "static")
 
 
+def test_one_selection_for_both_sources():
+    """Qwen's boxes and RF-DETR's boxes go through the SAME corridor selection."""
+    from . import anchor as A
+
+    W, H = 1280, 720
+    base = A.EgoCorridor(W, H)
+    lane, _ = A.build_corridor(base, _lane_result(conf=0.9))
+    a = A.LeadAnchor(W, H, use_qwen=False, corridor=lane)
+
+    def px(u, v, w=80, h=110):
+        return (u - w / 2.0, v - h, u + w / 2.0, v)
+
+    # RF-DETR hands over (label, box, score); Qwen's parser gives (label, box).
+    # Both must resolve to the same lead.
+    detr = [("car", px(1150, 700), 0.91), ("car", px(640, 700), 0.88)]
+    qwen = [("car", px(1150, 700)), ("car", px(640, 700))]
+    b1, i1 = a.select_from(detr)
+    b2, i2 = a.select_from(qwen)
+    check("select_from accepts detections with or without a score",
+          b1 == b2 and i1["reason"] == i2["reason"] == "ok", f"{b1} vs {b2}")
+    check("the in-lane vehicle is chosen regardless of the source",
+          abs((b1[0] + b1[2]) / 2 - 640) < 2 and i1["n_rejected"] == 1, str(i1))
+
+    # anchor() is now just "ask Qwen, then select_from" -- so the selection
+    # cannot diverge between the live detector path and the offline VLM path.
+    import inspect
+    src = inspect.getsource(A.LeadAnchor.anchor)
+    check("LeadAnchor.anchor delegates to select_from rather than re-implementing",
+          "self.select_from(" in src, "one implementation of 'which vehicle'")
+
+    # A pedestrian is still never a lead, whichever source reported it.
+    b, i = a.select_from([("pedestrian", px(640, 700), 0.99)])
+    check("a pedestrian from the detector is not a lead either",
+          b is None and i["reason"] == "no_vehicle_labels", str(i))
+
+
 def test_lead_corridor_check():
     """Only a lane corridor may invalidate a lead the tracker is holding."""
     from . import anchor as A
@@ -1304,6 +1340,7 @@ def main():
     test_purity()
     test_corridor_source()
     test_anchor_enumerates_corridor_selects()
+    test_one_selection_for_both_sources()
     test_lead_corridor_check()
     test_membership_overlap()
     test_membership_hysteresis_and_dwell()
