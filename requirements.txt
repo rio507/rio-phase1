@@ -54,3 +54,30 @@ opencv-contrib-python-headless<5
 # considered and rejected (see that module's docstring). gdown is only for
 # fetching the 825 MB checkpoint off Google Drive; see tools/fetch_lane_weights.py.
 gdown>=5.0
+
+# --- headway object detection (RF-DETR) ---
+# RF-DETR (Roboflow), APACHE-2.0. The licence is the reason for the choice:
+# Ultralytics YOLO is AGPL-3.0 and cannot ship in this product.
+#
+# PINNED TO 1.5.0 AND INSTALLED --no-deps, both deliberately:
+#   * rfdetr >= 1.6 requires transformers>=5.1, which would drag this repo off
+#     the transformers==4.57.0 that Qwen3-VL and Depth Anything are validated
+#     on. 1.5.0 declares transformers<5.0.0,>4.0.0 and is compatible.
+#   * its dependency list is a TRAINING stack (albumentations, roboflow,
+#     rf100vl, pycocotools...). Installing it normally also pulls supervision,
+#     which pulls opencv-python 5.x -- and that shadows the deliberate
+#     opencv-contrib-python-headless<5 build, taking CSRT and MOSSE with it.
+#     Observed: a plain `pip install rfdetr` silently replaced transformers
+#     4.57 with 5.14, huggingface_hub 0.36 with 1.25, and left two cv2 builds
+#     installed with the tracking API missing from the one that won.
+#
+# Install exactly like this:
+#   pip install --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+#
+# headway/detect.py imports rfdetr.models.lwdetr beneath a stub package object
+# so the training harness never executes; supervision/pycocotools/peft are only
+# needed to satisfy import statements along that path.
+rfdetr==1.5.0
+supervision==0.29.1
+pycocotools
+peft

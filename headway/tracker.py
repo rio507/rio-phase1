@@ -22,6 +22,71 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 
+# --- motion plausibility ----------------------------------------------------
+# Shared with membership.py. Since RF-DETR became the per-frame candidate
+# source the LIVE loop no longer runs CSRT at all -- the lead's box arrives from
+# detection every frame -- but v2 §8's confidence still wants a `track_quality`
+# term, and this is what that term always actually measured: does the box move
+# like a vehicle, or did we jump to a different object? The question is
+# identical whether successive boxes come from a correlation filter or from a
+# detector, so the scoring lives here, once, and both callers use it.
+DEFAULT_MAX_AREA_RATIO_PER_S = 8.0
+DEFAULT_MAX_SHIFT_FRAC_PER_S = 3.0
+DEFAULT_MAX_ASPECT_RATIO_CHANGE = 0.35
+
+
+def anomaly_score(excess: float, budget: float) -> float:
+    """1.0 while within budget, then decays exponentially past it.
+
+    A plain linear ramp (the obvious first cut) scores *every* frame below 1.0,
+    so ordinary jitter on a perfectly good lock accumulates into a low quality
+    and trips the §4 DEGRADED floor -- which is what the first version of this
+    file actually did on the synthetic clip. What is wanted is a discriminator,
+    not a penalty: normal motion should be indistinguishable from perfect, and
+    only a genuine discontinuity should collapse the score.
+    """
+    budget = max(float(budget), 1e-9)
+    if excess <= budget:
+        return 1.0
+    return float(np.exp(-(excess - budget) / budget))
+
+
+def motion_plausibility(old, new, dt: float,
+                        max_area_ratio_per_s=DEFAULT_MAX_AREA_RATIO_PER_S,
+                        max_shift_frac_per_s=DEFAULT_MAX_SHIFT_FRAC_PER_S,
+                        max_aspect_ratio_change=DEFAULT_MAX_ASPECT_RATIO_CHANGE) -> float:
+    """Plausibility of an old->new box transition, 0-1."""
+    dt = max(dt, 1e-3)
+    ox1, oy1, ox2, oy2 = old
+    nx1, ny1, nx2, ny2 = new
+
+    old_area = max((ox2 - ox1) * (oy2 - oy1), 1e-6)
+    new_area = max((nx2 - nx1) * (ny2 - ny1), 1e-6)
+
+    # Symmetric so growing and shrinking are treated the same way.
+    ratio = max(new_area / old_area, old_area / new_area)
+    area_score = anomaly_score(ratio - 1.0, (max_area_ratio_per_s - 1.0) * dt)
+
+    old_w = max(ox2 - ox1, 1e-6)
+    old_h = max(oy2 - oy1, 1e-6)
+    # Centre shift measured in box-widths: scale-free, so a distant (small) box
+    # is held to the same standard as a near one.
+    dx = abs((nx1 + nx2) / 2 - (ox1 + ox2) / 2) / old_w
+    dy = abs((ny1 + ny2) / 2 - (oy1 + oy2) / 2) / old_h
+    shift = float(np.hypot(dx, dy))
+    shift_score = anomaly_score(shift, max_shift_frac_per_s * dt)
+
+    # Aspect ratio of a given vehicle is near-constant; a sudden change means we
+    # latched onto something else (§7.4). Not time-scaled -- a vehicle's
+    # proportions shouldn't drift no matter how long you watch.
+    old_ar = old_w / old_h
+    new_ar = max(nx2 - nx1, 1e-6) / max(ny2 - ny1, 1e-6)
+    ar_ratio = max(new_ar / old_ar, old_ar / new_ar)
+    ar_score = anomaly_score(ar_ratio - 1.0, max_aspect_ratio_change)
+
+    return float(area_score * shift_score * ar_score)
+
+
 def _make_csrt():
     """CSRT moved namespaces across OpenCV versions; try each known home."""
     for factory in (
@@ -120,55 +185,15 @@ class LeadTracker:
         self._quality = 0.7 * self._quality + 0.3 * quality
         return new_box, float(np.clip(self._quality, 0.0, 1.0))
 
-    @staticmethod
-    def _anomaly_score(excess: float, budget: float) -> float:
-        """1.0 while within budget, then decays exponentially past it.
-
-        A plain linear ramp (the obvious first cut) scores *every* frame below
-        1.0, so ordinary tracker jitter on a perfectly good lock accumulates into
-        a low quality and trips the §4 DEGRADED floor -- which is what the first
-        version of this file actually did on the synthetic clip. What is wanted
-        is a discriminator, not a penalty: normal motion should be
-        indistinguishable from perfect, and only a genuine discontinuity should
-        collapse the score.
-        """
-        budget = max(float(budget), 1e-9)
-        if excess <= budget:
-            return 1.0
-        return float(np.exp(-(excess - budget) / budget))
+    _anomaly_score = staticmethod(anomaly_score)
 
     def _score(self, old, new, dt: float) -> float:
         """Plausibility of the old->new box transition, 0-1."""
-        dt = max(dt, 1e-3)
-        ox1, oy1, ox2, oy2 = old
-        nx1, ny1, nx2, ny2 = new
-
-        old_area = max((ox2 - ox1) * (oy2 - oy1), 1e-6)
-        new_area = max((nx2 - nx1) * (ny2 - ny1), 1e-6)
-
-        # Symmetric so growing and shrinking are treated the same way.
-        ratio = max(new_area / old_area, old_area / new_area)
-        area_score = self._anomaly_score(
-            ratio - 1.0, (self.max_area_ratio_per_s - 1.0) * dt)
-
-        old_w = max(ox2 - ox1, 1e-6)
-        old_h = max(oy2 - oy1, 1e-6)
-        # Centre shift measured in box-widths: scale-free, so a distant (small)
-        # box is held to the same standard as a near one.
-        dx = abs((nx1 + nx2) / 2 - (ox1 + ox2) / 2) / old_w
-        dy = abs((ny1 + ny2) / 2 - (oy1 + oy2) / 2) / old_h
-        shift = float(np.hypot(dx, dy))
-        shift_score = self._anomaly_score(shift, self.max_shift_frac_per_s * dt)
-
-        # Aspect ratio of a given vehicle is near-constant; a sudden change means
-        # the filter latched onto something else (§7.4). Not time-scaled -- a
-        # vehicle's proportions shouldn't drift no matter how long you watch.
-        old_ar = old_w / old_h
-        new_ar = max(nx2 - nx1, 1e-6) / max(ny2 - ny1, 1e-6)
-        ar_ratio = max(new_ar / old_ar, old_ar / new_ar)
-        ar_score = self._anomaly_score(ar_ratio - 1.0, self.max_aspect_ratio_change)
-
-        return float(area_score * shift_score * ar_score)
+        return motion_plausibility(
+            old, new, dt,
+            max_area_ratio_per_s=self.max_area_ratio_per_s,
+            max_shift_frac_per_s=self.max_shift_frac_per_s,
+            max_aspect_ratio_change=self.max_aspect_ratio_change)
 
     def reset(self) -> None:
         self._tracker = None

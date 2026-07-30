@@ -5,31 +5,31 @@ run_clip.py: the same fast loop (track -> depth -> filter -> classify -> voice),
 driven one frame at a time by HTTP instead of by a VideoCapture, and holding its
 state per session between calls.
 
-Per frame:
+Per frame, all of it:
   1. UFLDv2 lane detection -> ego-lane boundaries + corridor      (~2 ms, GPU)
-  2. CSRT tracker.update() carries the lead box forward           (~2 ms, CPU)
-  3. Depth Anything V2 Metric-Small over the frame                (~15 ms, GPU)
-  4. Median depth in the ROI -> range + depth confidence
-  5. Kalman update with the REAL dt between frame timestamps
-  6. tau / TTC / trend / confidence
-  7. LivePolicy -> band + voice decision
+  2. RF-DETR -> every road user in the frame                      (~5 ms, GPU)
+  3. Depth Anything V2 Metric-Small over the frame                (~7 ms, GPU)
+  4. membership.py -> overlap, dwell, merge, WHICH ONE IS THE LEAD (~1 ms, CPU)
+  5. Median depth in the lead's ROI -> range + depth confidence
+  6. Kalman update with the REAL dt between frame timestamps
+  7. tau / TTC / trend / confidence
+  8. LivePolicy -> band + voice decision
 
-Qwen runs on **none** of that. It is called only to (re-)anchor: on the first
-frame of a session, when the tracker loses or stops believing the box, and when
-the anchor goes stale past ANCHOR_MAX_AGE_S. That is the design's slow loop, and
-it is what keeps the per-frame cost at tens of milliseconds instead of seconds.
+THERE IS NO SLOW LOOP ANY MORE (design §9's graduation). Qwen used to enumerate
+vehicles for the anchor, at 0.6-1.5 s a call, and everything around it was
+rationing: an anchor staleness timer, a re-anchor-on-drift rule, a 1 s floor
+between calls, a 5 s candidate refresh, a token cap that truncated the reply,
+and CSRT to carry a box across the seconds in between. RF-DETR detects
+everything on every frame for about what the depth pass costs, so all of that
+is gone. Qwen retains /perceive's captions and RIO's commentary and touches
+nothing on this path -- which makes §1's LLM firewall a property of the
+architecture rather than a promise the anchor prompt has to keep.
 
-Model sharing: the anchor path uses whatever Qwen3-VL the app already has
-resident, via anchor.set_qwen_provider(). perceive.py installs that provider at
-import time; _ensure_qwen_provider() below imports perceive if nothing has. A
-second ~17 GB copy of the weights is never loaded.
-
-Lane geometry (headway/lanes.py) runs on every frame, unlike Qwen. At ~2 ms it
-is cheap enough to belong on the fast loop, and it has to be there: the corridor
-it feeds is what validates the lead, and a corridor that only updated every 20 s
-would be describing a bend the car left ten seconds ago. When lane confidence is
-low the corridor falls back to the static trapezoid and the loop behaves exactly
-as it did before -- see anchor.build_corridor().
+Lane geometry and detection are both per-frame for the same reason: the
+corridor decides which vehicle is the lead, and a corridor or a candidate set
+refreshed every few seconds would be describing a road the car has already left.
+When lane confidence is low the corridor falls back to the static trapezoid and
+the loop behaves as it did before -- see anchor.build_corridor().
 """
 import io
 import math
@@ -41,6 +41,7 @@ from PIL import Image
 
 from . import anchor as anchor_mod
 from . import depth as depth_mod
+from . import detect as detect_mod
 from . import lanes as lanes_mod
 from . import live_policy as policy_mod
 from . import membership as member_mod
@@ -49,18 +50,16 @@ from .filter import HeadwayFilter
 from .lanes import LaneDriftMonitor
 from .live_policy import LivePolicy
 from .membership import CandidateSet
-from .tracker import LeadTracker
 
-# --- anchor scheduling (v3 spec §1) ---------------------------------------
-# Qwen re-anchor when the anchor is older than this. The spec's number. v2 §7.4
-# wanted <= 5 s at 12 Hz; at 4 fps a Qwen call is ~1.3 s, i.e. five whole frame
-# slots, so 20 s is the concession that keeps the fast path fast. The tracker
-# quality gate below is what actually catches a bad box early -- staleness is
-# only the backstop.
-ANCHOR_MAX_AGE_S = 20.0
-# Re-anchor early when CSRT stops looking believable (v2 §7.4). This fires long
-# before the staleness timer on any real drift.
-TRACK_QUALITY_REANCHOR = 0.35
+# --- anchor scheduling: RETIRED --------------------------------------------
+# ANCHOR_MAX_AGE_S, TRACK_QUALITY_REANCHOR, CANDIDATE_REFRESH_S and
+# ANCHOR_MIN_INTERVAL_S all existed to ration Qwen. There is no Qwen on this
+# path and no anchor schedule: RF-DETR runs on every frame. They are gone
+# rather than set to 0 so nothing can quietly start scheduling again.
+#
+# anchor.py itself is NOT deleted -- run_clip.py is the Stage 0 offline harness
+# and still uses the Qwen anchor, which is the right tool for annotating a clip
+# with no latency budget.
 
 # --- frame timing ---------------------------------------------------------
 NOMINAL_DT_S = 0.25          # the client's ~4 fps cadence; used for frame 1 only
@@ -81,35 +80,6 @@ SESSION_IDLE_EVICT_S = 600.0
 # tracker is that it survives a bad frame. At 4 fps this is ~0.75 s.
 LEAD_OUT_OF_CORRIDOR_FRAMES = 3
 
-# How often the candidate set is refreshed from a fresh Qwen enumeration.
-#
-# This is NOT the lead anchor interval and must be much shorter than it. Lane
-# membership needs dwell time and merge detection needs a rising trend, and
-# both are measured on candidates that only come into existence when Qwen
-# enumerates. At the lead anchor's 20 s a merging car would not enter the
-# candidate set until it had already completed the merge, which is the one
-# event the promotion path exists to catch early.
-#
-# The cost is one Qwen call (~0.3-0.7 s) per interval. Between refreshes the
-# candidates cost 0.2 ms each per frame on MOSSE, so the interval is the whole
-# price. 5 s is the compromise: three extra calls per 20 s of steady following.
-CANDIDATE_REFRESH_S = 5.0
-
-# Hard floor between Qwen calls, whatever the reason for wanting one.
-#
-# Without this, `not tracker.active` in the re-anchor condition is true on EVERY
-# frame whenever there is no lead in our lane -- an empty ego lane, a gap in
-# traffic, a red light -- so the "slow loop" quietly runs at the frame rate.
-# Measured on a clip whose ego lane is mostly empty: 84 of 210 frames paid a
-# Qwen call before this floor existed, and the loop's p50 was the Qwen latency
-# rather than the 25 ms the fast path actually costs.
-#
-# Re-querying faster than this buys nothing anyway: a call takes ~0.6 s, so at
-# 4 fps a 1 s floor still means the next query starts as soon as the last one
-# could plausibly have finished. Re-acquisition after a real track loss is
-# delayed by at most this, and the Kalman coasts across it.
-ANCHOR_MIN_INTERVAL_S = 1.0
-
 # Serialises GPU work across sessions. One driver is the expected case, so this
 # costs nothing in practice; it exists so two concurrent sessions cannot race
 # depth's lazy module-level load or stack two depth passes on the GPU at once.
@@ -122,12 +92,12 @@ _provider_checked = False
 
 
 def _ensure_qwen_provider() -> None:
-    """Point headway.anchor at the app's resident Qwen3-VL, once.
+    """Retained for run_clip.py and any caller that still wants the Qwen anchor.
 
-    perceive.py already does this at import time, so under the live app this is
-    a no-op. It matters when live.py is reached first (a self-test, a different
-    entry point): without it anchor.py would fall back to loading its own copy
-    of the weights, which is exactly what the design forbids.
+    The live loop no longer calls it: nothing on this path touches Qwen, so
+    there is no provider to install and no risk of a second copy of the weights
+    being loaded here. perceive.py still installs the provider at import time
+    for its own captioning.
     """
     global _provider_checked
     if _provider_checked:
@@ -197,16 +167,20 @@ def lead_corridor_check(corridor, box, prev_count):
 class LiveSession:
     """One drive's worth of live headway state. Not thread-safe; hold `lock`."""
 
-    def __init__(self, key: str, use_qwen: bool = True):
+    def __init__(self, key: str, use_vision: bool = True, use_qwen: bool = None):
+        """`use_qwen` is the old name for `use_vision` and still accepted.
+
+        It gated the Qwen anchor; it now gates RF-DETR, because both answer the
+        same question the caller was actually asking -- may this session run
+        vision models at all (config.VISION_ENABLED)?
+        """
         self.key = key
-        self.use_qwen = bool(use_qwen)
+        self.use_vision = bool(use_vision if use_qwen is None else use_qwen)
         self.lock = threading.Lock()
 
-        self.tracker = LeadTracker()
         self.kf = HeadwayFilter()
         self.policy = LivePolicy()
 
-        self.anchor = None          # LeadAnchor, built once the frame size is known
         self.corridor = None        # this frame's corridor: LaneCorridor or EgoCorridor
         self.base_corridor = None   # the static trapezoid, always kept as fallback
         self.size = None            # (w, h)
@@ -218,10 +192,10 @@ class LiveSession:
         self.out_of_corridor = 0    # consecutive frames the lead was outside
 
         self.candidates = CandidateSet()
-        self.candidates_t = None    # session time of the last enumeration
-        self.last_qwen_t = None     # session time of the last Qwen call
         self.lead_id = None         # candidate id currently holding the lock
         self.n_merge_promotions = 0
+        self.n_detections = 0
+        self.detect_error = None    # first detector failure, reported once
 
         self.t = 0.0                # session clock, seconds
         self.last_wall = None
@@ -233,7 +207,6 @@ class LiveSession:
         self.created = time.time()
         self.last_used = time.time()
 
-        self.n_anchor_calls = 0
         self.n_frames = 0
 
     # -- geometry -----------------------------------------------------------
@@ -245,14 +218,9 @@ class LiveSession:
         self.size = (w, h)
         self.base_corridor = anchor_mod.EgoCorridor(w, h)
         self.corridor = self.base_corridor
-        self.anchor = anchor_mod.LeadAnchor(
-            w, h, use_qwen=self.use_qwen, corridor=self.corridor)
-        self.tracker.reset()
         self.drift.reset()
         self.candidates.reset()
-        self.candidates_t = None
         self.lead_id = None
-        self.last_qwen_t = None
 
     # -- clock --------------------------------------------------------------
     def _advance_clock(self, frame_t) -> float:
@@ -282,7 +250,6 @@ class LiveSession:
 
     def _restart_segment(self) -> None:
         """Drop continuity-dependent state after a break in the frame stream."""
-        self.tracker.reset()
         self.kf = HeadwayFilter()
         self.anchor_t = None
         self.reset_t = self.t
@@ -294,9 +261,7 @@ class LiveSession:
         self.drift.reset()
         self.out_of_corridor = 0
         self.candidates.reset()
-        self.candidates_t = None
         self.lead_id = None
-        self.last_qwen_t = None
 
     # -- main entry ---------------------------------------------------------
     def process(self, image_bytes: bytes, v_host, v_host_age_s, frame_t=None,
@@ -336,8 +301,6 @@ class LiveSession:
 
         self.corridor, lane_info = anchor_mod.build_corridor(
             self.base_corridor, lane_result)
-        # The anchor validates against whatever this frame's corridor is.
-        self.anchor.corridor = self.corridor
         if self.corridor.source == "ufld":
             self.n_lane_ufld += 1
         else:
@@ -362,52 +325,33 @@ class LiveSession:
                 depth_err = str(e)
         t_depth = time.perf_counter()
 
-        # --- anchor (slow loop): first frame, lost track, drift, or staleness --
-        anchor_age = (ANCHOR_MAX_AGE_S + 1.0) if self.anchor_t is None else (t - self.anchor_t)
-        cand_age = (CANDIDATE_REFRESH_S + 1.0 if self.candidates_t is None
-                    else t - self.candidates_t)
-        need_anchor = (not self.tracker.active
-                       or self.tracker.box is None
-                       or self.tracker.quality < TRACK_QUALITY_REANCHOR
-                       or anchor_age >= ANCHOR_MAX_AGE_S
-                       # ...or the thing we are tracking has left our lane.
-                       or self.out_of_corridor >= LEAD_OUT_OF_CORRIDOR_FRAMES
-                       # ...or the candidate set has gone stale, which is what
-                       # membership dwell and merge trends are measured on.
-                       or cand_age >= CANDIDATE_REFRESH_S)
-        # The floor is applied here rather than folded into need_anchor so the
-        # log still records that an anchor was WANTED and rate-limited, which is
-        # a different situation from not needing one.
-        rate_limited = (self.last_qwen_t is not None
-                        and (t - self.last_qwen_t) < ANCHOR_MIN_INTERVAL_S)
-        anchor_info = None
-        anchored = False
-        if need_anchor and rate_limited:
-            anchor_info = {"reason": "rate_limited",
-                           "since_last_s": round(t - self.last_qwen_t, 2)}
-        if need_anchor and not rate_limited and allow_anchor and self.use_qwen:
-            self.last_qwen_t = t
-            box, anchor_info = self.anchor.anchor(frame, self.frame_idx, depth=depth_full)
-            self.n_anchor_calls += 1
-            # The enumeration Qwen just produced is the candidate set. It is the
-            # same call either way -- anchor() already asked for every vehicle
-            # in view, so feeding the membership layer costs nothing extra.
-            self.candidates.observe(self.anchor.last_detections, t, frame=frame)
-            self.candidates_t = t
-            if box is not None:
-                try:
-                    self.tracker.init(frame, box)
-                    self.anchor_t = t
-                    self.reset_t = t          # starts the coaching warm-up
-                    anchored = True
-                    anchor_age = 0.0
-                    self.out_of_corridor = 0
-                except ValueError:
-                    anchor_info = dict(anchor_info or {}, reason="degenerate_box")
-        t_anchor = time.perf_counter()
+        # --- detect: every road user in this frame (RF-DETR, ~5 ms) --------
+        # THE SLOW LOOP IS GONE. There is no anchor schedule, no staleness
+        # timer, no rate limit and no candidate-refresh interval: those all
+        # existed to ration a 0.6-1.5 s Qwen call, and detection now costs
+        # about the same as the depth pass. Every vehicle in view is a
+        # candidate on every frame, which is what makes membership dwell and
+        # merge trends measurements rather than interpolations.
+        detections, det_err = [], None
+        with _gpu_lock:
+            try:
+                if not self.use_vision:
+                    raise RuntimeError("vision disabled (config.VISION_ENABLED)")
+                det = detect_mod.detect(frame)
+                detections = det["detections"]
+                self.n_detections += len(detections)
+            except Exception as e:
+                # Losing the detector costs the lead, not the session: the
+                # candidate set simply ages out and the loop reports UNKNOWN
+                # rather than warning off stale geometry.
+                if self.detect_error is None:
+                    self.detect_error = f"{type(e).__name__}: {e}"
+                    print(f"[headway.live] detector off: {self.detect_error}",
+                          flush=True)
+                det_err = self.detect_error
+        t_detect = time.perf_counter()
 
-        # --- candidates: carry every watched vehicle forward, score membership -
-        self.candidates.track(frame, t)
+        self.candidates.observe(detections, t)
 
         def _range_of(b):
             if depth_full is None:
@@ -425,35 +369,47 @@ class LiveSession:
 
         lead_cand, member_info = self.candidates.select_lead(t)
 
-        # --- lead switch: a nearer in-lane vehicle takes the lock -------------
-        # A car that has moved in between us and the vehicle we were following
-        # IS the new lead. Re-init the CSRT tracker on it and reset the filter:
-        # carrying a distance history that belongs to a different car is how a
-        # cut-in reads as a sudden closing rate.
+        # --- the lead IS a detection now -------------------------------------
+        # No CSRT follow. The box arrives fresh from RF-DETR every frame and is
+        # associated to its candidate by IoU, so there is nothing to drift and
+        # nothing to re-anchor. `quality` is the same motion-plausibility
+        # discriminator CSRT's quality used (tracker.motion_plausibility),
+        # applied to detection-to-detection continuity, so v2 s8 confidence
+        # still receives the kind of number it was tuned against.
+        #
+        # A nearer eligible vehicle taking the lock IS a new lead: the filter
+        # resets so the state machine re-confirms from scratch rather than
+        # reading a cut-in as a sudden closing rate.
         lead_switch = None
         if lead_cand is not None and lead_cand.id != self.lead_id:
-            try:
-                self.tracker.init(frame, lead_cand.box)
-                self.kf = HeadwayFilter()     # NEW_LEAD: standard confirmation
-                self.anchor_t = t
-                self.reset_t = t
-                self.out_of_corridor = 0
-                lead_switch = {
-                    "from_id": self.lead_id, "to_id": lead_cand.id,
-                    "label": lead_cand.label,
-                    "range_m": round(lead_cand.range_m, 2),
-                    "via_merge": bool(lead_cand.merge_promoted),
-                }
-                self.lead_id = lead_cand.id
-            except ValueError:
-                member_info["lead_switch_error"] = "degenerate_box"
+            self.kf = HeadwayFilter()         # NEW_LEAD: standard confirmation
+            self.reset_t = t
+            self.out_of_corridor = 0
+            lead_switch = {
+                "from_id": self.lead_id, "to_id": lead_cand.id,
+                "label": lead_cand.label,
+                "range_m": round(lead_cand.range_m, 2),
+                "via_merge": bool(lead_cand.merge_promoted),
+            }
+            self.lead_id = lead_cand.id
         elif lead_cand is not None:
             self.lead_id = lead_cand.id
-        t_members = time.perf_counter()
+        elif self.lead_id is not None:
+            self.lead_id = None
 
-        # --- track ---------------------------------------------------------
-        box, quality = (self.tracker.update(frame, dt) if self.tracker.active
-                        else (None, 0.0))
+        box = tuple(lead_cand.box) if lead_cand is not None else None
+        quality = lead_cand.quality if lead_cand is not None else 0.0
+        # Anchor freshness (v2 s8) is now "how long since the lead was last
+        # actually detected". Under Qwen this measured how stale a 20 s-old
+        # proposal had become; under per-frame detection it is ~0 while the
+        # lead is visible and climbs the moment it stops being detected, which
+        # is the same question with a truthful answer.
+        anchor_age = 0.0 if lead_cand is None else max(0.0, t - lead_cand.last_detected)
+        anchored = bool(lead_switch)
+        anchor_info = {"reason": "detector", "n_detections": len(detections),
+                       "error": det_err}
+        self.anchor_t = t if lead_cand is not None else self.anchor_t
+        t_members = time.perf_counter()
 
         # --- lead validation against this frame's corridor -------------------
         # Cheap, and the reason lane detection runs every frame rather than at
@@ -587,8 +543,8 @@ class LiveSession:
                 "decode": round((t_decode - t_start) * 1000, 1),
                 "lanes": round((t_lanes - t_decode) * 1000, 1),
                 "depth": round((t_depth - t_lanes) * 1000, 1),
-                "anchor": round((t_anchor - t_depth) * 1000, 1),
-                "membership": round((t_members - t_anchor) * 1000, 1),
+                "detect": round((t_detect - t_depth) * 1000, 1),
+                "membership": round((t_members - t_detect) * 1000, 1),
                 "track_filter": round((t_end - t_members) * 1000, 1),
                 "total": round((t_end - t_start) * 1000, 1),
             },
@@ -599,7 +555,6 @@ class LiveSession:
 # Session registry
 # ---------------------------------------------------------------------------
 def get_session(key: str, use_qwen: bool = True) -> LiveSession:
-    _ensure_qwen_provider()
     with _sessions_lock:
         _evict_idle_locked()
         s = _sessions.get(key)
@@ -623,7 +578,7 @@ def _evict_idle_locked() -> None:
 
 def active_sessions() -> dict:
     with _sessions_lock:
-        return {k: {"frames": s.n_frames, "anchor_calls": s.n_anchor_calls,
+        return {k: {"frames": s.n_frames,
                     "band": s.policy.band, "age_s": round(time.time() - s.created, 1),
                     "lane_ufld_frames": s.n_lane_ufld,
                     "lane_static_frames": s.n_lane_static,
@@ -632,5 +587,7 @@ def active_sessions() -> dict:
                     "lane_drift_events": s.drift.n_events,
                     "merge_promotions": s.n_merge_promotions,
                     "candidates": len(s.candidates.candidates),
+                    "detections": s.n_detections,
+                    "detect_error": s.detect_error,
                     "lane_error": s.lane_error}
                 for k, s in _sessions.items()}

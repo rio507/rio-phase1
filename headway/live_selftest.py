@@ -33,6 +33,8 @@ import numpy as np
 
 from . import anchor as anchor_mod
 from . import depth as depth_mod
+from . import detect as detect_mod
+from . import lanes as lanes_mod
 from . import live as live_mod
 from . import live_policy as P
 from . import state as v2
@@ -108,16 +110,46 @@ def run_pipeline():
 
     # Substitute depth and the anchor box; everything else runs for real.
     orig_depth_map, orig_roi = depth_mod.depth_map, depth_mod.roi_depth
-    orig_anchor = anchor_mod.LeadAnchor.anchor
+    orig_detect = detect_mod.detect
     depth_mod.depth_map = provider.depth_map
     depth_mod.roi_depth = provider.roi_depth
 
-    def gt_anchor(self, frame, frame_idx, depth=None):
+    # The candidate source is now RF-DETR, so THAT is what the clip's ground
+    # truth is injected through. Same reason the depth model is stubbed: the
+    # synthetic clip is a flat-shaded rectangle, so running a real detector on
+    # it would measure the detector, not the loop. Everything downstream --
+    # membership, dwell, lead selection, Kalman, policy -- is live.
+    def gt_detect(frame, score_min=None, variant=None):
         g = gt_by_frame.get(provider.frame)
-        self.last_anchor_frame = frame_idx
-        return (tuple(g["box"]) if g else None), {"reason": "gt"}
+        dets = [("car", tuple(g["box"]), 0.95)] if g else []
+        return {"detections": dets, "n_bonnet_rejected": 0,
+                "image": {"w": frame.shape[1], "h": frame.shape[0]},
+                "timing_ms": {"forward": 0.0, "post": 0.0, "total": 0.0}}
 
-    anchor_mod.LeadAnchor.anchor = gt_anchor
+    detect_mod.detect = gt_detect
+
+    # Lane detection is stubbed OUT for the same reason depth and detection are
+    # stubbed IN: the synthetic clip is a flat-shaded rectangle on a rendered
+    # road, and UFLDv2's reading of it is noise. Measured on this clip it flips
+    # between static and ufld frame to frame and sometimes locks a bogus 9 px
+    # lane, swinging the lead's membership overlap 1.00 -> 0.00 -> 0.75. That
+    # churns the lead lock and buries the band ladder under NEW_LEAD resets.
+    #
+    # This did not matter before RF-DETR because the corridor only vetted a
+    # fresh anchor; now membership gates the lead on every frame, so a corridor
+    # that flickers is a lead that flickers. Part A tests the loop, not the lane
+    # model on synthetic pixels, so the corridor here is the static trapezoid --
+    # which the same measurement shows gives a steady overlap of 1.00.
+    orig_lanes = lanes_mod.detect_lanes
+
+    def no_lanes(frame, weights_path=None):
+        return {"lanes": [], "lane_conf": [], "lane_index": [],
+                "ego_left": None, "ego_right": None, "confidence": 0.0,
+                "ego": {"reason": "stubbed_for_selftest"},
+                "image": {"w": frame.shape[1], "h": frame.shape[0]},
+                "timing_ms": {"forward": 0.0, "decode": 0.0, "total": 0.0}}
+
+    lanes_mod.detect_lanes = no_lanes
 
     records = []
     try:
@@ -146,7 +178,8 @@ def run_pipeline():
         cap.release()
     finally:
         depth_mod.depth_map, depth_mod.roi_depth = orig_depth_map, orig_roi
-        anchor_mod.LeadAnchor.anchor = orig_anchor
+        detect_mod.detect = orig_detect
+        lanes_mod.detect_lanes = orig_lanes
         live_mod.reset_session("selftest")
 
     # --- timeline -----------------------------------------------------------
@@ -231,25 +264,39 @@ def run_pipeline():
     check(all(0 <= r["urgency"] <= 3 for r in records), "urgency in 0-3")
     check(all(r["lead_box"] is None or len(r["lead_box"]) == 4 for r in records),
           "lead_box is a 4-tuple or null")
-    # No Qwen per frame. This used to read "exactly one anchor over the clip",
-    # and that was the right assertion when the anchor's only job was to (re-)
-    # find the lead. It now also refreshes the CANDIDATE SET, which membership
-    # dwell and merge-trend detection are measured on, so it fires on
-    # CANDIDATE_REFRESH_S as well -- 4 calls on this 16 s clip instead of 1.
+    # QWEN IS NOT ON THIS PATH AT ALL ANY MORE.
     #
-    # The invariant being defended is unchanged and is stated directly below
-    # rather than approximated by a count of one: Qwen must stay OFF the
-    # per-frame path. One call per 5 s at 4 fps is one frame in twenty. If a
-    # future edit puts it back on every frame, both of these fail.
-    n_anchors = session_anchor_calls(records)
-    span_s = records[-1]["t"] - records[0]["t"]
-    budget = int(span_s / live_mod.CANDIDATE_REFRESH_S) + 2
-    check(n_anchors <= budget,
-          "anchors are bounded by the candidate-refresh interval",
-          f"{n_anchors} anchored frame(s) over {span_s:.1f}s, budget {budget}")
-    check(n_anchors <= 0.2 * len(records),
-          "Qwen runs on at most 1 frame in 5 -- never the per-frame path",
-          f"{n_anchors}/{len(records)} frames anchored")
+    # This check has been through three forms. It began as "exactly one anchor
+    # over the clip", became "anchors are bounded by the candidate-refresh
+    # interval" when membership needed fresher candidates, and is now the
+    # strongest version available: the live loop never calls a language model,
+    # so there is no rate to bound. RF-DETR supplies candidates on every frame
+    # and the corridor selects among them.
+    import ast
+
+    src = os.path.join(os.path.dirname(__file__), "live.py")
+    with open(src) as fh:
+        tree = ast.parse(fh.read())
+    calls = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            calls.add(node.attr)
+    for banned in ("anchor", "qwen_handles", "last_detections"):
+        check(banned not in calls,
+              f"live.py never reaches for {banned!r}",
+              "Qwen is retired from the anchor path")
+    check(not hasattr(live_mod, "CANDIDATE_REFRESH_S")
+          and not hasattr(live_mod, "ANCHOR_MIN_INTERVAL_S")
+          and not hasattr(live_mod, "ANCHOR_MAX_AGE_S"),
+          "the Qwen rationing constants are gone, not merely unused",
+          "nothing can quietly start scheduling anchors again")
+
+    # And the loop really did see a detection on essentially every frame.
+    detected = [r for r in records
+                if (r.get("membership_info") or {}).get("n_candidates")]
+    check(len(detected) >= 0.9 * len(records),
+          "candidates are present on ~every frame, not once per interval",
+          f"{len(detected)}/{len(records)} frames had a candidate")
     return records
 
 
@@ -846,6 +893,99 @@ def run_lanes():
         print(f"  [SKIP] {clip} not present — real-footage check skipped")
 
 
+def run_detector():
+    """E -- RF-DETR: is it the published model, is it Apache, is it fast?"""
+    import time
+
+    from . import detect as D
+
+    head("E -- RF-DETR candidate source")
+
+    if not D.available():
+        print(f"  [SKIP] weights not at {D.WEIGHTS.get(D.VARIANT)} — "
+              "fetch with `python -m tools.fetch_detector_weights`")
+        return
+
+    import torch
+
+    # -- licence, checked not assumed ---------------------------------------
+    cfg = D._config(D.VARIANT)
+    check(str(cfg.get("license", "")).lower() == "apache-2.0",
+          "the loaded variant declares Apache-2.0",
+          f"license={cfg.get('license')!r} (YOLO's AGPL is why this matters)")
+    bad = dict(cfg); bad["license"] = "AGPL-3.0"
+    try:
+        D._assert_apache(bad); refused = False
+    except ValueError:
+        refused = True
+    check(refused, "a non-Apache variant would be refused at load time")
+
+    # -- the checkpoint really fits this architecture ------------------------
+    D._ensure_loaded()
+    check(D._model is not None and D._dtype == torch.float16,
+          "model is loaded in fp16 on CUDA", f"dtype={D._dtype}")
+    n_params = sum(p.numel() for p in D._model.parameters()) / 1e6
+    check(25.0 < n_params < 40.0, "parameter count matches RF-DETR Nano",
+          f"{n_params:.1f} M")
+    # _ensure_loaded raises on any key mismatch, so reaching here IS the proof.
+    check(True, "checkpoint loaded with zero missing/unexpected keys",
+          "strict load; a mismatch raises in _ensure_loaded")
+
+    # -- the training harness never ran --------------------------------------
+    import sys
+    check("rfdetr.detr" not in sys.modules and "rfdetr.datasets" not in sys.modules,
+          "the rfdetr training harness was never imported",
+          "detect.py imports rfdetr.models.lwdetr beneath a stub package")
+
+    # -- the ego bonnet, which is the dangerous false positive ---------------
+    W, H = 1280, 720
+    check(D._is_ego_bonnet(2, 661, 1279, 720, W, H),
+          "the ego bonnet strip is rejected",
+          "full width, flush with the bottom, aspect 21.6 — observed live")
+    check(not D._is_ego_bonnet(100, 300, 1200, 719, W, H),
+          "a genuinely close, TALL vehicle is NOT rejected",
+          "wide-and-tall is a lorry; wide-and-flat is our own bonnet")
+    check(not D._is_ego_bonnet(500, 600, 780, 720, W, H),
+          "a normal vehicle touching the frame bottom is not rejected")
+
+    # -- cost ----------------------------------------------------------------
+    clip = "/workspace/ufldv2/example.mp4"
+    frame = None
+    if os.path.exists(clip):
+        import cv2
+        cap = cv2.VideoCapture(clip)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 300)
+        ok, frame = cap.read()
+        cap.release()
+        if not ok:
+            frame = None
+    if frame is None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    for _ in range(5):
+        D.detect(frame)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    times = []
+    for _ in range(30):
+        t0 = time.perf_counter()
+        D.detect(frame)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    p50, p95 = times[len(times) // 2], times[int(len(times) * 0.95)]
+    # The whole justification for retiring Qwen: single-digit milliseconds, so
+    # detection can run on every frame instead of being rationed.
+    check(p95 < 10.0, "detection is single-digit ms — the point of the swap",
+          f"p50 {p50:.2f} ms, p95 {p95:.2f} ms (Qwen enumeration was 600-1500 ms)")
+
+    r = D.detect(frame)
+    check(all(lab in D.COCO_TO_LABEL.values() for lab, _, _ in r["detections"]),
+          "only road-user classes are emitted",
+          str(sorted({lab for lab, _, _ in r["detections"]})))
+
+
 def main():
     print("=" * 70)
     print("RIO live headway (v3) — verification")
@@ -854,6 +994,7 @@ def main():
     run_policy()
     run_firewall()
     run_lanes()
+    run_detector()
 
     print("\n" + "=" * 70)
     total = len(PASS) + len(FAIL)

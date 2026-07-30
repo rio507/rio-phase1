@@ -55,17 +55,35 @@ MERGE_MIN_OVERLAP = 0.15     # ...and it must actually be touching our lane
 MERGE_MAX_RANGE_M = 40.0     # ...and be close enough for the answer to matter
 MERGE_MIN_SAMPLES = 3
 
-# --- candidate bookkeeping ---------------------------------------------------
-MATCH_IOU = 0.30             # detection <-> existing candidate association
+# --- candidate association ---------------------------------------------------
+# Matching this frame's detections to the candidates we already hold.
+#
+# IoU ALONE DOES NOT WORK AT THIS FRAME RATE. The obvious choice -- and what
+# SORT/ByteTrack use -- is IoU overlap, but those run at 25-30 fps where a
+# vehicle barely moves between frames. This loop runs at 4 fps, and measured on
+# the winding clip a correctly-tracked motorcycle scores IoU 0.10-0.30 against
+# its own previous box because the camera is turning. At MATCH_IOU=0.30 that
+# minted a fresh candidate almost every frame: 10 live candidates for 2 real
+# vehicles, and no candidate ever survived long enough to earn its dwell.
+#
+# So association is by CENTRE DISPLACEMENT measured in box-diagonals, which is
+# scale-free and tolerant of the large per-frame motion 4 fps implies, with IoU
+# kept only as a fast accept. The label must match exactly: on the same clip a
+# motorcycle and its rider sit 0.29 diagonals apart, so distance alone would
+# happily swap them.
+MATCH_IOU = 0.30             # IoU this high is the same object, no question
+MATCH_MAX_CENTRE_FRAC = 1.0  # ...otherwise, centre may move up to one diagonal
+MATCH_MAX_AREA_RATIO = 3.0   # ...and may not change size by more than this
 
-# Age-out is measured from the last DETECTION, never from the last tracker
-# update. MOSSE almost never reports failure -- it will happily follow a patch
-# of tarmac forever and keep saying it succeeded -- so a liveness rule based on
-# "the tracker still works" retires nothing. Measured before this was fixed: 21
-# live candidates on a clip whose prompt asks for four, most of them tracking
-# scenery. A candidate that two consecutive enumerations did not confirm is
-# gone, whatever its tracker claims.
-CANDIDATE_MAX_UNDETECTED_S = 6.0
+# Age-out, measured from the last DETECTION.
+#
+# This was 6.0 s when candidates came from a 5 s Qwen enumeration and were
+# carried between enumerations by MOSSE micro-trackers, and even then it was
+# generous. RF-DETR detects on EVERY frame, so a candidate unseen for four
+# consecutive frames at 4 fps is occluded, out of shot, or was never real.
+# Holding stale boxes for six seconds was a workaround for how rarely we could
+# afford to look, and looking is now cheap.
+CANDIDATE_MAX_UNDETECTED_S = 1.0
 DEPTH_MEDIAN_N = 3           # per-candidate range smoothing (see range_m)
 HISTORY_S = 2.0              # overlap history kept per candidate
 
@@ -120,6 +138,33 @@ def iou(a, b):
     return float(inter / ua) if ua > 0 else 0.0
 
 
+def match_cost(box, label, cand):
+    """Association cost between a detection and a candidate. -> cost or None.
+
+    None means "cannot be the same object". Lower is better; IoU >= MATCH_IOU
+    short-circuits to 0.0.
+    """
+    if label is not None and cand.label is not None and label != cand.label:
+        return None
+    if iou(box, cand.box) >= MATCH_IOU:
+        return 0.0
+
+    ax1, ay1, ax2, ay2 = box
+    bx1, by1, bx2, by2 = cand.box
+    aw, ah = max(ax2 - ax1, 1e-6), max(ay2 - ay1, 1e-6)
+    bw, bh = max(bx2 - bx1, 1e-6), max(by2 - by1, 1e-6)
+
+    area_ratio = max((aw * ah) / (bw * bh), (bw * bh) / (aw * ah))
+    if area_ratio > MATCH_MAX_AREA_RATIO:
+        return None
+
+    dx = (ax1 + ax2) / 2.0 - (bx1 + bx2) / 2.0
+    dy = (ay1 + ay2) / 2.0 - (by1 + by2) / 2.0
+    diag = (math.hypot(aw, ah) + math.hypot(bw, bh)) / 2.0
+    frac = math.hypot(dx, dy) / max(diag, 1e-6)
+    return frac if frac <= MATCH_MAX_CENTRE_FRAC else None
+
+
 def _slope(samples):
     """Least-squares slope of overlap against time, per second.
 
@@ -142,7 +187,7 @@ class Candidate:
     __slots__ = ("id", "label", "box", "first_seen", "last_seen", "last_detected",
                  "overlap", "history", "member", "member_since", "merge_promoted",
                  "merge_t", "merge_slope", "depths", "tracker", "lost",
-                 "overlap_reason")
+                 "overlap_reason", "score", "quality", "n_detections")
 
     def __init__(self, cid, box, label, t):
         self.id = cid
@@ -162,6 +207,15 @@ class Candidate:
         self.depths = deque(maxlen=DEPTH_MEDIAN_N)
         self.tracker = None
         self.lost = False
+        self.score = 0.0            # detector confidence, last detection
+        self.n_detections = 1
+        # v2 sec8's track_quality term. With RF-DETR the box comes from a fresh
+        # detection every frame rather than from a correlation filter, but the
+        # question the term asks is unchanged: does this box move like one
+        # vehicle, or did we just jump to a different object? Same scoring
+        # function CSRT used, same EMA, so the confidence maths sees the same
+        # kind of number it was tuned against.
+        self.quality = 1.0
 
     # -- range ---------------------------------------------------------------
     @property
@@ -259,6 +313,8 @@ class Candidate:
             "e": int(self.eligible(self.last_seen)),
             "mp": int(self.merge_promoted),
             "r": (None if self.range_m is None else round(self.range_m, 1)),
+            "q": round(self.quality, 2),
+            "s": round(self.score, 2),
             "w": self.overlap_reason if self.overlap_reason != "ok" else None,
         }
 
@@ -287,38 +343,65 @@ class CandidateSet:
         self._factory = tracker_factory or _make_mosse
 
     # -- detections (slow loop) ----------------------------------------------
-    def observe(self, detections, t, frame=None):
-        """Fold in a fresh enumeration. `detections` is [(label, box), ...]."""
+    def observe(self, detections, t, frame=None, keep_labels=None):
+        """Fold in one frame's detections.
+
+        `detections` is [(label, box)] or [(label, box, score)]. Association is
+        greedy IoU against the boxes we already hold, which is all the identity
+        continuity a per-frame detector needs -- at 4 fps a vehicle moves a
+        fraction of its own width between frames, so successive detections of
+        the same car overlap heavily and detections of different cars do not.
+        This is what replaced the MOSSE micro-trackers: they existed only to
+        carry a box across the seconds between Qwen enumerations, and there are
+        no such gaps any more.
+
+        `keep_labels` limits which classes become candidates. Left None, every
+        detected class is kept -- membership.py wants to know a cyclist is in
+        the corridor even though LEAD_LABELS will never let one be the lead.
+        """
         t = float(t)
         unmatched = dict(self.candidates)
         seen = []
 
-        for label, box in detections:
-            if label is not None and label not in LEAD_LABELS:
+        for det in detections:
+            label, box = det[0], det[1]
+            score = float(det[2]) if len(det) > 2 else 0.0
+            if keep_labels is not None and label is not None and label not in keep_labels:
                 continue
-            best, best_iou = None, MATCH_IOU
+            best, best_cost = None, None
             for cid, cand in unmatched.items():
-                s = iou(box, cand.box)
-                if s >= best_iou:
-                    best, best_iou = cid, s
+                c = match_cost(box, label, cand)
+                if c is not None and (best_cost is None or c < best_cost):
+                    best, best_cost = cid, c
+            box = tuple(float(v) for v in box)
             if best is not None:
                 cand = unmatched.pop(best)
-                cand.box = tuple(float(v) for v in box)
+                dt = max(t - cand.last_detected, 1e-3)
+                # Same discriminator CSRT's quality used, now applied to
+                # detection-to-detection continuity. A jump to another vehicle
+                # collapses it; ordinary approach does not.
+                from .tracker import motion_plausibility
+                q = motion_plausibility(cand.box, box, dt)
+                cand.quality = 0.7 * cand.quality + 0.3 * q
+                cand.box = box
                 cand.label = label or cand.label
+                cand.score = score
+                cand.n_detections += 1
                 cand.last_detected = t
                 cand.last_seen = t
                 cand.lost = False
                 seen.append(cand)
             else:
                 cand = Candidate(self._next_id, box, label, t)
+                cand.score = score
                 self._next_id += 1
                 self.candidates[cand.id] = cand
                 seen.append(cand)
             if frame is not None:
                 self._init_tracker(cand, frame)
 
-        # A candidate Qwen no longer reports is not deleted here -- it may just
-        # have fallen off the end of a truncated list. It ages out below.
+        # Candidates this frame did not report are not deleted here -- a single
+        # missed detection is normal. They age out in _evict().
         self._evict(t)
         return seen
 
@@ -390,13 +473,19 @@ class CandidateSet:
         the filter and let the state machine re-confirm from scratch, rather
         than carrying a distance history that belongs to a different car.
         """
+        # LEAD_LABELS is enforced here rather than at observe(): a pedestrian or
+        # cyclist in the corridor is something the system must SEE (and log),
+        # it just must never be the thing a following distance is computed to.
         eligible = [c for c in self.candidates.values()
-                    if not c.lost and c.eligible(t) and c.range_m is not None]
+                    if not c.lost and c.label in LEAD_LABELS
+                    and c.eligible(t) and c.range_m is not None]
         info = {
             "n_candidates": len(self.candidates),
             "n_members": sum(1 for c in self.candidates.values()
                              if c.member and not c.lost),
             "n_eligible": len(eligible),
+            "n_vulnerable": sum(1 for c in self.candidates.values()
+                                if c.label not in LEAD_LABELS and not c.lost),
         }
         if not eligible:
             changed = self.lead_id is not None

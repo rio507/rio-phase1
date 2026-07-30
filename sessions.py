@@ -139,6 +139,7 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "membership_info": result.get("membership_info"),
         "lead_id": result.get("lead_id"),
         "lead_switch": result.get("lead_switch"),
+        "n_detections": len((result.get("membership") or [])),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),
     })

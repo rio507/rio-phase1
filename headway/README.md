@@ -36,13 +36,13 @@ band *and* an independent urgent flag, so τ = 2.6 s with TTC = 1.8 s still fire
 ## Pipeline
 
 ```
-frame ──► lanes.py    UFLDv2 finds the ego lane      (fast loop, ~2 ms)
+frame ──► lanes.py    UFLDv2 finds the ego lane        (~2 ms, every frame)
           │           → LaneCorridor, or the static trapezoid if unsure
           ▼
-          anchor.py   Qwen3-VL ENUMERATES vehicles  (slow loop, ≤1 Hz)
-          │           it is forbidden from picking the lead
+          detect.py   RF-DETR: every road user in view (~5 ms, every frame)
+          │           Apache-2.0. No LLM anywhere on this path.
           ▼
-          membership  overlap ≥40% of box-bottom edge → in lane   (~1 ms)
+          membership  overlap ≥40% of box-bottom edge → in lane   (~0.5 ms)
           │           held 0.5 s → lead-eligible; nearest wins
           │           rising overlap + <40 m → early merge promotion
           ▼
@@ -64,11 +64,12 @@ frame ──► lanes.py    UFLDv2 finds the ego lane      (fast loop, ~2 ms)
 | `tracker.py` | CSRT wrapper, `init()` / `update()` → box + quality |
 | `lanes.py` | **UFLDv2 lane geometry** — `detect_lanes()`, ego-pair selection, `LaneDriftMonitor` (logs only) |
 | `membership.py` | **In-lane membership** — bottom-edge overlap, hysteresis + dwell, merge promotion, lead selection |
-| `anchor.py` | Qwen3-VL grounding + `EgoCorridor` / `LaneCorridor` validation + `build_corridor()` source switch |
+| `detect.py` | **RF-DETR** candidate source (Apache-2.0), ego-bonnet filter |
+| `anchor.py` | `EgoCorridor` / `LaneCorridor` + `build_corridor()` switch. Its Qwen anchor is now used only by `run_clip.py` |
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 263 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 264 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -273,17 +274,23 @@ lock. Merge promotion: `MERGE_MIN_SLOPE` (0.25 /s) over `MERGE_WINDOW_S` (0.75),
 `MERGE_MIN_OVERLAP` (0.15), `MERGE_MAX_RANGE_M` (40) — and never off the static
 trapezoid.
 
-`CANDIDATE_MAX_UNDETECTED_S` (6.0) is measured from the last *detection*, never
-the last tracker update: MOSSE does not report failure, so a liveness rule based
-on the tracker retires nothing.
+`CANDIDATE_MAX_UNDETECTED_S` (1.0) is measured from the last *detection*. With
+per-frame detection, four missed frames means gone. Association is by **centre
+displacement in box-diagonals**, not IoU: at 4 fps a correctly-tracked vehicle
+scores IoU 0.10–0.30 against its own previous box, so IoU matching (what
+SORT/ByteTrack use at 25–30 fps) mints a new candidate almost every frame.
 
-### `live.py` — how often Qwen may run
+### `detect.py` — the candidate source
 
-`ANCHOR_MIN_INTERVAL_S` (1.0) is a hard floor between Qwen calls. Without it
-`not tracker.active` makes the "slow loop" run at the frame rate whenever the
-ego lane is empty. `CANDIDATE_REFRESH_S` (5.0) is how often the candidate set is
-re-enumerated — membership dwell and merge trends are measured on candidates,
-and at the lead anchor's 20 s a merging car would arrive too late to matter.
+`VARIANT` (`nano`) picks the RF-DETR size; `small` is already on disk and costs
++0.4 ms if nano's recall on distant vehicles ever proves too thin. `SCORE_MIN`
+(0.35) is deliberately low — membership decides what matters, not a class
+score. The `BONNET_*` constants reject the host car's own bonnet, which the
+detector otherwise calls a `car` at zero range dead centre in the lane.
+
+There is no anchor schedule any more. `ANCHOR_MAX_AGE_S`,
+`TRACK_QUALITY_REANCHOR`, `CANDIDATE_REFRESH_S` and `ANCHOR_MIN_INTERVAL_S`
+were all rationing for Qwen and have been deleted rather than zeroed.
 
 ### `tracker.py` — drift detection
 
@@ -346,17 +353,17 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
   proposals only. On a bend it reads a correctly-tracked lead as out-of-lane for
   many consecutive frames, so `lead_corridor_check()` gives that vote to the
   lane corridor alone.
-- **Enumeration is decode-bound, and it is the loop's bottleneck.** Qwen3-VL
-  decodes at ~52 tokens/s here, so listing vehicles costs ~0.6-1.5 s against a
-  250 ms frame budget — versus ~0.27 s for the old single-box prompt.
-  `ANCHOR_MAX_NEW_TOKENS` is capped *below* a full reply and truncation is
-  repaired, which keeps the nearest vehicles and drops the far tail. The real
-  fix is a purpose-built detector (a YOLO-class model runs in single-digit ms);
-  Qwen is doing a detector's job here because it was already resident.
-- **Membership evidence on the current test clips is thin.** Both have a mostly
-  empty ego lane, so few frames exercise the dwell and none contain a merge.
-  Zero adjacent-lane candidates ever became lead-eligible, which is the claim
-  under test, but it is a weak sample.
+- **~~Enumeration is decode-bound~~ — FIXED by RF-DETR (§9 graduation).** Qwen
+  enumeration cost 0.6–1.5 s per call and forced a token cap, a 1 s anchor
+  floor and a 5 s candidate refresh. RF-DETR Nano runs in ~5 ms, so all of that
+  is gone and detection is per-frame. Whole loop: **p95 20 ms at 4 fps, 12×
+  headroom, ~50 fps sustainable.**
+- **Depth is now the most expensive stage** (6.6 ms of a 19 ms frame), followed
+  by RF-DETR (5.3 ms) and UFLDv2 (2.1 ms). Nothing on the path is near the
+  budget; Stage 1's TensorRT work should start with DA-V2.
+- **`run_clip.py` still uses the Qwen anchor.** It is the offline Stage 0
+  harness with no latency budget, and a VLM that can be asked questions is the
+  right tool for annotating a clip. The LIVE path has no LLM in it at all.
 - **Lane departure is logged, never spoken.** `lane_drift` events go to the
   session JSONL and stop there, by design, until real-drive logs justify a
   threshold. It is not steering guidance and must not become any.

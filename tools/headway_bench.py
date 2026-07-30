@@ -69,7 +69,7 @@ def main():
     url = f"{args.base}/headway_frame{qs}"
 
     rtt, server_total, depth_ms, anchor_ms, tail_ms = [], [], [], [], []
-    lane_ms = []
+    lane_ms, detect_ms = [], []
     anchor_frames, steady_frames = [], []
     lane_src = {"ufld": 0, "static": 0}
     lane_fallback_why = {}
@@ -107,6 +107,7 @@ def main():
                 server_total.append(tm.get("total", 0.0))
                 depth_ms.append(tm.get("depth", 0.0))
                 anchor_ms.append(tm.get("anchor", 0.0))
+                detect_ms.append(tm.get("detect", 0.0))
                 tail_ms.append(tm.get("track_filter", 0.0))
                 lane_ms.append(tm.get("lanes", 0.0))
                 membership_ms.append(tm.get("membership", 0.0))
@@ -186,9 +187,10 @@ def main():
     stats("client round-trip", rtt)
     stats("server total", server_total)
     stats("  lanes (UFLDv2)", lane_ms)
+    stats("  detect (RF-DETR)", detect_ms)
     stats("  membership", membership_ms)
     stats("  depth (DA-V2)", depth_ms)
-    stats("  anchor (Qwen)", anchor_ms)
+    stats("  anchor (Qwen, retired)", anchor_ms)
     stats("  track+filter+policy", tail_ms)
     print()
     stats("ANCHOR frames", anchor_frames)

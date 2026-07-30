@@ -27,6 +27,7 @@ import perceive
 from headway import live as headway_live
 from headway import live_policy
 from headway import lanes as headway_lanes
+from headway import detect as headway_detect
 
 def _warm_vision():
     t = time.time()
@@ -46,6 +47,15 @@ def _warm_vision():
             print("[vision] lane detection warm", flush=True)
         except Exception as e:
             print(f"[vision] lane detection unavailable: {e}", flush=True)
+        # RF-DETR is now the headway candidate source and runs on EVERY frame,
+        # so an unwarmed first call would put a ~3 s weight load inside a live
+        # frame. Without it headway has no candidates at all and reports
+        # UNKNOWN -- it does not fall back to Qwen, which is the point.
+        try:
+            headway_detect.warm()
+            print("[vision] detector warm", flush=True)
+        except Exception as e:
+            print(f"[vision] detector unavailable: {e}", flush=True)
         # flush: stdout is block-buffered when uvicorn is redirected to a log
         # file, so without this the line can sit unseen for a long time.
         print(f"[vision] warm complete in {time.time() - t:.1f}s", flush=True)

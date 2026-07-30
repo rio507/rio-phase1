@@ -1094,13 +1094,24 @@ def test_lead_selection():
     check("a candidate with no range is not selectable",
           lead is None and info["reason"] == "no_eligible_candidate", str(info))
 
-    # Non-vehicles never enter the set at all.
+    # Non-vehicles ARE candidates -- the system must see a pedestrian in the
+    # corridor -- but LEAD_LABELS stops one ever becoming a following target.
+    # Under Qwen these were filtered at the prompt; RF-DETR reports them, and
+    # dropping them at the door would throw away the only record that a
+    # vulnerable road user was in our lane.
     cs2 = M.CandidateSet()
     cs2._factory = lambda: None
-    cs2.observe([("pedestrian", _box(640, 700)), ("car", _box(640, 700))], 0.0)
-    check("only vehicle labels become candidates",
-          len(cs2.candidates) == 1
-          and next(iter(cs2.candidates.values())).label == "car")
+    cs2.observe([("pedestrian", _box(400, 700)), ("car", _box(900, 700))], 0.0)
+    check("a pedestrian becomes a candidate (it must be seen)",
+          len(cs2.candidates) == 2, str([c.label for c in cs2.candidates.values()]))
+    for c in cs2.candidates.values():
+        for k in range(3):
+            c.depths.append(10.0)
+            c.update_overlap(0.95, "ok", k * 0.25)
+    lead, info = cs2.select_lead(1.0)
+    check("...but can never hold the lead lock, however close and in-lane",
+          lead is not None and lead.label == "car" and info["n_vulnerable"] == 1,
+          str(info))
 
     # A candidate no enumeration has re-confirmed is retired, even though its
     # tracker is still cheerfully reporting success. MOSSE never admits defeat,
@@ -1122,17 +1133,12 @@ def test_lead_selection():
 
 
 def _still_alive_after_redetection(M):
+    """Per-frame re-detection keeps one stable candidate, not a new one each frame."""
     cs = M.CandidateSet()
     cs._factory = lambda: None
-    for k in range(0, 40):
-        t = k * 0.25
-        if k % 8 == 0:                          # an enumeration every 2 s
-            cs.observe([("car", _box(640, 700))], t)
-        else:
-            for c in cs.candidates.values():
-                c.last_seen = t
-            cs._evict(t)
-    return len(cs.candidates) == 1
+    for k in range(0, 40):                      # RF-DETR detects every frame
+        cs.observe([("car", _box(640, 700))], k * 0.25)
+    return len(cs.candidates) == 1 and next(iter(cs.candidates)) == 1
 
 
 def test_membership_is_deterministic():
@@ -1154,8 +1160,11 @@ def test_membership_is_deterministic():
     # cv2 only for the MOSSE factory, anchor only for LEAD_LABELS. No model,
     # no clock, no randomness -- membership must be a pure function of boxes,
     # the lane polygon and the timestamps it is handed.
-    check("membership.py imports only maths, collections, cv2 and anchor",
-          imported <= {"math", "collections", "cv2", "anchor"},
+    # `tracker` is the shared motion-plausibility scorer, not a tracker
+    # instance: membership scores detection-to-detection continuity with the
+    # same function CSRT's quality used, so the two cannot drift apart.
+    check("membership.py imports only maths, collections, cv2, anchor, tracker",
+          imported <= {"math", "collections", "cv2", "anchor", "tracker"},
           f"imports: {sorted(imported)}")
     for forbidden in ("time", "random", "torch", "transformers", "numpy"):
         check(f"membership.py does not import {forbidden!r}",

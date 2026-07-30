@@ -111,6 +111,17 @@ log "UFLDv2 lane weights"
 python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headway will use the static corridor"
 
 # ---------------------------------------------------------------------------
+# 5c. RF-DETR detector (Apache-2.0) — the headway candidate source
+# ---------------------------------------------------------------------------
+# --no-deps on purpose: rfdetr's dependency list is a training stack, and
+# `supervision` pulls opencv-python 5.x which shadows the contrib-headless
+# build and removes CSRT/MOSSE. See the note in requirements.txt.
+log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
+pip install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+log "RF-DETR weights"
+python -m tools.fetch_detector_weights || log "  !! detector weights unavailable - headway will have no candidates"
+
+# ---------------------------------------------------------------------------
 # 6. Free port 8888
 # ---------------------------------------------------------------------------
 # RunPod starts JupyterLab on 8888, which is the port the proxy exposes and the
