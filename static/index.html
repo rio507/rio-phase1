@@ -480,6 +480,69 @@
     margin-top: -2px;
   }
 
+  /* ---------- navigation (placeholder) ---------- */
+
+  /* Nested inside the camera column the way .audio-panel nests in the voice
+     column, so it reads as a sub-panel of that column rather than a fifth
+     pipeline stage. */
+  .nav-panel { margin-top: 14px; }
+
+  .nav-head {
+    padding-bottom: 8px; margin-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-head .col-title { font-size: 13px; }
+
+  .nav-empty {
+    font-family: var(--font-mono);
+    font-size: 10.5px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    padding: 9px 12px; margin-bottom: 8px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+  }
+  .nav-empty::before { content: '\25B8\0020\0020'; }
+
+  .nav-dest {
+    display: block; width: 100%;
+    padding: 10px 12px; margin-bottom: 10px;
+    font-family: var(--font-mono); font-size: 12px;
+    color: var(--text-bright);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 0;
+    -webkit-appearance: none; appearance: none;
+  }
+  .nav-dest:focus { outline: none; border-color: var(--border-strong); }
+  /* Disabled until the Maps embed is wired; iOS otherwise greys it into
+     illegibility, so the dim is stated explicitly instead. */
+  .nav-dest:disabled { opacity: 1; color: var(--text-dimmer); cursor: not-allowed; }
+  .nav-dest::placeholder {
+    color: var(--text-dimmer);
+    letter-spacing: 0.15em; text-transform: uppercase;
+  }
+
+  /* Reserved geometry for the Maps embed: same 16:9 lock and corner brackets as
+     the camera box, so dropping the iframe/div in later changes nothing but
+     what is painted inside it. */
+  .nav-map {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border: 1px solid var(--border-strong);
+    overflow: hidden;
+  }
+  .nav-map-idle {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.25em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    background: repeating-linear-gradient(
+      0deg, rgba(95,179,232,0.03) 0px, rgba(95,179,232,0.03) 1px, transparent 1px, transparent 4px);
+    z-index: 1;
+  }
+
   /* ---------- column 2: perception ---------- */
 
   #observation {
@@ -594,9 +657,14 @@
 
   /* ---------- hold to talk ---------- */
 
-  #micbar { margin-top: 16px; }
+  /* Idle/desk layout: the control lives at the foot of the VOICE LAYER column,
+     full panel width, sized as a comfortable target without stealing a whole
+     band across the page. The drive-mode override further down is the one that
+     matters at speed and is deliberately left untouched by this placement. */
+  #micbar { margin-top: 12px; }
   #mic {
     display: block; width: 100%;
+    min-height: 90px;
     padding: 14px 20px; margin: 0;
     font-weight: 600; font-size: 18px;
     letter-spacing: 0.18em; text-transform: uppercase;
@@ -615,8 +683,11 @@
     box-shadow: 0 0 18px rgba(255,107,107,0.62), inset 0 0 32px rgba(255,107,107,0.12);
   }
 
-  /* While driving the mic pins to the bottom of the viewport so it can be hit
-     without looking, regardless of how far the columns have scrolled. */
+  /* While driving the mic leaves the Voice Layer column entirely and pins to the
+     bottom of the viewport so it can be hit without looking, regardless of how
+     far the columns have scrolled. position:fixed lifts it out of the column's
+     flow, so the in-column placement above costs the drive-safe target nothing.
+     A driver must never have to aim at a small button at speed. */
   body.driving { padding-bottom: 46dvh; }
   body.driving #micbar {
     position: fixed; left: 0; right: 0; bottom: 0;
@@ -725,6 +796,30 @@
       </div>
       <div class="speed-hint" id="speedhint">GPS speed &middot; override blank</div>
     </div>
+
+    <!-- ---- NAVIGATION (placeholder) ---- -->
+    <div class="panel nav-panel">
+      <div class="nav-head">
+        <div class="col-title">Navigation</div>
+        <div class="col-sub">Google Maps &middot; Route</div>
+      </div>
+
+      <div class="nav-empty" id="navempty">No Route Set</div>
+
+      <input id="navdest" class="nav-dest" type="text" disabled
+             placeholder="Destination" aria-label="Destination — not yet wired">
+
+      <!-- TODO(next session): mount the Google Maps JavaScript embed into
+           #navmap. It needs a Google Maps API key (Maps JavaScript API +
+           Directions API) served from the backend rather than hardcoded here,
+           and the loader script tag added to <head>. Everything the embed
+           needs is contained by this div: the 16:9 lock, the border and the
+           corner brackets are on the container, so wiring it up is a matter of
+           replacing .nav-map-idle with the rendered map. -->
+      <div class="nav-map bracketed" id="navmap">
+        <div class="nav-map-idle">Map Offline</div>
+      </div>
+    </div>
   </section>
 
   <!-- ============ COLUMN 2 - PERCEPTION ============ -->
@@ -784,13 +879,15 @@
       <div class="panel-label">Voice Downlink</div>
       <audio id="player" controls autoplay playsinline></audio>
     </div>
+
+    <!-- Idle placement only. body.driving fixes this to the bottom of the
+         viewport as the large drive-safe target; see #micbar in the stylesheet. -->
+    <div id="micbar">
+      <button id="mic">Hold to talk</button>
+    </div>
   </section>
 
 </main>
-
-<div id="micbar">
-  <button id="mic">Hold to talk</button>
-</div>
 
 <script>
 /* Shared drive state + helpers. Defined before the feature scripts so both
