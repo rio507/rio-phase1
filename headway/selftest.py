@@ -1113,10 +1113,19 @@ def test_lead_selection():
     check("a candidate without its dwell cannot take the lock, however close",
           lead is near, str(info))
 
-    # ...but it does once its own dwell has elapsed. That IS the cut-in rule.
+    # Dwell served, but still only ONE range sample: it must still wait. This is
+    # the corroboration guard, and it is what stops the first reading after a
+    # blind spell from taking the lock.
     lead, info = cs.select_lead(1.8)
-    check("once the cut-in has served its dwell it takes the lock",
-          lead is closest and info["lead_changed"], str(info))
+    check("a single uncorroborated range cannot take the lock either",
+          lead is near and info["n_uncorroborated"] == 1, str(info))
+
+    # ...corroborate it and the cut-in takes the lock. That IS the cut-in rule.
+    closest.depths.append(5.2)
+    lead, info = cs.select_lead(1.8)
+    check("once corroborated, the cut-in takes the lock",
+          lead is closest and info["lead_changed"]
+          and info["n_uncorroborated"] == 0, str(info))
 
     # A candidate with no depth cannot be ranked, so it cannot be the lead --
     # however close it would be. Fresh set, so no other candidate competes.
@@ -1227,6 +1236,60 @@ def test_membership_is_deterministic():
         runs.append(seq)
     check("identical inputs give identical membership decisions",
           runs[0] == runs[1])
+
+
+def test_range_corroboration_guard():
+    """The first range reading after a blind spell cannot take the lead lock.
+
+    Replays the measured failure: three frames of refused depth empty the sample
+    window, then one glare-corrupted frame offers a single 5.1 m reading for a
+    real ~30 m gap. Without the guard that reading took the lock and reset the
+    Kalman, discarding the outlier gate exactly when the measurement was an
+    outlier.
+    """
+    from . import membership as M
+
+    cs = M.CandidateSet()
+    cs._factory = lambda: None
+    c = M.Candidate(1, _box(640, 700), "car", 0.0)
+    cs.candidates[1] = c
+
+    # Good frames: range corroborated around 30 m, membership dwell served.
+    for k, d in enumerate((30.5, 30.1, 29.8)):
+        c.depths.append(d)
+        c.update_overlap(0.98, "ok", k * 0.25)
+    lead, info = cs.select_lead(0.75)
+    check("a corroborated lead holds the lock", lead is c
+          and abs(lead.range_m - 30.1) < 0.2, str(info))
+
+    # Depth refused for three frames (glare). Nones evict the good samples.
+    for k in range(3, 6):
+        c.depths.append(None)
+        c.update_overlap(0.98, "ok", k * 0.25)
+    check("a blind spell empties the range window", c.n_valid_range == 0
+          and c.range_m is None)
+    lead, info = cs.select_lead(1.5)
+    check("no range means no lead, so the Kalman coasts",
+          lead is None and info["reason"] == "no_eligible_candidate", str(info))
+
+    # The frame after: one corrupted reading.
+    c.depths.append(5.1)
+    c.update_overlap(0.98, "ok", 1.75)
+    check("that one reading is not corroboration", c.n_valid_range == 1)
+    lead, info = cs.select_lead(1.75)
+    check("a single 5.1 m reading after the blind spell CANNOT take the lock",
+          lead is None and info["n_uncorroborated"] == 1,
+          "this is the 5.12 m false lead, blocked")
+
+    # Two agreeing readings do earn it -- the guard delays by one frame, it does
+    # not refuse forever. If the depth really is 5 m, we will believe it.
+    c.depths.append(5.3)
+    lead, info = cs.select_lead(2.0)
+    check("two agreeing readings do take the lock (one frame later)",
+          lead is c and info["n_uncorroborated"] == 0, str(info))
+    check("RANGE_MIN_SAMPLES is smaller than the dwell it hides behind",
+          M.RANGE_MIN_SAMPLES <= M.MEMBER_HOLD_S / 0.25,
+          "so it costs nothing on a legitimate acquisition")
 
 
 def test_glare_gate():
@@ -1398,6 +1461,7 @@ def main():
     test_merge_promotion()
     test_lead_selection()
     test_membership_is_deterministic()
+    test_range_corroboration_guard()
     test_glare_gate()
     test_lane_drift()
     test_lane_confidence_contribution()

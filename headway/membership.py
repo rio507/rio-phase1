@@ -85,6 +85,30 @@ MATCH_MAX_AREA_RATIO = 3.0   # ...and may not change size by more than this
 # afford to look, and looking is now cheap.
 CANDIDATE_MAX_UNDETECTED_S = 1.0
 DEPTH_MEDIAN_N = 3           # per-candidate range smoothing (see range_m)
+
+# How many VALID range samples a candidate needs before it may hold the lead.
+#
+# This closes a hole that has nothing to do with how fast a range changes.
+# Measured on the winding clip: three consecutive frames had their depth refused
+# as glare-flared, which correctly emptied every candidate's sample window. On
+# the next frame -- still glare-corrupted, but below the refusal threshold -- a
+# candidate's history was [None, None, 5.1] and it took the lead lock on that
+# ONE uncorroborated sample, at 5.1 m for a real 30 m gap. A lead switch resets
+# the Kalman, so the filter's outlier gate was discarded at exactly the moment
+# the measurement was an outlier.
+#
+# A RATE bound was tried first and does not work: the bad jump (30 m -> 5 m in
+# 0.24 s, 107 m/s) sits inside the legitimate distribution, whose 99.5th
+# percentile is 78-84 m/s and whose max is 95-107 m/s, because ROI depth on a
+# small distant box genuinely swings that hard. Corroboration separates cleanly
+# where rate cannot.
+#
+# It costs nothing on any legitimate path, which is why 2 is enough: MEMBER_HOLD_S
+# already requires 0.5 s (two frames at 4 fps) of membership, and merge promotion
+# already requires three overlap samples over 0.75 s. Both are longer than this.
+# What it forbids is precisely the case above -- taking the lock on the first
+# reading after a blind spell.
+RANGE_MIN_SAMPLES = 2
 HISTORY_S = 2.0              # overlap history kept per candidate
 
 # Only a vehicle can be a lead. Mirrors anchor.LEAD_LABELS; imported from there
@@ -235,6 +259,16 @@ class Candidate:
         return float(vals[len(vals) // 2])
 
     @property
+    def n_valid_range(self):
+        """How many of the retained depth samples are usable numbers.
+
+        Falls to zero while depth is being refused (glare, model failure), which
+        is what makes RANGE_MIN_SAMPLES bite on the first frame afterwards.
+        """
+        return sum(1 for d in self.depths
+                   if d is not None and math.isfinite(d))
+
+    @property
     def member_age_s(self):
         return None if self.member_since is None else (self.last_seen - self.member_since)
 
@@ -314,6 +348,7 @@ class Candidate:
             "mp": int(self.merge_promoted),
             "r": (None if self.range_m is None else round(self.range_m, 1)),
             "q": round(self.quality, 2),
+            "nr": self.n_valid_range,
             "s": round(self.score, 2),
             "w": self.overlap_reason if self.overlap_reason != "ok" else None,
         }
@@ -478,7 +513,15 @@ class CandidateSet:
         # it just must never be the thing a following distance is computed to.
         eligible = [c for c in self.candidates.values()
                     if not c.lost and c.label in LEAD_LABELS
-                    and c.eligible(t) and c.range_m is not None]
+                    and c.eligible(t) and c.range_m is not None
+                    # ...and its range is corroborated, not a single reading
+                    # taken the frame after a blind spell. See
+                    # RANGE_MIN_SAMPLES.
+                    and c.n_valid_range >= RANGE_MIN_SAMPLES]
+        uncorroborated = [c.id for c in self.candidates.values()
+                          if not c.lost and c.label in LEAD_LABELS
+                          and c.eligible(t) and c.range_m is not None
+                          and c.n_valid_range < RANGE_MIN_SAMPLES]
         info = {
             "n_candidates": len(self.candidates),
             "n_members": sum(1 for c in self.candidates.values()
@@ -486,7 +529,10 @@ class CandidateSet:
             "n_eligible": len(eligible),
             "n_vulnerable": sum(1 for c in self.candidates.values()
                                 if c.label not in LEAD_LABELS and not c.lost),
+            "n_uncorroborated": len(uncorroborated),
         }
+        if uncorroborated:
+            info["uncorroborated"] = uncorroborated
         if not eligible:
             changed = self.lead_id is not None
             self.lead_id = None

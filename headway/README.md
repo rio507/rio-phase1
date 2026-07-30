@@ -69,7 +69,7 @@ frame ──► lanes.py    UFLDv2 finds the ego lane        (~2 ms, every frame
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 276 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 284 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -274,6 +274,10 @@ lock. Merge promotion: `MERGE_MIN_SLOPE` (0.25 /s) over `MERGE_WINDOW_S` (0.75),
 `MERGE_MIN_OVERLAP` (0.15), `MERGE_MAX_RANGE_M` (40) — and never off the static
 trapezoid.
 
+`RANGE_MIN_SAMPLES` (2) is the corroboration guard on lead selection — a rate
+bound was tried first and cannot work, because the bad 30 m → 5 m jump (107 m/s)
+sits inside the legitimate distribution, whose max is 95–107 m/s.
+
 `CANDIDATE_MAX_UNDETECTED_S` (1.0) is measured from the last *detection*. With
 per-frame detection, four missed frames means gone. Association is by **centre
 displacement in box-diagonals**, not IoU: at 4 fps a correctly-tracked vehicle
@@ -370,14 +374,20 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
   instead (black level: veiling glare leaves nothing dark), and a refused frame
   is treated as *no* depth so the Kalman coasts. Those three frames now read
   30.6/30.5/30.3 m with confidence decaying to 0.006, i.e. DEGRADED.
-  - **It is not complete.** `GLARE_BLACK_LEVEL = 90` was chosen for perfect
-    specificity (0 false positives in 410 frames; the clean clip peaks at 30).
-    A *partially* glared frame where a dark object enters shot scores below it —
-    one such frame on the winding clip still reports 5.12 m at confidence 1.0.
-    Lowering the threshold starts refusing frames whose depth is fine, and
-    tuning it further on 200 frames of one clip would be false precision.
-    `glare_p01` is logged on every frame so it can be re-derived from real
-    drives, the same way `DRIFT_RATIO` is waiting on real drives.
+  - **The gate is not complete, so there is a second line of defence.**
+    `GLARE_BLACK_LEVEL = 90` was chosen for perfect specificity (0 false
+    positives in 410 frames; the clean clip peaks at 30), which means a
+    *partially* glared frame with a dark object in shot slips through.
+    `membership.RANGE_MIN_SAMPLES` catches what the gate misses: a candidate
+    needs ≥2 corroborated range samples to take the lead lock, so the first
+    reading after a blind spell cannot. That removed all three false leads
+    (10.0 m, 5.12 m, 10.67 m) without delaying a single real acquisition or the
+    merge promotion. `glare_p01` is logged on every frame so the threshold can
+    be re-derived from real drives, the same way `DRIFT_RATIO` is.
+  - **What it looks like when both fire:** the Kalman coasts and confidence
+    decays to 0, so the band goes stale and the loop is silent. The *displayed*
+    distance drifts with the coast and can read low — it is flagged by
+    `confidence 0.0`, but the overlay does not currently grey it out.
   - A gate on the depth *range* was tried first and rejected: 32% of the winding
     clip has a 95th-percentile depth under 20 m and most of it is correct — a
     redwood corner genuinely has nothing 50 m away. That gate would blind the
