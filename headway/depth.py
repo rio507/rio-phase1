@@ -10,6 +10,7 @@ the caller to remember.
 Stage 0 runs this on an L40S in fp16 (~12 ms/frame at 810x1080). Stage 1 swaps
 the backend for TensorRT on Orin; the `depth_map()` contract stays identical.
 """
+import cv2
 import numpy as np
 import torch
 
@@ -67,6 +68,83 @@ def warm() -> None:
     _ensure_loaded()
     dummy = np.zeros((64, 64, 3), dtype=np.uint8)
     depth_map(dummy)
+
+
+# ---------------------------------------------------------------------------
+# Veiling-glare gate
+# ---------------------------------------------------------------------------
+# WHAT THIS DEFENDS AGAINST, measured, not imagined.
+#
+# On the winding-road clip the loop reported a lead at 5.19 m when the real gap
+# was ~31 m, with depth_conf 0.98 and overall confidence 0.96. The ROI was
+# internally consistent -- high valid fraction, low spread -- and completely
+# wrong. Inspecting the frames: the windscreen was flared by low sun into a
+# sheet of veiling haze, and DA-V2 read the whole scene as one near surface. The
+# ENTIRE depth map maxed out at 10-12.6 m on a road where tarmac was visibly
+# receding well past that.
+#
+# So no confidence term computed FROM the depth map can catch this: the model is
+# confidently wrong, and every statistic derived from its output agrees with it.
+# The tell has to come from the image.
+#
+# WHY NOT JUST CHECK THE DEPTH RANGE. That was the first idea and measurement
+# killed it. On this clip 32% of frames have a 95th-percentile depth under 20 m,
+# and most of them are correct: a redwood corner where the road curves out of
+# sight genuinely has nothing 50 m away. Gating on depth range would blind the
+# system in precisely the tight terrain where it matters most.
+#
+# WHAT ACTUALLY SEPARATES THEM is the black level. Veiling glare adds a roughly
+# uniform luminance floor, so nothing in the frame stays dark. Measured 1st
+# percentile of luminance:
+#     clean highway clip   : median 10, max 29   (210 frames)
+#     winding clip, normal : median 38, p95 74
+#     the collapsed frames : 103-146
+# At >= 90 the gate flags 7 frames on the winding clip and ALL SEVEN have a
+# depth map maxing at 10-15 m; it flags nothing at all on the clean clip. Lower
+# thresholds start catching frames whose depth is fine.
+#
+# LIMITS, because this threshold is not yet earned on real drives. Fog and heavy
+# spray raise the black level too -- and refusing to trust depth in fog is the
+# behaviour we want anyway. Night driving lowers it, so this gate is silent then
+# and offers no protection; a snow field may raise it legitimately. Treat 90 as
+# provisional, the way DRIFT_RATIO is provisional, and re-derive it from
+# real-drive logs (`glare_p01` is recorded on every headway frame for exactly
+# that).
+GLARE_BLACK_LEVEL = 90.0
+
+# Sampled on a downscaled copy: this runs on every frame and the statistic is a
+# whole-frame percentile, so full resolution buys nothing.
+GLARE_SAMPLE_W = 320
+
+
+def frame_trust(frame: np.ndarray):
+    """Is this frame's depth worth believing? -> (ok, info).
+
+    Cheap and deterministic: one greyscale conversion and one percentile on a
+    320 px-wide copy, well under a millisecond.
+
+    `ok=False` means treat the frame as having NO depth measurement -- which the
+    loop already handles by coasting the Kalman -- rather than as having a close
+    one. "I cannot see" and "there is something 5 m ahead" must never be
+    confused, and this is the difference between them.
+    """
+    if frame is None or frame.ndim != 3:
+        return True, {"reason": "not_an_image"}
+    h, w = frame.shape[:2]
+    if w > GLARE_SAMPLE_W:
+        scale = GLARE_SAMPLE_W / float(w)
+        small = cv2.resize(frame, (GLARE_SAMPLE_W, max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = frame
+    grey = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    p01 = float(np.percentile(grey, 1))
+    ok = p01 < GLARE_BLACK_LEVEL
+    return ok, {
+        "glare_p01": round(p01, 1),
+        "threshold": GLARE_BLACK_LEVEL,
+        "reason": "ok" if ok else "veiling_glare",
+    }
 
 
 def depth_map(frame: np.ndarray) -> np.ndarray:

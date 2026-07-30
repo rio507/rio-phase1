@@ -139,6 +139,12 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "membership_info": result.get("membership_info"),
         "lead_id": result.get("lead_id"),
         "lead_switch": result.get("lead_switch"),
+        # Whether this frame's depth was believed, and the black-level
+        # statistic behind that call. Logged on EVERY frame, not just the
+        # refused ones, because GLARE_BLACK_LEVEL is provisional and the
+        # only way to re-derive it is the distribution from real drives.
+        "depth_trusted": result.get("depth_trusted"),
+        "glare_p01": result.get("glare_p01"),
         "n_detections": len((result.get("membership") or [])),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),

@@ -69,7 +69,7 @@ frame ──► lanes.py    UFLDv2 finds the ego lane        (~2 ms, every frame
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 268 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 276 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -358,9 +358,30 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
   floor and a 5 s candidate refresh. RF-DETR Nano runs in ~5 ms, so all of that
   is gone and detection is per-frame. Whole loop: **p95 20 ms at 4 fps, 12×
   headroom, ~50 fps sustainable.**
-- **Depth is now the most expensive stage** (6.6 ms of a 19 ms frame), followed
-  by RF-DETR (5.3 ms) and UFLDv2 (2.1 ms). Nothing on the path is near the
+- **Depth is now the most expensive stage** (7 ms of a 22 ms frame), followed
+  by RF-DETR (6 ms) and UFLDv2 (2.5 ms). Nothing on the path is near the
   budget; Stage 1's TensorRT work should start with DA-V2.
+- **DA-V2 collapses under windscreen veiling glare, confidently.** Measured on
+  the winding clip: low sun flaring the screen made the model read the whole
+  scene as one near surface — the entire depth map maxing at 10–12.6 m — and it
+  reported a lead at **5.19 m for a real ~31 m gap with depth_conf 0.98**. No
+  statistic taken from the depth map can catch that, because the model and its
+  own confidence are wrong together. `depth.frame_trust()` gates on the IMAGE
+  instead (black level: veiling glare leaves nothing dark), and a refused frame
+  is treated as *no* depth so the Kalman coasts. Those three frames now read
+  30.6/30.5/30.3 m with confidence decaying to 0.006, i.e. DEGRADED.
+  - **It is not complete.** `GLARE_BLACK_LEVEL = 90` was chosen for perfect
+    specificity (0 false positives in 410 frames; the clean clip peaks at 30).
+    A *partially* glared frame where a dark object enters shot scores below it —
+    one such frame on the winding clip still reports 5.12 m at confidence 1.0.
+    Lowering the threshold starts refusing frames whose depth is fine, and
+    tuning it further on 200 frames of one clip would be false precision.
+    `glare_p01` is logged on every frame so it can be re-derived from real
+    drives, the same way `DRIFT_RATIO` is waiting on real drives.
+  - A gate on the depth *range* was tried first and rejected: 32% of the winding
+    clip has a 95th-percentile depth under 20 m and most of it is correct — a
+    redwood corner genuinely has nothing 50 m away. That gate would blind the
+    system in the tightest terrain.
 - **No LLM anywhere in the headway path, live or offline.** `run_clip.py`
   defaults to `--anchor detr` too: RF-DETR + the corridor, through the same
   `LeadAnchor.select_from()` the live loop uses. `--anchor qwen` is kept for

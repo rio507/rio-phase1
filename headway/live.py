@@ -196,6 +196,7 @@ class LiveSession:
         self.n_merge_promotions = 0
         self.n_detections = 0
         self.detect_error = None    # first detector failure, reported once
+        self.n_glare_frames = 0     # frames whose depth was refused as flared
 
         self.t = 0.0                # session clock, seconds
         self.last_wall = None
@@ -317,12 +318,27 @@ class LiveSession:
         # --- depth: one pass, shared by the anchor and the ROI measurement ---
         depth_full = None
         depth_err = None
+        # Veiling glare makes DA-V2 read the whole scene as one near surface --
+        # measured at 5.19 m for a real 31 m gap, with depth_conf 0.98. No
+        # statistic derived from the depth map can catch that, because the model
+        # and its own confidence agree with each other. So the frame is judged
+        # first, and a flared frame is treated as having NO depth rather than a
+        # close one: the Kalman coasts, no candidate gets a range, and no lead
+        # can be selected off it. See depth.frame_trust.
+        depth_trust, trust_info = depth_mod.frame_trust(frame)
         with _gpu_lock:
-            try:
-                depth_full = depth_mod.depth_map(frame)
-            except Exception as e:
-                # A depth failure costs this frame's range, not the session.
-                depth_err = str(e)
+            if not depth_trust:
+                # Skipping the depth pass entirely also gives the frame back its
+                # ~7 ms, which is a pleasant side effect and not the point.
+                depth_err = trust_info["reason"]
+            else:
+                try:
+                    depth_full = depth_mod.depth_map(frame)
+                except Exception as e:
+                    # A depth failure costs this frame's range, not the session.
+                    depth_err = str(e)
+        if not depth_trust:
+            self.n_glare_frames += 1
         t_depth = time.perf_counter()
 
         # --- detect: every road user in this frame (RF-DETR, ~5 ms) --------
@@ -539,6 +555,8 @@ class LiveSession:
 
             "image": {"w": w, "h": h},
             "depth_error": depth_err,
+            "depth_trusted": bool(depth_trust),
+            "glare_p01": trust_info.get("glare_p01"),
             "timing_ms": {
                 "decode": round((t_decode - t_start) * 1000, 1),
                 "lanes": round((t_lanes - t_decode) * 1000, 1),
@@ -589,5 +607,6 @@ def active_sessions() -> dict:
                     "candidates": len(s.candidates.candidates),
                     "detections": s.n_detections,
                     "detect_error": s.detect_error,
+                    "glare_frames": s.n_glare_frames,
                     "lane_error": s.lane_error}
                 for k, s in _sessions.items()}

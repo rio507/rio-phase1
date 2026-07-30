@@ -1229,6 +1229,57 @@ def test_membership_is_deterministic():
           runs[0] == runs[1])
 
 
+def test_glare_gate():
+    """A flared frame yields NO depth, not a close one."""
+    import numpy as np
+
+    from . import depth as D
+
+    H, W = 180, 320
+
+    # A normal scene has dark pixels somewhere -- shadow, tyre, tree.
+    normal = np.random.default_rng(0).integers(0, 255, (H, W, 3), dtype=np.uint8)
+    ok, info = D.frame_trust(normal)
+    check("an ordinary frame is trusted", ok, str(info))
+
+    # Veiling glare lifts the whole frame off black. Same contrast, no darks.
+    flared = np.clip(normal.astype(np.int16) // 2 + 130, 0, 255).astype(np.uint8)
+    ok, info = D.frame_trust(flared)
+    check("a frame with no dark pixels anywhere is refused",
+          not ok and info["reason"] == "veiling_glare", str(info))
+
+    # A DARK frame is not glare and must stay trusted -- night driving is
+    # exactly when this gate must keep its hands off.
+    night = (normal // 6).astype(np.uint8)
+    ok, info = D.frame_trust(night)
+    check("a dark (night) frame is still trusted", ok, str(info))
+
+    # The threshold sits well clear of both measured populations.
+    check("GLARE_BLACK_LEVEL is above the clean-clip maximum (29)",
+          D.GLARE_BLACK_LEVEL > 29.0)
+    check("...and below the observed collapsed frames (93-146)",
+          D.GLARE_BLACK_LEVEL <= 93.0, f"{D.GLARE_BLACK_LEVEL}")
+
+    # It is a statistic on the IMAGE, never on the depth map: the whole point is
+    # that the depth map and its own confidence agree with each other when they
+    # are wrong together.
+    # It is a statistic on the IMAGE, never on the depth map -- the whole point
+    # is that the depth map and its own confidence agree with each other when
+    # they are wrong together. Checked on the code, comments stripped.
+    from pathlib import Path
+    body = _code_only(Path(__file__).with_name("depth.py"))
+    fn = body[body.index("def frame_trust"):]
+    fn = fn[:fn.index("def depth_map")]
+    check("frame_trust never reads a depth map",
+          "depth_map" not in fn and "predicted_depth" not in fn,
+          "the tell has to come from the image, not from the model's own output")
+    check("...and it does not need the model loaded at all",
+          "_ensure_loaded" not in fn,
+          "so a flared frame skips the depth pass entirely")
+    check("the gate reports the statistic it judged on, for later tuning",
+          "glare_p01" in D.frame_trust(normal)[1])
+
+
 def test_lane_confidence_contribution():
     """Lane confidence may add to §8 confidence; it may never subtract."""
     args = (0.8, 0.3, 0.7, 2.0)      # valid, var, track, anchor_age
@@ -1347,6 +1398,7 @@ def main():
     test_merge_promotion()
     test_lead_selection()
     test_membership_is_deterministic()
+    test_glare_gate()
     test_lane_drift()
     test_lane_confidence_contribution()
     test_lane_advisory_only()
