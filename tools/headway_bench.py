@@ -75,6 +75,11 @@ def main():
     lane_fallback_why = {}
     lane_confs = []
     drifts = []
+    merges, switches = [], []
+    cand_seen, member_seen, elig_seen = [], [], []
+    ov_by_state, seen_ids, eligible_ids = {}, set(), set()
+    violations, hyst_holds = [], 0
+    membership_ms = []
     rows, spoken = [], []
     idx, n = 0, 0
     t_run = time.time()
@@ -104,6 +109,7 @@ def main():
                 anchor_ms.append(tm.get("anchor", 0.0))
                 tail_ms.append(tm.get("track_filter", 0.0))
                 lane_ms.append(tm.get("lanes", 0.0))
+                membership_ms.append(tm.get("membership", 0.0))
 
                 src = j.get("corridor_source") or "static"
                 lane_src[src] = lane_src.get(src, 0) + 1
@@ -113,6 +119,28 @@ def main():
                     lane_fallback_why[why] = lane_fallback_why.get(why, 0) + 1
                 if (j.get("lane_drift") or {}).get("drift"):
                     drifts.append((idx / src_fps, j["lane_drift"]))
+                for mp in (j.get("merge_promotions") or []):
+                    merges.append((idx / src_fps, mp))
+                mi = j.get("membership_info") or {}
+                cand_seen.append(mi.get("n_candidates", 0))
+                member_seen.append(mi.get("n_members", 0))
+                elig_seen.append(mi.get("n_eligible", 0))
+                if j.get("lead_switch"):
+                    switches.append((idx / src_fps, j["lead_switch"]))
+                for m in (j.get("membership") or []):
+                    ov_by_state.setdefault(bool(m["m"]), []).append(m["ov"])
+                    seen_ids.add(m["id"])
+                    if m["e"]:
+                        eligible_ids.add(m["id"])
+                    # THE violation to look for: eligible on a frame where it
+                    # is neither an in-lane member nor a merge promotion. A
+                    # candidate that was adjacent earlier and legitimately
+                    # moved into our lane is not a violation, so "was ever
+                    # adjacent" is the wrong test -- it has to be same-frame.
+                    if m["e"] and not m["m"] and not m["mp"]:
+                        violations.append((round(idx / src_fps, 2), m))
+                    if m["m"] and m["ov"] < 0.25:
+                        hyst_holds += 1
                 (anchor_frames if j.get("anchored") else steady_frames).append(
                     tm.get("total", 0.0))
                 rows.append((idx / src_fps, j))
@@ -158,6 +186,7 @@ def main():
     stats("client round-trip", rtt)
     stats("server total", server_total)
     stats("  lanes (UFLDv2)", lane_ms)
+    stats("  membership", membership_ms)
     stats("  depth (DA-V2)", depth_ms)
     stats("  anchor (Qwen)", anchor_ms)
     stats("  track+filter+policy", tail_ms)
@@ -197,6 +226,40 @@ def main():
             print(f"  cost of lane detection mean {statistics.mean(lane_ms):.2f} ms  "
                   f"({statistics.mean(lane_ms) / max(statistics.mean(server_total), 1e-9) * 100:.0f}% "
                   f"of server frame time)")
+
+    # --- in-lane membership -------------------------------------------------
+    if cand_seen:
+        print(f"\nmembership, {len(cand_seen)} frames")
+        print(f"  candidates tracked     mean {statistics.mean(cand_seen):.2f}  "
+              f"max {max(cand_seen)}")
+        print(f"  in-lane members        mean {statistics.mean(member_seen):.2f}  "
+              f"max {max(member_seen)}")
+        print(f"  lead-eligible          mean {statistics.mean(elig_seen):.2f}  "
+              f"max {max(elig_seen)}")
+        print(f"  distinct candidates seen: {len(seen_ids)}  "
+              f"ever lead-eligible: {len(eligible_ids)}")
+        print(f"  frames held by hysteresis (member below 25%): {hyst_holds}")
+        # THE CLAIM UNDER TEST: adjacent-lane traffic never becomes eligible.
+        print(f"  ADJACENT-LANE CANDIDATES ELIGIBLE WHILE NOT IN LANE: "
+              f"{len(violations)}" + ("  (none)" if not violations else ""))
+        for t, m in violations[:10]:
+            print(f"    {t:6.2f}s  cand {m['id']} ({m['l']}) overlap {m['ov']:.2f}")
+        for member, vals in sorted(ov_by_state.items()):
+            if vals:
+                label = "members" if member else "non-members"
+                print(f"  overlap of {label:12} n={len(vals):5} "
+                      f"mean {statistics.mean(vals):.3f}  p95 {pct(vals, 95):.3f}")
+
+    print(f"\nlead switches: {len(switches)}")
+    for t, sw in switches:
+        print(f"  {t:6.2f}s  {sw['from_id']} -> {sw['to_id']} ({sw['label']}) "
+              f"at {sw['range_m']} m  via_merge={sw['via_merge']}")
+
+    print(f"\nmerge_promotion events: {len(merges)}")
+    for t, mp in merges:
+        print(f"  {t:6.2f}s  cand {mp['candidate_id']} ({mp['label']}) "
+              f"overlap {mp['overlap']:.2f} rising {mp['slope_per_s']:+.2f}/s "
+              f"over {mp['window_s']:.2f}s at {mp['range_m']} m")
 
     print(f"\nlane_drift events (advisory log only, no voice): {len(drifts)}")
     for t, d in drifts:

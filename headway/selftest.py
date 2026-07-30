@@ -681,15 +681,21 @@ def test_anchor_enumerates_corridor_selects():
     from . import anchor as A
 
     # -- the prompt must not ask the model to choose -----------------------
+    # It IS allowed to scope what gets listed (our lane plus the ones either
+    # side is all any downstream rule reads, and enumerating the whole horizon
+    # cost seconds of decode). What it must never do is name the lead.
     p = A.ANCHOR_PROMPT.lower()
-    check("prompt asks for every vehicle in any lane",
-          "every vehicle" in p and "any lane" in p)
+    check("prompt asks for a list, not a pick",
+          "list the vehicles" in p and "at most" in p)
+    check("prompt covers the adjacent lanes merge detection needs",
+          "immediately left or right" in p)
     check("prompt explicitly declines to have the model pick the lead",
           "do not decide which vehicle i am following" in p)
-    for banned in ("my lane", "the lane i am driving in", "single vehicle",
+    for banned in ("the single vehicle directly ahead",
+                   "the lane i am driving in",
                    "ignore vehicles in other lanes"):
         check(f"prompt no longer says {banned!r}", banned not in p,
-              "that phrasing hands the lane judgement back to Qwen")
+              "that phrasing hands the lead selection back to Qwen")
 
     # -- parsing the enumerated reply --------------------------------------
     W, H = 1280, 720
@@ -728,10 +734,18 @@ def test_anchor_enumerates_corridor_selects():
           f"got {[lab for lab, _ in got]}")
     check("the repaired box keeps its real coordinates",
           abs(got[0][1][0] - 1004.8) < 0.5, str(got[0][1]))
-    check("token budget is above the length that truncated in the field",
-          A.ANCHOR_MAX_NEW_TOKENS >= 160
-          and A.LeadAnchor(W, H, use_qwen=False).max_new_tokens
-              == A.ANCHOR_MAX_NEW_TOKENS)
+    # The budget is deliberately BELOW a full reply. Decode runs ~52 tokens/s,
+    # so 192 tokens measured 3.4 s of frame time on a busy motorway; the reply
+    # is closest-first and repair keeps what arrived, so the budget buys
+    # latency at the cost of the far tail, which changes no decision.
+    check("token budget is bounded by the frame budget, not by reply length",
+          A.ANCHOR_MAX_NEW_TOKENS <= 96, f"{A.ANCHOR_MAX_NEW_TOKENS} tokens")
+    check("the anchor uses that budget",
+          A.LeadAnchor(W, H, use_qwen=False).max_new_tokens
+          == A.ANCHOR_MAX_NEW_TOKENS)
+    check("truncation is therefore expected, and survivable",
+          A.repair_truncated_json('{"o": [["car",1,2,300,400], [5') is not None,
+          "a capped budget is only safe because repair exists")
 
     mixed = '{"o": [["car", 100, 300, 200, 400], [300, 300, 400, 400]]}'
     check("an unlabelled entry beside labelled ones is dropped, not guessed",
@@ -857,6 +871,319 @@ def test_lead_corridor_check():
           n == 0 and geo is None)
 
 
+def _box(u, v, w=80, h=110):
+    """Box with bottom-centre at (u, v)."""
+    return (u - w / 2.0, v - h, u + w / 2.0, v)
+
+
+def test_membership_overlap():
+    """Membership is an overlap fraction of the bottom edge, not a centre point."""
+    from . import anchor as A
+    from . import membership as M
+
+    base = A.EgoCorridor(1280, 720)
+    lane, _ = A.build_corridor(base, _lane_result(conf=0.9))
+    # Lane at row 700 runs x = 312.6 .. 967.4 (654.8 px wide), no margin.
+    xl, xr = lane.bounds_at_row(700.0)
+    check("lane bounds at a row come back without the corridor margin",
+          abs(xl - 312.6) < 1 and abs(xr - 967.4) < 1, f"{xl:.1f}..{xr:.1f}")
+
+    frac, info = M.bottom_edge_overlap(_box(640, 700, w=100), lane)
+    check("a centred vehicle is fully in lane", abs(frac - 1.0) < 1e-6, str(info))
+
+    # THE WIDE-TRUCK CASE. A 400 px truck straddling the right line: its
+    # bottom-CENTRE at 967 is right on the boundary, but 50% of its body is in
+    # our lane. The centre-point test this replaces would call it a coin flip.
+    truck = _box(967, 700, w=400)
+    frac, _ = M.bottom_edge_overlap(truck, lane)
+    check("a wide truck straddling the line reads ~50% in lane",
+          abs(frac - 0.5) < 0.02, f"{frac:.3f}")
+    inside_centre, _ = lane.contains(967.0, 700.0)
+    check("...and the old centre-point test is the one that is ambiguous here",
+          inside_centre, "centre sits exactly on the boundary")
+
+    # THE MOTORCYCLE CASE. Narrow, hugging the inside of the right line: fully
+    # in lane by overlap.
+    moto = _box(940, 700, w=40)
+    frac, _ = M.bottom_edge_overlap(moto, lane)
+    check("a motorcycle hugging the lane edge is fully in lane",
+          abs(frac - 1.0) < 1e-6, f"{frac:.3f}")
+
+    # Wholly outside.
+    frac, _ = M.bottom_edge_overlap(_box(1150, 700, w=100), lane)
+    check("an adjacent-lane vehicle has zero overlap", frac == 0.0)
+
+    # Rows the paint does not reach are UNKNOWN, not "outside".
+    frac, info = M.bottom_edge_overlap(_box(640, 20, w=80), lane)
+    check("a row with no lane is reported as unknown, not as zero overlap",
+          info["reason"] == "no_lane_at_row", str(info))
+
+    # The trapezoid answers the same question, so the fallback path is the
+    # same code with worse geometry rather than a different rule.
+    frac_static, _ = M.bottom_edge_overlap(_box(640, 700, w=100), base)
+    check("the static trapezoid supports the same overlap test",
+          frac_static > 0.9, f"{frac_static:.3f}")
+
+
+def test_membership_hysteresis_and_dwell():
+    from . import membership as M
+
+    c = M.Candidate(1, _box(640, 700), "car", 0.0)
+    check("a candidate starts outside membership", not c.member)
+
+    c.update_overlap(0.30, "ok", 0.0)
+    check("30% does not enter membership (needs 40%)", not c.member)
+    c.update_overlap(0.45, "ok", 0.25)
+    check("45% enters membership", c.member and c.member_since == 0.25)
+
+    # Hysteresis: between the two thresholds, membership is KEPT.
+    c.update_overlap(0.30, "ok", 0.5)
+    check("30% keeps membership once held (hysteresis band)", c.member)
+    check("...and does not restart the dwell clock", c.member_since == 0.25)
+    c.update_overlap(0.20, "ok", 0.75)
+    check("below 25% leaves membership", not c.member and c.member_since is None)
+
+    # Dwell.
+    d = M.Candidate(2, _box(640, 700), "car", 0.0)
+    d.update_overlap(0.9, "ok", 0.0)
+    check("membership alone is not eligibility", not d.eligible(0.0))
+    d.update_overlap(0.9, "ok", 0.25)
+    check("0.25 s of membership is not enough", not d.eligible(0.25))
+    d.update_overlap(0.9, "ok", 0.5)
+    check("0.5 s of continuous membership is eligible", d.eligible(0.5))
+    check("MEMBER_HOLD_S is the ~0.5 s the spec asked for",
+          abs(M.MEMBER_HOLD_S - 0.5) < 1e-9)
+
+    # A break resets the clock -- this is what stops oncoming traffic swinging
+    # through the polygon on a bend from taking the lock.
+    d.update_overlap(0.1, "ok", 0.75)
+    d.update_overlap(0.9, "ok", 1.0)
+    check("membership lost and regained restarts the dwell",
+          not d.eligible(1.0) and d.member_since == 1.0)
+
+    # An unknown row neither grants nor revokes membership.
+    e = M.Candidate(3, _box(640, 700), "car", 0.0)
+    e.update_overlap(0.9, "ok", 0.0)
+    e.update_overlap(0.0, "no_lane_at_row", 0.25)
+    check("an unreadable row does not revoke membership", e.member)
+    check("...and does not enter the trend history", len(e.history) == 1)
+
+
+def test_merge_promotion():
+    from . import membership as M
+
+    def rising(c, t0, start, step, n, rng=25.0, dt=0.25):
+        out = []
+        for i in range(n):
+            c.depths.append(rng)
+            c.update_overlap(start + step * i, "ok", t0 + i * dt)
+            out.append(c.check_merge(t0 + i * dt, True))
+        return [e for e in out if e]
+
+    # A car easing in: overlap climbing ~0.4/s, 25 m ahead.
+    c = M.Candidate(1, _box(1000, 700), "car", 0.0)
+    events = rising(c, 0.0, 0.05, 0.10, 6)
+    check("a steadily merging vehicle is promoted", len(events) == 1, str(events))
+    ev = events[0]
+    check("the promotion window is at least MERGE_WINDOW_S",
+          ev["window_s"] >= M.MERGE_WINDOW_S - 1e-9, str(ev))
+    check("the promotion records the slope that justified it",
+          ev["slope_per_s"] >= M.MERGE_MIN_SLOPE, str(ev))
+    check("promotion fires once, not once per frame",
+          not rising(c, 2.0, 0.6, 0.10, 4))
+
+    # The whole point of promotion: eligible while still BELOW the membership
+    # threshold, so the lock is available before the merge completes. Overlap
+    # climbs 0.05 -> 0.33, never reaching MEMBER_ENTER_FRAC.
+    early = M.Candidate(8, _box(1000, 700), "car", 0.0)
+    ev = rising(early, 0.0, 0.05, 0.07, 5)
+    check("a merging vehicle is promoted before it qualifies as a member",
+          len(ev) == 1 and not early.member and early.overlap < M.MEMBER_ENTER_FRAC,
+          f"overlap {early.overlap:.2f}, member={early.member}")
+    check("...and that promotion alone makes it lead-eligible",
+          early.eligible(1.0) and early.member_since is None)
+
+    # Steady adjacent traffic: overlap flat. Must never promote.
+    flat = M.Candidate(2, _box(1000, 700), "car", 0.0)
+    check("a vehicle holding its lane is never promoted",
+          not rising(flat, 0.0, 0.30, 0.0, 8))
+    # Drifting away.
+    away = M.Candidate(3, _box(1000, 700), "car", 0.0)
+    check("a vehicle drifting away is never promoted",
+          not rising(away, 0.0, 0.35, -0.05, 8))
+
+    # Too far to matter.
+    far = M.Candidate(4, _box(1000, 700), "car", 0.0)
+    check("a merge beyond MERGE_MAX_RANGE_M is not promoted",
+          not rising(far, 0.0, 0.05, 0.10, 6, rng=M.MERGE_MAX_RANGE_M + 5))
+
+    # Too short a window: three frames at 4 fps is 0.5 s, under the 0.75 s bar.
+    quick = M.Candidate(5, _box(1000, 700), "car", 0.0)
+    check("a rise seen for under MERGE_WINDOW_S is not yet a merge",
+          not rising(quick, 0.0, 0.05, 0.15, 3))
+
+    # Not actually touching our lane yet.
+    edge = M.Candidate(6, _box(1000, 700), "car", 0.0)
+    check("a rise that has not reached MERGE_MIN_OVERLAP is not promoted",
+          not rising(edge, 0.0, 0.0, 0.02, 8))
+
+    # And the trapezoid may not declare one.
+    trap = M.Candidate(7, _box(1000, 700), "car", 0.0)
+    fired = []
+    for i in range(6):
+        trap.depths.append(25.0)
+        trap.update_overlap(0.05 + 0.10 * i, "ok", i * 0.25)
+        fired.append(trap.check_merge(i * 0.25, False))
+    check("no merge may be declared off the static trapezoid",
+          not any(fired))
+
+
+def test_lead_selection():
+    """Nearest eligible candidate wins; a cut-in is a NEW_LEAD."""
+    from . import membership as M
+
+    cs = M.CandidateSet(tracker_factory=None)
+    cs._factory = lambda: None      # no frames in this test; boxes set directly
+
+    def add(cid, u, rng, overlap=0.9, t=0.0):
+        c = M.Candidate(cid, _box(u, 700), "car", t)
+        cs.candidates[cid] = c
+        for k in range(3):
+            c.depths.append(rng)
+            c.update_overlap(overlap, "ok", t + k * 0.25)
+        return c
+
+    far = add(1, 640, 40.0)
+    lead, info = cs.select_lead(0.5)
+    check("the only eligible candidate takes the lock",
+          lead is far and info["lead_changed"], str(info))
+
+    # A car cuts in closer.
+    near = add(2, 640, 18.0, t=0.5)
+    lead, info = cs.select_lead(1.0)
+    check("a nearer in-lane vehicle becomes the new lead",
+          lead is near and info["lead_changed"]
+          and info["prev_lead_id"] == 1, str(info))
+    lead, info = cs.select_lead(1.25)
+    check("...and holding it is not reported as another change",
+          lead is near and not info["lead_changed"])
+
+    # An ineligible (too-brief) candidate must not steal the lock however close.
+    closest = M.Candidate(3, _box(640, 700), "car", 1.25)
+    cs.candidates[3] = closest
+    closest.depths.append(5.0)
+    closest.update_overlap(0.95, "ok", 1.25)
+    lead, info = cs.select_lead(1.5)
+    check("a candidate without its dwell cannot take the lock, however close",
+          lead is near, str(info))
+
+    # ...but it does once its own dwell has elapsed. That IS the cut-in rule.
+    lead, info = cs.select_lead(1.8)
+    check("once the cut-in has served its dwell it takes the lock",
+          lead is closest and info["lead_changed"], str(info))
+
+    # A candidate with no depth cannot be ranked, so it cannot be the lead --
+    # however close it would be. Fresh set, so no other candidate competes.
+    cs3 = M.CandidateSet()
+    cs3._factory = lambda: None
+    blind = M.Candidate(1, _box(640, 700), "car", 0.0)
+    cs3.candidates[1] = blind
+    for k in range(3):
+        blind.update_overlap(0.95, "ok", k * 0.25)      # no depths appended
+    lead, info = cs3.select_lead(1.0)
+    check("a candidate with no range is not selectable",
+          lead is None and info["reason"] == "no_eligible_candidate", str(info))
+
+    # Non-vehicles never enter the set at all.
+    cs2 = M.CandidateSet()
+    cs2._factory = lambda: None
+    cs2.observe([("pedestrian", _box(640, 700)), ("car", _box(640, 700))], 0.0)
+    check("only vehicle labels become candidates",
+          len(cs2.candidates) == 1
+          and next(iter(cs2.candidates.values())).label == "car")
+
+    # A candidate no enumeration has re-confirmed is retired, even though its
+    # tracker is still cheerfully reporting success. MOSSE never admits defeat,
+    # so a liveness rule based on the tracker retires nothing -- measured at 21
+    # live candidates on a clip whose prompt asks for four.
+    cs4 = M.CandidateSet()
+    cs4._factory = lambda: None
+    cs4.observe([("car", _box(640, 700))], 0.0)
+    for k in range(1, 40):                      # 10 s of "successful" tracking
+        t = k * 0.25
+        for c in cs4.candidates.values():
+            c.last_seen = t                     # what track() would set
+        cs4._evict(t)
+    check("a candidate no enumeration re-confirms is evicted",
+          not cs4.candidates,
+          "MOSSE reporting success is not evidence the vehicle is there")
+    check("...and re-detection keeps it alive",
+          _still_alive_after_redetection(M))
+
+
+def _still_alive_after_redetection(M):
+    cs = M.CandidateSet()
+    cs._factory = lambda: None
+    for k in range(0, 40):
+        t = k * 0.25
+        if k % 8 == 0:                          # an enumeration every 2 s
+            cs.observe([("car", _box(640, 700))], t)
+        else:
+            for c in cs.candidates.values():
+                c.last_seen = t
+            cs._evict(t)
+    return len(cs.candidates) == 1
+
+
+def test_membership_is_deterministic():
+    """No model, no clock, no randomness in the membership decision."""
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).with_name("membership.py")
+    tree = ast.parse(path.read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                imported.add(node.module.split(".")[0])
+            imported.update(a.name for a in node.names
+                            if node.level and not node.module)
+    # cv2 only for the MOSSE factory, anchor only for LEAD_LABELS. No model,
+    # no clock, no randomness -- membership must be a pure function of boxes,
+    # the lane polygon and the timestamps it is handed.
+    check("membership.py imports only maths, collections, cv2 and anchor",
+          imported <= {"math", "collections", "cv2", "anchor"},
+          f"imports: {sorted(imported)}")
+    for forbidden in ("time", "random", "torch", "transformers", "numpy"):
+        check(f"membership.py does not import {forbidden!r}",
+              forbidden not in imported, "membership is deterministic geometry")
+
+    src = _code_only(path).lower()
+    for banned in ("qwen", "generate", "prompt", "llm"):
+        check(f"membership.py code never references {banned!r}", banned not in src)
+
+    # Same inputs, same outputs, twice.
+    from . import membership as M
+    from . import anchor as A
+    lane, _ = A.build_corridor(A.EgoCorridor(1280, 720), _lane_result(conf=0.9))
+    runs = []
+    for _ in range(2):
+        c = M.Candidate(1, _box(900, 700, w=200), "car", 0.0)
+        seq = []
+        for i in range(8):
+            c.depths.append(20.0)
+            frac, _ = M.bottom_edge_overlap(
+                _box(900 - i * 20, 700, w=200), lane)
+            c.update_overlap(frac, "ok", i * 0.25)
+            seq.append((round(frac, 6), c.member, bool(c.check_merge(i * 0.25, True))))
+        runs.append(seq)
+    check("identical inputs give identical membership decisions",
+          runs[0] == runs[1])
+
+
 def test_lane_confidence_contribution():
     """Lane confidence may add to §8 confidence; it may never subtract."""
     args = (0.8, 0.3, 0.7, 2.0)      # valid, var, track, anchor_age
@@ -969,6 +1296,11 @@ def main():
     test_corridor_source()
     test_anchor_enumerates_corridor_selects()
     test_lead_corridor_check()
+    test_membership_overlap()
+    test_membership_hysteresis_and_dwell()
+    test_merge_promotion()
+    test_lead_selection()
+    test_membership_is_deterministic()
     test_lane_drift()
     test_lane_confidence_contribution()
     test_lane_advisory_only()

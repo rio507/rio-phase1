@@ -264,6 +264,11 @@ async def headway_frame_endpoint(
     # sessions.log_lane_drift and the scope note in headway/lanes.py.
     if (result.get("lane_drift") or {}).get("drift"):
         sessions.log_lane_drift(session_id, result)
+    # Merge promotions DO change behaviour (a promoted candidate can take the
+    # lead lock), so unlike drift these are worth pulling out of the stream to
+    # review against what the driver actually experienced.
+    if result.get("merge_promotions"):
+        sessions.log_merge_promotion(session_id, result)
     return result
 
 

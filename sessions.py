@@ -129,6 +129,16 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "lane_offset": result.get("lane_offset"),
         "lane_fallback_reason": (result.get("lane_info") or {}).get("fallback_reason"),
         "lead_out_of_corridor": result.get("lead_out_of_corridor"),
+        # Per-candidate membership, every frame. This is the largest thing in
+        # the log by some way -- six candidates of ~9 short keys at 4 Hz is
+        # roughly 1.5 kB/s, ~5 MB an hour. It is kept in full anyway because
+        # tuning MEMBER_ENTER_FRAC / MEMBER_HOLD_S / the merge slope is
+        # impossible from summary statistics: you need the frame where a
+        # candidate sat at 0.38 for four frames and never got adopted.
+        "membership": result.get("membership"),
+        "membership_info": result.get("membership_info"),
+        "lead_id": result.get("lead_id"),
+        "lead_switch": result.get("lead_switch"),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),
     })
@@ -162,6 +172,40 @@ def log_lane_drift(session_id: Optional[str], result: dict) -> None:
         "v_host": result.get("v_host"),
         "band": result.get("band"),
     })
+
+
+def log_merge_promotion(session_id: Optional[str], result: dict) -> None:
+    """A neighbouring vehicle promoted to lead-eligible on a rising overlap.
+
+    Its own event kind for the same reason lane_drift has one: these are rare,
+    they are the thing most likely to be tuned wrong, and reviewing them means
+    selecting them out of a whole drive. Each record carries the slope and the
+    window that justified it, so a false promotion can be argued with rather
+    than just noticed.
+
+    Unlike lane_drift this one DOES affect behaviour -- a promoted candidate can
+    take the lead lock, and the lead is what the voice path measures. It is
+    still not a voice line of its own.
+    """
+    if not session_id:
+        return
+    for ev in (result.get("merge_promotions") or []):
+        _write(session_id, "merge_promotion", {
+            "frame_idx": result.get("frame_idx"),
+            "t": result.get("t"),
+            "candidate_id": ev.get("candidate_id"),
+            "label": ev.get("label"),
+            "overlap": ev.get("overlap"),
+            "slope_per_s": ev.get("slope_per_s"),
+            "window_s": ev.get("window_s"),
+            "samples": ev.get("samples"),
+            "range_m": ev.get("range_m"),
+            "box": ev.get("box"),
+            "corridor_source": ev.get("corridor_source"),
+            "lane_conf": result.get("lane_conf"),
+            "v_host": result.get("v_host"),
+            "band": result.get("band"),
+        })
 
 
 def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes_len: int, latency_ms: float) -> None:

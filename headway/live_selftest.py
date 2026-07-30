@@ -231,10 +231,25 @@ def run_pipeline():
     check(all(0 <= r["urgency"] <= 3 for r in records), "urgency in 0-3")
     check(all(r["lead_box"] is None or len(r["lead_box"]) == 4 for r in records),
           "lead_box is a 4-tuple or null")
-    # No Qwen per frame: one anchor at session start, none after, on a 16 s clip.
-    check(session_anchor_calls(records) == 1,
-          "exactly one anchor over the clip -- no Qwen per frame",
-          f"{session_anchor_calls(records)} anchored frame(s)")
+    # No Qwen per frame. This used to read "exactly one anchor over the clip",
+    # and that was the right assertion when the anchor's only job was to (re-)
+    # find the lead. It now also refreshes the CANDIDATE SET, which membership
+    # dwell and merge-trend detection are measured on, so it fires on
+    # CANDIDATE_REFRESH_S as well -- 4 calls on this 16 s clip instead of 1.
+    #
+    # The invariant being defended is unchanged and is stated directly below
+    # rather than approximated by a count of one: Qwen must stay OFF the
+    # per-frame path. One call per 5 s at 4 fps is one frame in twenty. If a
+    # future edit puts it back on every frame, both of these fail.
+    n_anchors = session_anchor_calls(records)
+    span_s = records[-1]["t"] - records[0]["t"]
+    budget = int(span_s / live_mod.CANDIDATE_REFRESH_S) + 2
+    check(n_anchors <= budget,
+          "anchors are bounded by the candidate-refresh interval",
+          f"{n_anchors} anchored frame(s) over {span_s:.1f}s, budget {budget}")
+    check(n_anchors <= 0.2 * len(records),
+          "Qwen runs on at most 1 frame in 5 -- never the per-frame path",
+          f"{n_anchors}/{len(records)} frames anchored")
     return records
 
 

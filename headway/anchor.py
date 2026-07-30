@@ -48,18 +48,25 @@ QWEN_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 # LEAD_LABELS, restated here because headway imports nothing from the app.
 LEAD_LABELS = {"car", "truck", "bus", "van", "motorcycle"}
 
-# Cap on vehicles requested. Latency is ~13 decode tokens per compact object on
-# this GPU, and the corridor only ever keeps the nearest in-lane one, so a long
-# tail of far-off traffic costs time and buys nothing.
-MAX_ANCHOR_OBJECTS = 6
+# Cap on vehicles requested. Latency here is DECODE-bound: ~52 tokens/s on this
+# GPU, ~13 tokens per compact object, so every extra vehicle is a quarter of a
+# second of frame time. Four is what the downstream actually consumes -- the
+# corridor keeps the nearest in-lane one, and merge detection watches the lanes
+# either side. A fifth car three hundred metres up the road costs 250 ms and
+# changes no decision.
+MAX_ANCHOR_OBJECTS = 4
 
-# Decode budget for the anchor reply. The old single-box prompt needed almost
-# nothing; enumerating does. At ~13 tokens per compact object, six objects plus
-# the JSON scaffolding runs ~100, and the model does not always respect the cap
-# of six -- measured truncation at 128 on ordinary highway traffic. Truncation
-# is survivable now (repair_truncated_json) but a truncated list is still a
-# shorter candidate set, so the budget is set above the observed need.
-ANCHOR_MAX_NEW_TOKENS = 192
+# Decode budget for the anchor reply, and the single most expensive number in
+# the fast loop. Measured: 192 tokens is 3.4 SECONDS of decode, and the model
+# will happily fill whatever budget it is given on a busy motorway -- a bench
+# run with 192 put p95 frame time at 3.4 s against a 250 ms cadence.
+#
+# It is set BELOW the length a full reply would need, on purpose. The prompt
+# asks for closest-first ordering and repair_truncated_json() keeps whatever
+# arrived, so truncation drops the FAR tail -- exactly the vehicles that change
+# no decision. Spending a second of frame time to hear about them would be the
+# error; losing them is not.
+ANCHOR_MAX_NEW_TOKENS = 80
 
 # Grounding prompt. ENUMERATE, DO NOT SELECT.
 #
@@ -77,8 +84,14 @@ ANCHOR_MAX_NEW_TOKENS = 192
 # which of them is the lead is decided downstream by the corridor alone -- and
 # since UFLDv2 that corridor is measured lane paint, not a guessed trapezoid.
 ANCHOR_PROMPT = (
-    "Look at this forward-facing dashcam frame. List every vehicle on the road "
-    "ahead, in ANY lane, including oncoming and parked ones.\n"
+    # Scoped to what the geometry downstream can actually use: our lane (lead
+    # candidates) and the lanes either side (merge candidates). This is a
+    # SCOPING instruction, not a selection one -- the model is still forbidden
+    # from saying which vehicle we are following, and the corridor still
+    # decides membership. Enumerating the whole horizon instead cost seconds of
+    # decode for vehicles no rule reads.
+    "Look at this forward-facing dashcam frame. List the vehicles AHEAD of me "
+    "travelling my way, in my lane or the lanes immediately left or right.\n"
     "Labels allowed: car, truck, bus, van, motorcycle.\n"
     "Each vehicle is [label, x1, y1, x2, y2] using integer coordinates.\n"
     # Same failure perceive.py hit: without this the model emits the label once
@@ -182,6 +195,31 @@ class EgoCorridor:
             "reason": "inside" if inside else "outside_corridor",
         }
 
+    def bounds_at_row(self, v):
+        """(x_left, x_right) of the corridor at image row v, or None.
+
+        Same signature LaneCorridor exposes, so membership.py has ONE code path
+        for "how much of this vehicle is in my lane" whether the corridor came
+        from paint or from the trapezoid. The trapezoid's answer is worse -- it
+        is a projection of assumed geometry -- but it is the same shape of
+        answer, and an overlap test against it still beats the centre-point
+        test it replaces.
+
+        Returned WITHOUT the corridor margin: `contains()` owns the slack, and
+        membership expresses its own tolerance as the 40%/25% thresholds
+        instead. Adding both would double-count it.
+        """
+        g = self.ground_from_pixel(u=self.cx, v=v)
+        if g is None:
+            return None
+        forward, _ = g
+        ct, st = np.cos(self.pitch_rad), np.sin(self.pitch_rad)
+        z_c = self.camera_height_m * st + forward * ct
+        if z_c <= 1e-6:
+            return None
+        half_px = self.f_px * (self.lane_width_m / 2.0) / z_c
+        return (float(self.cx - half_px), float(self.cx + half_px))
+
     def polygon(self, near_m: float = 5.0, far_m: float = 60.0, steps: int = 12):
         """Corridor outline in pixel coords, for the debug overlay."""
         left, right = [], []
@@ -253,7 +291,12 @@ class LaneCorridor:
         return self.base.half_width_at(forward_m)
 
     def bounds_at_row(self, v):
-        """(x_left, x_right) of the ego lane at image row v, or None."""
+        """(x_left, x_right) of the ego lane at image row v, or None.
+
+        The real thing: measured paint, no margin. membership.py's overlap test
+        reads this, and EgoCorridor exposes the same call so the fallback
+        corridor answers the same question in the same units.
+        """
         from .lanes import x_at_y
         a = x_at_y(self.left, v, self._max_extrap)
         b = x_at_y(self.right, v, self._max_extrap)
@@ -640,6 +683,11 @@ class LeadAnchor:
         self.height = int(height)
         self.last_anchor_frame = None
         self.last_result = None
+        # Every vehicle the last enumeration reported, label included, BEFORE
+        # the corridor filtered it down to one. membership.py needs the ones
+        # that were rejected as much as the one that was kept -- an adjacent
+        # car is exactly what a merge starts as.
+        self.last_detections = []
 
     def due(self, frame_idx: int) -> bool:
         if self.last_anchor_frame is None:
@@ -649,12 +697,14 @@ class LeadAnchor:
     def anchor(self, frame, frame_idx: int, depth=None):
         """Propose + validate a lead box. Returns (box|None, info)."""
         self.last_anchor_frame = frame_idx
+        self.last_detections = []
         if not self.use_qwen:
             self.last_result = (None, {"reason": "qwen_disabled"})
             return self.last_result
 
         raw = self._query_qwen(frame)
         detected = _parse_vehicles(raw, self.width, self.height)
+        self.last_detections = list(detected)
         info = {"raw": (raw or "")[:300], "n_detected": len(detected),
                 "corridor_source": getattr(self.corridor, "source", "static")}
 

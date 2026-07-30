@@ -39,8 +39,12 @@ band *and* an independent urgent flag, so τ = 2.6 s with TTC = 1.8 s still fire
 frame ──► lanes.py    UFLDv2 finds the ego lane      (fast loop, ~2 ms)
           │           → LaneCorridor, or the static trapezoid if unsure
           ▼
-          anchor.py   Qwen3-VL proposes a lead box  (slow loop, ~1 Hz)
-          │           ego-corridor geometry vetoes it
+          anchor.py   Qwen3-VL ENUMERATES vehicles  (slow loop, ≤1 Hz)
+          │           it is forbidden from picking the lead
+          ▼
+          membership  overlap ≥40% of box-bottom edge → in lane   (~1 ms)
+          │           held 0.5 s → lead-eligible; nearest wins
+          │           rising overlap + <40 m → early merge promotion
           ▼
           tracker.py  CSRT holds the box between anchors  (fast loop)
           │
@@ -59,11 +63,12 @@ frame ──► lanes.py    UFLDv2 finds the ego lane      (fast loop, ~2 ms)
 | `depth.py` | Depth Anything V2 Metric-**Small** loader (Apache-2.0 only), `depth_map()`, `roi_depth()` |
 | `tracker.py` | CSRT wrapper, `init()` / `update()` → box + quality |
 | `lanes.py` | **UFLDv2 lane geometry** — `detect_lanes()`, ego-pair selection, `LaneDriftMonitor` (logs only) |
+| `membership.py` | **In-lane membership** — bottom-edge overlap, hysteresis + dwell, merge promotion, lead selection |
 | `anchor.py` | Qwen3-VL grounding + `EgoCorridor` / `LaneCorridor` validation + `build_corridor()` source switch |
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 175 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 263 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -259,6 +264,27 @@ Drift (advisory log only): `DRIFT_RATIO` (0.70), `DRIFT_HOLD_S` (1.0),
 show the camera's fixed lean; the raw `lane_offset` in the JSONL is what you
 read it off).
 
+### `membership.py` — in-lane membership
+
+`MEMBER_ENTER_FRAC` (0.40) / `MEMBER_EXIT_FRAC` (0.25) are the hysteresis band:
+a candidate must be substantially in the lane to be adopted, only marginally in
+it to be kept. `MEMBER_HOLD_S` (0.5) is the dwell before it can hold the lead
+lock. Merge promotion: `MERGE_MIN_SLOPE` (0.25 /s) over `MERGE_WINDOW_S` (0.75),
+`MERGE_MIN_OVERLAP` (0.15), `MERGE_MAX_RANGE_M` (40) — and never off the static
+trapezoid.
+
+`CANDIDATE_MAX_UNDETECTED_S` (6.0) is measured from the last *detection*, never
+the last tracker update: MOSSE does not report failure, so a liveness rule based
+on the tracker retires nothing.
+
+### `live.py` — how often Qwen may run
+
+`ANCHOR_MIN_INTERVAL_S` (1.0) is a hard floor between Qwen calls. Without it
+`not tracker.active` makes the "slow loop" run at the frame rate whenever the
+ego lane is empty. `CANDIDATE_REFRESH_S` (5.0) is how often the candidate set is
+re-enumerated — membership dwell and merge trends are measured on candidates,
+and at the lead anchor's 20 s a merging car would arrive too late to matter.
+
 ### `tracker.py` — drift detection
 
 `max_area_ratio_per_s` (8.0), `max_shift_frac_per_s` (3.0),
@@ -320,6 +346,17 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
   proposals only. On a bend it reads a correctly-tracked lead as out-of-lane for
   many consecutive frames, so `lead_corridor_check()` gives that vote to the
   lane corridor alone.
+- **Enumeration is decode-bound, and it is the loop's bottleneck.** Qwen3-VL
+  decodes at ~52 tokens/s here, so listing vehicles costs ~0.6-1.5 s against a
+  250 ms frame budget — versus ~0.27 s for the old single-box prompt.
+  `ANCHOR_MAX_NEW_TOKENS` is capped *below* a full reply and truncation is
+  repaired, which keeps the nearest vehicles and drops the far tail. The real
+  fix is a purpose-built detector (a YOLO-class model runs in single-digit ms);
+  Qwen is doing a detector's job here because it was already resident.
+- **Membership evidence on the current test clips is thin.** Both have a mostly
+  empty ego lane, so few frames exercise the dwell and none contain a merge.
+  Zero adjacent-lane candidates ever became lead-eligible, which is the claim
+  under test, but it is a weak sample.
 - **Lane departure is logged, never spoken.** `lane_drift` events go to the
   session JSONL and stop there, by design, until real-drive logs justify a
   threshold. It is not steering guidance and must not become any.

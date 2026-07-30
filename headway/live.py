@@ -43,10 +43,12 @@ from . import anchor as anchor_mod
 from . import depth as depth_mod
 from . import lanes as lanes_mod
 from . import live_policy as policy_mod
+from . import membership as member_mod
 from . import state as v2
 from .filter import HeadwayFilter
 from .lanes import LaneDriftMonitor
 from .live_policy import LivePolicy
+from .membership import CandidateSet
 from .tracker import LeadTracker
 
 # --- anchor scheduling (v3 spec §1) ---------------------------------------
@@ -78,6 +80,35 @@ SESSION_IDLE_EVICT_S = 600.0
 # across a boundary on any lane-splitting truck, and the whole point of the
 # tracker is that it survives a bad frame. At 4 fps this is ~0.75 s.
 LEAD_OUT_OF_CORRIDOR_FRAMES = 3
+
+# How often the candidate set is refreshed from a fresh Qwen enumeration.
+#
+# This is NOT the lead anchor interval and must be much shorter than it. Lane
+# membership needs dwell time and merge detection needs a rising trend, and
+# both are measured on candidates that only come into existence when Qwen
+# enumerates. At the lead anchor's 20 s a merging car would not enter the
+# candidate set until it had already completed the merge, which is the one
+# event the promotion path exists to catch early.
+#
+# The cost is one Qwen call (~0.3-0.7 s) per interval. Between refreshes the
+# candidates cost 0.2 ms each per frame on MOSSE, so the interval is the whole
+# price. 5 s is the compromise: three extra calls per 20 s of steady following.
+CANDIDATE_REFRESH_S = 5.0
+
+# Hard floor between Qwen calls, whatever the reason for wanting one.
+#
+# Without this, `not tracker.active` in the re-anchor condition is true on EVERY
+# frame whenever there is no lead in our lane -- an empty ego lane, a gap in
+# traffic, a red light -- so the "slow loop" quietly runs at the frame rate.
+# Measured on a clip whose ego lane is mostly empty: 84 of 210 frames paid a
+# Qwen call before this floor existed, and the loop's p50 was the Qwen latency
+# rather than the 25 ms the fast path actually costs.
+#
+# Re-querying faster than this buys nothing anyway: a call takes ~0.6 s, so at
+# 4 fps a 1 s floor still means the next query starts as soon as the last one
+# could plausibly have finished. Re-acquisition after a real track loss is
+# delayed by at most this, and the Kalman coasts across it.
+ANCHOR_MIN_INTERVAL_S = 1.0
 
 # Serialises GPU work across sessions. One driver is the expected case, so this
 # costs nothing in practice; it exists so two concurrent sessions cannot race
@@ -186,6 +217,12 @@ class LiveSession:
         self.n_lane_static = 0      # ...and frames that fell back
         self.out_of_corridor = 0    # consecutive frames the lead was outside
 
+        self.candidates = CandidateSet()
+        self.candidates_t = None    # session time of the last enumeration
+        self.last_qwen_t = None     # session time of the last Qwen call
+        self.lead_id = None         # candidate id currently holding the lock
+        self.n_merge_promotions = 0
+
         self.t = 0.0                # session clock, seconds
         self.last_wall = None
         self.last_frame_t = None
@@ -212,6 +249,10 @@ class LiveSession:
             w, h, use_qwen=self.use_qwen, corridor=self.corridor)
         self.tracker.reset()
         self.drift.reset()
+        self.candidates.reset()
+        self.candidates_t = None
+        self.lead_id = None
+        self.last_qwen_t = None
 
     # -- clock --------------------------------------------------------------
     def _advance_clock(self, frame_t) -> float:
@@ -247,9 +288,15 @@ class LiveSession:
         self.reset_t = self.t
         self.trend = v2.STABLE
         # A drift excursion measured across a break in the stream was never
-        # observed continuously, so its timer goes with everything else.
+        # observed continuously, so its timer goes with everything else. So do
+        # the candidates: membership dwell and merge trend are both claims about
+        # continuous observation, and neither survives a gap in the frames.
         self.drift.reset()
         self.out_of_corridor = 0
+        self.candidates.reset()
+        self.candidates_t = None
+        self.lead_id = None
+        self.last_qwen_t = None
 
     # -- main entry ---------------------------------------------------------
     def process(self, image_bytes: bytes, v_host, v_host_age_s, frame_t=None,
@@ -317,17 +364,36 @@ class LiveSession:
 
         # --- anchor (slow loop): first frame, lost track, drift, or staleness --
         anchor_age = (ANCHOR_MAX_AGE_S + 1.0) if self.anchor_t is None else (t - self.anchor_t)
+        cand_age = (CANDIDATE_REFRESH_S + 1.0 if self.candidates_t is None
+                    else t - self.candidates_t)
         need_anchor = (not self.tracker.active
                        or self.tracker.box is None
                        or self.tracker.quality < TRACK_QUALITY_REANCHOR
                        or anchor_age >= ANCHOR_MAX_AGE_S
                        # ...or the thing we are tracking has left our lane.
-                       or self.out_of_corridor >= LEAD_OUT_OF_CORRIDOR_FRAMES)
+                       or self.out_of_corridor >= LEAD_OUT_OF_CORRIDOR_FRAMES
+                       # ...or the candidate set has gone stale, which is what
+                       # membership dwell and merge trends are measured on.
+                       or cand_age >= CANDIDATE_REFRESH_S)
+        # The floor is applied here rather than folded into need_anchor so the
+        # log still records that an anchor was WANTED and rate-limited, which is
+        # a different situation from not needing one.
+        rate_limited = (self.last_qwen_t is not None
+                        and (t - self.last_qwen_t) < ANCHOR_MIN_INTERVAL_S)
         anchor_info = None
         anchored = False
-        if need_anchor and allow_anchor and self.use_qwen:
+        if need_anchor and rate_limited:
+            anchor_info = {"reason": "rate_limited",
+                           "since_last_s": round(t - self.last_qwen_t, 2)}
+        if need_anchor and not rate_limited and allow_anchor and self.use_qwen:
+            self.last_qwen_t = t
             box, anchor_info = self.anchor.anchor(frame, self.frame_idx, depth=depth_full)
             self.n_anchor_calls += 1
+            # The enumeration Qwen just produced is the candidate set. It is the
+            # same call either way -- anchor() already asked for every vehicle
+            # in view, so feeding the membership layer costs nothing extra.
+            self.candidates.observe(self.anchor.last_detections, t, frame=frame)
+            self.candidates_t = t
             if box is not None:
                 try:
                     self.tracker.init(frame, box)
@@ -339,6 +405,51 @@ class LiveSession:
                 except ValueError:
                     anchor_info = dict(anchor_info or {}, reason="degenerate_box")
         t_anchor = time.perf_counter()
+
+        # --- candidates: carry every watched vehicle forward, score membership -
+        self.candidates.track(frame, t)
+
+        def _range_of(b):
+            if depth_full is None:
+                return None
+            d, conf, _ = depth_mod.roi_depth(depth_full, b)
+            return float(d) if (np.isfinite(d) and conf > 0.2) else None
+
+        # Merge promotion needs real lane paint. Declaring a merge off the
+        # trapezoid would be inventing the one event a driver is least able to
+        # check against what they can see.
+        promotions = self.candidates.evaluate(
+            self.corridor, t, depth_fn=_range_of,
+            allow_merge=(self.corridor.source == "ufld"))
+        self.n_merge_promotions += len(promotions)
+
+        lead_cand, member_info = self.candidates.select_lead(t)
+
+        # --- lead switch: a nearer in-lane vehicle takes the lock -------------
+        # A car that has moved in between us and the vehicle we were following
+        # IS the new lead. Re-init the CSRT tracker on it and reset the filter:
+        # carrying a distance history that belongs to a different car is how a
+        # cut-in reads as a sudden closing rate.
+        lead_switch = None
+        if lead_cand is not None and lead_cand.id != self.lead_id:
+            try:
+                self.tracker.init(frame, lead_cand.box)
+                self.kf = HeadwayFilter()     # NEW_LEAD: standard confirmation
+                self.anchor_t = t
+                self.reset_t = t
+                self.out_of_corridor = 0
+                lead_switch = {
+                    "from_id": self.lead_id, "to_id": lead_cand.id,
+                    "label": lead_cand.label,
+                    "range_m": round(lead_cand.range_m, 2),
+                    "via_merge": bool(lead_cand.merge_promoted),
+                }
+                self.lead_id = lead_cand.id
+            except ValueError:
+                member_info["lead_switch_error"] = "degenerate_box"
+        elif lead_cand is not None:
+            self.lead_id = lead_cand.id
+        t_members = time.perf_counter()
 
         # --- track ---------------------------------------------------------
         box, quality = (self.tracker.update(frame, dt) if self.tracker.active
@@ -458,6 +569,15 @@ class LiveSession:
                       for pts in ((lane_result or {}).get("lanes") or [])],
             "lead_geo": lead_geo,
             "lead_out_of_corridor": self.out_of_corridor,
+
+            # Membership: one compact record per watched candidate per frame.
+            # Short keys because this ships on every frame -- see
+            # membership.Candidate.to_log for the legend.
+            "membership": self.candidates.to_log(),
+            "membership_info": member_info,
+            "lead_id": self.lead_id,
+            "lead_switch": lead_switch,
+            "merge_promotions": promotions,
             "lane_offset": drift.get("offset"),
             "lane_drift": drift,
 
@@ -468,7 +588,8 @@ class LiveSession:
                 "lanes": round((t_lanes - t_decode) * 1000, 1),
                 "depth": round((t_depth - t_lanes) * 1000, 1),
                 "anchor": round((t_anchor - t_depth) * 1000, 1),
-                "track_filter": round((t_end - t_anchor) * 1000, 1),
+                "membership": round((t_members - t_anchor) * 1000, 1),
+                "track_filter": round((t_end - t_members) * 1000, 1),
                 "total": round((t_end - t_start) * 1000, 1),
             },
         }
@@ -509,5 +630,7 @@ def active_sessions() -> dict:
                     "lane_ufld_pct": (round(100.0 * s.n_lane_ufld
                                             / max(1, s.n_lane_ufld + s.n_lane_static), 1)),
                     "lane_drift_events": s.drift.n_events,
+                    "merge_promotions": s.n_merge_promotions,
+                    "candidates": len(s.candidates.candidates),
                     "lane_error": s.lane_error}
                 for k, s in _sessions.items()}
