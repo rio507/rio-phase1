@@ -36,7 +36,10 @@ band *and* an independent urgent flag, so τ = 2.6 s with TTC = 1.8 s still fire
 ## Pipeline
 
 ```
-frame ──► anchor.py   Qwen3-VL proposes a lead box  (slow loop, ~1 Hz)
+frame ──► lanes.py    UFLDv2 finds the ego lane      (fast loop, ~2 ms)
+          │           → LaneCorridor, or the static trapezoid if unsure
+          ▼
+          anchor.py   Qwen3-VL proposes a lead box  (slow loop, ~1 Hz)
           │           ego-corridor geometry vetoes it
           ▼
           tracker.py  CSRT holds the box between anchors  (fast loop)
@@ -55,11 +58,12 @@ frame ──► anchor.py   Qwen3-VL proposes a lead box  (slow loop, ~1 Hz)
 |---|---|
 | `depth.py` | Depth Anything V2 Metric-**Small** loader (Apache-2.0 only), `depth_map()`, `roi_depth()` |
 | `tracker.py` | CSRT wrapper, `init()` / `update()` → box + quality |
-| `anchor.py` | Qwen3-VL grounding + `EgoCorridor` geometric validation |
+| `lanes.py` | **UFLDv2 lane geometry** — `detect_lanes()`, ego-pair selection, `LaneDriftMonitor` (logs only) |
+| `anchor.py` | Qwen3-VL grounding + `EgoCorridor` / `LaneCorridor` validation + `build_corridor()` source switch |
 | `filter.py` | Kalman on the gap, innovation gating, `--tune` harness for Q |
 | `state.py` | **Warning logic v2** — five τ bands, TTC urgent, voice policy (pure) |
 | `run_clip.py` | Stage 0 harness + synthetic clip generator |
-| `selftest.py` | 109 spec-compliance checks, no GPU, ~1 s |
+| `selftest.py` | 175 spec-compliance checks, no GPU, ~1 s |
 
 ---
 
@@ -243,6 +247,18 @@ and note the 0.286 s lag figure only holds for the configured R.
 focal length. Then `CAMERA_HEIGHT_M` (1.3), `CAMERA_PITCH_RAD` (0.0),
 `LANE_WIDTH_M` (3.5), `CORRIDOR_MARGIN_M` (0.6).
 
+### `lanes.py` — lane geometry (UFLDv2)
+
+`LANE_CONF_MIN` (0.55) is the switch: at or above it the corridor is built from
+detected paint, below it the static trapezoid takes over. `CORRIDOR_MARGIN_M /
+LANE_WIDTH_M` becomes `LANE_MARGIN_FRAC` in image space, so the lane corridor
+needs no focal-length calibration at all — only the range gate still does.
+
+Drift (advisory log only): `DRIFT_RATIO` (0.70), `DRIFT_HOLD_S` (1.0),
+`DRIFT_REARM_RATIO` (0.50), `center_bias` (0.0 — set this once real-drive logs
+show the camera's fixed lean; the raw `lane_offset` in the JSONL is what you
+read it off).
+
 ### `tracker.py` — drift detection
 
 `max_area_ratio_per_s` (8.0), `max_shift_frac_per_s` (3.0),
@@ -294,8 +310,19 @@ detectors land — but under v2 they change nothing. Flag if that was not intend
 - **Fixed host speed.** τ is only as good as `--v-host`. TTC is unaffected.
 - **No calibration.** Depth carries an uncalibrated scale bias (design §0
   Challenge 2). τ inherits it; TTC cancels it. Cone calibration is Stage 2.
-- **Straight corridor.** No IMU, so no yaw-rate bend — the known curve weakness
-  (design §7.3). The `yaw_rate` path is implemented and unused.
+- **Straight corridor — only when the paint is unreadable.** UFLDv2 now bounds
+  the corridor with the real ego-lane lines, which fixes the curve weakness
+  (design §7.3) wherever lane confidence clears `LANE_CONF_MIN`. Below it the
+  straight trapezoid is back, and there is still no IMU, so the `yaw_rate` bend
+  path remains implemented and unused. Measured on a winding, glare-heavy
+  mountain clip: 71.5% of frames on lane geometry, 28.5% fallen back.
+- **The trapezoid may not veto an established track.** It filters fresh Qwen
+  proposals only. On a bend it reads a correctly-tracked lead as out-of-lane for
+  many consecutive frames, so `lead_corridor_check()` gives that vote to the
+  lane corridor alone.
+- **Lane departure is logged, never spoken.** `lane_drift` events go to the
+  session JSONL and stop there, by design, until real-drive logs justify a
+  threshold. It is not steering guidance and must not become any.
 - **Shadow mode always.** Voice actions are recorded as intent, never played
   (design §0 Challenge 3). Wire `audio_sink` and set `shadow_mode=False` only
   after shadow data justifies it. The urgent clips must be **pre-rendered** —

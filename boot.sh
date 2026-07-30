@@ -101,6 +101,16 @@ else:
 PY
 
 # ---------------------------------------------------------------------------
+# 5b. UFLDv2 lane weights
+# ---------------------------------------------------------------------------
+# 825 MB, gitignored, fetched from the upstream model zoo and checksum-verified.
+# Deliberately NOT fatal: without it headway falls back to the static trapezoid
+# corridor and logs corridor_source=static, which is the pre-UFLDv2 behaviour.
+# A pod that comes up with no lane model should still come up.
+log "UFLDv2 lane weights"
+python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headway will use the static corridor"
+
+# ---------------------------------------------------------------------------
 # 6. Free port 8888
 # ---------------------------------------------------------------------------
 # RunPod starts JupyterLab on 8888, which is the port the proxy exposes and the

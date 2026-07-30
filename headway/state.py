@@ -115,6 +115,21 @@ ANCHOR_FRESH_S = 5.0             # freshness 1.0 up to here
 ANCHOR_STALE_S = 10.0            # freshness 0.0 from here
 MAX_COAST_S = 1.0                # headway_design §5: coast <=1 s, decaying conf
 
+# --- lane geometry contribution (UFLDv2) -----------------------------------
+# Credit, never penalty. A frame whose lead was validated against real lane
+# paint is better evidence than the same frame validated against a guessed
+# trapezoid, so it earns a small bonus. A frame that fell back to the trapezoid
+# scores exactly what it scored before lane detection existed.
+#
+# Doing it the other way round -- docking confidence when the paint is
+# unreadable -- would mean shipping a change that goes QUIETER at night and in
+# rain than the tuned system does today, purely because a new sensor cannot see.
+# Every threshold in v2 §8 was tuned against the un-bonused number, so this is
+# the only direction that cannot silently retune them. The bonus is small enough
+# that it cannot lift a DEGRADED frame (CONF_FLOOR) into speaking on its own:
+# 0.05 of headroom is inside the noise the depth terms already carry.
+CONF_LANE_BONUS = 0.05
+
 # --- voice cooldowns, seconds (v2 §6). Gate VOICE ONLY -- overlay/log always update.
 COOLDOWN_CALM_S = 30.0
 COOLDOWN_STRONG_S = 15.0
@@ -322,7 +337,8 @@ def anchor_freshness(anchor_age_s: float) -> float:
 
 
 def compute_confidence(depth_valid_ratio, roi_variance_norm, track_quality,
-                       anchor_age_s, coast_age=0.0) -> float:
+                       anchor_age_s, coast_age=0.0,
+                       lane_conf=None, corridor_source="static") -> float:
     """v2 §8 confidence: a weighted SUM.
 
         .30*depth_valid_ratio + .30*(1 - roi_variance_norm)
@@ -337,6 +353,10 @@ def compute_confidence(depth_valid_ratio, roi_variance_norm, track_quality,
     headway_design §5 ("coast Kalman prediction max 1.0 s with decaying
     confidence"), which v2 does not supersede. Without it, coasted data would
     keep full confidence right up to the LOST cutoff.
+
+    `lane_conf`/`corridor_source` add CONF_LANE_BONUS when the lead was
+    validated against detected lane paint rather than the static trapezoid. The
+    defaults reproduce the pre-UFLDv2 number exactly, digit for digit.
     """
     valid = _clip01(depth_valid_ratio)
     var = _clip01(roi_variance_norm)
@@ -347,6 +367,9 @@ def compute_confidence(depth_valid_ratio, roi_variance_norm, track_quality,
             + CONF_W_VARIANCE * (1.0 - var)
             + CONF_W_TRACK * track
             + CONF_W_ANCHOR * fresh)
+
+    if corridor_source == "ufld" and lane_conf is not None:
+        base += CONF_LANE_BONUS * _clip01(lane_conf)
 
     coast = max(0.0, 1.0 - float(coast_age) / MAX_COAST_S)
     return _clip01(base * coast)

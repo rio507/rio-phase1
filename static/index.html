@@ -431,6 +431,11 @@
   #headwayhud .hw-band { font-weight: 500; font-size: 12px; letter-spacing: 0.18em; }
   #headwayhud .hw-line { color: var(--text-dim); font-size: 10px; }
   #headwayhud .hw-line b { color: var(--text); font-weight: 500; }
+  /* Lane source. Cyan when the corridor is real paint, dim when it has fallen
+     back to the trapezoid -- deliberately not amber or red: falling back is
+     correct behaviour in rain and at night, not a fault to alarm about. */
+  #headwayhud b.hw-lanesrc.src-ufld   { color: var(--blue); }
+  #headwayhud b.hw-lanesrc.src-static { color: var(--text-dimmer); }
 
   /* One class per band. The colour IS the warning at a glance, so it drives the
      rail, the label and the glow together. */
@@ -688,6 +693,11 @@
         <span class="hw-band" id="hwband">Standby</span>
         <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
         <span class="hw-line"><i>Gap</i> <b id="hwgap">--</b> &middot; <i>V</i> <b id="hwspeed">--</b></span>
+        <!-- Which corridor the lead was validated against this frame. UFLD =
+             built from detected lane paint, STATIC = the fixed trapezoid
+             fallback. Shown because "the system is degraded but still running"
+             must be visible without opening the log. -->
+        <span class="hw-line"><i>Lanes</i> <b id="hwlanes" class="hw-lanesrc">--</b></span>
       </div>
       <div class="cam-overlay">
         <span><i>Frames</i><b id="statframes">0</b></span>
@@ -1505,6 +1515,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const elTrend = document.getElementById('hwtrend');
   const elGap = document.getElementById('hwgap');
   const elSpeed = document.getElementById('hwspeed');
+  const elLanes = document.getElementById('hwlanes');
   const toggle = document.getElementById('headway');
   const speedInput = document.getElementById('speedval');
   const unitBtn = document.getElementById('speedunit');
@@ -1669,6 +1680,15 @@ document.addEventListener('DOMContentLoaded', () => {
       ? j.distance_m.toFixed(1) + ' m' : '--';
     const s = speed();
     elSpeed.textContent = (s.v === null) ? '--' : s.v.toFixed(1) + ' m/s';
+    if (elLanes) {
+      const src = (j && j.corridor_source) === 'ufld' ? 'ufld' : 'static';
+      const conf = (j && typeof j.lane_conf === 'number') ? j.lane_conf : null;
+      // The confidence rides along with the label: STATIC 0.31 says the paint
+      // was seen and rejected, STATIC 0.00 says it was not seen at all, and
+      // those are different problems.
+      elLanes.textContent = src.toUpperCase() + (conf === null ? '' : ' ' + conf.toFixed(2));
+      elLanes.className = 'hw-lanesrc src-' + src;
+    }
   }
 
   function resetHud() {
@@ -1677,6 +1697,7 @@ document.addEventListener('DOMContentLoaded', () => {
     elBand.textContent = 'Standby';
     elTau.textContent = '--'; elTrend.textContent = '--';
     elGap.textContent = '--'; elSpeed.textContent = '--';
+    if (elLanes) { elLanes.textContent = '--'; elLanes.className = 'hw-lanesrc'; }
   }
 
   /* ---------------- the frame call ---------------------------------------- */
@@ -1930,6 +1951,33 @@ document.addEventListener('DOMContentLoaded', () => {
     ctx.restore();
   }
 
+  /* Detected lane lines. Thin cyan, same family as the corridor stroke — these
+     are the geometry the corridor is built from, so they read as one system
+     rather than a second opinion. All four are drawn the same weight: the ego
+     pair is already called out by the corridor's dashed outline sitting on top
+     of it, so colouring it twice would just be noise. Kept to 1px so a busy
+     four-lane detection cannot compete with the lead box for attention. */
+  function drawLanes(m, lanes) {
+    if (!lanes || !lanes.length) return;
+    ctx.save();
+    ctx.lineWidth = 1;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.shadowColor = 'rgba(95,179,232,0.55)';
+    ctx.shadowBlur = 5;
+    lanes.forEach(pts => {
+      if (!pts || pts.length < 2) return;
+      ctx.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        const x = m.x(pts[i][0]), y = m.y(pts[i][1]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = 'rgba(95,179,232,0.75)';
+      ctx.stroke();
+    });
+    ctx.restore();
+  }
+
   // Outlined text rather than a backing panel: legible over a bright road
   // scene without dropping an opaque block onto the frame.
   function drawLabel(text, x, y, color) {
@@ -1996,6 +2044,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // a corridor this frame the headway result supplies one. Drawing both would
     // just double-stroke identical geometry.
     if (!drewCorridor) drawCorridor(m, r.corridor);
+    // Lanes under the box, over the corridor fill.
+    drawLanes(m, r.lanes);
     if (!r.lead_box) return;
 
     const x1 = m.x(r.lead_box[0]), y1 = m.y(r.lead_box[1]);

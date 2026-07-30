@@ -119,8 +119,48 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "track_lost": result.get("track_lost"),
         "v_host": result.get("v_host"),
         "v_host_stale": result.get("v_host_stale"),
+        # Lane geometry: which corridor decided this frame, how sure the paint
+        # was, and where in the lane the car sat. The polylines themselves are
+        # dropped for the same reason the corridor polygon is -- four lanes of
+        # 72 points at 4 Hz would be most of the file -- but the three scalars
+        # that explain a decision are kept.
+        "corridor_source": result.get("corridor_source"),
+        "lane_conf": result.get("lane_conf"),
+        "lane_offset": result.get("lane_offset"),
+        "lane_fallback_reason": (result.get("lane_info") or {}).get("fallback_reason"),
+        "lead_out_of_corridor": result.get("lead_out_of_corridor"),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),
+    })
+
+
+def log_lane_drift(session_id: Optional[str], result: dict) -> None:
+    """A confirmed lane-departure excursion. ADVISORY RECORD ONLY.
+
+    Its own event kind, deliberately: this is the raw material for deciding
+    whether lane departure should ever have a voice, and that review needs to
+    select drift events on their own and score them against what the drive
+    actually looked like. Folding them into the headway stream at 4 Hz would
+    bury a handful of events in tens of thousands of frames.
+
+    Nothing consumes this at runtime. No voice line is attached to it, and none
+    should be until real-drive logs say the threshold is right.
+    """
+    if not session_id:
+        return
+    drift = result.get("lane_drift") or {}
+    _write(session_id, "lane_drift", {
+        "frame_idx": result.get("frame_idx"),
+        "t": result.get("t"),
+        "side": drift.get("side"),
+        "offset": drift.get("offset"),
+        "held_s": drift.get("held_s"),
+        "threshold": drift.get("threshold"),
+        "lane_conf": result.get("lane_conf"),
+        "corridor_source": result.get("corridor_source"),
+        "event_index": drift.get("event_index"),
+        "v_host": result.get("v_host"),
+        "band": result.get("band"),
     })
 
 

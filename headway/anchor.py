@@ -60,7 +60,13 @@ class EgoCorridor:
     Works in both directions: `ground_from_pixel` inverts the projection so a
     box-bottom-centre pixel becomes (forward distance, lateral offset), which is
     what the containment test actually needs.
+
+    Since UFLDv2 landed this is the FALLBACK corridor, not the only one — see
+    LaneCorridor and build_corridor() below. It is still what runs whenever the
+    paint cannot be read, so it has not been weakened or retuned.
     """
+
+    source = "static"
 
     def __init__(self, width_px, height_px, lane_width_m=LANE_WIDTH_M,
                  camera_height_m=CAMERA_HEIGHT_M, pitch_rad=CAMERA_PITCH_RAD,
@@ -132,6 +138,7 @@ class EgoCorridor:
             "bend_m": round(bend, 3),
             "offset_m": round(offset, 2),
             "half_width_m": round(half, 2),
+            "corridor_source": "static",
             "reason": "inside" if inside else "outside_corridor",
         }
 
@@ -151,6 +158,165 @@ class EgoCorridor:
                 u = self.cx + self.f_px * (sign * half) / z_c
                 acc.append((float(u), float(v)))
         return left + right[::-1]
+
+
+# ---------------------------------------------------------------------------
+# Lane-derived corridor (UFLDv2)
+# ---------------------------------------------------------------------------
+# The corridor margin as a fraction of lane width, rather than a metre count
+# projected through a guessed focal length. CORRIDOR_MARGIN_M of LANE_WIDTH_M is
+# the same slack the trapezoid allows -- expressed against the lane the camera
+# can actually see, it needs no calibration at all, and it stays correct on a
+# narrow urban lane where 0.6 m is proportionally much more forgiving.
+LANE_MARGIN_FRAC = CORRIDOR_MARGIN_M / LANE_WIDTH_M
+
+# How far below its lowest detected point a boundary may be extended before the
+# containment test stops trusting it and hands the row back to the trapezoid.
+LANE_EXTRAP_FRAC = 0.20
+
+
+class LaneCorridor:
+    """Ego corridor bounded by two detected lane boundaries (UFLDv2).
+
+    Same contract as EgoCorridor -- `contains`, `polygon`, `ground_from_pixel`
+    -- so nothing downstream needs to know which one it holds.
+
+    The division of labour matters. Lane paint answers "is this vehicle between
+    my lines?", which is the question the corridor exists to ask, and answers it
+    without assuming a straight road, a level camera or a 3.5 m lane. It cannot
+    answer "how far away is it" -- so range still comes from the pinhole
+    projection in `base` (and, further downstream, from Depth Anything). The
+    curve weakness the trapezoid has on bends (§7.3) is exactly the part that
+    lane paint fixes; the range estimate is unchanged and no better than it was.
+    """
+
+    source = "ufld"
+
+    def __init__(self, base: EgoCorridor, ego_left, ego_right, confidence,
+                 margin_frac: float = LANE_MARGIN_FRAC):
+        self.base = base
+        self.w, self.h = base.w, base.h
+        self.cx, self.cy, self.f_px = base.cx, base.cy, base.f_px
+        self.camera_height_m = base.camera_height_m
+        self.pitch_rad = base.pitch_rad
+        self.left = list(ego_left)
+        self.right = list(ego_right)
+        self.confidence = float(confidence)
+        self.margin_frac = float(margin_frac)
+        self._max_extrap = base.h * LANE_EXTRAP_FRAC
+
+    # -- delegated projection ------------------------------------------------
+    def ground_from_pixel(self, u, v):
+        return self.base.ground_from_pixel(u, v)
+
+    def half_width_at(self, forward_m):
+        return self.base.half_width_at(forward_m)
+
+    def bounds_at_row(self, v):
+        """(x_left, x_right) of the ego lane at image row v, or None."""
+        from .lanes import x_at_y
+        a = x_at_y(self.left, v, self._max_extrap)
+        b = x_at_y(self.right, v, self._max_extrap)
+        if a is None or b is None:
+            return None
+        xl, xr = a[0], b[0]
+        return (xl, xr) if xr > xl else None
+
+    # -- containment ---------------------------------------------------------
+    def contains(self, u, v, yaw_rate=None, v_host=None):
+        """Is this pixel between the detected lane lines? -> (bool, info).
+
+        The range gate is unchanged -- a vehicle 200 m away is still not a lead
+        even if it is dead centre between the lines. Only the lateral test moves
+        from projected metres to measured paint.
+        """
+        g = self.ground_from_pixel(u, v)
+        if g is None:
+            return False, {"reason": "above_horizon", "corridor_source": "ufld"}
+        forward, lateral = g
+        if not (MIN_RANGE_M <= forward <= MAX_RANGE_M):
+            return False, {"reason": "out_of_range", "forward_m": round(forward, 2),
+                           "lateral_m": round(lateral, 2), "corridor_source": "ufld"}
+
+        bounds = self.bounds_at_row(v)
+        if bounds is None:
+            # The paint does not reach this row (a lead near the horizon, above
+            # where the net declared the lane). Rather than extrapolate a
+            # boundary a hundred rows past its last evidence, this one pixel
+            # falls back to the trapezoid. Logged, so it is visible in review.
+            inside, info = self.base.contains(u, v, yaw_rate, v_host)
+            info["corridor_source"] = "ufld_row_fallback"
+            return inside, info
+
+        xl, xr = bounds
+        lane_w = xr - xl
+        margin = self.margin_frac * lane_w
+        centre = (xl + xr) / 2.0
+        # Signed position across the lane: 0 at the centreline, +-1 at a
+        # boundary. The margin is what allows a shade past 1.0.
+        offset_norm = (float(u) - centre) / (lane_w / 2.0)
+        inside = (xl - margin) <= float(u) <= (xr + margin)
+
+        return inside, {
+            "forward_m": round(forward, 2),
+            "lateral_m": round(offset_norm * LANE_WIDTH_M / 2.0, 2),
+            "offset_norm": round(offset_norm, 3),
+            "lane_px": [round(xl, 1), round(xr, 1)],
+            "margin_px": round(margin, 1),
+            "corridor_source": "ufld",
+            "reason": "inside" if inside else "outside_lane",
+        }
+
+    def polygon(self, near_m: float = 5.0, far_m: float = 60.0, steps: int = 12):
+        """The lane polygon itself — left boundary out, right boundary back.
+
+        Point order matches EgoCorridor.polygon() (near->far down one side, far
+        ->near back the other) so the overlay's existing fill/stroke needs no
+        change. near_m/far_m/steps are accepted and ignored: the extent of this
+        polygon is however far the paint was actually visible, which is the
+        honest thing to draw.
+        """
+        return ([(float(x), float(y)) for x, y in reversed(self.left)]
+                + [(float(x), float(y)) for x, y in self.right])
+
+
+def build_corridor(base: EgoCorridor, lane_result, conf_min=None):
+    """Pick the corridor for this frame. -> (corridor, info).
+
+    THE FALLBACK IS THE POINT. UFLDv2 is confident on daylight highway paint and
+    much less so at night, in rain, on worn or snow-covered markings, and on
+    unmarked roads -- the conditions where a wrong corridor would do the most
+    damage. Below the confidence floor the static trapezoid takes over, which is
+    exactly the behaviour this system had before lanes existed. There is no
+    third mode where a low-confidence lane is used anyway.
+    """
+    from . import lanes as lanes_mod
+    floor = lanes_mod.LANE_CONF_MIN if conf_min is None else float(conf_min)
+
+    if not lane_result:
+        return base, {"corridor_source": "static", "lane_conf": 0.0,
+                      "fallback_reason": "no_lane_result"}
+
+    conf = float(lane_result.get("confidence") or 0.0)
+    left, right = lane_result.get("ego_left"), lane_result.get("ego_right")
+
+    if left is None or right is None:
+        return base, {"corridor_source": "static", "lane_conf": conf,
+                      "fallback_reason": (lane_result.get("ego") or {}).get(
+                          "reason", "no_ego_pair")}
+    if conf < floor:
+        return base, {"corridor_source": "static", "lane_conf": round(conf, 3),
+                      "fallback_reason": "low_confidence",
+                      "conf_floor": floor}
+
+    return LaneCorridor(base, left, right, conf), {
+        "corridor_source": "ufld",
+        "lane_conf": round(conf, 3),
+        "conf_floor": floor,
+        "lane_width_frac": round(
+            float((lane_result.get("ego") or {}).get("lane_width_frac") or 0.0), 3),
+        "extrapolated": bool((lane_result.get("ego") or {}).get("extrapolated")),
+    }
 
 
 # ---------------------------------------------------------------------------

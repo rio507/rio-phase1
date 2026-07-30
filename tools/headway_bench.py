@@ -69,7 +69,12 @@ def main():
     url = f"{args.base}/headway_frame{qs}"
 
     rtt, server_total, depth_ms, anchor_ms, tail_ms = [], [], [], [], []
+    lane_ms = []
     anchor_frames, steady_frames = [], []
+    lane_src = {"ufld": 0, "static": 0}
+    lane_fallback_why = {}
+    lane_confs = []
+    drifts = []
     rows, spoken = [], []
     idx, n = 0, 0
     t_run = time.time()
@@ -98,6 +103,16 @@ def main():
                 depth_ms.append(tm.get("depth", 0.0))
                 anchor_ms.append(tm.get("anchor", 0.0))
                 tail_ms.append(tm.get("track_filter", 0.0))
+                lane_ms.append(tm.get("lanes", 0.0))
+
+                src = j.get("corridor_source") or "static"
+                lane_src[src] = lane_src.get(src, 0) + 1
+                lane_confs.append(j.get("lane_conf") or 0.0)
+                if src != "ufld":
+                    why = (j.get("lane_info") or {}).get("fallback_reason", "?")
+                    lane_fallback_why[why] = lane_fallback_why.get(why, 0) + 1
+                if (j.get("lane_drift") or {}).get("drift"):
+                    drifts.append((idx / src_fps, j["lane_drift"]))
                 (anchor_frames if j.get("anchored") else steady_frames).append(
                     tm.get("total", 0.0))
                 rows.append((idx / src_fps, j))
@@ -142,6 +157,7 @@ def main():
     print(f"\nlatency (ms), {n} frames in {elapsed:.1f}s")
     stats("client round-trip", rtt)
     stats("server total", server_total)
+    stats("  lanes (UFLDv2)", lane_ms)
     stats("  depth (DA-V2)", depth_ms)
     stats("  anchor (Qwen)", anchor_ms)
     stats("  track+filter+policy", tail_ms)
@@ -156,6 +172,36 @@ def main():
               f"({'OK — ' if p95 < budget else 'OVER — '}"
               f"{budget / max(p95, 1e-6):.1f}x headroom)")
         print(f"  max sustainable rate (steady):   {1000.0 / max(p95, 1e-6):.1f} fps")
+
+    # --- lane geometry -----------------------------------------------------
+    # The number that matters is the split, not the average: a corridor built
+    # from paint and a corridor guessed from a trapezoid are different systems,
+    # and "how often was each one running" is the claim this tool exists to
+    # settle.
+    total_lane = sum(lane_src.values())
+    if total_lane:
+        print(f"\nlane geometry, {total_lane} frames")
+        for src in sorted(lane_src, key=lambda s: -lane_src[s]):
+            n_src = lane_src[src]
+            print(f"  corridor {src:8} {n_src:4} frames  "
+                  f"{100.0 * n_src / total_lane:5.1f}%")
+        if lane_fallback_why:
+            print("  fallback reasons:")
+            for why, c in sorted(lane_fallback_why.items(), key=lambda kv: -kv[1]):
+                print(f"    {why:24} {c:4}")
+        if lane_confs:
+            print(f"  lane confidence        mean {statistics.mean(lane_confs):.3f}  "
+                  f"p05 {pct(lane_confs, 5):.3f}  p50 {pct(lane_confs, 50):.3f}  "
+                  f"p95 {pct(lane_confs, 95):.3f}")
+        if lane_ms:
+            print(f"  cost of lane detection mean {statistics.mean(lane_ms):.2f} ms  "
+                  f"({statistics.mean(lane_ms) / max(statistics.mean(server_total), 1e-9) * 100:.0f}% "
+                  f"of server frame time)")
+
+    print(f"\nlane_drift events (advisory log only, no voice): {len(drifts)}")
+    for t, d in drifts:
+        print(f"  {t:6.2f}s  {d['side']:>5}  offset {d['offset']:+.2f}  "
+              f"held {d['held_s']:.2f}s")
 
     if sid:
         requests.post(f"{args.base}/session/end?session_id={sid}", timeout=30)

@@ -454,6 +454,352 @@ def test_purity():
     check("state.py performs no file I/O", "open(" not in src)
 
 
+# ===========================================================================
+# Lane geometry (UFLDv2): the corridor-source switch and the drift detector.
+# Both are pure functions of a lane result, so they are tested here with
+# synthetic lane polylines rather than a GPU and a video. The model itself is
+# checked in live_selftest.py, which is allowed to need weights.
+# ===========================================================================
+def _lane(x_top, x_bottom, h=720, n=20):
+    """A straight lane boundary from x_top at 0.42h down to x_bottom at h."""
+    return [(x_top + (x_bottom - x_top) * i / (n - 1),
+             0.42 * h + (h - 0.42 * h) * i / (n - 1)) for i in range(n)]
+
+
+def _lane_result(conf=0.9, w=1280, h=720, left=(560, 300), right=(720, 980)):
+    """A well-formed detect_lanes() payload with an ego pair.
+
+    `confidence` comes back out of select_ego_pair rather than being echoed
+    from `conf`, so the geometry factor is part of what these tests exercise --
+    an implausibly narrow pair has to be able to score itself down to zero.
+    """
+    from . import lanes as L
+    lanes_ = [_lane(*left, h=h), _lane(*right, h=h)]
+    ego, pair_conf = L.select_ego_pair(
+        [{"points": lanes_[0], "confidence": conf, "lane_index": 1},
+         {"points": lanes_[1], "confidence": conf, "lane_index": 2}], w, h)
+    return {"lanes": lanes_, "ego_left": ego["ego_left"],
+            "ego_right": ego["ego_right"], "confidence": pair_conf, "ego": ego,
+            "image": {"w": w, "h": h}}
+
+
+def test_corridor_source():
+    from . import anchor as A
+    from . import lanes as L
+
+    base = A.EgoCorridor(1280, 720)
+    check("static trapezoid self-identifies", base.source == "static")
+
+    # -- the switch ---------------------------------------------------------
+    c, i = A.build_corridor(base, _lane_result(conf=0.90))
+    check("high-confidence lanes -> UFLD corridor",
+          i["corridor_source"] == "ufld" and c.source == "ufld", str(i))
+    check("UFLD corridor is a LaneCorridor", isinstance(c, A.LaneCorridor))
+
+    c, i = A.build_corridor(base, _lane_result(conf=0.20))
+    check("low-confidence lanes -> static fallback",
+          i["corridor_source"] == "static" and c is base
+          and i["fallback_reason"] == "low_confidence", str(i))
+
+    c, i = A.build_corridor(base, None)
+    check("no lane result -> static fallback",
+          c is base and i["fallback_reason"] == "no_lane_result", str(i))
+
+    lr = _lane_result(conf=0.9)
+    lr["ego_left"] = None
+    c, i = A.build_corridor(base, lr)
+    check("half an ego pair -> static fallback, never half a corridor",
+          c is base and i["corridor_source"] == "static", str(i))
+
+    # The threshold is a boundary, so pin both sides of it.
+    eps = 1e-6
+    c_at, _ = A.build_corridor(base, _lane_result(conf=L.LANE_CONF_MIN))
+    c_below, _ = A.build_corridor(base, _lane_result(conf=L.LANE_CONF_MIN - 0.02))
+    check("threshold is inclusive at LANE_CONF_MIN, exclusive below",
+          c_at.source == "ufld" and c_below.source == "static")
+
+    # -- both lanes on one side of centre is not an ego pair ----------------
+    c, i = A.build_corridor(base, _lane_result(conf=0.9, left=(200, 100),
+                                               right=(300, 250)))
+    check("lanes that do not bracket centre -> static fallback",
+          c is base and i["fallback_reason"] == "no_bracketing_pair", str(i))
+
+    # -- an implausibly narrow pair scores zero and therefore falls back ----
+    c, i = A.build_corridor(base, _lane_result(conf=0.9, left=(630, 620),
+                                               right=(650, 660)))
+    check("implausible lane width -> static fallback",
+          c is base, str(i))
+
+    # -- containment --------------------------------------------------------
+    corr, _ = A.build_corridor(base, _lane_result(conf=0.9))
+    # At row 700 the synthetic lane runs from x=286 to x=966.
+    inside, geo = corr.contains(640.0, 700.0)
+    check("lead between the lines is inside the lane corridor",
+          inside and geo["corridor_source"] == "ufld", str(geo))
+    outside, geo = corr.contains(1150.0, 700.0)
+    check("lead beyond the right line is outside",
+          not outside and geo["reason"] == "outside_lane", str(geo))
+
+    # The margin is real and finite: just past the paint is still in, far past
+    # it is not.
+    xl, xr = corr.bounds_at_row(700.0)
+    margin = A.LANE_MARGIN_FRAC * (xr - xl)
+    just_in, _ = corr.contains(xr + margin * 0.5, 700.0)
+    just_out, _ = corr.contains(xr + margin * 1.5, 700.0)
+    check("corridor margin admits a shade past the line but not a lane's worth",
+          just_in and not just_out)
+
+    # -- the range gate survives the switch ---------------------------------
+    _, geo = corr.contains(640.0, 700.0)
+    near = corr.contains(640.0, 719.0)[1]
+    check("UFLD corridor still reports a forward range",
+          "forward_m" in geo and geo["forward_m"] > 0, str(geo))
+    above, geo = corr.contains(640.0, 10.0)
+    check("above the horizon is still rejected under UFLD",
+          not above, str(geo))
+
+    # -- rows the paint does not reach fall back per-pixel, not per-frame ---
+    short = _lane_result(conf=0.9)
+    short["ego_left"] = short["ego_left"][:4]     # only the far end survives
+    short["ego_right"] = short["ego_right"][:4]
+    c2, _ = A.build_corridor(base, short)
+    _, geo = c2.contains(640.0, 715.0)
+    check("row below the detected paint falls back to the trapezoid",
+          geo["corridor_source"] == "ufld_row_fallback", str(geo))
+
+    # -- polygon ------------------------------------------------------------
+    poly = corr.polygon()
+    check("lane corridor draws a closed-able polygon", len(poly) >= 6)
+    check("polygon runs near->far down one side and back",
+          poly[0][1] > poly[len(poly) // 2 - 1][1], str(poly[:2]))
+
+
+def test_lane_drift():
+    from .lanes import LaneDriftMonitor as M
+    W, H = 1280, 720
+
+    # Offset sign convention: image centre right of the lane centre means the
+    # car is toward the RIGHT boundary.
+    left_of_centre = {"ego": {"x_bottom_left": 300.0, "x_bottom_right": 800.0}}
+    check("offset is +ve when the car sits right of the lane centre",
+          M.offset(left_of_centre, W, H) > 0)
+    centred = {"ego": {"x_bottom_left": 340.0, "x_bottom_right": 940.0}}
+    check("offset is ~0 dead centre", abs(M.offset(centred, W, H)) < 1e-6)
+    check("no ego pair -> no offset", M.offset({"ego": {}}, W, H) is None)
+
+    def at(offset_ratio):
+        """A lane result placing the car at a given fraction toward a boundary."""
+        half = 300.0
+        centre = W * 0.5 - offset_ratio * half
+        return {"ego": {"x_bottom_left": centre - half,
+                        "x_bottom_right": centre + half}}
+
+    # -- must hold, not merely touch ---------------------------------------
+    m = M()
+    r = m.update(at(0.9), W, H, 0.0, 0.9)
+    check("a single frame past the threshold does not fire", not r["drift"])
+    r = m.update(at(0.9), W, H, 0.5, 0.9)
+    check("half the hold time does not fire", not r["drift"] and r["reason"] == "holding")
+    r = m.update(at(0.9), W, H, 1.05, 0.9)
+    check("held past DRIFT_HOLD_S fires once", r["drift"] and r["side"] == "right",
+          str(r))
+    r = m.update(at(0.9), W, H, 2.0, 0.9)
+    check("a held drift does not fire again while held",
+          not r["drift"] and r["reason"] == "already_reported")
+
+    # -- re-arm requires actually recentring --------------------------------
+    m.update(at(0.6), W, H, 3.0, 0.9)                # inside rearm ratio? no (0.6 > 0.5)
+    r = m.update(at(0.9), W, H, 5.0, 0.9)
+    check("drifting back out without recentring does not re-fire", not r["drift"])
+    m.update(at(0.1), W, H, 6.0, 0.9)                # recentred -> re-armed
+    m.update(at(0.9), W, H, 7.0, 0.9)
+    r = m.update(at(0.9), W, H, 8.1, 0.9)
+    check("a second excursion after recentring fires", r["drift"], str(r))
+    check("events are counted", m.n_events == 2)
+
+    # -- staying inside the lane never fires --------------------------------
+    m2 = M()
+    fired = [m2.update(at(0.5), W, H, i * 0.25, 0.9)["drift"] for i in range(40)]
+    check("10 s at 50% offset never fires", not any(fired))
+
+    # -- low lane confidence cannot sustain an excursion --------------------
+    m3 = M()
+    m3.update(at(0.9), W, H, 0.0, 0.9)
+    r = m3.update(at(0.9), W, H, 0.5, 0.2)           # paint lost mid-excursion
+    check("low lane confidence breaks the hold", not r["drift"]
+          and r["reason"] == "no_lane_confidence", str(r))
+    r = m3.update(at(0.9), W, H, 1.1, 0.9)
+    check("the timer restarts after a confidence gap, not resumes",
+          not r["drift"], str(r))
+
+    # -- crossing from one side to the other restarts the timer -------------
+    m4 = M()
+    m4.update(at(0.9), W, H, 0.0, 0.9)
+    r = m4.update(at(-0.9), W, H, 0.6, 0.9)
+    check("swapping sides restarts the hold", not r["drift"], str(r))
+    r = m4.update(at(-0.9), W, H, 1.7, 0.9)
+    check("the new side then fires on its own hold",
+          r["drift"] and r["side"] == "left", str(r))
+
+    # -- reset clears everything -------------------------------------------
+    m4.reset()
+    r = m4.update(at(-0.9), W, H, 2.0, 0.9)
+    check("reset drops an excursion in progress", not r["drift"])
+
+    # -- camera mount bias --------------------------------------------------
+    biased = M(center_bias=-0.30)
+    r = biased.update(at(-0.30), W, H, 0.0, 0.9)
+    check("center_bias zeroes out a fixed mounting offset",
+          abs(r["offset"]) < 1e-6, str(r))
+
+    # -- incoherent thresholds are refused, not silently obeyed --------------
+    # Found the hard way: with rearm_ratio (0.50) above a lowered ratio (0.35),
+    # every frame of a single excursion re-armed and re-fired -- one drift
+    # produced 16 records in a 10 s clip. This is the exact edit someone makes
+    # when tuning DRIFT_RATIO down after a real drive.
+    from .lanes import DRIFT_RATIO, DRIFT_REARM_RATIO
+    check("shipped defaults are coherent", DRIFT_REARM_RATIO < DRIFT_RATIO,
+          f"rearm {DRIFT_REARM_RATIO} < ratio {DRIFT_RATIO}")
+    for bad in (dict(ratio=0.35), dict(ratio=0.5, rearm_ratio=0.5),
+                dict(ratio=0.5, rearm_ratio=-0.1), dict(hold_s=0.0)):
+        try:
+            M(**bad)
+            ok = False
+        except ValueError:
+            ok = True
+        check(f"a monitor built with {bad} is refused", ok)
+
+    # ...and a coherently-lowered threshold still fires exactly once.
+    m5 = M(ratio=0.35, rearm_ratio=0.20)
+    fires = [m5.update(at(0.42), W, H, i * 0.25, 0.9)["drift"] for i in range(24)]
+    check("a lowered-but-coherent threshold reports one excursion once",
+          sum(fires) == 1, f"{sum(fires)} events in {len(fires)} frames")
+
+
+def test_lead_corridor_check():
+    """Only a lane corridor may invalidate a lead the tracker is holding."""
+    from . import anchor as A
+    from .live import lead_corridor_check, LEAD_OUT_OF_CORRIDOR_FRAMES
+
+    base = A.EgoCorridor(1280, 720)
+    lane, _ = A.build_corridor(base, _lane_result(conf=0.9))
+    in_box = (600.0, 500.0, 680.0, 700.0)      # bottom-centre 640,700: in lane
+    out_box = (1100.0, 500.0, 1200.0, 700.0)   # bottom-centre 1150,700: not
+
+    n, geo = lead_corridor_check(lane, in_box, 5)
+    check("a lead back inside the lane clears the miss count", n == 0, str(geo))
+    n, _ = lead_corridor_check(lane, out_box, 0)
+    check("a lead outside the lane starts counting", n == 1)
+    n, _ = lead_corridor_check(lane, out_box, 2)
+    check("consecutive misses accumulate", n == 3)
+    check("three misses is what triggers a re-anchor",
+          LEAD_OUT_OF_CORRIDOR_FRAMES == 3)
+
+    # The whole point: the trapezoid does not get a vote on an existing track.
+    n, geo = lead_corridor_check(base, out_box, 9)
+    check("the static trapezoid never invalidates an established lead",
+          n == 0, f"count={n} geo={geo}")
+    n, _ = lead_corridor_check(base, in_box, 9)
+    check("...whether the trapezoid agrees or not", n == 0)
+
+    n, geo = lead_corridor_check(lane, None, 4)
+    check("no lead means no miss count and no geometry",
+          n == 0 and geo is None)
+
+
+def test_lane_confidence_contribution():
+    """Lane confidence may add to §8 confidence; it may never subtract."""
+    args = (0.8, 0.3, 0.7, 2.0)      # valid, var, track, anchor_age
+    baseline = compute_confidence(*args)
+    check("default args reproduce the pre-lane confidence exactly",
+          compute_confidence(*args, lane_conf=None) == baseline)
+    check("a static-corridor frame scores exactly the baseline",
+          compute_confidence(*args, lane_conf=0.95,
+                             corridor_source="static") == baseline)
+    boosted = compute_confidence(*args, lane_conf=0.95, corridor_source="ufld")
+    check("a UFLD-corridor frame scores above the baseline", boosted > baseline)
+    check("the lane bonus is capped at CONF_LANE_BONUS",
+          boosted - baseline <= S.CONF_LANE_BONUS + 1e-9,
+          f"{boosted:.4f} vs {baseline:.4f}")
+    check("zero lane confidence is worth nothing, not something",
+          compute_confidence(*args, lane_conf=0.0,
+                             corridor_source="ufld") == baseline)
+    # The bonus must not be able to drag a bad frame over the speaking floor.
+    bad = (0.15, 0.9, 0.2, 30.0)
+    check("the lane bonus cannot lift a DEGRADED frame over CONF_FLOOR",
+          compute_confidence(*bad) < S.CONF_FLOOR
+          and compute_confidence(*bad, lane_conf=1.0,
+                                 corridor_source="ufld") < S.CONF_FLOOR)
+
+
+def _code_only(path):
+    """A module's source with every comment and string literal removed.
+
+    The point is to check what the module *does*, not what it says about
+    itself. lanes.py explains at length that it must never speak -- a naive
+    grep for "voice" would fail on the very comment that forbids it, and the
+    obvious fix (delete the prose) would trade a real explanation for a green
+    check. So the prose is tokenised away and the code alone is inspected.
+    """
+    import io
+    import tokenize
+    from pathlib import Path
+
+    out = []
+    src = Path(path).read_text()
+    for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+        if tok.type in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        out.append(tok.string)
+    return " ".join(out)
+
+
+def test_lane_advisory_only():
+    """Lane departure logs. It must have no path to the voice channel."""
+    from pathlib import Path
+    code = _code_only(Path(__file__).with_name("lanes.py")).lower()
+
+    check("lanes.py code imports no policy or voice module",
+          "live_policy" not in code and "voice" not in code
+          and "line_text" not in code and "line_audio" not in code)
+    for banned in ("speak", "urgency", "audio", "clip", "sessions"):
+        check(f"lanes.py code never references {banned!r}",
+              banned not in code,
+              "drift logging must not acquire a voice by accident")
+
+    # The prose that documents the limit must still be there. A future edit
+    # that strips the explanation is exactly when someone is most likely to
+    # wire this into the voice channel by mistake.
+    src = Path(__file__).with_name("lanes.py").read_text()
+    check("lanes.py still documents that drift is advisory-only",
+          "ADVISORY LOGGING ONLY" in src and "never speaks" in src.lower())
+
+    # And the policy must not be able to see a drift result even if one is
+    # handed to it: LivePolicy.tick takes named arguments and none of them are
+    # lane-shaped.
+    import inspect
+    from .live_policy import LivePolicy
+    params = set(inspect.signature(LivePolicy.tick).parameters)
+    check("LivePolicy.tick accepts no lane/drift argument",
+          not any("lane" in p or "drift" in p for p in params), str(sorted(params)))
+
+    # The drift record must never carry a spoken line into the session log.
+    import json as _json
+    from . import lanes as L
+    m = L.LaneDriftMonitor()
+    fired = None
+    for i in range(12):
+        r = m.update({"ego": {"x_bottom_left": 200.0, "x_bottom_right": 700.0}},
+                     1280, 720, i * 0.25, 0.9)
+        if r["drift"]:
+            fired = r
+            break
+    blob = _json.dumps(fired or {}).lower()
+    check("a fired drift event contains no voice field",
+          fired is not None and not any(k in blob for k in
+                                        ("speak", "voice", "line", "clip")),
+          str(fired))
+
 def main():
     print("=" * 70)
     print("headway warning-logic v2 self-test (docs/warning_logic_v2.md)")
@@ -470,6 +816,11 @@ def main():
     test_cooldowns()
     test_cutin_and_warmup()
     test_purity()
+    test_corridor_source()
+    test_lead_corridor_check()
+    test_lane_drift()
+    test_lane_confidence_contribution()
+    test_lane_advisory_only()
 
     passed = sum(1 for ok, _, _ in _results if ok)
     total = len(_results)

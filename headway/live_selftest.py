@@ -618,6 +618,219 @@ def run_firewall():
     check("open" not in calls, "live_policy.py performs no file I/O")
 
 
+# ===========================================================================
+# D. UFLDv2 lane model — is it really the published network, decoded the
+#    published way?
+# ===========================================================================
+# headway/lanes.py restates the upstream architecture instead of importing the
+# training repo (see its module docstring for why). That buys a clean
+# integration and takes on one specific risk: a network that is *shaped* like
+# UFLDv2, loading the official weights into subtly the wrong places, producing
+# confident nonsense. These checks are what close that risk. They need the
+# checkpoint, so they skip rather than fail when it is absent -- the loop is
+# designed to run without it, and a CI box with no weights should not go red.
+def _pred2coords_reference(pred, row_anchor, col_anchor, local_width,
+                           num_grid_row, num_grid_col, W, H):
+    """Literal transcription of demo.py:pred2coords, upstream commit as cloned.
+
+    Deliberately unoptimised and deliberately not shared with lanes.py: the
+    whole value of this function is that it was written from the reference and
+    not from our implementation.
+    """
+    import torch
+
+    batch_size, num_grid_row_, num_cls_row, num_lane_row = pred['loc_row'].shape
+    batch_size, num_grid_col_, num_cls_col, num_lane_col = pred['loc_col'].shape
+
+    max_indices_row = pred['loc_row'].argmax(1).cpu()
+    valid_row = pred['exist_row'].argmax(1).cpu()
+    max_indices_col = pred['loc_col'].argmax(1).cpu()
+    valid_col = pred['exist_col'].argmax(1).cpu()
+
+    loc_row = pred['loc_row'].float().cpu()
+    loc_col = pred['loc_col'].float().cpu()
+
+    coords = []
+    for i in range(num_lane_row):
+        tmp = []
+        if valid_row[0, :, i].sum() > num_cls_row / 2:
+            for k in range(valid_row.shape[1]):
+                if valid_row[0, k, i]:
+                    all_ind = torch.tensor(list(range(
+                        max(0, max_indices_row[0, k, i] - local_width),
+                        min(num_grid_row - 1, max_indices_row[0, k, i] + local_width) + 1)))
+                    out_tmp = (loc_row[0, all_ind, k, i].softmax(0) * all_ind.float()).sum() + 0.5
+                    out_tmp = out_tmp / (num_grid_row - 1) * W
+                    tmp.append((float(out_tmp), float(row_anchor[k] * H)))
+        coords.append(tmp)
+
+    col = []
+    for i in range(num_lane_col):
+        tmp = []
+        if valid_col[0, :, i].sum() > num_cls_col / 4:
+            for k in range(valid_col.shape[1]):
+                if valid_col[0, k, i]:
+                    all_ind = torch.tensor(list(range(
+                        max(0, max_indices_col[0, k, i] - local_width),
+                        min(num_grid_col - 1, max_indices_col[0, k, i] + local_width) + 1)))
+                    out_tmp = (loc_col[0, all_ind, k, i].softmax(0) * all_ind.float()).sum() + 0.5
+                    out_tmp = out_tmp / (num_grid_col - 1) * H
+                    tmp.append((float(col_anchor[k] * W), float(out_tmp)))
+        col.append(tmp)
+    return coords, col
+
+
+def run_lanes():
+    import time
+
+    from . import lanes as L
+
+    head("D -- UFLDv2 lane model fidelity")
+
+    if not L.available():
+        print(f"  [SKIP] weights not present at {L.DEFAULT_WEIGHTS} — "
+              "lane checks skipped; the loop falls back to the trapezoid")
+        return
+
+    import torch
+
+    # -- the checkpoint fits the model exactly ------------------------------
+    net = L.ParsingNet()
+    try:
+        L._load_state_dict(net, L.DEFAULT_WEIGHTS)
+        loaded = True
+        detail = ""
+    except RuntimeError as e:
+        loaded, detail = False, str(e)[:200]
+    check(loaded, "official culane_res18 checkpoint loads with no missing or "
+                  "unexpected keys", detail)
+    if not loaded:
+        return
+
+    check(net.total_dim == 91224 and net.input_dim == 4000,
+          "head dimensions match configs/culane_res18.py",
+          f"total_dim={net.total_dim} input_dim={net.input_dim}")
+
+    # -- decoding matches the reference loop, cell for cell -----------------
+    # On a real road frame, not noise: the network correctly finds no lanes in
+    # noise, so a comparison there would agree on the empty set and prove
+    # nothing. The clip ships with the upstream repo.
+    import cv2
+    clip = "/workspace/ufldv2/example.mp4"
+    real = None
+    if os.path.exists(clip):
+        cap = cv2.VideoCapture(clip)
+        ok, real = cap.read()
+        cap.release()
+        if not ok:
+            real = None
+
+    L._ensure_loaded()
+    if real is None:
+        print(f"  [SKIP] {clip} not present — decode-vs-reference check needs "
+              "a frame with lanes in it")
+        torch.manual_seed(0)
+        probe_frame = (torch.rand(720, 1280, 3) * 255).numpy().astype("uint8")
+    else:
+        probe_frame = real
+
+    with torch.inference_mode():
+        pred = L._net(L._preprocess(probe_frame))
+
+    ref_row, ref_col = _pred2coords_reference(
+        pred, L.ROW_ANCHOR, L.COL_ANCHOR, L.LOCAL_WIDTH,
+        L.NUM_CELL_ROW, L.NUM_CELL_COL, 1280, 720)
+
+    row_pos, row_valid, row_pe = L._decode_branch(
+        pred["loc_row"], pred["exist_row"], L.NUM_CELL_ROW)
+    col_pos, col_valid, col_pe = L._decode_branch(
+        pred["loc_col"], pred["exist_col"], L.NUM_CELL_COL)
+
+    worst = 0.0
+    n_compared = 0
+    for i in range(L.NUM_LANES):
+        ours = L._lane_from_row(row_pos, row_valid, row_pe, i, 1280, 720)
+        theirs = ref_row[i]
+        if not theirs:
+            continue
+        if ours is None:
+            worst = float("inf")
+            break
+        if len(ours["points"]) != len(theirs):
+            worst = float("inf")
+            break
+        for (ax, ay), (bx, by) in zip(ours["points"], theirs):
+            worst = max(worst, abs(ax - bx), abs(ay - by))
+            n_compared += 1
+    check(worst < 1e-3 and (n_compared > 0 or real is None),
+          "vectorised row decode matches demo.py:pred2coords",
+          f"max |delta| = {worst:.2e} px over {n_compared} points")
+
+    worst_c, n_c = 0.0, 0
+    for i in range(L.NUM_LANES):
+        ours = L._lane_from_col(col_pos, col_valid, col_pe, i, 1280, 720)
+        theirs = ref_col[i]
+        if not theirs or ours is None:
+            continue
+        pts = sorted(theirs, key=lambda p: p[1])
+        for (ax, ay), (bx, by) in zip(ours["points"], pts):
+            worst_c = max(worst_c, abs(ax - bx), abs(ay - by))
+            n_c += 1
+    check(worst_c < 1e-3, "vectorised column decode matches the reference",
+          f"max |delta| = {worst_c:.2e} px over {n_c} points")
+
+    # -- the -inf window mask is not the same as clamping -------------------
+    # A lane against the frame edge sits at cell 0 or cell G-1, where the +/-1
+    # window runs off the grid. Upstream shortens the window; clamping would
+    # duplicate a logit and shift the weighted mean. This asserts the branch is
+    # actually reachable and handled, not merely written.
+    G = 8
+    loc = torch.full((1, G, 1, 1), -20.0)
+    loc[0, 0, 0, 0] = 5.0                       # argmax at the very first cell
+    loc[0, 1, 0, 0] = 5.0                       # ...tied with its neighbour
+    exist = torch.tensor([[[[0.0]], [[9.0]]]])  # exists
+    pos, valid, _ = L._decode_branch(loc, exist, G)
+    # Reference window is [0, 1], two equal logits -> mean cell 0.5, +0.5 = 1.0.
+    check(abs(float(pos[0, 0]) - 1.0) < 1e-5 and bool(valid[0, 0]),
+          "edge-cell decode window is truncated, not clamped",
+          f"pos={float(pos[0, 0]):.6f} (clamping would give 0.8333)")
+
+    # -- cost, on the real frame path ---------------------------------------
+    probe = probe_frame
+    for _ in range(5):
+        L.detect_lanes(probe)
+    torch.cuda.synchronize() if torch.cuda.is_available() else None
+    times = []
+    for _ in range(30):
+        t0 = time.perf_counter()
+        L.detect_lanes(probe)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    p50, p95 = times[len(times) // 2], times[int(len(times) * 0.95)]
+    # The frame budget at 4 fps is 250 ms and depth already takes ~7 ms. Lane
+    # detection has to be small enough that adding it does not change the
+    # cadence; 10 ms is the line at which that stops being obviously true.
+    check(p95 < 10.0, "lane detection stays inside the per-frame budget",
+          f"p50 {p50:.2f} ms, p95 {p95:.2f} ms over 30 frames")
+
+    # -- and it actually finds the lane on real footage ---------------------
+    if real is not None:
+        r = L.detect_lanes(real)
+        check(r["ego_left"] is not None and r["ego_right"] is not None
+              and r["confidence"] >= L.LANE_CONF_MIN,
+              "ego pair found with usable confidence on real dashcam footage",
+              f"conf={r['confidence']} lanes={len(r['lanes'])}")
+        xl = r["ego"]["x_bottom_left"]
+        xr = r["ego"]["x_bottom_right"]
+        check(xl < real.shape[1] / 2 < xr,
+              "the ego pair brackets image centre at the bottom",
+              f"{xl:.0f} < {real.shape[1] / 2:.0f} < {xr:.0f}")
+    else:
+        print(f"  [SKIP] {clip} not present — real-footage check skipped")
+
+
 def main():
     print("=" * 70)
     print("RIO live headway (v3) — verification")
@@ -625,6 +838,7 @@ def main():
     run_pipeline()
     run_policy()
     run_firewall()
+    run_lanes()
 
     print("\n" + "=" * 70)
     total = len(PASS) + len(FAIL)

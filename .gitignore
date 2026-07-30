@@ -9,3 +9,4 @@ app.py.embedfix.bak
 uvicorn.log*
 training_data/
 runs/
+weights/

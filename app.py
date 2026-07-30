@@ -26,6 +26,7 @@ import perceive
 # already installed and never pulls a second copy of the weights.
 from headway import live as headway_live
 from headway import live_policy
+from headway import lanes as headway_lanes
 
 def _warm_vision():
     t = time.time()
@@ -35,6 +36,16 @@ def _warm_vision():
         # the same thread, after Qwen, so the overlay's first frame does not pay
         # the depth load while a drive is already running.
         perceive.warm()
+        # UFLDv2 lane geometry. Same reasoning, and it matters more here: this
+        # one runs on EVERY headway frame, so an unwarmed first call would put
+        # a ~2 s weight load inside a live frame instead of a 2 ms forward.
+        # A missing checkpoint must not take the server down -- headway falls
+        # back to the static trapezoid and says so once.
+        try:
+            headway_lanes.warm()
+            print("[vision] lane detection warm", flush=True)
+        except Exception as e:
+            print(f"[vision] lane detection unavailable: {e}", flush=True)
         # flush: stdout is block-buffered when uvicorn is redirected to a log
         # file, so without this the line can sit unseen for a long time.
         print(f"[vision] warm complete in {time.time() - t:.1f}s", flush=True)
@@ -248,6 +259,11 @@ async def headway_frame_endpoint(
         session.lock.release()
 
     sessions.log_headway(session_id, result, (time.time() - t0) * 1000)
+    # Lane departure is logged, not spoken. It gets its own event kind so a
+    # review pass can pull the handful of excursions out of a whole drive; see
+    # sessions.log_lane_drift and the scope note in headway/lanes.py.
+    if (result.get("lane_drift") or {}).get("drift"):
+        sessions.log_lane_drift(session_id, result)
     return result
 
 

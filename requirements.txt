@@ -37,3 +37,11 @@ Pillow>=10.0.1
 # <5 pin is what keeps that probe from becoming a real portability problem.
 # headless: no GUI libs on a server, and the full build pulls in GTK/X11.
 opencv-contrib-python-headless<5
+
+# --- headway lane geometry (UFLDv2) ---
+# The lane model is Ultra-Fast-Lane-Detection-v2 (MIT), culane_res18. Its
+# architecture is restated in headway/lanes.py and runs on the torch/torchvision
+# already pinned above, so there is no new inference dependency -- ONNX was
+# considered and rejected (see that module's docstring). gdown is only for
+# fetching the 825 MB checkpoint off Google Drive; see tools/fetch_lane_weights.py.
+gdown>=5.0
