@@ -489,6 +489,35 @@ class LiveSession:
             new_lead=snap["new_lead"], track_lost=(box is None),
         )
 
+        # --- per-object record for the conversation path ---------------------
+        # Everything the scene graph needs and the headway log deliberately
+        # drops: the box itself, and where the lane was at the row the object
+        # meets the road. `membership` (Candidate.to_log) stays as it is --
+        # it ships to the session JSONL on every frame and is already the
+        # largest thing in the file, so this rides in the response only and is
+        # not logged. Nothing downstream of here can affect a warning.
+        scene_objects = []
+        for cand in self.candidates.candidates.values():
+            if cand.lost:
+                continue
+            bounds = self.corridor.bounds_at_row(cand.box[3])
+            scene_objects.append({
+                "id": cand.id,
+                "label": cand.label,
+                "box": [round(float(v), 1) for v in cand.box],
+                "range_m": (None if cand.range_m is None
+                            else round(float(cand.range_m), 2)),
+                "score": round(float(cand.score), 3),
+                "overlap": round(float(cand.overlap), 3),
+                "quality": round(float(cand.quality), 3),
+                "member": bool(cand.member),
+                "is_lead": cand.id == self.lead_id,
+                "age_s": round(max(0.0, t - cand.first_seen), 2),
+                "lane_bounds": (None if bounds is None
+                                else [round(float(bounds[0]), 1),
+                                      round(float(bounds[1]), 1)]),
+            })
+
         self.frame_idx += 1
         self.n_frames += 1
         t_end = time.perf_counter()
@@ -547,6 +576,9 @@ class LiveSession:
             # membership.Candidate.to_log for the legend.
             "membership": self.candidates.to_log(),
             "membership_info": member_info,
+            # Read by framebuf/scene for the conversation path. Not logged --
+            # see the comment where it is built.
+            "scene_objects": scene_objects,
             "lead_id": self.lead_id,
             "lead_switch": lead_switch,
             "merge_promotions": promotions,

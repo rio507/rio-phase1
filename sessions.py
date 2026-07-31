@@ -249,6 +249,63 @@ def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes
     })
 
 
+def log_visual_qa(session_id: Optional[str], meta: dict) -> None:
+    """One visual conversation turn, every stage of it.
+
+    Its own kind because it is the only event in the file that records a
+    DECISION CHAIN rather than a measurement: what the driver asked, how it was
+    classified and by what (rules or model), which frame was chosen out of the
+    ring and how much better it scored than simply taking the newest one, which
+    track the reference resolved to and by which method, what the crop actually
+    contained, what went to the model, and how long every stage took.
+
+    That chain is the only way to argue with a bad answer. "RIO described the
+    wrong car" has at least four distinct causes -- misrouted, wrong frame,
+    wrong track, or the model misreading a good crop -- and they are
+    indistinguishable from the reply alone.
+
+    NO IMAGES. Not the frame, not the crop, not a thumbnail. Only their ids,
+    sizes and scores. Images are written only when config.RING_PERSIST is on,
+    by framebuf.persist, and then this record carries the PATH -- so a review
+    can find them if they were kept and can see that they were not if they
+    weren't.
+    """
+    if not session_id or not meta:
+        return
+    route = meta.get("route") or {}
+    _write(session_id, "visual_qa", {
+        "talk_id": meta.get("talk_id"),
+        "question": meta.get("question"),
+        # -- classification
+        "request_type": route.get("request_type"),
+        "route_method": route.get("method"),
+        "route_confidence": route.get("confidence"),
+        "object_reference": route.get("object_reference"),
+        "phase_b_type": route.get("phase_b"),
+        # -- frame selection
+        "frame_selection": meta.get("frame_selection"),
+        "object_frame_selection": meta.get("object_frame_selection"),
+        "ring": meta.get("ring"),
+        # -- grounding
+        "resolution": meta.get("resolution"),
+        "referent": meta.get("referent"),
+        "referent_source": meta.get("referent_source"),
+        "referent_visible": meta.get("referent_visible"),
+        "enrichment": meta.get("enrichment"),
+        "crop": meta.get("crop"),
+        "crop_source": meta.get("crop_source"),
+        # -- the request and what came back
+        "request": meta.get("request"),
+        "reply": meta.get("reply"),
+        "error": meta.get("error"),
+        "visual_unavailable": meta.get("visual_unavailable"),
+        # -- retained images, if the operator turned that on
+        "frame_path": meta.get("frame_path"),
+        "crop_path": (meta.get("referent") or {}).get("last_crop_path"),
+        "timing_ms": meta.get("timing_ms", {}),
+    })
+
+
 def is_active(session_id: str) -> bool:
     return session_id in _open_handles
 

@@ -116,8 +116,27 @@ python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headw
 # --no-deps on purpose: rfdetr's dependency list is a training stack, and
 # `supervision` pulls opencv-python 5.x which shadows the contrib-headless
 # build and removes CSRT/MOSSE. See the note in requirements.txt.
+#
+# scipy is listed EXPLICITLY and must stay. --no-deps means we take on the job
+# of supplying whatever the modules we actually import need, and scipy is the
+# one thing in that set nothing else installs for us:
+# `rfdetr.models.lwdetr` -> `rfdetr.models.matcher` -> `scipy.optimize`, at
+# IMPORT time, so without it the sideways import in headway/detect.py dies with
+# `No module named 'scipy'` and the pod comes up with no detector at all.
+#
+# Checked rather than guessed: of everything the import pulls in, scipy is the
+# only package whose sole non-extra requirers are rfdetr and supervision --
+# i.e. the two things installed here with --no-deps. pydantic, PyYAML, tqdm,
+# regex and defusedxml all arrive properly as dependencies of fastapi,
+# transformers, accelerate or huggingface_hub, so they are NOT listed here.
+#
+# This is not hypothetical. RF-DETR is the candidate source for the headway
+# lead AND for the visual conversation's scene graph (docs/visual_qa.md), so a
+# missing scipy is a pod where the gap warnings never fire and RIO cannot see
+# anything to talk about. The smoke check below is what catches it.
 log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
 pip install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+pip install --no-cache-dir --no-deps scipy
 # Both of the next two run `python -m` / import from the repo, so they need the
 # repo as cwd. The script is documented as `bash /workspace/boot.sh`, which
 # leaves cwd wherever the caller happened to be; the cd further down (step 7)
@@ -134,10 +153,10 @@ python -m tools.fetch_detector_weights || log "  !! detector weights unavailable
 #   * CSRT, which disappears if anything drags opencv-python 5.x in on top of
 #     the pinned contrib-headless build
 log "detector + tracker smoke check"
-python - <<'PY' || log "  !! SMOKE CHECK FAILED - headway will have no candidates"
+python - <<'PY' || log "  !! SMOKE CHECK FAILED - no headway candidates AND an empty scene graph"
 import cv2
 from headway import detect
-detect._rfdetr_models()
+detect._rfdetr_models()          # also proves scipy is present: matcher imports it
 print(f"   rfdetr importable from {detect._pkg_dir()}")
 assert any(hasattr(cv2, n) for n in ("TrackerCSRT_create", "TrackerCSRT")) or hasattr(cv2, "legacy"), \
     f"cv2 {cv2.__version__} has no CSRT - check for a stray opencv-python install"

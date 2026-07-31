@@ -24,6 +24,9 @@ import llm_interface
 import vision
 import perceive
 import nav
+import framebuf
+import router as request_router
+import visual_qa
 # Import order matters: perceive lends vision's resident Qwen3-VL to
 # headway.anchor at import time, so headway.live's anchor path finds a provider
 # already installed and never pulls a second copy of the weights.
@@ -133,6 +136,35 @@ def last_talk_endpoint():
     return dict(_last_talk)
 
 
+def _visual_key(session_id):
+    """Ring/visual-session key. One driver, so a keyless turn still has state."""
+    return session_id or "default"
+
+
+def _route_and_prepare(transcript: str, session_id: str):
+    """Classify the utterance and, if it is visual, build the turn. -> (route, va).
+
+    Blocking on purpose and always called through a threadpool: the router may
+    ask a model, and preparing a visual turn decodes frames and can run a Qwen
+    pass. Neither belongs on the event loop.
+
+    Never fatal. A router or preparation failure returns no visual turn, and the
+    ordinary conversation path answers instead — degraded, not broken.
+    """
+    key = _visual_key(session_id)
+    try:
+        if not config.VISUAL_QA_ENABLED:
+            return None, None
+        has_ref = visual_qa.get_session(key).active_referent() is not None
+        route = request_router.classify(transcript, has_referent=has_ref)
+        if not request_router.is_visual(route["request_type"]):
+            return route, None
+        return route, visual_qa.answer(key, transcript, route)
+    except Exception as e:
+        print(f"[talk] visual routing failed: {type(e).__name__}: {e}", flush=True)
+        return None, None
+
+
 @app.post("/talk")
 async def talk(audio: UploadFile, session_id: str = Query(default=None)):
     t0 = time.time()
@@ -151,9 +183,17 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
 
     t1 = time.time()
 
+    # A question about what is out of the window goes down the visual path, and
+    # everything else goes where it always did. The decision is made here, once,
+    # on the server, so the voice path and the text path cannot diverge on it.
+    route, va = await run_in_threadpool(_route_and_prepare, transcript, session_id)
+    request_type = (route or {}).get("request_type", "non_visual_question")
+
     print({
         "transcript": transcript,
         "whisper_seconds": round(t1 - t0, 3),
+        "request_type": request_type,
+        "visual": va is not None,
     })
 
     talk_id = uuid.uuid4().hex[:12]
@@ -163,7 +203,9 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
         reply_parts = []
         audio_len = 0
 
-        for token in llm_interface.generate_stream(transcript):
+        tokens = va.stream() if va is not None else llm_interface.generate_stream(transcript)
+
+        for token in tokens:
             buffer += token
             reply_parts.append(token)
 
@@ -188,18 +230,89 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
             "session_id": session_id,
             "audio_bytes": audio_len,
             "latency_ms": round(latency_ms, 1),
+            "request_type": request_type,
             "t": time.time(),
         })
         sessions.log_talk(session_id, transcript, reply, audio_len, latency_ms)
+        if va is not None:
+            # Every stage of the visual turn, with its own latencies. The STT
+            # cost is added here because it is the one stage that happens
+            # before the turn object exists.
+            va.meta.setdefault("timing_ms", {})["stt"] = round((t1 - t0) * 1000, 1)
+            va.meta["talk_id"] = talk_id
+            sessions.log_visual_qa(session_id, va.meta)
 
     # The transcript is known before streaming starts, so it can ride on a header.
     # URL-encoded because headers are latin-1 only and transcripts are UTF-8.
     headers = {
         "X-Transcript": quote(transcript, safe=""),
         "X-Talk-Id": talk_id,
-        "Access-Control-Expose-Headers": "X-Transcript, X-Talk-Id",
+        "X-Request-Type": request_type,
+        "Access-Control-Expose-Headers": "X-Transcript, X-Talk-Id, X-Request-Type",
     }
     return StreamingResponse(streamer(), media_type="audio/mpeg", headers=headers)
+
+
+# --- Visual conversation (docs/visual_qa.md) --------------------------------
+
+
+@app.get("/scene")
+def scene_endpoint(session_id: str = Query(default=None)):
+    """The live scene graph: what RIO can currently see, with stable track ids.
+
+    Read-only view of state the 4 fps headway loop already produces. It runs no
+    model and changes nothing — the dashboard draws it, the acceptance tests
+    assert on it, and a driver never hears it.
+    """
+    return visual_qa.scene_graph(_visual_key(session_id))
+
+
+@app.post("/ask")
+async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
+    """A visual question in text, answered in text. No microphone, no TTS.
+
+    This is the same pipeline /talk uses, minus Whisper at the front and
+    ElevenLabs at the back, which is what makes the acceptance tests runnable
+    without a car. `meta` carries every stage's decision and latency.
+    """
+    question = str(body.get("question") or "").strip()
+    if not question:
+        return {"error": "no question"}
+
+    route, va = await run_in_threadpool(_route_and_prepare, question, session_id)
+    if va is None:
+        # Not a visual question (or the visual path is unavailable): answer it
+        # the ordinary way rather than refusing, so /ask is a complete
+        # conversational endpoint and not a visual-only one.
+        reply = await run_in_threadpool(
+            lambda: "".join(llm_interface.generate_stream(question)).strip())
+        return {"reply": reply, "request_type": (route or {}).get(
+            "request_type", "non_visual_question"), "visual": False,
+            "route": route}
+
+    reply = await run_in_threadpool(va.text)
+    sessions.log_visual_qa(session_id, va.meta)
+    return {"reply": reply, "request_type": route["request_type"],
+            "visual": True, "meta": va.meta}
+
+
+@app.get("/visual_state")
+def visual_state_endpoint(session_id: str = Query(default=None)):
+    """Frame buffer and referent state. Diagnostics for the dashboard."""
+    key = _visual_key(session_id)
+    ring = framebuf.peek_ring(key)
+    sess = visual_qa.get_session(key)
+    ref = sess.active_referent()
+    return {
+        "session_id": key,
+        "buffer": ring.stats() if ring else {"frames": 0},
+        "retention": {"seconds": config.RING_SECONDS,
+                      "max_frames": config.RING_MAX_FRAMES,
+                      "persist_images": config.RING_PERSIST},
+        "active_referent": ref.to_log() if ref else None,
+        "turns": len(sess.turns),
+        "enriched_tracks": sorted(sess.enrichment.all().keys()),
+    }
 
 from fastapi import File
 import sessions
@@ -288,6 +401,18 @@ async def headway_frame_endpoint(
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     finally:
         session.lock.release()
+
+    # Retain the frame for the conversation path. AFTER processing, so nothing
+    # here is inside the 250 ms frame budget, and outside the session lock,
+    # which the frame no longer needs. The ring is RAM-only and six seconds
+    # long — see framebuf.py.
+    if config.VISUAL_QA_ENABLED:
+        try:
+            framebuf.get_ring(_visual_key(session_id)).push(image_bytes, result)
+        except Exception as e:
+            # Losing a frame from the buffer costs a better answer later. It
+            # must never cost the headway frame that has already been computed.
+            print(f"[framebuf] push failed: {type(e).__name__}: {e}", flush=True)
 
     sessions.log_headway(session_id, result, (time.time() - t0) * 1000)
     # Lane departure is logged, not spoken. It gets its own event kind so a
@@ -438,6 +563,13 @@ def session_end_endpoint(session_id: str = Query(...)):
     # Kalman filter and cooldown table survive for every drive the process has
     # ever seen, and a re-used session id would resume mid-warning.
     headway_live.reset_session(session_id)
+    # ...and the visual state with it. The frame ring is the one that matters:
+    # it holds pictures of the road, and "the drive ended" is exactly when they
+    # should stop existing. The referent goes too — a car discussed on the last
+    # drive must not be what "what year is it?" attaches to on the next one.
+    key = _visual_key(session_id)
+    framebuf.drop_ring(key)
+    visual_qa.drop_session(key)
     return {"closed": closed}
 
 

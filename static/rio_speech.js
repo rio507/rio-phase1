@@ -13,6 +13,12 @@
  *   P2  the near-tier turn. The one nav line that is genuinely time-critical:
  *       four seconds out, saying it late is the same as not saying it.
  *   P3  every other nav announcement.
+ *   P4  conversation — RIO answering the driver, including a visual answer
+ *       about something out of the window. Lowest on purpose: it is the only
+ *       tier the driver can simply ask for again, and it is the longest, so a
+ *       turn or a gap warning arriving mid-sentence must cut straight through
+ *       it. Everything above this stays true only inside a window; a reply to
+ *       "what kind of car is that" does not.
  *
  * Two rules beyond the priority ladder:
  *
@@ -35,7 +41,7 @@
 (function (root) {
   'use strict';
 
-  var P = { SAFETY: 1, TURN_NEAR: 2, NAV: 3 };
+  var P = { SAFETY: 1, TURN_NEAR: 2, NAV: 3, CONVO: 4 };
 
   // A play() that never settles would leave RIO mute for the rest of the drive,
   // so every item is on a watchdog. Longer than any line RIO says.

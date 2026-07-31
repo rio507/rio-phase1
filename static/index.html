@@ -676,6 +676,7 @@
   }
   .turn-driver .turn-tag { color: var(--text-dimmer); }
   .turn-rio .turn-tag { color: var(--accent); }
+  .turn-route { color: var(--text-dimmer); letter-spacing: 0.16em; }
   .turn-text { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text); }
   .turn-rio .turn-text { color: var(--text-bright); }
   .turn-empty { color: var(--text-dimmer); font-family: var(--font-mono); font-size: 11px; }
@@ -968,7 +969,10 @@
       <div class="turn-text turn-empty" id="turndriver">Awaiting input.</div>
     </div>
     <div class="turn turn-rio">
-      <div class="turn-tag">RIO</div>
+      <!-- The tag says which pipeline answered. A visual turn means GPT-5.5 was
+           handed the frame and a crop; anything else means it answered from the
+           conversation alone. A misroute is visible here before it is audible. -->
+      <div class="turn-tag">RIO<span class="turn-route" id="turnroute"></span></div>
       <div class="turn-text turn-empty" id="turnrio">Standing by.</div>
     </div>
 
@@ -1063,6 +1067,66 @@ window.RIO = (function () {
       if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
       const p = player.play();
       if (p && p.catch) p.catch(() => {}); // user can still hit the controls
+    },
+
+    /* RIO's reply to the driver, spoken through the arbiter rather than played
+       straight at the audio element.
+
+       This was the last voice on the page that owned its own mouth. It worked
+       while conversation was the only thing that talked back, and stopped
+       working the moment navigation could speak: a reply and a turn
+       announcement would simply play over each other, and the one you could
+       not make out was whichever mattered more.
+
+       Priority 4, below every nav line and far below a gap warning. That
+       ordering is deliberate and it is not about importance — it is about what
+       is still true later. A turn announced after the junction is worthless and
+       a gap warning is worthless three seconds late; an answer to "what kind of
+       car is that" can be asked for again. So conversation is the tier that
+       yields, and a visual answer gets cut off mid-sentence by a near-tier turn
+       exactly as it should be.
+
+       Group "convo": a newer reply replaces an older one still speaking, which
+       is what happens when the driver asks a second question without waiting. */
+    sayReply(player, blob, meta) {
+      meta = meta || {};
+      let cleanup = null;
+      return RIO.speech.say({
+        priority: RIO.speech.P.CONVO,
+        group: 'convo',
+        id: 'convo:' + (meta.talkId || String(Date.now())),
+        text: meta.text || '',
+        meta: meta,
+        // No TTL: unlike a nav line, an answer does not expire on a clock. It
+        // does need a watchdog longer than the default, because a visual answer
+        // is several sentences rather than one.
+        maxMs: 60000,
+        play: function () {
+          return new Promise(function (resolve, reject) {
+            const url = URL.createObjectURL(blob);
+            let settled = false;
+            const done = (fn, arg) => {
+              if (settled) return;
+              settled = true;
+              player.onended = player.onerror = null;
+              URL.revokeObjectURL(url);
+              fn(arg);
+            };
+            // A pre-empted reply never reaches 'ended', so stop() has to be the
+            // one that releases the blob.
+            cleanup = () => done(resolve);
+            player.onended = () => done(resolve);
+            player.onerror = () => done(reject, new Error('audio error'));
+            player.src = url;
+            const p = player.play();
+            if (p && p.catch) p.catch(e => done(reject, e));
+          });
+        },
+        stop: function () {
+          try { player.pause(); } catch (e) {}
+          if (cleanup) cleanup();
+        },
+      });
     },
 
     // --- shared webcam ---
@@ -1188,6 +1252,20 @@ RIO.ui = (function () {
       if (state === 'listening' || state === 'speaking') ring.classList.add(state);
       label.textContent = state;
     },
+    // Which pipeline answered the last turn. Cosmetic, and the fastest way to
+    // spot the router sending a visual question down the plain path.
+    requestType(type) {
+      const el = $('turnroute');
+      if (!el) return;
+      const SHORT = {
+        scene_description: 'scene', specific_object_question: 'object',
+        visual_follow_up: 'follow-up', object_comparison: 'compare',
+        location_or_landmark_question: 'place', read_visible_text: 'text',
+        clarification_required: 'clarify', non_visual_question: '',
+      };
+      const label = SHORT[type] === undefined ? type : SHORT[type];
+      el.textContent = label ? ' · ' + label : '';
+    },
     markTalkStart() { talkStart = performance.now(); expectingReply = true; },
     get expectingReply() { return expectingReply; },
     clearExpect() { expectingReply = false; },
@@ -1279,8 +1357,12 @@ async function startRec() {
       const rawTx = r.headers.get('X-Transcript');
       if (rawTx) { try { transcript = decodeURIComponent(rawTx); } catch (e) { transcript = rawTx; } }
       const talkId = r.headers.get('X-Talk-Id');
+      // Whether the server answered this from the camera or from conversation
+      // alone. Shown on the HUD; it is the fastest way to see a misroute.
+      const requestType = r.headers.get('X-Request-Type') || '';
       if (transcript) RIO.ui.driver(transcript);
-      RIO.playReply(player, await r.blob());
+      RIO.sayReply(player, await r.blob(), { talkId: talkId, type: requestType });
+      RIO.ui.requestType(requestType);
       // Reply text only exists once the stream finished; pick it up from /last_talk.
       RIO.ui.fetchReply(talkId).then(j => {
         if (!j) return;

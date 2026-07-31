@@ -44,6 +44,30 @@ Use the current camera observation as RIO's visual context. If the driver asks w
             yield delta
 
     history.append({"role": "assistant", "content": "".join(full_reply)})
+    _trim()
 
+
+def note_turn(user_text: str, reply: str) -> None:
+    """Record a turn that was answered somewhere else.
+
+    The visual path (visual_qa.py) runs its own multimodal request against its
+    own system prompt, so nothing about that turn passes through
+    generate_stream. Without this the driver could ask about a car, get an
+    answer, and then find that the next ordinary question had no idea the
+    exchange had happened — one conversation split across two memories.
+
+    Only the plain question and the spoken reply are kept. The images and the
+    perception grounding stay out: they are large, they are stale within
+    seconds, and re-sending them on an unrelated later turn would be worse than
+    not having them.
+    """
+    if not user_text or not reply:
+        return
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": reply})
+    _trim()
+
+
+def _trim() -> None:
     if len(history) > 21:
         history[:] = [history[0]] + history[-20:]

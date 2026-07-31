@@ -301,6 +301,59 @@ section('speech arbiter — one mouth');
     }
 
     // -----------------------------------------------------------------------
+    // Conversation (P4). A visual answer is the longest thing RIO says and the
+    // only one the driver can simply ask for again, so it is the tier that
+    // yields to everything. These four checks are the whole of that claim.
+    // -----------------------------------------------------------------------
+    section('arbiter — conversation yields to navigation and safety');
+    {
+      const arb = speech.makeArbiter();
+      const ends = [];
+      const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer',
+                           text: 'That looks like a C5 Corvette.',
+                           onDone: r => ends.push('convo:' + r) });
+      const near = item({ priority: speech.P.TURN_NEAR, group: 'nav:m3', id: 'near',
+                          onDone: r => ends.push('near:' + r) });
+      arb.say(convo); await wait();
+      ok(arb.state().speaking.id === 'answer', 'a visual answer speaks when nothing else is');
+      arb.say(near); await wait();
+      ok(arb.state().speaking.id === 'near',
+         'the near-tier turn pre-empts a visual answer mid-sentence');
+      ok(ends[0] === 'convo:preempted',
+         'the cut-off answer is dropped, never resumed after the turn');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer' });
+      const hw = item({ priority: speech.P.SAFETY, group: 'headway', id: 'too_close' });
+      arb.say(convo); await wait();
+      arb.say(hw); await wait();
+      ok(arb.state().speaking.id === 'too_close',
+         'a gap warning pre-empts a visual answer');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const ends = [];
+      const first = item({ priority: speech.P.CONVO, group: 'convo', id: 'a1',
+                           onDone: r => ends.push('a1:' + r) });
+      const second = item({ priority: speech.P.CONVO, group: 'convo', id: 'a2' });
+      arb.say(first); await wait();
+      arb.say(second); await wait();
+      ok(ends[0] === 'a1:superseded' && arb.state().speaking.id === 'a2',
+         'asking a second question replaces the answer still being spoken');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const hw = item({ priority: speech.P.SAFETY, group: 'headway', id: 'hw' });
+      const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer' });
+      const nav = item({ priority: speech.P.NAV, group: 'nav:m0', id: 'far' });
+      arb.say(hw); await wait();
+      arb.say(convo); arb.say(nav); await wait();
+      ok(arb.state().queued.map(i => i.id).join(',') === 'far,answer',
+         'queued behind a warning, the nav line goes first and conversation last');
+    }
+
+    // -----------------------------------------------------------------------
     // Optional: the same progression checks against a real Google route.
     // -----------------------------------------------------------------------
     const fixture = process.argv[2];

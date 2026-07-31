@@ -105,6 +105,21 @@ def get_route(route_id: str) -> Optional[dict]:
     return _ROUTES.get(route_id)
 
 
+def latest_route() -> Optional[dict]:
+    """The most recently computed route, or None.
+
+    Read by the visual conversation path, which wants to know where the car is
+    headed when the driver asks about what is out of the window. It is NOT a
+    claim about progress along the route: the progression engine is client-side
+    (static/rio_navcore.js) and the server does not know which maneuver is
+    current. Callers must present this as "where we're going", never as "what's
+    coming up next".
+    """
+    if not _ROUTES:
+        return None
+    return next(reversed(_ROUTES.values()))
+
+
 def _remember(route: dict) -> None:
     _ROUTES[route["route_id"]] = route
     while len(_ROUTES) > _MAX_ROUTES:
