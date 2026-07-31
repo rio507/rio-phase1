@@ -6,6 +6,7 @@ Upgraded from Qwen2.5-VL-3B. Qwen3-VL needs transformers >= 4.57.0 and a
 different model class; torch stays at 2.4.1+cu124 (4.57 only wants >= 2.2).
 """
 import io
+import os
 import threading
 import torch
 from PIL import Image
@@ -26,14 +27,35 @@ _lock = threading.Lock()
 _last_observation = ""
 
 
+# Where the weights go. Pinned rather than "auto".
+#
+# HONEST NOTE ON WHAT THIS DOES AND DOES NOT FIX. It was changed while chasing
+# a startup failure -- "Cannot copy out of meta tensor" from inside
+# accelerate's dispatch_model -- and it did NOT fix it. That failure was two
+# uvicorn processes loading Qwen onto the same card at once; it happens on
+# "auto" and on "cuda:0" alike, and stops happening when there is one server.
+#
+# It is kept pinned anyway, for a smaller and separate reason: "auto" asks
+# accelerate to plan a memory budget from whatever the card has free at that
+# instant, and to offload whatever it thinks will not fit. On one GPU with
+# 97 GB and a 17 GB model there is nothing to plan, and a plan that depends on
+# timing is a plan that can differ between two identical restarts. Pinning
+# removes a variable rather than a bug.
+#
+# If this ever has to run on a card too small for the model, that is a
+# deliberate change to make here, with sharding thought about on purpose.
+DEVICE_MAP = os.environ.get("RIO_QWEN_DEVICE",
+                            "cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 def _ensure_loaded():
     global _processor, _model
     if _model is None:
-        print("[vision] Loading Qwen3-VL-8B...", flush=True)
+        print(f"[vision] Loading Qwen3-VL-8B onto {DEVICE_MAP}...", flush=True)
         _processor = AutoProcessor.from_pretrained(MODEL_ID)
         # `dtype` replaces the deprecated `torch_dtype` kwarg in transformers 4.57.
         _model = Qwen3VLForConditionalGeneration.from_pretrained(
-            MODEL_ID, dtype=torch.bfloat16, device_map="auto"
+            MODEL_ID, dtype=torch.bfloat16, device_map=DEVICE_MAP
         )
         print("[vision] Loaded.", flush=True)
 

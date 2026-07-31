@@ -43,6 +43,17 @@ import scene as scene_mod
 # settled without asking a model. Expressed as a fraction of the top score, so
 # it scales with how much evidence the phrase actually carried.
 DECISIVE_MARGIN = 0.25
+
+# ...and an absolute floor underneath it, which is what makes a cue-less
+# question honest. "What is that?" carries no side, no class and no colour, so
+# every candidate scores on the weak priors alone and the relative test above
+# passes on a difference of 0.07 between two cars that are equally plausible to
+# anyone looking out of the window. Measured on the test clip at t=42.5 s (a
+# black saloon beside us, a white one a lane further over): margin 0.000.
+#
+# Below this floor the question genuinely has more than one answer, and the
+# right move is to ask -- which is what Phase B added.
+DECISIVE_MIN_MARGIN = 0.15
 # ...and this is the margin below which even the model's pick is reported as
 # ambiguous rather than certain.
 AMBIGUOUS_MARGIN = 0.12
@@ -289,7 +300,9 @@ def resolve(question: str, phrase: Optional[str], graph, frame,
                   for (s, w), o in scored[:6]]
 
     decisive = (second is None
-                or (top_score > 0 and margin >= DECISIVE_MARGIN * abs(top_score)))
+                or (top_score > 0
+                    and margin >= DECISIVE_MARGIN * abs(top_score)
+                    and margin >= DECISIVE_MIN_MARGIN))
     if decisive and top_score > 0:
         return Resolution(
             track_id=top.track_id, candidate_id=top.candidate_id,
@@ -301,9 +314,24 @@ def resolve(question: str, phrase: Optional[str], graph, frame,
                   "enriched": list(enriched.keys())},
             latency_ms=(time.perf_counter() - t0) * 1000)
 
-    # Two or more are plausible. This is what a VLM is for.
+    # Two or more are plausible. A VLM can settle that — but ONLY when the
+    # driver's words actually contain something to look for.
+    #
+    # This gate was added after watching it fail. Asked a bare "What is that?"
+    # with a black saloon beside us and a white one a lane over, Qwen picked a
+    # third vehicle entirely, on the far side of the road, and reported itself
+    # sure. It was not being stupid: the question contains no side, no class and
+    # no colour, so there is nothing in the image that could distinguish the
+    # right answer from the wrong one. The ambiguity is in the LANGUAGE, and no
+    # amount of looking at the road resolves it.
+    #
+    # So a cue-less reference goes straight to ambiguous, which is what makes
+    # RIO ask instead of guess.
+    discriminating = bool(cues.get("side") or cues.get("labels")
+                          or cues.get("colour") or cues.get("nearest")
+                          or cues.get("far"))
     plausible = [(s, o) for (s, _why), o in scored if s > -0.5][:MAX_CANDIDATES]
-    if allow_model and frame is not None and len(plausible) > 1:
+    if allow_model and discriminating and frame is not None and len(plausible) > 1:
         adapter = adapter or enrich_mod.get_adapter()
         cands = [(o.candidate_id, o.box, _describe(o)) for _, o in plausible]
         try:
@@ -334,8 +362,143 @@ def resolve(question: str, phrase: Optional[str], graph, frame,
         alternatives=[o.track_id for (_, o) in scored[1:4]],
         cues=_cues_log(cues), scores=log_scores,
         info={"margin": None if margin is None else round(margin, 3),
-              "enriched": list(enriched.keys())},
+              "enriched": list(enriched.keys()),
+              # Why it stayed ambiguous: nothing in the phrase pointed at
+              # anything, so the model was never consulted.
+              "no_discriminating_cue": not discriminating},
         latency_ms=(time.perf_counter() - t0) * 1000)
+
+
+def describe(obj) -> str:
+    """A driver-readable description of one candidate. Public: the clarifying
+    question is built from these, and the log records them so a bad question can
+    be read back rather than re-enacted."""
+    return _describe(obj)
+
+
+def resolve_among(text: str, graph, allowed_track_ids, frame=None,
+                  cache: enrich_mod.EnrichmentCache = None,
+                  adapter=None) -> Resolution:
+    """Which of the objects RIO just offered did the driver pick?
+
+    A much easier problem than open resolution, and a different one: the set is
+    known, small, and was described out loud a moment ago, so the driver's words
+    are chosen to distinguish THESE candidates from each other. "The black one"
+    is not a description of a car, it is a contrast with the white one.
+
+    Scoring is therefore the same machinery restricted to the offered set, with
+    one addition: ordinal answers ("the first one", "the second") are positional
+    references to the order the question used, which no amount of looking at the
+    road can resolve.
+    """
+    t0 = time.perf_counter()
+    allowed = list(allowed_track_ids or [])
+    objs = [o for o in graph.objects if o.track_id in allowed] if graph else []
+    cues = parse_cues(text, "")
+
+    # Ordinals refer to the ORDER RIO offered them in, not to anything visible.
+    ordinal = _ordinal_index(text)
+    if ordinal is not None and 0 <= ordinal < len(allowed):
+        tid = allowed[ordinal]
+        return Resolution(
+            track_id=tid, candidate_id=scene_mod.candidate_id_of(tid),
+            method="ordinal", confidence=0.8, ambiguous=False,
+            alternatives=[t for t in allowed if t != tid],
+            cues=_cues_log(cues),
+            info={"ordinal": ordinal, "offered": allowed},
+            latency_ms=(time.perf_counter() - t0) * 1000)
+
+    if not objs:
+        # Everything offered has since aged out of the graph. The driver's
+        # answer is still meaningful -- they picked one of the things RIO
+        # described -- but there is no live object to attach it to.
+        return Resolution(method="offered_gone", cues=_cues_log(cues),
+                          alternatives=allowed,
+                          info={"offered": allowed},
+                          latency_ms=(time.perf_counter() - t0) * 1000)
+
+    if cues.get("colour"):
+        want = [o.track_id for o in objs if not (o.attributes or {}).get("color")]
+        if want and frame is not None and cache is not None:
+            got = enrich_mod.enrich_objects(frame, want, cache, adapter,
+                                            max_objects=len(want))
+            for o in objs:
+                e = got.get(o.track_id)
+                if e:
+                    o.attributes.update(
+                        {k: v for k, v in (e.get("attributes") or {}).items() if v})
+                    o.fine_label = o.fine_label or e.get("fine_label")
+
+    scored = sorted(((score_object(o, cues, len(objs)), o) for o in objs),
+                    key=lambda s: -s[0][0])
+    (top_score, _why), top = scored[0]
+    second = scored[1][0][0] if len(scored) > 1 else None
+    margin = None if second is None else (top_score - second)
+    log_scores = [{"track_id": o.track_id, "score": round(s, 3), "why": w}
+                  for (s, w), o in scored]
+
+    # A deliberately low bar. The driver has just been asked a direct question
+    # and has answered it; the alternative to accepting a weak signal is asking
+    # again, and asking twice is worse than being corrected once.
+    resolved = top_score > 0 and (margin is None or margin > 0.01)
+    return Resolution(
+        track_id=top.track_id if resolved else None,
+        candidate_id=top.candidate_id if resolved else None,
+        method="clarified" if resolved else "clarify_unresolved",
+        confidence=0.8 if resolved else 0.0,
+        ambiguous=not resolved,
+        alternatives=[o.track_id for (_s, _w), o in scored[1:]],
+        cues=_cues_log(cues), scores=log_scores,
+        info={"offered": allowed,
+              "margin": None if margin is None else round(margin, 3)},
+        latency_ms=(time.perf_counter() - t0) * 1000)
+
+
+def _ordinal_index(text: str):
+    """"the second one" -> 1. None for anything that is not an ordinal.
+
+    Deliberately narrow: "the first one" and "the black one" both end in "one",
+    and only the first of them is positional.
+    """
+    t = (text or "").lower()
+    for word, idx in (("first", 0), ("second", 1), ("third", 2), ("last", -1)):
+        if re.search(r"\b%s\b" % word, t):
+            return idx
+    return None
+
+
+_NOUNS_RE = (r"car|cars|vehicle|truck|lorry|pickup|suv|van|bus|coupe|sedan|"
+             r"saloon|wagon|hatchback|jeep|bike|motorbike|motorcycle|cyclist|"
+             r"bicycle|rider|pedestrian|person")
+
+# Connectors that separate the two halves of a comparison.
+_COMPARE_SPLIT = r"\s+(?:or|versus|vs\.?|against|compared to|next to)\s+"
+
+
+def split_comparison(question: str):
+    """"the truck or the white car" -> ["the truck", "the white car"].
+
+    Returns None when the utterance does not actually name two things, which is
+    most of the time: "which one is faster" is a comparison in intent and names
+    nothing, and guessing a second object out of it would be inventing half the
+    question.
+    """
+    text = (question or "").strip()
+    # "compare X to Y" gets its own pattern rather than putting bare " to " in
+    # the connector list, where it would split "the car next to us" in half.
+    m = re.match(r"\s*compare\s+(.+?)\s+(?:to|with|against)\s+(.+)$", text, re.I)
+    if m:
+        parts = [m.group(1).strip(" ?.,"), m.group(2).strip(" ?.,")]
+        if all(re.search(r"\b(%s)\b|\bone\b" % _NOUNS_RE, p, re.I) for p in parts):
+            return parts
+
+    # Work from the part after a leading interrogative, so "which is bigger,
+    # the truck or the car" splits on the right "or".
+    m = re.search(r"[,:]\s*(.+)$", text)
+    tail = m.group(1) if m else text
+    parts = [p.strip(" ?.,") for p in re.split(_COMPARE_SPLIT, tail, flags=re.I)]
+    parts = [p for p in parts if p and re.search(r"\b(%s)\b|\bone\b" % _NOUNS_RE, p, re.I)]
+    return parts[:2] if len(parts) >= 2 else None
 
 
 def _confidence(top_score: float, margin) -> float:

@@ -2,6 +2,7 @@
 
 import math
 import os
+import sys
 import time
 import uuid
 import threading
@@ -34,6 +35,32 @@ from headway import live as headway_live
 from headway import live_policy
 from headway import lanes as headway_lanes
 from headway import detect as headway_detect
+
+# Set once the warm thread has finished, successfully or not.
+#
+# uvicorn opens the port before the models are loaded -- deliberately, so the
+# pod reports ready immediately -- and a dashboard left open from a previous
+# run starts POSTing /headway_frame at 4 fps the instant it can. Those requests
+# lazily load RF-DETR, UFLDv2 and Depth Anything on the threadpool while Qwen
+# is still being dispatched onto the same card.
+#
+# WHAT THIS IS NOT. It is not the fix for "Cannot copy out of meta tensor"
+# during the Qwen load, which is what it was written to chase. That failure
+# turned out to be TWO uvicorn processes started by mistake, both loading Qwen
+# onto the same GPU at once; with a single server it does not happen, with or
+# without traffic arriving during startup. (Worth knowing if it ever comes
+# back: check `nvidia-smi --query-compute-apps` for a second server before
+# suspecting anything subtler. `pkill -f "uvicorn app:app"` is a good way to
+# create one, because the pattern also matches the shell running the pkill.)
+#
+# It is kept because refusing a frame while the models are still loading is the
+# right answer to that request regardless. Processing one early means paying a
+# ~3 s lazy model load inside a request that has a 250 ms budget, and getting a
+# frame with no detector behind it -- which reports UNKNOWN anyway. The client
+# simply sends the next frame, and /headway_frame already has a "skipped"
+# contract for exactly this shape of thing.
+_warm_done = threading.Event()
+
 
 def _warm_vision():
     t = time.time()
@@ -68,7 +95,23 @@ def _warm_vision():
     except Exception as e:
         # Warming is an optimisation; a failure here must not stop the server.
         # The first /observe will simply load the model the old way.
+        #
+        # The traceback goes to the log too. A one-line message is enough to
+        # know the pod came up without vision and useless for knowing why:
+        # this failure has been seen as "Cannot copy out of meta tensor", which
+        # names a symptom several layers below the cause and is not something
+        # anyone reconstructs from the message alone.
+        import traceback
+
         print(f"[vision] warm failed after {time.time() - t:.1f}s: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+    finally:
+        # ALWAYS, including on failure. A warm that died must not leave the
+        # frame endpoints refusing work for the rest of the process's life --
+        # degraded vision is recoverable, a server that never accepts a frame
+        # is not.
+        _warm_done.set()
 
 
 @asynccontextmanager
@@ -155,8 +198,16 @@ def _route_and_prepare(transcript: str, session_id: str):
     try:
         if not config.VISUAL_QA_ENABLED:
             return None, None
-        has_ref = visual_qa.get_session(key).active_referent() is not None
-        route = request_router.classify(transcript, has_referent=has_ref)
+        sess = visual_qa.get_session(key)
+        # Both pieces of conversational state the router needs. Missing the
+        # second one is invisible until it matters: RIO asks "the black one or
+        # the white one?", the driver says "the black one", and without knowing
+        # a question is outstanding the router reads that as an ordinary
+        # utterance and the answer never lands.
+        route = request_router.classify(
+            transcript,
+            has_referent=sess.active_referent() is not None,
+            pending_clarification=sess.pending_clarification() is not None)
         if not request_router.is_visual(route["request_type"]):
             return route, None
         return route, visual_qa.answer(key, transcript, route)
@@ -335,6 +386,12 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
     Returns the same caption /observe would, plus boxes, per-object distance and
     the ego corridor, so the Camera panel can draw what RIO is looking at.
     """
+    # Same gate as /headway_frame, same reason: this path runs Qwen and Depth
+    # Anything, and doing that while Qwen is mid-load is what breaks the load.
+    if not _warm_done.is_set():
+        return {"boxes": [], "corridor": [], "caption": "", "observation": "",
+                "skipped": "warming", "timing_ms": {"total": 0.0}}
+
     import time as _t
     _t0 = _t.time()
     image_bytes = await image.read()
@@ -384,6 +441,11 @@ async def headway_frame_endpoint(
     ~2 fps a queued frame would be measured against a dt that has already
     passed, which corrupts the very velocity estimate the warning rests on.
     """
+    # Models still loading: refuse the frame rather than pull three more models
+    # onto the card while Qwen is being dispatched onto it. See _warm_done.
+    if not _warm_done.is_set():
+        return {"ok": False, "skipped": "warming"}
+
     t0 = time.time()
     image_bytes = await image.read()
     key = session_id or "default"

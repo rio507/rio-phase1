@@ -42,8 +42,14 @@ READ_TEXT = "read_visible_text"
 CLARIFY = "clarification_required"
 NON_VISUAL = "non_visual_question"
 
+# Not in the spec's list, and needed: the spec names the type for "RIO must ask
+# which one", but a clarification is a two-turn exchange and the second turn --
+# the driver answering -- is a different thing to route. It never comes from the
+# rules below unless a question is actually outstanding.
+CLARIFY_RESPONSE = "clarification_response"
+
 PHASE_A_TYPES = {SCENE, OBJECT, FOLLOW_UP, NON_VISUAL}
-PHASE_B_TYPES = {COMPARISON, LANDMARK, READ_TEXT, CLARIFY}
+PHASE_B_TYPES = {COMPARISON, LANDMARK, READ_TEXT, CLARIFY, CLARIFY_RESPONSE}
 
 # Below this the rules do not trust themselves and the model is asked.
 RULE_CONFIDENCE_MIN = 0.6
@@ -122,6 +128,37 @@ _LANDMARK_PATTERNS = [
     r"\bwhat exit\b",
 ]
 
+# Answers to "which one?". Short, and they name a property rather than asking
+# anything -- "the black one", "the SUV", "left one", "the first one", "no, the
+# truck". Only consulted when a clarification is actually outstanding, because
+# every one of these is also a perfectly ordinary thing to say otherwise.
+_CLARIFY_RESPONSE_PATTERNS = [
+    # "the black one", and "no, the white one" — a correction is still an answer.
+    r"^\s*(no,?\s+|yeah,?\s+|yes,?\s+)?(the\s+)?\w+\s+one\b",
+    r"^\s*(no,?\s+|yeah,?\s+|yes,?\s+)?the\s+(%s)\b" % _OBJECT_NOUNS,
+    r"^\s*(the\s+)?(first|second|third|last|other)\b",
+    r"^\s*(the\s+)?(left|right|near|far|closer|closest|nearest|further|furthest)\s*(one)?\b",
+    r"^\s*(no,?\s+)?(that|this)\s+(one|other)\b",
+    r"^\s*(the\s+)?\w+\s+(%s)\b" % _OBJECT_NOUNS,          # "the black sedan"
+    r"^\s*(both|either|neither)\b",
+]
+
+# Details a photograph frequently cannot support: a year, a trim, an engine, a
+# registration. Flagged so the answer can be told when the crop is not good
+# enough to carry the claim being asked for -- acceptance test 6.
+_FINE_DETAIL_PATTERNS = [
+    r"\bwhat year\b", r"\bwhich year\b", r"\bhow old\b",
+    r"\b(model|trim|generation|spec|engine|badge|variant)\b",
+    r"\b(number ?plate|licen[cs]e ?plate|registration|plate)\b",
+    r"\bexactly what\b", r"\bwhat exact\b",
+]
+
+
+def wants_fine_detail(question: str) -> bool:
+    """Is the driver asking for something a photograph often cannot support?"""
+    return _any(_FINE_DETAIL_PATTERNS, (question or "").lower())
+
+
 # Questions that mention nothing visual at all and must not touch the camera.
 _NON_VISUAL_PATTERNS = [
     r"^\s*(hey|hi|hello|yo|morning|evening)\b",
@@ -175,17 +212,29 @@ def extract_reference(text: str):
 
 
 def classify(question: str, has_referent: bool = False,
-             use_model: bool = None) -> dict:
+             use_model: bool = None, pending_clarification: bool = False) -> dict:
     """Driver utterance -> a routing decision.
 
     `has_referent` is whether an active visual referent is alive; it is what
     separates "what year is it" (a follow-up about the car we were just
     discussing) from the same words with nothing to attach them to.
+
+    `pending_clarification` is whether RIO has just asked which of several
+    objects the driver meant. It gates the only reading under which "the black
+    one" is a complete utterance rather than a fragment.
     """
     t0 = time.perf_counter()
     text = (question or "").strip().lower()
     if not text:
         return _result(NON_VISUAL, None, 1.0, "empty", t0)
+
+    # An outstanding "which one?" is answered before anything else is
+    # considered -- but ONLY if this actually sounds like an answer. A driver
+    # who ignores the question and asks something else entirely is not
+    # answering it, and forcing their words into a selection would be worse
+    # than having never asked.
+    if pending_clarification and _any(_CLARIFY_RESPONSE_PATTERNS, text):
+        return _result(CLARIFY_RESPONSE, text, 0.85, "rules", t0)
 
     scene_hits = _count(_SCENE_PATTERNS, text)
     object_hits = _count(_OBJECT_PATTERNS, text)
@@ -240,9 +289,10 @@ def _result(request_type, reference, confidence, method, t0) -> dict:
         "request_type": request_type,
         "object_reference": reference,
         "requires_full_frame": request_type in (SCENE, OBJECT, FOLLOW_UP,
-                                                COMPARISON, LANDMARK, READ_TEXT),
+                                                COMPARISON, LANDMARK, READ_TEXT,
+                                                CLARIFY_RESPONSE),
         "requires_object_crop": request_type in (OBJECT, FOLLOW_UP, READ_TEXT,
-                                                 COMPARISON),
+                                                 COMPARISON, CLARIFY_RESPONSE),
         "confidence": confidence,
         "method": method,
         "phase_b": request_type in PHASE_B_TYPES,

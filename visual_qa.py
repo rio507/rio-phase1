@@ -51,7 +51,7 @@ import frameselect
 import resolve as resolve_mod
 import router
 import scene as scene_mod
-from rio_prompts import VISUAL_SYSTEM_PROMPT
+from rio_prompts import CLARIFY_SYSTEM_PROMPT, VISUAL_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +144,10 @@ class VisualReferent:
     last_position: Optional[str] = None
     last_depth_m: Optional[float] = None
     last_motion: Optional[str] = None
+    # Wall clock of the last frame this object was actually seen in. What makes
+    # "it's out of sight now" a statement with a number behind it rather than a
+    # guess, and what stops a referent from silently going stale.
+    last_seen_at: float = 0.0
 
     def stale(self, ttl_s: float = None) -> bool:
         ttl = config.REFERENT_TTL_S if ttl_s is None else ttl_s
@@ -170,10 +174,43 @@ class VisualReferent:
         self.last_position = obj.position
         self.last_depth_m = obj.depth_m
         self.last_motion = obj.motion
+        self.last_seen_at = time.time()
         if obj.fine_label:
             self.fine_label = obj.fine_label
         if obj.attributes:
             self.attributes.update(obj.attributes)
+
+    def unseen_for(self) -> Optional[float]:
+        return None if not self.last_seen_at else (time.time() - self.last_seen_at)
+
+
+@dataclass
+class PendingClarification:
+    """A "which one?" RIO has asked and is waiting on.
+
+    Holds the ORIGINAL question, because that is what has to be answered once
+    the driver picks: they said "the black one", and what they actually want to
+    know is still "what kind of car is that".
+    """
+    question: str
+    candidates: list                      # track ids, in the order offered
+    descriptions: dict = field(default_factory=dict)
+    asked_at: float = 0.0
+    text: str = ""
+    frame_id: Optional[str] = None
+
+    def stale(self, ttl_s: float = None) -> bool:
+        ttl = config.CLARIFY_TTL_S if ttl_s is None else ttl_s
+        return (time.time() - self.asked_at) > ttl
+
+    def to_log(self) -> dict:
+        return {
+            "original_question": self.question,
+            "candidates": list(self.candidates),
+            "descriptions": dict(self.descriptions),
+            "asked": self.text,
+            "age_s": round(time.time() - self.asked_at, 1),
+        }
 
 
 class VisualSession:
@@ -182,6 +219,7 @@ class VisualSession:
     def __init__(self, key: str):
         self.key = key
         self.referent: Optional[VisualReferent] = None
+        self.pending: Optional[PendingClarification] = None
         self.enrichment = enrich_mod.EnrichmentCache()
         self.turns = []                 # [{"q":..., "a":..., "t":...}]
         self.lock = threading.Lock()
@@ -191,6 +229,24 @@ class VisualSession:
         if self.referent is None or self.referent.stale():
             return None
         return self.referent
+
+    def pending_clarification(self) -> Optional[PendingClarification]:
+        """An outstanding "which one?", if it has not lapsed.
+
+        A lapsed question is dropped rather than kept: the next thing the driver
+        says a minute later is a new utterance, and treating it as an answer to
+        something they have forgotten being asked is worse than not having
+        asked.
+        """
+        if self.pending is None:
+            return None
+        if self.pending.stale():
+            self.pending = None
+            return None
+        return self.pending
+
+    def clear_pending(self) -> None:
+        self.pending = None
 
     def remember(self, ref: VisualReferent) -> None:
         self.referent = ref
@@ -206,6 +262,7 @@ class VisualSession:
 
     def reset(self) -> None:
         self.referent = None
+        self.pending = None
         self.enrichment.reset()
         self.turns.clear()
 
@@ -275,6 +332,7 @@ class VisualAnswer:
             "phase": "A",
         }
         self._messages = None
+        self._system = VISUAL_SYSTEM_PROMPT
         self._images = []
         self._frame = None
         self._crop = None
@@ -282,6 +340,11 @@ class VisualAnswer:
         self._graph = None
         self._resolution = None
         self._referent = None
+        # Phase B: set when this turn is RIO asking which one, rather than
+        # answering. The two are different enough — different prompt, different
+        # memory, no referent committed — that the flag is worth its weight.
+        self._asking = None            # PendingClarification being composed
+        self._compare = []             # [(referent, crop, crop_info)] for a comparison
         self._t_start = time.perf_counter()
 
     # -- stages -------------------------------------------------------------
@@ -297,7 +360,9 @@ class VisualAnswer:
         if self.route is None:
             self.route = router.classify(
                 self.question,
-                has_referent=self.session.active_referent() is not None)
+                has_referent=self.session.active_referent() is not None,
+                pending_clarification=(
+                    self.session.pending_clarification() is not None))
         self.meta["route"] = self.route
         t = self._stage("route", t)
 
@@ -330,21 +395,208 @@ class VisualAnswer:
         self._graph = self._graph_for(frame, ring)
         t = self._stage("select_frame", t)
 
-        # 3. Which object is this about?
+        # 3. A comparison is two objects, and is its own path from here.
+        if rtype == router.COMPARISON:
+            self._prepare_comparison(ring, ref_wall)
+            self._stage("prepare_total", self._t_start)
+            return
+
+        # 4. Which object is this about?
         self._referent = self._establish_referent(ring, rtype)
         t = self._stage("resolve", t)
 
-        # 4. The clearest recent frame containing THAT object, and a crop of it.
+        # 5. Nothing separated the candidates: ask, rather than guess.
+        if self._should_clarify(rtype):
+            self._prepare_clarification(ring)
+            self._stage("clarify", t)
+            self._stage("prepare_total", self._t_start)
+            return
+
+        # 6. The clearest recent frame containing THAT object, and a crop of it.
         if self._referent is not None:
             self._pick_object_frame(ring, ref_wall)
         t = self._stage("crop", t)
 
-        # 5. Attributes for whatever is about to be described.
+        # 7. Attributes for whatever is about to be described.
         self._enrich(ring)
         t = self._stage("enrich", t)
 
         self._build_messages()
         self._stage("prepare_total", self._t_start)
+
+    # -- clarification ------------------------------------------------------
+    def _should_clarify(self, rtype) -> bool:
+        """Is the honest move to ask which one, rather than to answer?
+
+        Four conditions, and all of them matter:
+
+          the reference was genuinely ambiguous  -- not merely low-scoring
+          there is more than one thing it could be
+          this is a question ABOUT an object    -- a scene question has no
+                                                   referent to be unsure about,
+                                                   and a follow-up already knows
+                                                   what it is discussing
+          RIO is not already waiting on an answer -- asking twice in a row is
+                                                    worse than guessing once
+        """
+        res = self._resolution
+        if res is None or not res.ambiguous:
+            return False
+        # OBJECT only. Reading text is deliberately excluded: nothing in the
+        # detector's vocabulary is a sign, so a "what does that say" reference
+        # NEVER matches a tracked object and is therefore always ambiguous --
+        # and asking "the white saloon, or the black one?" about a road sign is
+        # not a clarifying question, it is a non sequitur. Observed exactly
+        # once, which was enough.
+        if rtype != router.OBJECT:
+            return False
+        if self.session.pending_clarification() is not None:
+            self.meta["clarify_suppressed"] = "already_asked"
+            return False
+        candidates = [c for c in ([res.track_id] + list(res.alternatives)) if c]
+        return len(candidates) >= 2
+
+    def _prepare_clarification(self, ring) -> None:
+        """Compose the "which one?" turn. Nothing is committed as the referent."""
+        res = self._resolution
+        offered = [c for c in ([res.track_id] + list(res.alternatives)) if c]
+        offered = offered[:config.CLARIFY_MAX_CANDIDATES]
+
+        # The candidates have to be told apart by how they LOOK, so this is
+        # where enrichment earns its latency: colour is usually the only thing
+        # that separates two saloons in adjacent lanes.
+        enrich_mod.enrich_objects(self._frame, offered, self.session.enrichment,
+                                  max_objects=len(offered))
+        self._graph = self._graph_for(self._frame, ring)
+
+        descriptions = {}
+        for tid in offered:
+            obj = self._graph.by_track(tid) if self._graph else None
+            if obj is not None:
+                descriptions[tid] = resolve_mod.describe(obj)
+        # Anything that has since left the graph cannot be offered: RIO would be
+        # asking about a car that is no longer there.
+        offered = [t for t in offered if t in descriptions]
+        if len(offered) < 2:
+            self.meta["clarify_abandoned"] = "candidates_gone"
+            self._build_messages()
+            return
+
+        self._asking = PendingClarification(
+            question=self.question, candidates=offered, descriptions=descriptions,
+            asked_at=time.time(),
+            frame_id=self._frame.frame_id if self._frame else None)
+        self.meta["clarification"] = {"offered": offered,
+                                      "descriptions": descriptions}
+        self._system = CLARIFY_SYSTEM_PROMPT
+        self._build_clarify_messages(offered, descriptions)
+
+    def _build_clarify_messages(self, offered, descriptions) -> None:
+        listing = "\n".join(f"  - {descriptions[t]}" for t in offered)
+        parts = [{
+            "type": "text",
+            "text": (f"The driver asked: {self.question}\n\n"
+                     f"It could be any of these:\n{listing}\n\n"
+                     "Ask which one they mean, in one short question."),
+        }]
+        if self._frame is not None:
+            parts.append({"type": "image_url", "image_url": {
+                "url": _data_url(self._frame.jpeg),
+                "detail": config.VISUAL_FRAME_DETAIL}})
+            self._images.append(("frame", len(self._frame.jpeg)))
+        self._messages = [{"role": "user", "content": parts}]
+        self.meta["request"] = {
+            "model": config.OPENAI_VISUAL_MODEL,
+            "images": [{"kind": k, "bytes": n} for k, n in self._images],
+            "history_turns": 0,
+            "grounding_bytes": len(listing),
+            "reasoning_effort": config.OPENAI_VISUAL_REASONING_EFFORT,
+            "purpose": "clarification",
+        }
+
+    # -- comparison ---------------------------------------------------------
+    def _prepare_comparison(self, ring, ref_wall) -> None:
+        """Two objects, two crops, one frame.
+
+        Falls back to a plain object question when the driver named only one
+        thing ("which one is faster?" names nothing) -- the alternative is
+        inventing the second half of the comparison.
+        """
+        phrases = resolve_mod.split_comparison(self.question)
+        self.meta["comparison"] = {"phrases": phrases}
+        if not phrases or self._graph is None:
+            self.meta["comparison"]["fell_back"] = "no_two_references"
+            self._referent = self._establish_referent(ring, router.OBJECT)
+            if self._referent is not None:
+                self._pick_object_frame(ring, ref_wall)
+            self._enrich(ring)
+            self._build_messages()
+            return
+
+        picked = []
+        used = set()
+        for phrase in phrases[:config.COMPARE_MAX_OBJECTS]:
+            res = resolve_mod.resolve(phrase, phrase, self._graph, self._frame,
+                                      self.session.enrichment)
+            if res.track_id is None or res.track_id in used:
+                # Second-choice fallback: two references that resolve to the
+                # same object mean one of them was matched on weaker evidence.
+                alt = next((a for a in res.alternatives if a not in used), None)
+                if alt is None:
+                    continue
+                res.track_id, res.candidate_id = alt, scene_mod.candidate_id_of(alt)
+                res.info["reassigned_from_duplicate"] = True
+            used.add(res.track_id)
+            picked.append((phrase, res))
+
+        self.meta["comparison"]["resolved"] = [
+            {"phrase": p, **r.to_log()} for p, r in picked]
+        if len(picked) < 2:
+            self.meta["comparison"]["fell_back"] = "could_not_resolve_both"
+            if picked:
+                obj = self._graph.by_track(picked[0][1].track_id)
+                if obj is not None:
+                    self._referent = VisualReferent(
+                        track_id=obj.track_id, label=obj.label,
+                        fine_label=obj.fine_label, attributes=dict(obj.attributes),
+                        established_at=time.time(), last_used_at=time.time(),
+                        question=self.question)
+                    self._referent.observe(obj)
+                    self._pick_object_frame(ring, ref_wall)
+            self._enrich(ring)
+            self._build_messages()
+            return
+
+        # Enrich both, then crop both from the frame they are both in — the
+        # comparison has to be of the same moment or it is not a comparison.
+        enrich_mod.enrich_objects(self._frame,
+                                  [r.track_id for _p, r in picked],
+                                  self.session.enrichment,
+                                  max_objects=len(picked))
+        self._graph = self._graph_for(self._frame, ring)
+        for _phrase, res in picked:
+            obj = self._graph.by_track(res.track_id)
+            frame_obj = (self._frame.object_by_id(res.candidate_id)
+                         if self._frame else None)
+            if obj is None or frame_obj is None:
+                continue
+            try:
+                crop, info = scene_mod.crop_jpeg(self._frame.jpeg, frame_obj["box"])
+            except Exception as e:
+                print(f"[visual_qa] comparison crop failed: {e}", flush=True)
+                continue
+            self._compare.append((obj, crop, info))
+        # The first one becomes the active referent, so "and how old is it?"
+        # afterwards has something to attach to.
+        if self._compare:
+            obj = self._compare[0][0]
+            ref = VisualReferent(
+                track_id=obj.track_id, label=obj.label, fine_label=obj.fine_label,
+                attributes=dict(obj.attributes), established_at=time.time(),
+                last_used_at=time.time(), question=self.question)
+            ref.observe(obj)
+            self._referent = ref
+        self._build_messages()
 
     def _graph_for(self, frame, ring):
         if frame is None:
@@ -360,6 +612,41 @@ class VisualAnswer:
 
         if rtype == router.SCENE:
             return None
+
+        # The driver has just answered "which one?". Resolve within exactly the
+        # set RIO offered — nothing else is a valid answer to that question —
+        # and swap the original question back in, because "the black one" is
+        # not what they want to know, it is which thing they want to know it
+        # about.
+        if rtype == router.CLARIFY_RESPONSE:
+            pending = self.session.pending_clarification()
+            if pending is not None:
+                res = resolve_mod.resolve_among(
+                    self.question, self._graph, pending.candidates,
+                    self._frame, self.session.enrichment)
+                self._resolution = res
+                self.meta["resolution"] = res.to_log()
+                self.meta["answered_clarification"] = pending.to_log()
+                self.session.clear_pending()
+                # The turn is now the ORIGINAL question, asked about the object
+                # they picked.
+                self.meta["original_question"] = pending.question
+                self.meta["selection"] = self.question
+                self.question = pending.question
+                if res.track_id is not None and self._graph is not None:
+                    obj = self._graph.by_track(res.track_id)
+                    if obj is not None:
+                        self.meta["referent_source"] = "clarified"
+                        ref = VisualReferent(
+                            track_id=obj.track_id, label=obj.label,
+                            fine_label=obj.fine_label,
+                            attributes=dict(obj.attributes),
+                            established_at=time.time(), last_used_at=time.time(),
+                            question=pending.question)
+                        ref.observe(obj)
+                        return ref
+                self.meta["referent_source"] = "clarify_unresolved"
+                return active
 
         # A follow-up continues the object already under discussion, and does
         # NOT re-identify: that is the whole point of holding a referent, and
@@ -394,6 +681,14 @@ class VisualAnswer:
             self.meta["referent_source"] = "unresolved"
             return None
 
+        # A text question that landed on a vehicle by weak scoring has not
+        # found the sign; it has found the nearest car. Cropping it would put a
+        # close-up of a boot lid in front of the model and invite it to read
+        # words off it. The wide frame at high detail is the honest input.
+        if rtype == router.READ_TEXT and res.ambiguous:
+            self.meta["referent_source"] = "text_no_tracked_object"
+            return None
+
         # A resolved object that is the SAME track as the active referent keeps
         # the referent's stored crop history rather than starting over.
         if active is not None and active.track_id == res.track_id:
@@ -426,15 +721,22 @@ class VisualAnswer:
         self.meta["object_frame_selection"] = sel
 
         if frame is None:
+            # The object has left the buffer: overtaken, turned off, or simply
+            # too far back to still be detected. This is acceptance test 5, and
+            # the rule it enforces is that RIO must NOT quietly start talking
+            # about a different car. The referent is kept, the last good crop is
+            # what the answer is based on, and the grounding says plainly that
+            # the vehicle is no longer in view.
+            self.meta["referent_visible"] = False
+            self.meta["referent_unseen_s"] = (
+                None if ref.unseen_for() is None else round(ref.unseen_for(), 1))
             if ref.last_crop_jpeg:
                 self._crop = ref.last_crop_jpeg
                 self._crop_info = dict(ref.last_crop_info)
                 self._crop_info["from_memory"] = True
                 self.meta["crop_source"] = "referent_memory"
-                self.meta["referent_visible"] = False
             else:
                 self.meta["crop_source"] = "none"
-                self.meta["referent_visible"] = False
             return
 
         self.meta["referent_visible"] = True
@@ -548,12 +850,24 @@ class VisualAnswer:
                     "cannot actually read. If the driver wants one identified "
                     "they will ask, and you will get a close view of it then.")
 
-        if self._referent is not None:
+        if self._compare:
+            grounding["comparing"] = [
+                {"which": i + 1, "label": o.label, "fine_label": o.fine_label,
+                 "attributes": o.attributes, "position": o.position,
+                 "depth_meters": o.depth_m, "motion": o.motion}
+                for i, (o, _c, _info) in enumerate(self._compare)]
+            grounding["comparison_guidance"] = (
+                "Two crops follow, in this order. Compare only these two, "
+                "answer the question that was actually asked, and say so if the "
+                "images do not settle it.")
+
+        if self._referent is not None and not self._compare:
             r = self._referent
+            visible = self.meta.get("referent_visible", True)
             grounding["referring_to"] = {
                 "track_id": r.track_id, "label": r.label,
                 "fine_label": r.fine_label, "attributes": r.attributes,
-                "still_visible": self.meta.get("referent_visible", True),
+                "still_visible": visible,
             }
             obj = self._graph.by_track(r.track_id) if self._graph else None
             if obj is not None:
@@ -561,10 +875,64 @@ class VisualAnswer:
                     "position": obj.position, "motion": obj.motion,
                     "depth_meters": obj.depth_m,
                 })
+            elif not visible:
+                grounding["referring_to"].update({
+                    "last_known_position": r.last_position,
+                    "last_known_depth_meters": r.last_depth_m,
+                    "last_known_motion": r.last_motion,
+                })
+            if not visible:
+                # Acceptance test 5. The wide shot is current and does NOT
+                # contain this vehicle, while the crop does and is older —
+                # without saying so, the model reconciles the two by describing
+                # whatever car IS on that side of the road now.
+                unseen = self.meta.get("referent_unseen_s")
+                grounding["referent_no_longer_visible"] = {
+                    "seconds_since_last_seen": unseen,
+                    "guidance": (
+                        "This vehicle is no longer in view. The close crop is "
+                        "from when it was last seen; the wide shot is current "
+                        "and does not contain it — do not describe a different "
+                        "vehicle from the wide shot as if it were this one, and "
+                        "do not switch to another car. Answer about the one you "
+                        "were discussing, and mention that it is out of sight "
+                        "only if it actually bears on the answer."),
+                }
             if self._resolution is not None and self._resolution.ambiguous:
                 grounding["reference_uncertain"] = (
                     "the local system could not be sure which object was meant; "
                     "describe what you are looking at so the driver can correct you")
+
+        if self.route["request_type"] == router.READ_TEXT:
+            # Nothing in the detector's vocabulary is a sign, so there is
+            # usually no tracked object to crop and the wide frame is all there
+            # is. It goes at high detail for that reason.
+            grounding["read_text_guidance"] = (
+                "The driver is asking what something says. Read only what is "
+                "actually legible in the image, word for word. If it is too "
+                "small, too far, angled away or motion-blurred to read, say "
+                "that plainly and describe what you can make out instead — the "
+                "shape, the colour, what kind of sign it looks like. Never "
+                "reconstruct wording from what a sign of that type usually "
+                "says.")
+
+        if router.wants_fine_detail(self.question):
+            # Acceptance test 6. A year, a trim, an engine or a plate is the
+            # class of answer a photograph most often cannot support, and the
+            # class the model is most willing to supply anyway.
+            obj_px = (self._crop_info or {}).get("object_px") or [0, 0]
+            limited = bool(self._crop_info) and max(obj_px) < config.CROP_DETAIL_LIMIT_PX
+            grounding["fine_detail_requested"] = {
+                "detail_limited": limited,
+                "guidance": (
+                    "The driver is asking for a specific detail — a year, a "
+                    "model, a trim, a plate. Give it only if the image actually "
+                    "carries it. Otherwise say what the shape and proportions "
+                    "DO narrow it down to, name the range you are confident in, "
+                    "and be plain about what you cannot see from this angle. A "
+                    "confident wrong year is the worst answer available here; "
+                    "an honest range is a good one."),
+            }
         if self._crop_info:
             # The honest description of what the crop actually is. Crops are
             # upscaled so the object gets enough image tokens (see
@@ -608,14 +976,26 @@ class VisualAnswer:
                               + json.dumps(grounding, ensure_ascii=False)})
 
         if self._frame is not None:
-            parts.append({"type": "text", "text": "Full road scene:"})
+            current = ("Current road scene (the object asked about is NOT in "
+                       "this one):" if self.meta.get("referent_visible") is False
+                       else "Full road scene:")
+            parts.append({"type": "text", "text": current})
             parts.append({"type": "image_url", "image_url": {
                 "url": _data_url(self._frame.jpeg),
-                "detail": config.VISUAL_FRAME_DETAIL}})
+                "detail": (config.READ_TEXT_FRAME_DETAIL
+                           if self.route["request_type"] == router.READ_TEXT
+                           else config.VISUAL_FRAME_DETAIL)}})
             self._images.append(("frame", len(self._frame.jpeg)))
-        if self._crop is not None:
-            parts.append({"type": "text",
-                          "text": "Close crop of the object being asked about:"})
+        for i, (obj, crop, _info) in enumerate(self._compare):
+            parts.append({"type": "text", "text": f"Crop {i + 1}:"})
+            parts.append({"type": "image_url", "image_url": {
+                "url": _data_url(crop), "detail": config.VISUAL_CROP_DETAIL}})
+            self._images.append((f"crop{i + 1}", len(crop)))
+        if self._crop is not None and not self._compare:
+            label = ("Close crop of the object being asked about, from when it "
+                     "was last visible:" if self.meta.get("referent_visible") is False
+                     else "Close crop of the object being asked about:")
+            parts.append({"type": "text", "text": label})
             parts.append({"type": "image_url", "image_url": {
                 "url": _data_url(self._crop),
                 "detail": config.VISUAL_CROP_DETAIL}})
@@ -646,8 +1026,7 @@ class VisualAnswer:
         first = None
         parts = []
         try:
-            for delta in get_chat_adapter().stream(VISUAL_SYSTEM_PROMPT,
-                                                   self._messages):
+            for delta in get_chat_adapter().stream(self._system, self._messages):
                 if first is None:
                     first = time.perf_counter()
                     self.timing["gpt_first_token"] = round((first - t0) * 1000, 1)
@@ -671,7 +1050,17 @@ class VisualAnswer:
         still has to leave the referent established, or the follow-up it is
         about to test has nothing to follow up on.
         """
-        if self._referent is not None:
+        if self._asking is not None:
+            # This turn ASKED rather than answered. No referent is committed —
+            # that is the entire point: RIO does not know which one yet, and
+            # recording a guess here would make the driver's answer irrelevant.
+            # The question is armed only if it was actually spoken.
+            if self.reply:
+                self._asking.text = self.reply
+                self.session.pending = self._asking
+                self.meta["asked_clarification"] = self._asking.to_log()
+            self.meta["is_clarification"] = True
+        elif self._referent is not None:
             # Remembered even when generation failed and nothing was said. The
             # referent is established by what the driver ASKED about, not by
             # whether RIO managed to answer — and a failed turn is exactly when

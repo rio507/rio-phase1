@@ -83,7 +83,12 @@ CROP_PAD_FRAC = 0.6
 # anything under CROP_DETAIL_LIMIT_PX is flagged to the model as detail-limited.
 CROP_MIN_PX = 768
 CROP_MAX_PX = 1024
-CROP_DETAIL_LIMIT_PX = 96
+# Long side of the object IN THE ORIGINAL FRAME, below which fine detail is not
+# really present. Raised from 96 after looking at what the numbers correspond
+# to: the saloon that GPT-5.5 identifies correctly and hedges the year on sits
+# at 245 px, while a car 70 m back comes in around 120 px and carries no
+# readable badge at all. 96 was letting the second case through unflagged.
+CROP_DETAIL_LIMIT_PX = 160
 
 # --- Qwen enrichment --------------------------------------------------------
 # Attribute enrichment is on demand, never on the 4 fps path: one Qwen call per
@@ -120,3 +125,32 @@ VISUAL_HISTORY_TURNS = 6
 # An active referent older than this is stale: the driver has moved on, and
 # "what year is it" should not silently attach to a car from two minutes ago.
 REFERENT_TTL_S = 90.0
+
+
+# ---------------------------------------------------------------------------
+# Phase B — clarification, lost objects, comparisons, reading text
+# ---------------------------------------------------------------------------
+
+# How long RIO waits for an answer to "which one?". Longer than a referent's
+# idle life is wrong (the driver has moved on) and shorter than a few seconds is
+# wrong too (they were driving). A pending question that expires simply lapses:
+# the next utterance is treated as a fresh one, never as an answer to something
+# RIO asked a minute ago.
+CLARIFY_TTL_S = 45.0
+
+# Candidates offered in a clarifying question. Two is the natural shape of the
+# question ("the black one, or the white one?"); three is the most a driver can
+# hold while driving, and past that the honest move is to describe the group.
+CLARIFY_MAX_CANDIDATES = 3
+CLARIFY_MAX_TOKENS = 300
+
+# A comparison needs exactly two objects. More than that is not a comparison,
+# it is a survey, and the answer stops being useful at a glance.
+COMPARE_MAX_OBJECTS = 2
+
+# Reading text needs resolution above all else, so the full frame goes at high
+# detail regardless of what a scene question would use. Nothing in the
+# detector's vocabulary is a sign (COCO gives us person/bicycle/car/motorcycle/
+# bus/truck), so there is usually no tracked object to crop and the frame is
+# all there is — see docs/visual_qa.md §12.
+READ_TEXT_FRAME_DETAIL = "high"
