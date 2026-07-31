@@ -47,13 +47,22 @@ did not match the weights is an error rather than a silently half-random
 network -- verified at 0 missing / 0 unexpected keys.
 """
 import os
+import sys
 import threading
 import time
 
 import numpy as np
 import torch
 
-RFDETR_PKG = "/usr/local/lib/python3.12/dist-packages/rfdetr"
+# Where rfdetr's package directory is. NOT a constant: this used to be the
+# literal "/usr/local/lib/python3.12/dist-packages/rfdetr", which was true of
+# the pod it was written on and false the moment that pod was rebuilt on a
+# Python 3.11 image. pip had installed rfdetr correctly the whole time; the
+# stub's __path__ simply pointed at a directory that no longer existed, and the
+# failure surfaced as `No module named 'rfdetr.models'` — which reads like a
+# package-layout change and is nothing of the sort. Resolved at run time now, so
+# it follows whichever interpreter is actually running.
+RFDETR_PKG = os.environ.get("RIO_RFDETR_PKG", "")   # override; "" = discover
 
 # Nano: 30.5 M params, 384x384, 2 decoder layers. The smallest published
 # variant. Small (512 px, 3 decoder layers) is the fallback if nano's recall on
@@ -131,14 +140,64 @@ _lock = threading.Lock()
 _load_error = None
 
 
+_pkg_path = None
+
+
+def _pkg_dir():
+    """rfdetr's package directory, found WITHOUT executing its __init__.
+
+    find_spec on the top-level name only asks the path finders — it does not run
+    the module, which is the whole point of the sideways import. (The same call
+    on a SUBmodule would import the parent, so this must stay a top-level
+    lookup.)
+
+    Memoised, and that is not an optimisation. find_spec consults sys.modules
+    FIRST, and once the stub is installed there it raises ValueError on the
+    stub's absent __spec__ — so a second call would report rfdetr uninstalled
+    while the module it points at is loaded and working. The answer is cached
+    from the one call that happens before the stub exists, and the stub's own
+    __path__ is the fallback for anyone who asks later.
+    """
+    global _pkg_path
+    if RFDETR_PKG:
+        return RFDETR_PKG
+    if _pkg_path and os.path.isdir(_pkg_path):
+        return _pkg_path
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("rfdetr")
+    except (ImportError, ValueError):
+        spec = None
+    locations = list(getattr(spec, "submodule_search_locations", None) or [])
+    if not locations:
+        # Already imported (stub or real): believe what it says about itself.
+        locations = list(getattr(sys.modules.get("rfdetr"), "__path__", None) or [])
+        locations = [p for p in locations if os.path.isdir(p)]
+    if not locations:
+        raise ImportError(
+            "rfdetr is not importable by this interpreter "
+            f"({sys.executable}). Install it the way boot.sh does — "
+            "`pip install --no-deps rfdetr==1.5.0 supervision==0.29.1 "
+            "pycocotools peft` — or point RIO_RFDETR_PKG at the package "
+            "directory.")
+    _pkg_path = locations[0]
+    return _pkg_path
+
+
 def _rfdetr_models():
     """Import rfdetr.models.lwdetr without executing the package __init__."""
-    import sys
     import types
 
-    if "rfdetr" not in sys.modules:
+    existing = sys.modules.get("rfdetr")
+    if existing is None or (getattr(existing, "_rio_stub", False)
+                            and not os.path.isdir((getattr(existing, "__path__", None) or [""])[0])):
+        # Second half of that condition: a stub left behind by an earlier failed
+        # attempt would otherwise pin the bad path for the life of the process,
+        # so a fixed environment could not recover without a restart.
         stub = types.ModuleType("rfdetr")
-        stub.__path__ = [RFDETR_PKG]
+        stub.__path__ = [_pkg_dir()]
+        stub._rio_stub = True
         sys.modules["rfdetr"] = stub
     from rfdetr.models.lwdetr import PostProcess, build_model
     return build_model, PostProcess

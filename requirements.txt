@@ -75,13 +75,23 @@ gdown>=5.0
 #     4.57 with 5.14, huggingface_hub 0.36 with 1.25, and left two cv2 builds
 #     installed with the tracking API missing from the one that won.
 #
-# Install exactly like this:
-#   pip install --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
-#
 # headway/detect.py imports rfdetr.models.lwdetr beneath a stub package object
 # so the training harness never executes; supervision/pycocotools/peft are only
 # needed to satisfy import statements along that path.
-rfdetr==1.5.0
-supervision==0.29.1
-pycocotools
-peft
+#
+# THESE FOUR ARE DELIBERATELY NOT INSTALLABLE FROM THIS FILE. They used to be
+# plain requirement lines, which meant `pip install -r requirements.txt` — step
+# 3 of boot.sh — installed them WITH the dependency tree the paragraph above
+# says must never be installed, and boot.sh's later --no-deps line then found
+# them "already satisfied" and did nothing. That is how this pod ended up with
+# roboflow, albumentations and opencv-python 5.0.0.93 sitting on top of the
+# pinned opencv-contrib-python-headless build, one resolver away from losing
+# CSRT. Commented out, the pin is still the single source of the version and
+# only boot.sh §5c can act on it, which is where the --no-deps flag lives:
+#
+#   pip install --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+#
+# rfdetr==1.5.0
+# supervision==0.29.1
+# pycocotools
+# peft

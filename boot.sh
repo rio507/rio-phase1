@@ -118,8 +118,31 @@ python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headw
 # build and removes CSRT/MOSSE. See the note in requirements.txt.
 log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
 pip install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+# Both of the next two run `python -m` / import from the repo, so they need the
+# repo as cwd. The script is documented as `bash /workspace/boot.sh`, which
+# leaves cwd wherever the caller happened to be; the cd further down (step 7)
+# was too late to help them.
+cd "$REPO"
+
 log "RF-DETR weights"
 python -m tools.fetch_detector_weights || log "  !! detector weights unavailable - headway will have no candidates"
+
+# Prove the two things that have actually broken here before, while the log is
+# still being read, rather than discovering them mid-drive as an UNKNOWN band:
+#   * the sideways rfdetr import (it was pinned to a hardcoded python3.12 path
+#     and silently died when the pod was rebuilt on 3.11)
+#   * CSRT, which disappears if anything drags opencv-python 5.x in on top of
+#     the pinned contrib-headless build
+log "detector + tracker smoke check"
+python - <<'PY' || log "  !! SMOKE CHECK FAILED - headway will have no candidates"
+import cv2
+from headway import detect
+detect._rfdetr_models()
+print(f"   rfdetr importable from {detect._pkg_dir()}")
+assert any(hasattr(cv2, n) for n in ("TrackerCSRT_create", "TrackerCSRT")) or hasattr(cv2, "legacy"), \
+    f"cv2 {cv2.__version__} has no CSRT - check for a stray opencv-python install"
+print(f"   cv2 {cv2.__version__} has the tracking API")
+PY
 
 # ---------------------------------------------------------------------------
 # 6. Free port 8888
