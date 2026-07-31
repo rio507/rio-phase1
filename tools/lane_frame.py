@@ -151,22 +151,40 @@ def main():
                     help="seconds of clip fed in before --at, so the tracker "
                          "and Kalman are in the state a real drive would be in")
     ap.add_argument("--fps", type=float, default=4.0)
-    ap.add_argument("--session", default="lane_frame")
+    # Empty by default, and that is now load-bearing. /headway_frame refuses a
+    # frame tagged with a session id the server has no record of -- that is how
+    # a dashboard left open across a restart is stopped (see app.py). This tool
+    # never calls /session/start, so the id it used to pass ("lane_frame") is
+    # exactly such an id, and every frame would now come back
+    # {"ok": false, "stale": true} leaving the stills blank.
+    #
+    # Sending no id at all is the desk-testing path and is explicitly welcome.
+    # It costs nothing here: the frames land on headway.live's "default"
+    # session, which gives the same continuity across the warm-up run, and
+    # /headway_reset with no id resets that same one. The only thing given up
+    # is a JSONL, which a stills renderer never wanted -- it is what produced
+    # stray-lane_frame.jsonl.
+    #
+    # Pass --session <a real session id from /session/start> if you do want the
+    # run logged.
+    ap.add_argument("--session", default="",
+                    help="optional live session id to log this run under; "
+                         "empty (the default) uses the unlogged desk path")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.clip)
     if not cap.isOpened():
         raise SystemExit(f"cannot open {args.clip}")
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    url = f"{args.base}/headway_frame?session_id={args.session}"
+    qs = f"?session_id={args.session}" if args.session else ""
+    url = f"{args.base}/headway_frame{qs}"
 
     shots = []
     for target in sorted(args.at):
         # A cold session has no tracker and no filter history, so a frame
         # grabbed straight out of one shows an empty overlay. Feeding the run-up
         # first makes the still representative of the drive at that moment.
-        requests.post(f"{args.base}/headway_reset?session_id={args.session}",
-                      timeout=60)
+        requests.post(f"{args.base}/headway_reset{qs}", timeout=60)
         start = max(0.0, target - args.warmup)
         t = start
         last = None
