@@ -480,7 +480,7 @@
     margin-top: -2px;
   }
 
-  /* ---------- navigation (placeholder) ---------- */
+  /* ---------- navigation ---------- */
 
   /* Nested inside the camera column the way .audio-panel nests in the voice
      column, so it reads as a sub-panel of that column rather than a fifth
@@ -514,17 +514,108 @@
     -webkit-appearance: none; appearance: none;
   }
   .nav-dest:focus { outline: none; border-color: var(--border-strong); }
-  /* Disabled until the Maps embed is wired; iOS otherwise greys it into
-     illegibility, so the dim is stated explicitly instead. */
+  /* Only disabled if the page is served without a Maps key. */
   .nav-dest:disabled { opacity: 1; color: var(--text-dimmer); cursor: not-allowed; }
   .nav-dest::placeholder {
     color: var(--text-dimmer);
     letter-spacing: 0.15em; text-transform: uppercase;
   }
 
-  /* Reserved geometry for the Maps embed: same 16:9 lock and corner brackets as
-     the camera box, so dropping the iframe/div in later changes nothing but
-     what is painted inside it. */
+  .nav-destrow { display: flex; gap: 6px; align-items: stretch; margin-bottom: 8px; }
+  .nav-destrow .nav-dest { margin-bottom: 0; flex: 1; min-width: 0; }
+  /* Compact next to the destination box: these are desk controls, not the
+     drive-safe targets #mic and #drive are. */
+  .nav-btn {
+    width: auto; min-height: 0; flex: 0 0 auto;
+    padding: 0 12px; font-size: 11px; letter-spacing: 0.12em;
+  }
+  .nav-btn[aria-pressed="true"] {
+    color: #1a1206; background: var(--amber); border-color: var(--amber);
+  }
+
+  /* Autocomplete, rendered here rather than by Google's own widget: one key
+     surface (the suggest call is server-side) and it can be made to look like
+     the rest of the HUD. */
+  .nav-suggest {
+    margin: -6px 0 10px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    max-height: 190px; overflow-y: auto;
+  }
+  .nav-sug {
+    padding: 8px 10px; cursor: pointer;
+    border-bottom: 1px solid rgba(95,179,232,0.10);
+  }
+  .nav-sug:last-child { border-bottom: 0; }
+  .nav-sug:hover { background: var(--surface-hover); }
+  .nav-sug b {
+    display: block; font-family: var(--font-mono); font-weight: 500;
+    font-size: 11.5px; color: var(--text-bright);
+  }
+  .nav-sug i {
+    display: block; font-style: normal;
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--text-dimmer); margin-top: 2px;
+  }
+
+  .nav-summary { display: flex; gap: 6px; margin-bottom: 8px; }
+  .nav-summary span {
+    flex: 1; padding: 7px 9px;
+    background: var(--bg-1); border: 1px solid var(--border);
+    font-family: var(--font-mono);
+  }
+  .nav-summary i {
+    display: block; font-style: normal;
+    font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--text-dimmer); margin-bottom: 3px;
+  }
+  .nav-summary b { font-weight: 500; font-size: 12.5px; color: var(--text); }
+
+  /* The current maneuver. The one thing in this panel a driver may glance at,
+     so it is the brightest thing in it and the distance is the largest text. */
+  .nav-man {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; margin-bottom: 10px;
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    box-shadow: inset 0 0 22px rgba(95,179,232,0.06);
+    clip-path: var(--miter);
+  }
+  .nav-man-icon {
+    flex: 0 0 auto; font-size: 22px; line-height: 1;
+    color: var(--accent-bright);
+    text-shadow: 0 0 10px rgba(95,179,232,0.65);
+  }
+  .nav-man-text {
+    flex: 1; min-width: 0;
+    font-family: var(--font-ui); font-weight: 600;
+    font-size: 14px; line-height: 1.3;
+    color: var(--text-bright);
+  }
+  .nav-man-dist {
+    flex: 0 0 auto;
+    font-family: var(--font-mono); font-size: 15px;
+    color: var(--amber);
+  }
+
+  /* Desk controls. Deliberately last and deliberately dimmer: this row is for
+     testing announcements without a car, and it should never read as part of
+     the driving surface. */
+  .nav-dev { display: flex; gap: 6px; margin-top: 10px; }
+  .nav-dev input {
+    min-width: 0;
+    padding: 7px 9px;
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--text); background: var(--bg-1);
+    border: 1px solid var(--border);
+    -webkit-appearance: none; appearance: none; border-radius: 0;
+  }
+  .nav-dev input:focus { outline: none; border-color: var(--border-strong); }
+  .nav-dev input::placeholder { color: var(--text-dimmer); }
+  #navsimspeed { flex: 0 0 70px; }
+  #navorigin { flex: 1; }
+
+  /* Same 16:9 lock and corner brackets as the camera box. */
   .nav-map {
     position: relative;
     aspect-ratio: 16 / 9;
@@ -797,27 +888,57 @@
       <div class="speed-hint" id="speedhint">GPS speed &middot; override blank</div>
     </div>
 
-    <!-- ---- NAVIGATION (placeholder) ---- -->
+    <!-- ---- NAVIGATION ----
+         Google computes the route; RIO runs the progression against it. The
+         wiring is in static/rio_nav.js, the maneuver engine in
+         static/rio_navcore.js, and every announcement goes out through the
+         speech arbiter in static/rio_speech.js — there is only one mouth. -->
     <div class="panel nav-panel">
       <div class="nav-head">
         <div class="col-title">Navigation</div>
-        <div class="col-sub">Google Maps &middot; Route</div>
+        <div class="col-sub">Google Routes &middot; RIO Progression</div>
       </div>
 
       <div class="nav-empty" id="navempty">No Route Set</div>
 
-      <input id="navdest" class="nav-dest" type="text" disabled
-             placeholder="Destination" aria-label="Destination — not yet wired">
+      <div class="nav-destrow">
+        <input id="navdest" class="nav-dest" type="text"
+               placeholder="Destination" aria-label="Destination"
+               autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="navgo" class="hud-btn nav-btn" type="button">Route</button>
+        <button id="navclear" class="hud-btn nav-btn" type="button">Clear</button>
+      </div>
+      <div class="nav-suggest" id="navsuggest" style="display:none;"></div>
 
-      <!-- TODO(next session): mount the Google Maps JavaScript embed into
-           #navmap. It needs a Google Maps API key (Maps JavaScript API +
-           Directions API) served from the backend rather than hardcoded here,
-           and the loader script tag added to <head>. Everything the embed
-           needs is contained by this div: the 16:9 lock, the border and the
-           corner brackets are on the container, so wiring it up is a matter of
-           replacing .nav-map-idle with the rendered map. -->
+      <div class="nav-summary" id="navsummary" style="display:none;">
+        <span><i>ETA</i><b id="naveta">&mdash;</b></span>
+        <span><i>Distance</i><b id="navdistance">&mdash;</b></span>
+        <span><i>Remaining</i><b id="navremaining">&mdash;</b></span>
+      </div>
+
+      <div class="nav-man" id="navman" style="display:none;">
+        <span class="nav-man-icon" id="navmanicon">&#8593;</span>
+        <span class="nav-man-text" id="navmantext"></span>
+        <span class="nav-man-dist" id="navmandist"></span>
+      </div>
+
       <div class="nav-map bracketed" id="navmap">
-        <div class="nav-map-idle">Map Offline</div>
+        <div class="nav-map-idle" id="navmapidle">Awaiting Route</div>
+      </div>
+
+      <!-- Desk mode. GPS on a desk is a stationary fix with no speed, so the
+           simulator walks the host position along the route's own polyline at a
+           set speed and feeds it through exactly the same position handler a
+           real fix goes through. The start-point box exists for the same
+           reason: to test a route somewhere other than where the laptop is. -->
+      <div class="nav-dev">
+        <button id="navsim" class="hud-btn nav-btn" type="button" aria-pressed="false"
+                title="Walk the host position along the route to test announcements">Simulate Drive</button>
+        <input id="navsimspeed" type="number" inputmode="decimal" min="1" step="5" value="30"
+               aria-label="Simulated speed in mph" title="Simulated speed (mph)">
+        <input id="navorigin" type="text" placeholder="Start point (blank = GPS)"
+               autocomplete="off" spellcheck="false"
+               aria-label="Start point override — address or lat,lng">
       </div>
     </div>
   </section>
@@ -1619,7 +1740,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const speedHint = document.getElementById('speedhint');
   const runBtn = document.getElementById('runheadway');
   const preview = document.getElementById('preview');
-  const spokenLine = document.getElementById('spokenline');
 
   const CADENCE_MS = 250;                 // ~4 fps
   const MPH_TO_MS = 0.44704;
@@ -1665,27 +1785,55 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  /* Play one element to completion. The elements are shared and long-lived, so
+     the handlers are torn down on the way out — a stale onended left behind
+     would resolve the NEXT warning's promise the moment this one finished. */
+  function playElement(el, src) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const done = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        el.onended = el.onerror = null;
+        fn(arg);
+      };
+      el.onended = () => done(resolve);
+      el.onerror = () => done(reject, new Error('audio error'));
+      try {
+        if (src) el.src = src; else el.currentTime = 0;
+        const p = el.play();
+        if (p && p.catch) p.catch(e => done(reject, e));
+      } catch (e) { done(reject, e); }
+    });
+  }
+
+  /* The headway voice now speaks through the arbiter instead of grabbing the
+     audio device directly. Priority 1: a gap warning outranks anything
+     navigation has to say, and pre-empts it mid-word.
+
+     Group "headway" preserves the behaviour this path already had — a fresher
+     warning replaces an older one, which is how the red tier interrupted a calm
+     line before the arbiter existed. The policy that decides WHETHER to speak is
+     still entirely server-side; this only decides who gets the mouth. */
   function speak(sp) {
     if (!sp) return;
-    if (spokenLine) spokenLine.textContent = sp.text || '';
-    if (sp.audio === 'tts') {
-      try {
-        tts.src = '/headway_voice?line=' + encodeURIComponent(sp.line);
-        const p = tts.play();
-        if (p && p.catch) p.catch(() => {});
-      } catch (e) { /* the warning still shows on the HUD */ }
-      return;
-    }
-    const a = clips[sp.audio];
-    if (!a) return;
-    // The red tier interrupts coaching: a calm line still playing while the gap
-    // has collapsed is worse than silence.
-    try { tts.pause(); } catch (e) {}
-    try {
-      a.currentTime = 0;
-      const p = a.play();
-      if (p && p.catch) p.catch(() => {});
-    } catch (e) { /* non-fatal */ }
+    const isTts = sp.audio === 'tts';
+    const el = isTts ? tts : clips[sp.audio];
+    if (!el) return;
+    RIO.speech.say({
+      priority: RIO.speech.P.SAFETY,
+      group: 'headway',
+      id: 'headway:' + (sp.line || sp.audio),
+      text: sp.text || '',
+      // A warning about a gap that was measured three seconds ago is not a
+      // warning. It cannot normally queue at all — nothing outranks it — so
+      // this only bites if the device itself is stalled.
+      ttlMs: 2500,
+      meta: { line: sp.line, audio: sp.audio },
+      play: () => playElement(el, isTts
+        ? '/headway_voice?line=' + encodeURIComponent(sp.line) : null),
+      stop: () => { try { el.pause(); } catch (e) {} },
+    });
   }
 
   /* ---------------- host speed -------------------------------------------
@@ -1696,6 +1844,13 @@ document.addEventListener('DOMContentLoaded', () => {
   let gpsAt = 0;
   let watchId = null;
   let unit = 'ms';
+
+  /* ONE Geolocation watch for the whole page. Headway needs the speed,
+     navigation needs the position, and two watchPosition calls would mean two
+     subscriptions to the same radio: double the battery, and — worse — two
+     slightly different ideas of where the car is. Anything else that needs
+     fixes subscribes here. */
+  const posSubs = [];
 
   function startWatch() {
     if (watchId !== null || !navigator.geolocation) return;
@@ -1708,6 +1863,9 @@ document.addEventListener('DOMContentLoaded', () => {
                       && isFinite(pos.coords.speed)) ? pos.coords.speed : null;
           gpsAt = performance.now();
           paintHint();
+          for (const fn of posSubs) {
+            try { fn(pos); } catch (e) { /* a subscriber must not break the watch */ }
+          }
         },
         () => { gpsSpeed = null; paintHint(); },
         { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
@@ -1916,6 +2074,8 @@ document.addEventListener('DOMContentLoaded', () => {
     unlock: unlock,
     startWatch: startWatch,
     stopWatch: stopWatch,
+    // Subscribe to the shared position watch (navigation uses this).
+    onPosition: fn => { if (typeof fn === 'function') posSubs.push(fn); },
     speed: speed,
     captureFromVideo: captureFromVideo,
     resetSession: resetSession,
@@ -2311,6 +2471,42 @@ document.addEventListener('DOMContentLoaded', () => {
 
   window.RIO = window.RIO || {};
   RIO.overlay = { render: render, headway: headway, clear: clear, redraw: redraw };
+});
+</script>
+
+<!-- ---- Navigation. Loaded last, and in this order:
+       rio_speech.js    the arbiter — must exist before anything asks to speak
+       rio_navcore.js   the maneuver engine — no DOM, node-testable
+       rio_nav.js       the panel, the map, the simulator, the logging
+     rio_nav.js subscribes to the headway block's position watch on
+     DOMContentLoaded, so it has to be parsed after that block or RIO.headway
+     will not exist yet when its listener runs. ---- -->
+<script>
+  /* Injected by app.py's index() from GOOGLE_MAPS_API_KEY in .env. The literal
+     placeholder is what is committed; if you ever see it in the page source,
+     the page was served from /static/index.html instead of "/". */
+  window.RIO_MAPS_KEY = "__GOOGLE_MAPS_API_KEY__";
+</script>
+<script src="/static/rio_speech.js"></script>
+<script src="/static/rio_navcore.js"></script>
+<script src="/static/rio_nav.js"></script>
+<script>
+/* One mouth, one line on the HUD. Whatever the arbiter starts playing is what
+   the Voice Layer column shows — headway and navigation alike, which is the
+   point of there being an arbiter at all. */
+document.addEventListener('DOMContentLoaded', () => {
+  const spoken = document.getElementById('spokenline');
+  if (!spoken) return;
+  RIO.speech.onEvent(ev => {
+    if (ev.type !== 'start') return;
+    spoken.textContent = ev.item.text || '';
+    spoken.classList.toggle('has-line', !!ev.item.text);
+  });
+  // A nav announcement's exact wording is decided server-side and comes back
+  // with the audio; it replaces the precomputed line the moment it arrives.
+  if (RIO.bus) RIO.bus.on('speaking', e => {
+    if (e.text) { spoken.textContent = e.text; spoken.classList.add('has-line'); }
+  });
 });
 </script>
 </body>

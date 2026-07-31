@@ -215,6 +215,29 @@ def log_merge_promotion(session_id: Optional[str], result: dict) -> None:
         })
 
 
+def log_nav(session_id: Optional[str], event: str, payload: Optional[dict] = None) -> None:
+    """One navigation event — route_set, maneuver_approach, maneuver_complete,
+    reroute, arrived — under a single kind so a whole drive's navigation can be
+    selected out of the stream in one pass.
+
+    One kind rather than one per event, unlike lane_drift and merge_promotion:
+    those are rare findings pulled out of a 4 Hz stream, whereas these ARE the
+    stream — a handful of events per turn, and their order is the thing under
+    review. Splitting them across kinds would make "did the far tier fire before
+    the near tier" a join instead of a read.
+
+    The payload is whatever the provider and the progression engine recorded for
+    that event; it always carries the route_id, so events survive a reroute
+    without becoming ambiguous.
+    """
+    if not session_id:
+        return
+    body = {"event": event}
+    if payload:
+        body.update(payload)
+    _write(session_id, "nav", body)
+
+
 def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes_len: int, latency_ms: float) -> None:
     if not session_id:
         return

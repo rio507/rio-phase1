@@ -5,6 +5,10 @@ openai>=1.0
 elevenlabs>=1.0
 python-dotenv
 python-multipart
+# nav.py talks to the Google Routes/Geocoding/Places APIs. It arrives with the
+# openai client anyway; pinned here because navigation depends on it directly
+# and should not break if that transitive dependency ever changes.
+httpx
 
 # --- ML stack (Qwen3-VL-8B observer) ---
 # Torch is NOT on PyPI in its CUDA build. Install the three torch packages from

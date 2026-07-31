@@ -1,10 +1,12 @@
 
 
 import math
+import os
 import time
 import uuid
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import quote
 from dotenv import load_dotenv
 from starlette.concurrency import run_in_threadpool
@@ -21,6 +23,7 @@ import voice
 import llm_interface
 import vision
 import perceive
+import nav
 # Import order matters: perceive lends vision's resident Qwen3-VL to
 # headway.anchor at import time, so headway.live's anchor path finds a provider
 # already installed and never pulls a second copy of the weights.
@@ -82,9 +85,27 @@ client = OpenAI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+INDEX_PATH = Path("static/index.html")
+MAPS_KEY_TOKEN = "__GOOGLE_MAPS_API_KEY__"
+
+
 @app.get("/")
 def index():
-    return FileResponse("static/index.html")
+    """index.html with the Maps browser key injected at serve time.
+
+    The Maps JavaScript API needs a key the browser can see, so "keep it out of
+    the browser" is not available — but "keep it out of the repository" is, and
+    that is the line that matters: the key lives in .env (gitignored) and enters
+    the page here, on the way out. Nothing in static/ ever contains it.
+
+    Consequence worth knowing: the page must be loaded from "/" and not from
+    /static/index.html, which the StaticFiles mount will happily serve with the
+    placeholder still in it — the map would be the only thing that fails, and it
+    fails visibly.
+    """
+    html = INDEX_PATH.read_text()
+    return HTMLResponse(html.replace(MAPS_KEY_TOKEN,
+                                     os.getenv("GOOGLE_MAPS_API_KEY", "")))
 
 @app.get("/health")
 def health():
@@ -308,6 +329,98 @@ def headway_voice_endpoint(line: str = Query(...)):
     text = live_policy.LINE_TEXT[line]
     return StreamingResponse(voice.synthesize_stream(text), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store"})
+
+
+# --- Navigation (WebNavProvider, step 1) ---
+#
+# Three endpoints and no more: ask Google for a route, look an announcement up,
+# record what the progression engine did. The engine itself is client-side (see
+# static/rio_navcore.js) — nothing here is in the timing path between a driver
+# and a turn.
+
+
+@app.get("/nav/suggest")
+def nav_suggest_endpoint(q: str = Query(...), lat: float = Query(default=None),
+                         lng: float = Query(default=None)):
+    """Places autocomplete for the destination box. Never fatal — an empty list
+    just means the driver types the address in full and it geocodes."""
+    return {"suggestions": nav.suggest(q, lat, lng)}
+
+
+@app.get("/nav/geocode")
+def nav_geocode_endpoint(q: str = Query(...)):
+    """Address -> lat/lng. Used for the desk-testing start-point override, and
+    as the fallback when a destination is typed rather than picked."""
+    g = nav.geocode(q)
+    return g or {"error": "could not find that place", "q": q}
+
+
+@app.post("/nav/route")
+def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
+    """Compute a route and make it the active one.
+
+    Google decides the route. The only judgement in this handler is refusing to
+    pretend: a routing failure comes back as an error the panel shows, never as
+    a stale or invented route.
+    """
+    try:
+        lat = float(body.get("lat"))
+        lng = float(body.get("lng"))
+    except (TypeError, ValueError):
+        return {"error": "need a current position (lat, lng) to route from"}
+    try:
+        route = nav.compute_route(
+            lat, lng,
+            destination=str(body.get("destination") or ""),
+            place_id=str(body.get("place_id") or ""),
+            label=str(body.get("label") or ""),
+            reroute_of=body.get("reroute_of"),
+        )
+    except nav.NavError as e:
+        sessions.log_nav(session_id, "route_failed", {
+            "destination": body.get("destination"), "error": str(e)})
+        return {"error": str(e)}
+    # route_set is logged here rather than from the browser: the server is the
+    # only place that holds the whole route, and the summary it writes is the
+    # record a review reads to see what RIO *intended* to say on this drive.
+    sessions.log_nav(session_id, "route_set", nav.summary(route))
+    return route
+
+
+@app.get("/nav/voice")
+def nav_voice_endpoint(route_id: str = Query(...), m: int = Query(...),
+                       tier: str = Query(...), dist_m: float = Query(default=None)):
+    """TTS for one precomputed announcement, addressed by (route, maneuver, tier).
+
+    Deliberately not a text-to-speech endpoint, for the same reason
+    /headway_voice is not: the browser sends coordinates into a table, never a
+    sentence. Anything that does not resolve to a maneuver on a live route is
+    refused, so the set of things RIO's voice can ever say about navigation is
+    bounded by what Google returned and this process precomputed.
+
+    The exact sentence rides back on X-Nav-Text so the panel displays the words
+    that are being spoken rather than its own reconstruction of them.
+    """
+    text = nav.announcement_text(route_id, m, tier, dist_m)
+    if not text:
+        return {"error": "unknown route, maneuver or tier",
+                "route_id": route_id, "m": m, "tier": tier}
+    return StreamingResponse(
+        voice.synthesize_stream(text), media_type="audio/mpeg",
+        headers={
+            "X-Nav-Text": quote(text, safe=""),
+            "Access-Control-Expose-Headers": "X-Nav-Text",
+            "Cache-Control": "no-store",
+        })
+
+
+@app.post("/nav/event")
+def nav_event_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
+    """Record one progression event (kind "nav") in the session JSONL."""
+    event = str(body.get("event") or "unknown")
+    payload = body.get("payload")
+    sessions.log_nav(session_id, event, payload if isinstance(payload, dict) else None)
+    return {"logged": event}
 
 
 # --- Phase 2.5 session endpoints ---
