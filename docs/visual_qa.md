@@ -587,4 +587,55 @@ POST /ask?session_id=…            a visual question in text, answered in text
 GET  /visual_state?session_id=…   buffer, retention settings, active referent
 POST /talk?session_id=…           unchanged contract; now routes, and returns
                                   X-Request-Type
+POST /session/heartbeat?session_id=…   "still driving" — see §14
+GET  /sessions                    which drives this process thinks are live
 ```
+
+---
+
+## §14 Session liveness
+
+A drive holds real state: an open JSONL, a tracker and Kalman filter in
+`headway.live`, and a frame ring with a few megabytes of road in it. All of it
+is released by `/session/end` — when that arrives.
+
+Two ways it does not arrive, and both were happening:
+
+**The client outlives the server.** A dashboard tab left open across a restart
+keeps POSTing `/headway_frame` at 4 fps against a session id the new process
+has never issued. Everything downstream created state on demand, so it was
+served in full: a fresh `LiveSession` minted, GPU spent on every frame, events
+spilled into `stray-<id>.jsonl`, forever. This is what made a restart look like
+a Qwen bug — the frames arrived before the models had finished loading.
+
+**The server outlives the client.** A flat battery, a slept laptop, a tab closed
+while the page was hidden: `pagehide` never fires, nothing says the drive
+ended, and the state is held for the life of the process. Measured on this pod
+before the fix: 54 sessions started, 6 never closed, 16 stray files.
+
+The fix is one mechanism for both directions:
+
+- The dashboard beats every **10 s** (`POST /session/heartbeat`). A beat that
+  comes back `ok: false` means this server does not know the drive, and the
+  client stops it and says so rather than streaming into nothing.
+- `/headway_frame` and `/perceive` refuse a frame whose session id is not live,
+  with `stale: true`. The frame path notices sixteen times faster than the
+  heartbeat does. A frame with **no** session id is a different thing and still
+  welcome — that is the desk-testing path.
+- A reaper thread ends sessions unheard-from for **120 s**, releasing headway
+  state, the frame ring and the visual referent through the same
+  `_teardown_session` the tidy exit uses. The record gets
+  `session_end {"reason": "abandoned"}`, so a review can tell a drive that
+  ended from one that was dropped.
+
+**Short beat, long fuse**, and the asymmetry is deliberate. Mobile browsers
+throttle a backgrounded tab's timers hard, and a driver taking a call has not
+stopped driving; reaping a live drive would split its log and reset the headway
+state mid-road. Twelve missed beats is unambiguous, two is not. A failed
+`fetch` is likewise never treated as a stale session — losing signal is normal
+in a car. Only the server actually saying it does not know the session counts.
+
+Verified end to end: a stale id is refused on the first frame; a real session
+is unaffected; an id-less frame still works; and a session abandoned mid-drive
+was reaped at 140 s (120 s fuse plus one 20 s scan) with the ring emptied,
+headway state gone, and later frames from that tab refused.

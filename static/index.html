@@ -1453,8 +1453,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const PERCEIVE_MS_SOLO = 5000;
   const PERCEIVE_MS_HEADWAY = 15000;
 
+  /* How often the dashboard tells the server it is still driving.
+
+     Short, because its job is to notice quickly that the server no longer
+     knows about this drive — after a restart, a tab left open will otherwise
+     keep POSTing frames at 4 fps into a process that has never heard of it,
+     forever. The server's patience is much longer (2 minutes): a phone that
+     backgrounds this tab has its timers throttled hard, and a driver taking a
+     call has not stopped driving. Short beat, long fuse. */
+  const HEARTBEAT_MS = 10000;
+
   let timer = null;
   let hwTimer = null;
+  let hbTimer = null;
   let inflight = false;
   let busy = false;      // guards double-taps on the toggle itself
   let wakeLock = null;
@@ -1500,6 +1511,50 @@ document.addEventListener('DOMContentLoaded', () => {
     }, perceiveInterval());
   }
 
+  /* ---- session heartbeat -------------------------------------------------
+     Two failure modes, one mechanism.
+
+     The server forgot us (it restarted): the beat comes back ok:false and the
+     drive stops here rather than streaming frames into nothing.
+
+     We forgot the server (this page went away without firing pagehide — a flat
+     battery, a slept laptop, a force-quit): the beats stop, and after two
+     minutes the server reaps the session and releases the tracker, the filter
+     and the frame ring instead of holding them for the life of the process.
+
+     A failed FETCH is not a stale session. Losing signal for a moment is
+     normal in a car and must not end a drive; only the server actually saying
+     "I do not know this session" does. */
+  async function beat() {
+    if (!RIO.driving) return true;
+    try {
+      const r = await fetch('/session/heartbeat?session_id='
+                            + encodeURIComponent(RIO.sessionId), { method: 'POST' });
+      const j = await r.json();
+      return !(j && j.ok === false);
+    } catch (e) {
+      return true;     // network blip, not a verdict
+    }
+  }
+
+  function scheduleHeartbeat() {
+    hbTimer = setTimeout(async () => {
+      if (!RIO.driving) return;
+      const alive = await beat();
+      if (!alive) { await staleStop(); return; }
+      if (RIO.driving) scheduleHeartbeat();
+    }, HEARTBEAT_MS);
+  }
+
+  /* The server does not know this drive. Stop, and say why — a dashboard that
+     silently stopped capturing would look exactly like one that is working. */
+  async function staleStop() {
+    if (!RIO.driving) return;
+    await endDrive({ stale: true });
+    say('Drive stopped — the server restarted and no longer has this session. '
+        + 'Tap Start Drive to begin a new one.');
+  }
+
   // The headway loop. Same chained-timeout discipline as the perception loop,
   // but the next delay is the cadence MINUS the time this frame took, so
   // per-frame processing does not silently halve the frame rate.
@@ -1512,6 +1567,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const t0 = performance.now();
         try {
           const j = await RIO.headway.captureFromVideo(video);
+          // The frame path learns about a dead session sooner than the
+          // heartbeat does, because it runs sixteen times as often.
+          if (j && j.stale) { await staleStop(); return; }
           if (j && j.ok !== false) {
             hwFrames++;
             say('Drive active - ' + frames + ' perceive / ' + hwFrames
@@ -1583,12 +1641,15 @@ document.addEventListener('DOMContentLoaded', () => {
     say('Drive active - session ' + sid.slice(0, 8));
     schedule();
     scheduleHeadway();
+    scheduleHeartbeat();
   }
 
-  async function endDrive() {
+  async function endDrive(opts) {
+    opts = opts || {};
     const sid = RIO.sessionId;
     if (timer) { clearTimeout(timer); timer = null; }
     if (hwTimer) { clearTimeout(hwTimer); hwTimer = null; }
+    if (hbTimer) { clearTimeout(hbTimer); hbTimer = null; }
     if (RIO.headway) { RIO.headway.stopWatch(); RIO.headway.resetHud(); }
 
     // Clear session first so in-flight captures stop tagging themselves.
@@ -1606,6 +1667,10 @@ document.addEventListener('DOMContentLoaded', () => {
     driveBtn.classList.remove('active');
     driveBtn.textContent = 'Start Drive';
     RIO.ui.session(null);
+
+    // A stale session is one the server has already forgotten, so there is
+    // nothing to close and the caller writes its own message.
+    if (opts.stale) return;
 
     try {
       await fetch('/session/end?session_id=' + encodeURIComponent(sid), { method: 'POST' });
@@ -1629,9 +1694,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // If the browser drops the wake lock (tab backgrounded), take it again on return.
   document.addEventListener('visibilitychange', async () => {
-    if (document.visibilityState === 'visible' && RIO.driving && 'wakeLock' in navigator && !wakeLock) {
+    if (document.visibilityState !== 'visible' || !RIO.driving) return;
+    if ('wakeLock' in navigator && !wakeLock) {
       try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
     }
+    // Coming back is exactly when this page is most likely to be talking to a
+    // server that has moved on without it, and its timers have just been
+    // throttled for however long it was hidden. Ask straight away rather than
+    // waiting out the next beat.
+    if (!(await beat())) await staleStop();
   });
 
   // Best-effort session close if the page is closed mid-drive.

@@ -114,12 +114,46 @@ def _warm_vision():
         _warm_done.set()
 
 
+# How often the reaper looks. Much shorter than SESSION_ABANDON_S, because the
+# cost of looking is a dictionary scan and the cost of not looking is a drive's
+# worth of state held for as long as the process lives.
+REAP_INTERVAL_S = 20.0
+
+_stop_reaper = threading.Event()
+
+
+def _reap_abandoned_sessions():
+    """End drives whose client has stopped reporting in.
+
+    The other half of the heartbeat. /session/end covers the tidy exit; this
+    covers the phone that went flat, the laptop that slept, and the tab closed
+    while the page was hidden — none of which get to send anything.
+
+    Runs on its own thread rather than piggybacking on request handling,
+    precisely because the case it exists for is "no more requests are coming".
+    """
+    while not _stop_reaper.wait(REAP_INTERVAL_S):
+        try:
+            for sid in sessions.abandoned():
+                idle = sessions.idle_for(sid)
+                print(f"[sessions] reaping {sid[:8]} — no contact for "
+                      f"{idle:.0f}s", flush=True)
+                _teardown_session(sid, reason="abandoned")
+        except Exception as e:
+            # A reaper that dies takes the cleanup with it for the life of the
+            # process, so it survives its own mistakes.
+            print(f"[sessions] reaper error: {type(e).__name__}: {e}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Warm on a daemon thread so uvicorn reports ready immediately. vision._lock
     # makes an early /observe wait for this load instead of starting a second one.
     threading.Thread(target=_warm_vision, name="vision-warm", daemon=True).start()
+    threading.Thread(target=_reap_abandoned_sessions, name="session-reaper",
+                     daemon=True).start()
     yield
+    _stop_reaper.set()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -392,6 +426,13 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
         return {"boxes": [], "corridor": [], "caption": "", "observation": "",
                 "skipped": "warming", "timing_ms": {"total": 0.0}}
 
+    # ...and the same staleness rule. This one costs a full Qwen generate, so
+    # it is the more expensive of the two to serve for nobody.
+    if session_id and not sessions.touch(session_id):
+        return {"boxes": [], "corridor": [], "caption": "", "observation": "",
+                "stale": True, "reason": "unknown_session",
+                "timing_ms": {"total": 0.0}}
+
     import time as _t
     _t0 = _t.time()
     image_bytes = await image.read()
@@ -445,6 +486,17 @@ async def headway_frame_endpoint(
     # onto the card while Qwen is being dispatched onto it. See _warm_done.
     if not _warm_done.is_set():
         return {"ok": False, "skipped": "warming"}
+
+    # A frame tagged with a session this process has never heard of is a tab
+    # left open across a restart. Refusing costs nothing and stops the whole
+    # cascade: no LiveSession minted on demand, no frame ring filled, no GPU
+    # spent, no events spilled into stray-<id>.jsonl for a drive nobody is on.
+    #
+    # `stale` is the client's cue to stop. A frame with NO session id is a
+    # different thing entirely and still welcome — that is the desk-testing
+    # path, where a clip is run through the loop with no drive in progress.
+    if session_id and not sessions.touch(session_id):
+        return {"ok": False, "stale": True, "reason": "unknown_session"}
 
     t0 = time.time()
     image_bytes = await image.read()
@@ -618,9 +670,16 @@ def session_start_endpoint(metadata: dict = Body(default=None, embed=True)):
     return {"session_id": sid}
 
 
-@app.post("/session/end")
-def session_end_endpoint(session_id: str = Query(...)):
-    closed = sessions.end_session(session_id)
+def _teardown_session(session_id: str, reason: str = "closed") -> bool:
+    """End a drive and drop everything it was holding.
+
+    One function, because there are now two ways in — the driver tapping End
+    Drive, and the reaper noticing the client has gone — and a drive that ends
+    the second way must release exactly as much as one that ends the first way.
+    Anything freed on only one path is a leak that only shows up on the
+    failure case, which is the worst place to find one.
+    """
+    closed = sessions.end_session(session_id, reason=reason)
     # Drop the live headway state with the session. Without this a tracker,
     # Kalman filter and cooldown table survive for every drive the process has
     # ever seen, and a re-used session id would resume mid-warning.
@@ -632,7 +691,36 @@ def session_end_endpoint(session_id: str = Query(...)):
     key = _visual_key(session_id)
     framebuf.drop_ring(key)
     visual_qa.drop_session(key)
-    return {"closed": closed}
+    return closed
+
+
+@app.post("/session/end")
+def session_end_endpoint(session_id: str = Query(...)):
+    return {"closed": _teardown_session(session_id)}
+
+
+@app.post("/session/heartbeat")
+def session_heartbeat_endpoint(session_id: str = Query(...)):
+    """"I am still driving." Sent by the dashboard every few seconds.
+
+    It answers a question the client cannot answer for itself: does this server
+    still know about my drive? After a restart the answer is no, and the tab
+    that has been cheerfully POSTing frames at 4 fps into a process that has
+    never heard of it needs to be told so — see sessions.touch().
+
+    `ok: false` is an instruction, not an error. The client stops the drive.
+    """
+    if sessions.touch(session_id):
+        return {"ok": True, "session_id": session_id,
+                "idle_s": round(sessions.idle_for(session_id) or 0.0, 2)}
+    return {"ok": False, "unknown_session": True, "session_id": session_id}
+
+
+@app.get("/sessions")
+def sessions_endpoint():
+    """Which drives this process thinks are live, and how long since each spoke."""
+    return {"sessions": sessions.active_sessions(),
+            "abandon_after_s": sessions.SESSION_ABANDON_S}
 
 
 @app.post("/session/mark")

@@ -20,23 +20,87 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # Open writer handles keyed by session_id.
 _open_handles: dict = {}
 
+# Last time each open session was heard from: a heartbeat, a frame, anything at
+# all tagged with its id.
+#
+# WHY THIS EXISTS. A drive ends in one of two ways. The tidy way is
+# /session/end, sent by the dashboard when the driver taps End Drive or the page
+# is closed. The other way is that the client simply stops being there -- a
+# phone that ran out of battery, a tab closed while the laptop was asleep, a
+# browser that never got to fire pagehide -- and nothing arrives to say so.
+#
+# Before this, such a session stayed open forever: an fd on a JSONL nobody was
+# writing to, a tracker and Kalman filter in headway.live, a frame ring holding
+# pictures of a road the car left an hour ago. Worse, a stale tab that kept
+# POSTing frames against a session the server had forgotten (after a restart)
+# was served in full -- new state created on demand, GPU work done, events
+# spilled into stray-<id>.jsonl -- for a drive nobody was on.
+#
+# 54 sessions on this pod, 6 of them never closed, 16 stray files.
+_last_seen: dict = {}
+
+# How long a session may go unheard-from before it is treated as abandoned.
+#
+# Deliberately generous, and it is the client's timer that is short (10 s), not
+# this. A backgrounded tab is throttled hard by mobile browsers -- a driver
+# taking a call can stop the heartbeat for a minute without having stopped
+# driving -- and reaping a live drive would split its log in half and reset the
+# headway state mid-road. Twelve missed beats is unambiguous; two is not.
+SESSION_ABANDON_S = 120.0
+
 
 def start_session(metadata: Optional[dict] = None) -> str:
     sid = str(uuid.uuid4())
     path = SESSIONS_DIR / f"{sid}.jsonl"
     f = path.open("a", buffering=1)  # line-buffered
     _open_handles[sid] = f
+    _last_seen[sid] = time.time()
     _write(sid, "session_start", {"metadata": metadata or {}})
     return sid
 
 
-def end_session(session_id: str) -> bool:
-    _write(session_id, "session_end", {})
+def end_session(session_id: str, reason: str = "closed") -> bool:
+    _write(session_id, "session_end", {"reason": reason})
+    _last_seen.pop(session_id, None)
     f = _open_handles.pop(session_id, None)
     if f:
         f.close()
         return True
     return False
+
+
+def touch(session_id: Optional[str]) -> bool:
+    """Note that a session is still being driven. -> False if it is not ours.
+
+    False is the answer that matters: it means the client is talking about a
+    session this process has no record of, which after a restart is exactly
+    what a tab left open from the previous run looks like. The caller is
+    expected to refuse the work and tell the client to stop, rather than
+    quietly minting fresh state for a drive nobody is on.
+    """
+    if not session_id or session_id not in _open_handles:
+        return False
+    _last_seen[session_id] = time.time()
+    return True
+
+
+def idle_for(session_id: str) -> Optional[float]:
+    """Seconds since this session was last heard from, or None if unknown."""
+    seen = _last_seen.get(session_id)
+    return None if seen is None else (time.time() - seen)
+
+
+def abandoned(timeout_s: float = None) -> list:
+    """Open sessions whose client has stopped reporting in."""
+    timeout_s = SESSION_ABANDON_S if timeout_s is None else timeout_s
+    now = time.time()
+    return [sid for sid in list(_open_handles)
+            if (now - _last_seen.get(sid, now)) > timeout_s]
+
+
+def active_sessions() -> dict:
+    return {sid: {"idle_s": round(idle_for(sid) or 0.0, 1)}
+            for sid in list(_open_handles)}
 
 
 def mark(session_id: str, tag: str, payload: Optional[dict] = None) -> None:
