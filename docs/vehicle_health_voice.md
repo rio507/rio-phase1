@@ -284,9 +284,23 @@ The Python selftest needs no network and no GPU. Eight parts:
 
 `node tools/nav_selftest.js` is where the interrupt semantics are actually
 proved — pre-emption, supersede-by-group, queue order — because that drives the
-real arbiter. Six new checks cover the health tier. **Node is not installed in
-this container**, so those were not executed here; part G asserts the ladder
-statically so a renumber cannot pass unnoticed.
+real arbiter through the code that ships. 41 checks, six of them the new tier:
+
+```
+=== arbiter — vehicle health sits between safety and navigation ===
+  ok    the ladder is safety > vehicle health > near turn > nav > conversation
+  ok    a critical health announcement cuts through a turn announcement
+  ok    and the turn is dropped rather than resumed behind it
+  ok    a gap warning still pre-empts vehicle health — never above safety
+  ok    and it interrupts casual conversation, which is the whole point
+  ok    a worse fault replaces the announcement still being spoken
+  ok    queued behind a warning: health, then the turn, then conversation
+```
+
+Part G of the Python selftest asserts the ladder statically as well, so a
+renumber cannot pass unnoticed on a machine with no node installed — which is
+the normal state of the pod. `apt-get install -y nodejs` is enough; the harness
+is plain ES5 with no dependencies and runs on anything from v12 up.
 
 Driving it by hand: the tire scenario selector at the foot of the Vehicle Health
 column switches the mock live, and `/vehicle/health/policy` shows what the
