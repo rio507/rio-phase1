@@ -10,13 +10,45 @@
 #
 #   bash /workspace/boot.sh
 #
+# RUN IT SO IT CANNOT BE HUNG UP ON. The torch step downloads ~3 GB and the
+# Qwen weights are 16 GB; if the terminal drops during either, SIGHUP kills this
+# script somewhere in the middle and leaves a PARTIALLY provisioned pod. Use
+# tmux, or:
+#
+#   nohup bash /workspace/boot.sh &
+#
+# That is not a hypothetical failure. On 2026-08-02 this pod came up with steps
+# 1-4 complete and step 5c (RF-DETR) never run: the detector was missing for the
+# whole day, headway had no candidate source, and nobody noticed because a
+# missing detector is deliberately non-fatal. Reconstructing that took package
+# mtimes and dpkg timestamps, because the only record of what this script did
+# was scrollback in a terminal that had gone. Hence BOOT_LOG below.
+#
 set -euo pipefail
 
 REPO=/workspace/rio-phase1
 PORT=8888
 HF_HOME_DIR=/workspace/.cache/huggingface
 
+# On the PERSISTENT volume, deliberately. A boot log inside the container layer
+# is a boot log that disappears with the thing it was describing.
+BOOT_LOG=/workspace/boot.log
+exec > >(tee -a "$BOOT_LOG") 2>&1
+printf '\n===== boot.sh %s (pid %s) =====\n' "$(date -Is)" "$$"
+
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+
+# `set -e` makes this script abort on the first failure, which is right -- but a
+# silent abort is how a half-provisioned pod happens. Say where it stopped, in
+# the persistent log, and say what to run to find out what is missing.
+trap 'rc=$?; printf "\n!! boot.sh ABORTED at line %s (exit %s): %s\n" \
+      "$LINENO" "$rc" "$BASH_COMMAND"; \
+      printf "   The pod is PARTIALLY provisioned. What is missing:\n"; \
+      printf "     cd %s && python -m tools.preflight\n" "$REPO"; \
+      printf "   Full log: %s\n" "$BOOT_LOG"; exit $rc' ERR
+trap 'printf "\n!! boot.sh was INTERRUPTED (signal). The pod is PARTIALLY\n"; \
+      printf "   provisioned -- run: cd %s && python -m tools.preflight\n" "$REPO"; \
+      exit 130' HUP INT TERM
 
 # ---------------------------------------------------------------------------
 # 1. HF_HOME — keep model weights on the persistent volume
@@ -208,6 +240,24 @@ done
 
 # Model warm runs in the background and takes ~40s more. Not fatal, just noted.
 echo "   (Qwen3-VL warm continues in background — watch: tail -f $REPO/uvicorn.log)"
+
+# ---------------------------------------------------------------------------
+# 8b. Preflight — did any of the above silently not happen?
+# ---------------------------------------------------------------------------
+# The steps above are individually loud and collectively easy to lose: several
+# are deliberately non-fatal (a pod that comes up degraded beats a pod that does
+# not come up), and this script is long enough that an abort in the middle looks
+# like a successful run to anyone who only sees the end.
+#
+# So the last thing it does is ask, from scratch, what is actually present.
+# Non-fatal on purpose -- the server is already up by this point and taking it
+# down over a missing lane model would be the wrong trade -- but it prints what
+# is missing and what breaks because of it, into a log that survives the pod.
+log "preflight"
+python -m tools.preflight || {
+    echo "   !! this pod is INCOMPLETE — see the list above"
+    echo "   !! for the repair commands: python -m tools.preflight --fix"
+}
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code

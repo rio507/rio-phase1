@@ -197,7 +197,49 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "rio-phase1"}
+    """Is the server up, and is it whole?
+
+    `status: ok` used to mean only "the process is answering", which is a
+    weaker claim than it reads as. Several capabilities are deliberately
+    non-fatal when missing — a pod that comes up without a detector is better
+    than a pod that does not come up — and the cost of that choice is that a
+    degraded pod looks identical to a healthy one from here.
+
+    It is not hypothetical. On 2026-08-02 this pod ran for a day with no
+    RF-DETR: boot.sh had aborted before installing it, headway had no candidate
+    source and reported UNKNOWN for every frame, and /health said "ok"
+    throughout. `degraded` is the field that would have said so.
+
+    Cheap: every check below is a `in sys.modules` test or an attribute lookup
+    on something already imported. Nothing is loaded to answer this.
+    """
+    degraded = []
+
+    if not headway_detect.available():
+        degraded.append({
+            "component": "detector",
+            "detail": "RF-DETR is not loaded — headway has no candidates and "
+                      "the visual scene graph is empty",
+            "fix": "python -m tools.preflight --fix"})
+    if not headway_lanes.available():
+        degraded.append({
+            "component": "lanes",
+            "detail": "UFLDv2 is not loaded — headway uses the static trapezoid "
+                      "corridor",
+            "fix": "python -m tools.fetch_lane_weights"})
+    if not _warm_done.is_set():
+        degraded.append({
+            "component": "warm",
+            "detail": "models are still loading — frames are refused until this "
+                      "clears (normally ~45s from start)",
+            "fix": ""})
+
+    return {"status": "ok", "service": "rio-phase1",
+            # "ok" the process is up; "degraded" it is up and missing something
+            # it is supposed to have. Never "error" — if this handler runs at
+            # all, the server is answering.
+            "readiness": "ok" if not degraded else "degraded",
+            "degraded": degraded}
 
 
 # Most recent completed talk turn, for the dashboard to pick up after playback.
