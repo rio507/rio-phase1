@@ -25,6 +25,7 @@ import llm_interface
 import vision
 import perceive
 import nav
+import tires
 import framebuf
 import router as request_router
 import visual_qa
@@ -660,6 +661,51 @@ def nav_event_endpoint(body: dict = Body(...), session_id: str = Query(default=N
     payload = body.get("payload")
     sessions.log_nav(session_id, event, payload if isinstance(payload, dict) else None)
     return {"logged": event}
+
+
+# ---------------------------------------------------------------------------
+# Vehicle health — tires
+# ---------------------------------------------------------------------------
+# Thin on purpose. Every threshold, every state name and every string the panel
+# prints is decided in tires.py against config.py; these three handlers exist
+# only to put that on the wire. When the mock provider is replaced by real TPMS
+# hardware, nothing here changes.
+
+@app.get("/vehicle/tires")
+def vehicle_tires_endpoint():
+    """Current tire state, already normalised and already worded.
+
+    The dashboard polls this at the cadence the payload itself carries
+    (`poll_ms`), and renders it verbatim — it does no arithmetic and holds no
+    thresholds of its own.
+    """
+    return tires.snapshot()
+
+
+@app.get("/vehicle/tires/scenario")
+def vehicle_tires_scenario_endpoint():
+    """Which mock scenario is live, and what else is on offer.
+
+    Empty `scenarios` is the honest answer from a real provider: hardware has
+    exactly one scenario, which is whatever the tires are actually doing.
+    """
+    return {"scenario": tires.current_scenario(),
+            "scenarios": tires.scenarios(),
+            "provider": tires.provider().name}
+
+
+@app.post("/vehicle/tires/scenario")
+def vehicle_tires_scenario_set_endpoint(name: str = Query(...)):
+    """Switch the mock provider's scenario. Development only.
+
+    Returns a full snapshot rather than an acknowledgement so the panel repaints
+    on the same round trip instead of showing the old state until the next poll.
+    An unknown name changes nothing and says so.
+    """
+    if not tires.set_scenario(name):
+        return {"error": "unknown scenario", "name": name,
+                "scenarios": tires.scenarios()}
+    return tires.snapshot()
 
 
 # --- Phase 2.5 session endpoints ---

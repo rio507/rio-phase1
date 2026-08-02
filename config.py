@@ -154,3 +154,71 @@ COMPARE_MAX_OBJECTS = 2
 # bus/truck), so there is usually no tracked object to crop and the frame is
 # all there is — see docs/visual_qa.md §12.
 READ_TEXT_FRAME_DETAIL = "high"
+
+
+# ---------------------------------------------------------------------------
+# Vehicle health — tires (phase 1)
+# ---------------------------------------------------------------------------
+# Every threshold the Vehicle Health column reacts to lives here and nowhere
+# else. tires.py reads them, the browser never sees them: a number duplicated in
+# JavaScript is a number that will disagree with this file the first time
+# somebody tunes it.
+
+# Which TireHealthProvider is live. "mock" until there is hardware to point at;
+# the Bluetooth / RF receiver / ESP32 / RIO Connect providers land here later
+# and nothing above this line changes when they do.
+TIRE_PROVIDER = "mock"
+
+# Placard pressures, cold, per corner. Front and rear differ on most cars and
+# the panel is worthless if it compares every tire to the same number: a
+# correctly-inflated rear would read 2 PSI low all day and the driver would
+# learn to ignore the warning, which is the only real failure mode this feature
+# has.
+TIRE_TARGET_PSI = {"FL": 35.0, "FR": 35.0, "RL": 33.0, "RR": 33.0}
+
+# How far under target before it is worth saying something. 3.0 PSI is roughly
+# where handling and wear start to move and comfortably outside the ~1.5 PSI of
+# swing a tire sees between a cold morning and a hot motorway hour — tighter
+# than this and the panel cries wolf every sunrise.
+TIRE_PRESSURE_WARN_DELTA = 3.0
+# ~20% under a 33-35 PSI placard: the point at which the sidewall is carrying
+# load it was not designed to carry and heat starts to build faster than the
+# tire can shed it. This is a "stop driving on it" number, not a "top it up"
+# number, and it is coloured accordingly.
+TIRE_PRESSURE_CRITICAL_DELTA = 6.0
+# Over-inflation gets a wider band than under-inflation because it is genuinely
+# less dangerous and because a tire that has been sitting in the sun legitimately
+# reads high.
+TIRE_PRESSURE_HIGH_DELTA = 5.0
+
+# Running temperature. A tire on a warm day at speed sits around 100-120°F;
+# 150 means something is wrong with the pressure, the alignment or the brake
+# behind it, and 180 is where the rubber-to-belt bond starts to suffer.
+TIRE_TEMP_WARN_F = 150.0
+TIRE_TEMP_CRITICAL_F = 180.0
+
+# Loss over 24 hours that counts as a leak rather than weather. A sealed tire
+# loses ~1 PSI a month to permeation and about 1 PSI per 10°F of ambient swing,
+# so anything past 1.5 PSI/day is air leaving through something. This is the one
+# threshold that can flag a puncture while the pressure is still in band.
+TIRE_TREND_LEAK_PSI_24H = -1.5
+
+# Sensor battery. TPMS cells are 5-10 year lithium units that fall off a cliff
+# rather than fading, so this is "book the replacement", not "urgent".
+TIRE_BATTERY_LOW_PCT = 20.0
+
+# A reading older than this is not a reading. Direct TPMS sensors report every
+# 30-60 s while rolling and go to sleep when parked, so this has to be long
+# enough to survive a set of traffic lights and short enough that a receiver
+# that died ten minutes ago is not still being believed.
+TIRE_STALE_AFTER_S = 180.0
+
+# How often the dashboard asks. Sent to the browser in the /vehicle/tires
+# payload rather than written into the JavaScript, so this is the only place it
+# exists. Well under TIRE_STALE_AFTER_S so a tire goes stale on screen within
+# one poll of going stale in fact.
+TIRE_POLL_MS = 5000
+
+# Which mock scenario a fresh process starts in. Dev only — a real provider has
+# exactly one scenario, which is whatever the tires are actually doing.
+TIRE_DEFAULT_SCENARIO = "all_normal"
