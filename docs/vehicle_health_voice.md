@@ -1,5 +1,13 @@
 # Vehicle Health as a conversation context — and as a check engine light
 
+> **Superseded in part by `docs/tire_diagnostics.md`.** The conversation layer,
+> router intent, priority tier, prompt and endpoints described here are all
+> current. What changed is where the TIRE issues come from: `TireSource` used to
+> classify one instantaneous reading, and now reads confirmed findings out of the
+> OBD-inspired diagnostic engine. One reading can no longer become an issue, and
+> the communication ledger that records what the driver was told is persisted on
+> the Issue rather than held in the policy's memory.
+
 RIO understands the car the same way she understands navigation and the world
 out of the window: as one more context source. She answers questions about it
 naturally, and she interrupts about it exactly when a modern check engine light

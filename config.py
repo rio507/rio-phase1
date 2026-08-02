@@ -483,3 +483,228 @@ HEALTH_DRIVING_MPH = 5.0
 # the issue list is already sorted worst-first — so the cut falls on the ones
 # that were never going to be mentioned.
 HEALTH_MAX_ISSUES = 6
+
+
+# ---------------------------------------------------------------------------
+# TPMS radio behaviour — what the mock has to imitate to be worth testing against
+# ---------------------------------------------------------------------------
+# The tire mock used to hand back four perfect readings on every call, stamped
+# with the instant it was asked. Nothing that consumes it noticed, because
+# nothing consumed it but a dashboard that repaints every five seconds.
+#
+# A diagnostic monitor notices immediately. Every enabling condition it has --
+# "enough valid samples", "comparable thermal state", "a report actually
+# arrived" -- is meaningless against a stream that answers instantly, always,
+# with a fresh number. A monitor tuned on that stream would confirm faults in
+# four polls and then never fire on real hardware, which reports twice a minute,
+# sleeps in the driveway, and lies for the first second after it wakes up.
+#
+# So these describe a direct TPMS sensor as one actually behaves. They are what
+# the mock is measured against, not what it is convenient for the mock to do.
+
+# How often a rolling sensor transmits. Real direct TPMS sensors send every
+# 30-60 s while the wheel is turning, and the spread matters: four sensors that
+# reported in lockstep would let a monitor compare four corners at the same
+# instant, which is exactly the luxury real hardware does not give you.
+TIRE_REPORT_INTERVAL_S = 45.0
+TIRE_REPORT_JITTER_S = 12.0
+
+# Sensors sleep when the wheel stops, to make a 5-10 year battery last. This is
+# the single most important behaviour in this block: it means "no reading" is
+# the NORMAL state of a parked car, and any monitor that treats silence as a
+# fault will scream every night. Motion is what wakes them.
+TIRE_SLEEP_AFTER_PARKED_S = 900.0
+
+# The first reports after a wake-up are junk. The sensor has just powered its
+# radio and its ADC from cold, and the first one or two frames carry pressures
+# that can be tens of PSI out. Every real receiver discards them; ours has to
+# know they exist in order to discard them.
+TIRE_WAKE_JUNK_REPORTS = 2
+
+# Fraction of transmissions that simply do not arrive. 433 MHz through a wheel
+# arch, a steel rim and a moving car: 3% is a good receiver on a good day, and a
+# monitor that requires N consecutive reports without allowing for this will
+# never reach READY.
+TIRE_PACKET_LOSS_FRAC = 0.03
+
+# A direct TPMS sensor watches its own pressure between transmissions and
+# switches to a fast mode when it moves quickly. This is why a blowout is
+# detectable at all: at the nominal 45 s interval the tire would be flat before
+# the second report. A monitor tuned against a mock without this would be tuned
+# against a limitation the hardware does not have.
+TIRE_FAST_MODE_PSI = 3.0
+TIRE_FAST_MODE_INTERVAL_S = 6.0
+
+# A sensor whose cell is dying does not go quiet, it goes erratic -- long gaps,
+# then a burst, with values that wander. Distinguishing that from a tire that is
+# actually losing air is the plausibility monitor's whole job.
+TIRE_DYING_BATTERY_PCT = 4.0
+TIRE_DYING_LOSS_FRAC = 0.45
+TIRE_DYING_NOISE_PSI = 2.5
+
+# An impossible step between consecutive reports from one sensor. A tire cannot
+# gain or lose this much in a minute except by being inflated or destroyed, and
+# both of those have their own monitors -- so a step this large in ONE report,
+# with no supporting evidence, is a bad packet and is rejected as a measurement.
+TIRE_IMPLAUSIBLE_STEP_PSI = 8.0
+# Outside this, the number is not a tire pressure at all.
+TIRE_PLAUSIBLE_RANGE_PSI = (2.0, 70.0)
+
+
+# ---------------------------------------------------------------------------
+# Tire diagnostic monitors (tire_diag/) — OBD-inspired, not OBD-II
+# ---------------------------------------------------------------------------
+# RIO Tire Health is not an OBD-II system and emits no SAE powertrain codes.
+# What is borrowed is the discipline: a monitor runs only under valid
+# conditions, one bad reading makes a PENDING fault and never a confirmed one,
+# and a problem is repaired only after passing verification.
+#
+# These are the knobs that decide how much evidence is enough. They are
+# PROVISIONAL: nothing here has seen a real drive, which is exactly why every
+# monitor ships in shadow mode. Read the shadow logs, then tune these, then
+# consider letting one speak.
+
+TIRE_DIAG_ENABLED = True
+
+# Where the diagnostic record lives, beside the insight baselines. Diagnostic
+# history has to survive a restart -- an issue that vanishes when the process
+# does is not a diagnostic system, it is a status light.
+TIRE_DIAG_DIR = "/workspace/rio-phase1/training_data/vehicle"
+# Append-only. Trimmed only by age, never by "the problem went away".
+TIRE_DIAG_MAX_EVENTS = 4000
+# A resolved issue stays queryable this long, so "has this happened before on
+# this tire" has an answer. Recurrence is the whole reason to keep it.
+TIRE_DIAG_RESOLVED_RETAIN_DAYS = 180.0
+
+# --- what counts as a sample -----------------------------------------------
+# A report older than this is not evidence of anything current. Shorter than
+# TIRE_STALE_AFTER_S because a monitor needs a stricter bar than a display: the
+# panel showing a two-minute-old number is fine, a leak monitor fitting a trend
+# through one is not.
+TIRE_DIAG_SAMPLE_MAX_AGE_S = 150.0
+# How long a corner may go without a report, while moving, before the
+# connectivity monitor starts counting misses. Three missed transmissions at the
+# nominal interval -- enough to ride out the packet loss the radio really has.
+TIRE_DIAG_MISSED_REPORT_S = 150.0
+
+# --- run pacing ------------------------------------------------------------
+# A monitor run needs NEW evidence. Two runs off the same sample are one run
+# that was counted twice, and confirmation counts would then be a measure of
+# poll rate rather than of persistence.
+TIRE_DIAG_MIN_RUN_SPACING_S = 20.0
+
+# --- thermal comparability -------------------------------------------------
+# Tire pressure moves about 1 PSI per 10°F. Comparing a warm motorway reading
+# with yesterday's cold parked one produces a 4 PSI "loss" that is entirely
+# thermal, and a leak monitor that does it will find a leak in every tire on
+# every car on the first cold night of the year. Two samples are comparable when
+# their temperatures are within this.
+TIRE_DIAG_COMPARABLE_TEMP_F = 12.0
+
+# --- slow leak -------------------------------------------------------------
+# Decline that counts as evidence, across thermally comparable samples.
+TIRE_DIAG_LEAK_PSI = 1.2
+# ...and how much more than the peers it has to be. This is what separates a
+# leak from weather: four tires down 4 PSI on a cold morning is the air outside,
+# one tire down 4 PSI while its peers held is the air inside.
+TIRE_DIAG_LEAK_PEER_MARGIN_PSI = 0.9
+# Over at least this long. A leak is a rate, and a rate needs a baseline.
+TIRE_DIAG_LEAK_WINDOW_S = 1800.0
+TIRE_DIAG_LEAK_MIN_SAMPLES = 4
+
+# --- asymmetric loss -------------------------------------------------------
+# One corner against its axle peer, which shares load, road and weather. A
+# difference this large between them is about the tire, not the day.
+TIRE_DIAG_ASYM_MARGIN_PSI = 1.5
+TIRE_DIAG_ASYM_WINDOW_S = 1200.0
+TIRE_DIAG_ASYM_MIN_SAMPLES = 3
+
+# --- critical pressure -----------------------------------------------------
+# An absolute floor, independent of the placard target. Below this the sidewall
+# is carrying load it was not built for whatever the target says, and a car with
+# a 28 PSI placard is in as much trouble at 15 PSI as one with 35.
+TIRE_DIAG_CRITICAL_FLOOR_PSI = 18.0
+# Falling, for the urgent path: this much down between consecutive validated
+# reports. A tire that is critically low AND still going is a different problem
+# from one that has been low since Tuesday.
+TIRE_DIAG_FALLING_PSI = 0.8
+
+# --- inflation -------------------------------------------------------------
+# A step up this large is somebody with an airline, not a tire warming up.
+# Recognising it matters as much as recognising a leak: it is how a pressure
+# issue gets verified as repaired rather than quietly healed for the wrong
+# reason.
+TIRE_DIAG_INFLATION_STEP_PSI = 2.0
+
+# --- plausibility ----------------------------------------------------------
+# How many implausible samples in the window before the SENSOR is the suspect
+# rather than the packet. One malformed frame is a radio; four is hardware.
+TIRE_DIAG_IMPLAUSIBLE_COUNT = 4
+TIRE_DIAG_IMPLAUSIBLE_WINDOW_S = 900.0
+
+# --- confirmation and healing ----------------------------------------------
+# Qualifying monitor runs before a CANDIDATE becomes ACTIVE. Per monitor,
+# because the consequence of being wrong is not the same for a slow leak as for
+# a flat tire.
+TIRE_DIAG_CONFIRM_RUNS = {
+    "tire.low_pressure": 2,
+    "tire.critical_low_pressure": 2,
+    "tire.slow_leak": 3,
+    "tire.asymmetric_loss": 2,
+    "tpms.sensor_connectivity": 2,
+    "tpms.sensor_plausibility": 2,
+    "tire.sensor_loss_during_decline": 1,   # one-trip; the gates are elsewhere
+    "tire.inflation_event": 1,              # an observation, not a fault
+    "tpms.receiver_health": 2,
+}
+
+# Drive cycles required on top of the run count. Mostly zero, deliberately: OBD
+# waits for drive cycles because an emissions fault is never urgent, and a
+# critically low tire that waited through three drives to be mentioned would be
+# a design failure. Only the slow leak uses one, because a leak measured within
+# a single drive is mostly measuring the drive.
+TIRE_DIAG_CONFIRM_CYCLES = {
+    "tire.slow_leak": 1,
+}
+
+# Passing runs before an ACTIVE issue is RESOLVED. Always more than one: a
+# single good sample is how a warm tire on a motorway "fixes" a leak.
+TIRE_DIAG_HEAL_RUNS = {
+    "tire.low_pressure": 2,
+    "tire.critical_low_pressure": 3,
+    "tire.slow_leak": 2,
+    "tire.asymmetric_loss": 2,
+    "tpms.sensor_connectivity": 2,
+    "tpms.sensor_plausibility": 3,
+    "tire.sensor_loss_during_decline": 2,
+    "tpms.receiver_health": 1,
+}
+# ...and how long the good behaviour has to hold.
+TIRE_DIAG_HEAL_STABLE_S = {
+    "tire.low_pressure": 300.0,
+    "tire.critical_low_pressure": 600.0,
+    "tire.slow_leak": 1800.0,
+    "tire.asymmetric_loss": 900.0,
+    "tpms.sensor_connectivity": 300.0,
+    "tpms.sensor_plausibility": 600.0,
+    "tire.sensor_loss_during_decline": 600.0,
+    "tpms.receiver_health": 60.0,
+}
+# Recovery has to clear the threshold by this much before it counts as recovery
+# at all, so a pressure hovering on the line cannot heal and re-fail forever.
+TIRE_DIAG_HEAL_HYSTERESIS_PSI = 1.0
+
+# --- drive cycles ----------------------------------------------------------
+# A drive cycle starts when the car has been parked long enough for the previous
+# one to have ended and then moves. These are built on the existing session
+# infrastructure -- sessions.py already knows when a drive starts and ends --
+# and these two thresholds only cover the case where nobody told us.
+TIRE_DIAG_DRIVE_START_MPH = 5.0
+TIRE_DIAG_DRIVE_END_PARKED_S = 300.0
+
+# --- shadow mode -----------------------------------------------------------
+# The master switch, over the per-code `speak` flags in tire_diag/codes.py.
+# While this is True nothing these monitors find is ever spoken, whatever any
+# individual code says -- the announcement RIO would have made is written to the
+# shadow log instead. The urgent fast path is the documented exception.
+TIRE_DIAG_SHADOW_MODE = True

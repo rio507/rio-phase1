@@ -248,13 +248,334 @@ def _sc_no_sensors(now, elapsed):
     return {}
 
 
+# --- scenarios that exist to exercise the RADIO, not the tire ---------------
+# Everything above this line is about what the tire is doing. Everything below
+# is about what the sensor and the receiver are doing, which is a different
+# failure surface and the one the diagnostic monitors spend most of their
+# enabling conditions on.
+
+def _sc_dying_sensor(now, elapsed):
+    """A cell on its way out. Reports erratically and wanders while doing it.
+
+    Distinct from battery_low, which is a healthy sensor with a low cell and is
+    the "book the replacement" case. This one is actively lying, and telling it
+    apart from a tire that is genuinely losing air is the plausibility monitor's
+    entire reason to exist.
+    """
+    s = _base_set(now)
+    s["RL"] = replace(s["RL"], battery_pct=config.TIRE_DYING_BATTERY_PCT)
+    return s
+
+
+def _sc_cold_morning(now, elapsed):
+    """Every tire down together, because it is cold, not because it is leaking.
+
+    ~1 PSI per 10°F: a 35°F night against a 75°F placard puts all four about
+    4 PSI down at once. Absolute low-pressure monitors SHOULD fire here -- the
+    tires really are under-inflated. The slow-leak monitor must NOT, because
+    nothing has left the tire, and four corners moving together is the signature
+    that separates weather from a puncture.
+    """
+    s = _base_set(now)
+    return {c: replace(r, pressure_psi=round(r.pressure_psi - 4.2, 1),
+                       temp_f=41.0, trend_psi_24h=-4.1)
+            for c, r in s.items()}
+
+
+def _sc_inflation_event(now, elapsed):
+    """The driver put air in. Starts low, steps up ninety seconds in.
+
+    The step is what matters. A leak that is fixed does not drift back up, it
+    jumps, and a monitor that cannot recognise the jump will keep an issue open
+    on a tire that has been sorted -- or worse, heal it slowly and quietly for
+    the wrong reason.
+    """
+    s = _base_set(now)
+    inflated = elapsed > 90.0
+    s["RL"] = replace(s["RL"],
+                      pressure_psi=33.4 if inflated else 28.6,
+                      trend_psi_24h=0.0 if inflated else -2.2)
+    return s
+
+
+def _sc_receiver_outage(now, elapsed):
+    """The receiver, not the tires. All four go quiet at the same instant.
+
+    Four simultaneous sensor failures do not happen. The correct diagnosis is
+    one fault in the box, and a system that reports four tire faults here has
+    pointed the driver at four wheels when the thing to look at is under the
+    dash.
+    """
+    return {c: TireReading(c, None, None, None, False, None, now - 300.0)
+            for c in CORNERS}
+
+
+def _sc_leak_then_sensor_loss(now, elapsed):
+    """The nastiest one, and the reason a monitor for it exists.
+
+    A tire is measurably losing air, and then its sensor stops answering. The
+    naive reading is "that corner is now unknown", which quietly downgrades a
+    developing fault into an absence of information. The truth is the opposite:
+    the last thing we knew about that tire was that it was going down, and
+    losing sight of it makes that worse, not moot.
+    """
+    s = _base_set(now)
+    # Four minutes of decline before the sensor goes, which is not padding: the
+    # monitor has to have CONFIRMED a decline before losing sight of it, or the
+    # scenario is just an ordinary disconnect. At a 45 s report interval that is
+    # about five reports, which is what two qualifying runs actually costs.
+    if elapsed > 240.0:
+        s["RL"] = TireReading("RL", None, None, None, False, None, now - 90.0)
+    else:
+        drop = 1.4 * (elapsed / 60.0)
+        s["RL"] = replace(s["RL"], pressure_psi=round(29.6 - drop, 1),
+                          trend_psi_24h=-3.6)
+    return s
+
+
+def _sc_blowout(now, elapsed):
+    """Air leaving fast enough to see between reports. The urgent fast path."""
+    s = _base_set(now)
+    psi = max(6.0, 30.0 - 4.0 * elapsed / 10.0)
+    s["RL"] = replace(s["RL"], pressure_psi=round(psi, 1), temp_f=112.0,
+                      trend_psi_24h=-9.0)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# The radio between the tire and us
+# ---------------------------------------------------------------------------
+
+class _Radio:
+    """What actually happens between a sensor and a receiver.
+
+    The scenario functions above describe THE TIRE: what is true of it at this
+    instant. This class describes what we get to know about it, which is a much
+    poorer thing -- a report every forty-odd seconds while the wheel turns,
+    nothing at all when it does not, junk for the first frame or two after a
+    wake, and one packet in thirty that never arrives.
+
+    Why the mock does this at all
+    -----------------------------
+    Because otherwise every enabling condition in tire_diag/monitors.py is
+    untestable. "Minimum valid samples", "comparable thermal state", "the sensor
+    is still transmitting" are all statements about a stream that is sparse,
+    late and occasionally wrong. Tuned against a stream that answers instantly
+    and perfectly, a monitor confirms a fault in four polls and then never fires
+    on real hardware. The mock has to be at least as hostile as the road.
+
+    Deterministic, like everything else in this file
+    -----------------------------------------------
+    Not one call to random(). Packet loss and jitter come from a hash of
+    (corner, report index), so the same scenario replayed from the same start
+    time drops the same packets -- which is what makes a monitor failure
+    reproducible instead of something that happened once on a Tuesday.
+
+    Motion comes from outside
+    -------------------------
+    Sensors wake on rotation, so the radio has to know whether the car is
+    moving, and this file deliberately cannot find that out for itself --
+    telemetry.py imports tires.py, and the reverse would be a cycle. set_motion()
+    is the seam; vehicle_health and the diagnostic engine both call it because
+    both already compute it.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # Held per corner: the last report we actually received.
+        self._last: Dict[str, TireReading] = {}
+        self._report_n: Dict[str, int] = {}
+        self._next_at: Dict[str, float] = {}
+        self._moving = False
+        self._motion_at = 0.0
+        self._still_since = None
+        self._asleep = False
+        self._woke_at = None
+        self._junk_left: Dict[str, int] = {}
+
+    # -- motion, supplied by whoever knows ----------------------------------
+    def set_motion(self, moving: bool, at: float) -> None:
+        with self._lock:
+            was = self._moving
+            self._moving = bool(moving)
+            self._motion_at = at
+            if moving:
+                self._still_since = None
+                if self._asleep:
+                    # Wake. Every sensor now owes us a report, and the first one
+                    # or two of them are not to be believed.
+                    self._asleep = False
+                    self._woke_at = at
+                    for c in CORNERS:
+                        self._junk_left[c] = config.TIRE_WAKE_JUNK_REPORTS
+                        self._next_at[c] = at + 1.0 + 0.7 * CORNERS.index(c)
+            elif was and self._still_since is None:
+                self._still_since = at
+
+    def _tick_sleep(self, now: float) -> None:
+        if self._moving or self._asleep:
+            return
+        since = self._still_since
+        if since is None:
+            self._still_since = now
+            return
+        if (now - since) >= config.TIRE_SLEEP_AFTER_PARKED_S:
+            self._asleep = True
+
+    # -- deterministic pseudo-noise ----------------------------------------
+    @staticmethod
+    def _hash01(corner: str, n: int, salt: str) -> float:
+        """A stable 0..1 from a key. zlib.crc32 rather than hash() because
+        hash() of a str is salted per process, and a mock that drops different
+        packets on every run is a mock nobody can reproduce a bug in."""
+        import zlib
+        return (zlib.crc32(f"{corner}:{n}:{salt}".encode()) % 10000) / 10000.0
+
+    # -- the one thing the provider calls ----------------------------------
+    def transport(self, truth: Dict[str, TireReading], now: float) -> Dict[str, TireReading]:
+        """Ideal readings in, what the receiver actually holds out.
+
+        A corner absent from `truth` has no sensor at all and stays absent. A
+        corner present but never yet reported is also absent -- "the sensor
+        exists and has not spoken" is not the same as "the sensor said 35.2",
+        and inventing the second is the failure this whole layer exists to
+        prevent.
+        """
+        with self._lock:
+            self._tick_sleep(now)
+            out: Dict[str, TireReading] = {}
+
+            for corner in CORNERS:
+                ideal = truth.get(corner)
+                if ideal is None:
+                    # No sensor on this corner in this scenario. Forget anything
+                    # we were holding for it.
+                    self._last.pop(corner, None)
+                    continue
+
+                if not ideal.connected:
+                    # The scenario is asserting the sensor is off the air. That
+                    # is a fact about the world, not about the radio, so it
+                    # passes through untouched -- including its own stale stamp.
+                    out[corner] = ideal
+                    self._last[corner] = ideal
+                    continue
+
+                due = self._next_at.get(corner)
+                if due is None:
+                    # First ever read of this corner. Deliver immediately, so a
+                    # freshly-selected scenario shows something at once, and
+                    # schedule the next one properly.
+                    self._deliver(corner, ideal, now, first=True)
+                elif not self._asleep and now >= due:
+                    self._deliver(corner, ideal, now)
+
+                held = self._last.get(corner)
+                if held is not None:
+                    out[corner] = held
+
+            return out
+
+    def _deliver(self, corner: str, ideal: TireReading, now: float,
+                 first: bool = False) -> None:
+        n = self._report_n.get(corner, 0)
+        self._report_n[corner] = n + 1
+
+        interval = config.TIRE_REPORT_INTERVAL_S
+        jitter = config.TIRE_REPORT_JITTER_S * (self._hash01(corner, n, "j") - 0.5) * 2
+
+        # Real sensors do not report a blowout every forty-five seconds. A
+        # direct TPMS sensor watches its own pressure and switches to a fast
+        # transmit mode when it moves quickly -- every few seconds instead of
+        # every minute -- because the whole point of the sensor is the case where
+        # a minute is too long. Without this the mock would make the urgent fast
+        # path structurally impossible to reach in time, and we would tune it
+        # against a limit the hardware does not actually have.
+        held = self._last.get(corner)
+        if (held is not None and held.pressure_psi is not None
+                and ideal.pressure_psi is not None
+                and abs(ideal.pressure_psi - held.pressure_psi) >= config.TIRE_FAST_MODE_PSI):
+            self._next_at[corner] = now + config.TIRE_FAST_MODE_INTERVAL_S
+        else:
+            self._next_at[corner] = now + max(5.0, interval + jitter)
+
+        dying = (ideal.battery_pct is not None
+                 and ideal.battery_pct <= config.TIRE_DYING_BATTERY_PCT)
+
+        # Packet loss. The report was sent and did not arrive: we keep the
+        # previous one, with its previous timestamp, which is precisely how a
+        # real receiver behaves and precisely what makes "how old is this
+        # reading" a question worth asking.
+        loss = config.TIRE_DYING_LOSS_FRAC if dying else config.TIRE_PACKET_LOSS_FRAC
+        if not first and self._hash01(corner, n, "l") < loss:
+            return
+
+        psi = ideal.pressure_psi
+        junk = self._junk_left.get(corner, 0)
+        if junk > 0:
+            # A cold radio and a cold ADC. The number is wrong by tens of PSI
+            # and every real receiver throws it away; ours has to be given the
+            # chance to.
+            self._junk_left[corner] = junk - 1
+            # Either direction. A junk frame reading 62 PSI is as common as one
+            # reading 4, and a plausibility monitor that only guards the low
+            # side would pass the high one straight through to a driver.
+            offset = 18.0 + 22.0 * self._hash01(corner, n, "w")
+            if self._hash01(corner, n, "s") < 0.5:
+                offset = -offset
+            psi = round(max(0.5, (psi or 30.0) - offset), 1)
+        elif dying:
+            # Wandering, not drifting. The direction changes report to report,
+            # which is what tells it apart from air actually leaving.
+            noise = config.TIRE_DYING_NOISE_PSI * (self._hash01(corner, n, "n") - 0.5) * 2
+            psi = round((psi or 30.0) + noise, 1)
+
+        # A scenario that backdated its own stamp is asserting something about
+        # staleness -- stale_data exists to say "these readings are hours old"
+        # -- and the radio must not overwrite that with the moment it happened
+        # to deliver them. Only a reading the scenario stamped as current gets
+        # stamped with the report time.
+        stamp = now
+        if ideal.updated_at is not None and ideal.updated_at < now - 1.0:
+            stamp = ideal.updated_at
+        self._last[corner] = replace(ideal, pressure_psi=psi, updated_at=stamp)
+
+    def state(self) -> dict:
+        """What the radio is doing. Diagnostics only -- no threshold reads it."""
+        with self._lock:
+            return {
+                "moving": self._moving,
+                "asleep": self._asleep,
+                "still_for_s": (None if self._still_since is None
+                                else round(time.time() - self._still_since, 1)),
+                "reports": dict(self._report_n),
+                "junk_pending": {c: n for c, n in self._junk_left.items() if n},
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last.clear()
+            self._report_n.clear()
+            self._next_at.clear()
+            self._junk_left.clear()
+            self._asleep = False
+            self._woke_at = None
+            self._still_since = None
+
+
 class MockTireProvider(TireHealthProvider):
-    """Named scenarios instead of random numbers.
+    """Named scenarios instead of random numbers, through a realistic radio.
 
     A provider that jitters plausible values is useless for building a UI: you
     cannot get back to the state you were just looking at. Every scenario here is
-    reproducible, and the only thing that moves on its own is the slow leak,
-    which moves because that is what it is demonstrating.
+    reproducible -- including the packet loss, which is hashed rather than
+    random -- and the only things that move on their own are the ones
+    demonstrating movement.
+
+    Two layers, deliberately: the scenario says what is true of the tire, and
+    _Radio says what we get to hear about it. Keeping them apart is what lets a
+    test assert "the tire is at 28 PSI and the monitor has not been told yet",
+    which is the state every enabling condition in the diagnostic layer is about.
     """
 
     name = "mock"
@@ -273,12 +594,20 @@ class MockTireProvider(TireHealthProvider):
         ("battery_low",         "Battery Low",    _sc_battery_low),
         ("stale_data",          "Stale Data",     _sc_stale_data),
         ("no_sensors",          "No Sensors",     _sc_no_sensors),
+        # --- radio and diagnostic scenarios ---
+        ("dying_sensor",        "Dying Sensor",   _sc_dying_sensor),
+        ("cold_morning",        "Cold Morning",   _sc_cold_morning),
+        ("inflation_event",     "Air Added",      _sc_inflation_event),
+        ("receiver_outage",     "Receiver Down",  _sc_receiver_outage),
+        ("leak_then_loss",      "Leak Then Lost", _sc_leak_then_sensor_loss),
+        ("blowout",             "Blowout",        _sc_blowout),
     )
 
     def __init__(self, scenario: str = None):
         self._lock = threading.Lock()
         self._scenario = self._resolve(scenario or config.TIRE_DEFAULT_SCENARIO)
         self._set_at = time.time()
+        self.radio = _Radio()
 
     @classmethod
     def _resolve(cls, name: str) -> str:
@@ -293,27 +622,48 @@ class MockTireProvider(TireHealthProvider):
         with self._lock:
             return self._scenario
 
-    def set_scenario(self, name: str) -> bool:
+    def set_scenario(self, name: str, at: float = None) -> bool:
         """-> True if the name was known. An unknown name changes nothing: the
-        caller gets False and the panel keeps showing what it was showing."""
+        caller gets False and the panel keeps showing what it was showing.
+
+        `at` sets the scenario's zero point on the caller's clock. Several
+        scenarios are functions of elapsed time — the slow leak walks down, the
+        blowout collapses, the inflation event steps up at ninety seconds — and
+        a zero point taken from time.time() while the reader passes a synthetic
+        `at` produces an elapsed of minus fifty years and pressures in the
+        millions. Production never passes it; tire_diag/selftest.py always does.
+        """
         if not any(n == name for n, _, _ in self.SCENARIOS):
             return False
         with self._lock:
             self._scenario = name
             # Reset, so the slow leak restarts from the top every time it is
             # selected rather than resuming wherever it got to an hour ago.
-            self._set_at = time.time()
+            self._set_at = time.time() if at is None else float(at)
+        # The radio forgets with it. A held report from the previous scenario
+        # would be served as the new one's first reading -- a measurement of a
+        # car that no longer exists, which is the one thing this layer must
+        # never produce.
+        self.radio.reset()
         return True
 
     def available(self) -> bool:
         return self.scenario != "no_sensors"
 
-    def read(self) -> List[TireReading]:
+    def read(self, at: float = None) -> List[TireReading]:
+        """What the receiver currently holds, not what the tires currently are.
+
+        `at` overrides the clock. It exists for tire_diag/selftest.py, which
+        drives days of sensor behaviour in a few milliseconds and cannot do that
+        against time.time() -- the same reason headway's policy takes `t` from
+        its caller rather than reading a clock of its own.
+        """
         with self._lock:
             name, set_at = self._scenario, self._set_at
         build = next(fn for n, _, fn in self.SCENARIOS if n == name)
-        now = time.time()
-        return list(build(now, now - set_at).values())
+        now = time.time() if at is None else float(at)
+        truth = build(now, now - set_at)
+        return list(self.radio.transport(truth, now).values())
 
 
 # ---------------------------------------------------------------------------
@@ -570,17 +920,45 @@ def _banners(tires: List[dict]) -> List[dict]:
 # The one thing app.py calls
 # ---------------------------------------------------------------------------
 
-def snapshot() -> dict:
+def set_motion(moving: bool, at: float = None) -> None:
+    """Tell the provider whether the wheels are turning.
+
+    Direct TPMS sensors wake on rotation and sleep when it stops, so "is the car
+    moving" is not a detail of the mock -- it is the thing that decides whether
+    any reading exists at all. This file cannot work it out for itself:
+    telemetry.py imports tires.py, and asking the other way would be a cycle.
+    So whoever already knows tells us. vehicle_health._driving() and the
+    diagnostic engine both compute it, and both call this.
+
+    A no-op on a provider without a radio, which is every real one -- hardware
+    does not need to be told the car is moving.
+    """
+    radio = getattr(_provider, "radio", None)
+    if radio is not None:
+        radio.set_motion(bool(moving), time.time() if at is None else float(at))
+
+
+def radio_state() -> dict:
+    """What the mock's radio is doing. Diagnostics; empty on real hardware."""
+    radio = getattr(_provider, "radio", None)
+    return radio.state() if radio is not None else {}
+
+
+def snapshot(at: float = None) -> dict:
     """Everything the Vehicle Health column needs, in the shape it renders it.
 
     Nothing in here requires the caller to know which provider produced it, and
     nothing downstream is allowed to compute anything from it.
+
+    `at` overrides the clock, for tests that drive hours of sensor behaviour in
+    milliseconds. Production never passes it.
     """
     p = _provider
-    now = time.time()
+    now = time.time() if at is None else float(at)
 
     try:
-        readings = {r.corner: r for r in (p.read() or []) if r.corner in CORNERS}
+        raw = p.read(at=now) if at is not None else p.read()
+        readings = {r.corner: r for r in (raw or []) if r.corner in CORNERS}
     except Exception as e:
         # A provider that throws is a provider that is not there. The panel says
         # so; it does not take the dashboard down with it.
@@ -645,8 +1023,14 @@ def scenarios() -> List[dict]:
     return MockTireProvider.scenarios() if hasattr(_provider, "scenario") else []
 
 
-def set_scenario(name: str) -> bool:
+def set_scenario(name: str, at: float = None) -> bool:
     """-> True if it took. False on a provider with no scenarios (real hardware
-    has exactly one scenario, which is whatever the tires are actually doing)."""
+    has exactly one scenario, which is whatever the tires are actually doing).
+
+    `at` sets the scenario's zero point on the caller's clock — see
+    MockTireProvider.set_scenario. Production never passes it.
+    """
     setter = getattr(_provider, "set_scenario", None)
-    return bool(setter and setter(name))
+    if setter is None:
+        return False
+    return bool(setter(name, at=at) if at is not None else setter(name))

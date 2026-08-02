@@ -90,6 +90,28 @@
       meta: { key: ann.key, type: ann.type, severity: ann.severity,
               reason: ann.reason },
       play: function () {
+        /* The urgent fast path plays a pre-rendered clip instead of waiting on
+           a TTS round trip — the same mechanism, and the same argument, as the
+           headway red tier: 300-800 ms to first audio is exactly the delay a
+           fast path exists to avoid. Everything else is live TTS, addressed by
+           the id the server's policy issued. */
+        if (ann.audio && ann.audio !== 'tts') {
+          return new Promise(function (resolve, reject) {
+            var settled = false;
+            var done = function (fn) {
+              if (settled) return;
+              settled = true;
+              audio.onended = audio.onerror = null;
+              fn();
+            };
+            cleanup = function () { done(resolve); };
+            audio.onended = function () { done(resolve); };
+            audio.onerror = function () { done(reject); };
+            audio.src = '/static/audio/' + ann.audio + '.mp3';
+            var p = audio.play();
+            if (p && p.catch) p.catch(function (e) { done(function () { reject(e); }); });
+          });
+        }
         return fetch('/vehicle/health/voice?id=' + encodeURIComponent(ann.id),
                      ctl ? { signal: ctl.signal } : undefined)
           .then(function (r) {

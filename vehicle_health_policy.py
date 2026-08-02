@@ -82,10 +82,17 @@ against the same thresholds; it is not model output and cannot be.
 
 # --- severity vocabulary ---------------------------------------------------
 INFORMATIONAL = "informational"
+ADVISORY = "advisory"
 WARNING = "warning"
 CRITICAL = "critical"
 
-SEVERITY_RANK = {"normal": 0, INFORMATIONAL: 1, WARNING: 2, CRITICAL: 3}
+# `advisory` was added with the diagnostic monitors. It is the level for a
+# CONFIRMED finding that belongs on the dashboard and in a drive-start briefing
+# but must never interrupt a drive -- a possible slow leak is the case it exists
+# for. Without it, everything confirmed had to be either ignorable or worth
+# interrupting for, and a slow leak is neither.
+SEVERITY_RANK = {"normal": 0, INFORMATIONAL: 1, ADVISORY: 2, WARNING: 3,
+                 CRITICAL: 4}
 
 # The threshold at which RIO speaks without being asked. This single constant is
 # the spec's "configurable severity threshold", and moving it to WARNING is how
@@ -160,6 +167,11 @@ R_ALREADY = "suppressed_already_announced"
 R_MIN_GAP = "suppressed_by_min_gap"
 R_POST_REQUEST = "suppressed_after_status_request"
 R_NO_LINE = "suppressed_no_line_for_type"
+# Shadow mode: the decision to speak was MADE and then not carried out, because
+# this monitor has never been cleared to interrupt anybody. The words are
+# composed anyway and handed back as a proposal -- that proposal is the entire
+# output of a shadow deployment, and it is worthless if it is not the real one.
+R_SHADOW = "shadow_mode_proposal_only"
 
 SPEAK_REASONS = (R_FIRST, R_WORSENED, R_RETURNED, R_REMINDER)
 
@@ -395,6 +407,31 @@ class VehicleHealthPolicy:
         if not text:
             return self._quiet(R_NO_LINE, t, issue=chosen)
 
+        # Shadow mode. The decision has been made in full -- severity, cooldown,
+        # priority, wording -- and is then not carried out. What comes back is
+        # the proposal, which is the only honest way to answer "how often would
+        # this have interrupted somebody" before it interrupts anybody.
+        #
+        # Nothing is written here. Recording the proposal is the caller's job:
+        # this module performs no I/O, and that is asserted, not assumed.
+        if not chosen.get("announce_allowed", True):
+            out = self._quiet(R_SHADOW, t, issue=chosen)
+            out["proposal"] = {
+                "issue_id": chosen.get("issue_id") or chosen.get("key"),
+                "key": chosen.get("key"),
+                "code": chosen.get("code"),
+                "severity": chosen.get("severity"),
+                "text": text,
+                "would_have_fired_because": why,
+                "at": t,
+            }
+            # A proposal is a decision that happened, so it consumes the same
+            # per-issue cooldown a real announcement would. Otherwise the shadow
+            # log would show a fault proposing itself on every poll and would
+            # wildly overstate how talkative the monitor really is.
+            self._mark(chosen, t)
+            return out
+
         return self._fire(chosen, why, text, t)
 
     # -- the driver asked ---------------------------------------------------
@@ -510,13 +547,15 @@ class VehicleHealthPolicy:
 
         return R_ALREADY
 
-    def _fire(self, issue, reason, text, t) -> dict:
-        key = str(issue.get("key") or "")
-        self._counter += 1
-        # Deterministic id: no clock, no randomness, so a whole session replays
-        # to the character. `#n` distinguishes a reminder from the original.
-        aid = f"{key}#{self._counter}"
+    def _mark(self, issue, t) -> None:
+        """Record that a decision was reached for this issue at t.
 
+        Shared by the real announcement and the shadow proposal, because both
+        ARE decisions and both must consume the cooldown. A shadow deployment
+        whose proposals were free of the cooldown would report a rate of
+        interruption that the live system would never produce.
+        """
+        key = str(issue.get("key") or "")
         st = self._seen.setdefault(key, self._blank(t))
         st["announced_t"] = t
         st["rank"] = int(issue.get("severity_rank", 0))
@@ -525,6 +564,15 @@ class VehicleHealthPolicy:
         st["resolved_for"] = None
         self._last_announce_t = t
 
+    def _fire(self, issue, reason, text, t) -> dict:
+        key = str(issue.get("key") or "")
+        self._counter += 1
+        # Deterministic id: no clock, no randomness, so a whole session replays
+        # to the character. `#n` distinguishes a reminder from the original.
+        aid = f"{key}#{self._counter}"
+
+        self._mark(issue, t)
+
         self._issued.append((aid, text))
         if len(self._issued) > ISSUED_MAX:
             del self._issued[:len(self._issued) - ISSUED_MAX]
@@ -532,10 +580,18 @@ class VehicleHealthPolicy:
         announce = {
             "id": aid,
             "key": key,
+            "issue_id": issue.get("issue_id") or key,
+            "code": issue.get("code"),
             "type": issue.get("type"),
             "severity": issue.get("severity"),
             "text": text,
             "reason": reason,
+            # "tts" or a pre-rendered clip id. The urgent fast path uses a clip
+            # for the reason the headway red tier does: a TTS round trip is
+            # 300-800 ms, and the whole argument for the fast path is that
+            # waiting is what it exists to avoid.
+            "audio": issue.get("audio") or "tts",
+            "fast_path": bool(issue.get("fast_path")),
             "at": t,
         }
         self.log.append({"t": round(t, 3), "key": key, "spoken": True,

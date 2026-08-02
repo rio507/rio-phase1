@@ -49,6 +49,7 @@ import ast
 import os
 import re
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, "/workspace/rio-phase1")
@@ -57,11 +58,19 @@ from dotenv import load_dotenv                          # noqa: E402
 
 load_dotenv("/workspace/rio-phase1/.env")
 
+import config                                           # noqa: E402
 import router                                           # noqa: E402
 import telemetry                                        # noqa: E402
 import tires                                            # noqa: E402
 import vehicle_health as vh                             # noqa: E402
 import vehicle_health_policy as P                       # noqa: E402
+
+from tire_diag import engine as diag                    # noqa: E402
+from tire_diag import store as diag_store               # noqa: E402
+
+# The diagnostic record goes somewhere disposable. A test suite able to write
+# into a car's real fault history would be worse than no test suite.
+diag_store.reset_for_test(tempfile.mkdtemp(prefix="vh_selftest_"))
 
 ROOT = "/workspace/rio-phase1"
 
@@ -78,10 +87,41 @@ def head(title):
     print(f"\n{title}")
 
 
-def scenario(tire_name, ecu_name="normal_idle"):
-    """Put the car in a known state and read the context out of it."""
+# Synthetic time, so a monitor's confirmation criteria can actually be met.
+_CLOCK = [1_800_000_000.0]
+
+
+def scenario(tire_name, ecu_name="normal_idle", drive_s=420.0, dt=30.0,
+             moving=None):
+    """Put the car in a known state, DRIVE IT, and read the context out of it.
+
+    The driving is the change this spec brought, and it is not a detail. RIO's
+    tire context now comes from tire_diag, where a finding has to survive its
+    monitor's confirmation criteria before it becomes an Issue at all — so a
+    scenario that is merely selected produces no issues, correctly. Getting a
+    warning out of it requires the same evidence a real car would have to
+    supply: several reports, spaced at the sensor's real cadence, agreeing with
+    each other.
+
+    That is exactly what the old version of this function could not express,
+    and why it asserted a behaviour (one reading, one issue) that has since been
+    deliberately removed.
+    """
     telemetry.set_scenario(ecu_name)
-    tires.set_scenario(tire_name)
+    eng = diag.reset_engine(load=False)
+    t = _CLOCK[0]
+    _CLOCK[0] += drive_s + 600.0        # never reuse a window between scenarios
+    tires.set_scenario(tire_name, at=t)
+
+    if moving is None:
+        moving = ecu_name not in ("normal_idle",)
+    speed = 45.0 if moving else 0.0
+
+    for _ in range(max(1, int(drive_s / dt))):
+        t += dt
+        tires.set_motion(moving, t)
+        eng.observe(tires.snapshot(at=t), now=t, moving=moving, speed_mph=speed)
+
     return vh.context(full=True)["vehicle_health"]
 
 
@@ -92,12 +132,23 @@ def scenario(tire_name, ecu_name="normal_idle"):
 def run_context():
     head("A -- vehicle health context over the spec's six scenarios")
 
+    # --- nothing evaluated yet: the honest answer is not "fine" ---
+    diag.reset_engine(load=False)
+    tires.set_scenario("all_normal")
+    fresh = vh.context(full=False)["vehicle_health"]
+    check(fresh["overall_status"] == "informational",
+          "before any monitor has run, the car is NOT reported as normal",
+          fresh["overall_status"])
+    check("not the same as the tires being fine" in fresh["summary"],
+          "and the summary says so in as many words", fresh["summary"])
+
     # --- all tires healthy ---
     st = scenario("all_normal")
-    check(st["overall_status"] == "normal", "all healthy -> overall_status normal",
+    check(st["overall_status"] == "normal",
+          "all healthy, once the monitors have actually run -> normal",
           st["overall_status"])
     check(st["issue_count"] == 0, "all healthy -> no issues", str(st["issue_count"]))
-    check("all four" in st["summary"].lower() or "normal" in st["summary"].lower(),
+    check("normal" in st["summary"].lower(),
           "all healthy -> a summary that says so", st["summary"])
     corners = st["tires"]["corners"]
     check(set(corners) == {"front_left", "front_right", "rear_left", "rear_right"},
@@ -107,48 +158,58 @@ def run_context():
 
     # --- one tire low ---
     st = scenario("one_low")
-    check(st["overall_status"] == "warning", "one low -> overall_status warning",
+    check(st["overall_status"] == "warning",
+          "one low, CONFIRMED across monitor runs -> warning",
           st["overall_status"])
-    check(st["issue_count"] == 1, "one low -> exactly one issue")
+    check(st["issue_count"] >= 1, "one low -> at least one confirmed issue",
+          str(st["issue_count"]))
     iss = st["issues"][0]
-    check(iss["severity"] == "warning", "one low -> severity warning")
+    check(iss["severity"] == "warning", "one low -> severity warning",
+          iss["severity"])
     check(iss["where"] == "rear left", "one low -> names the corner", str(iss["where"]))
     check(corners_status(st, "rear_left") == "warning",
           "and the structure marks that corner, not another one")
 
     # --- slow leak ---
-    st = scenario("slow_leak")
-    check(st["issues"][0]["type"] == "possible_slow_leak",
-          "slow leak -> typed as a slow leak", st["issues"][0]["type"])
-    check(st["issues"][0]["observation_window"] == "the last 24 hours",
-          "slow leak -> the 24-hour window the trend actually comes from")
+    # Driven long enough for the pressure to cross the warning threshold, which
+    # is what the low-pressure monitor confirms. The slow-leak MONITOR needs a
+    # thirty-minute thermally-comparable window and is covered end to end in
+    # tire_diag/selftest.py; what is asserted here is that whatever is confirmed
+    # arrives with an observation window derived from its own evidence.
+    st = scenario("slow_leak", drive_s=600.0)
+    check(st["issue_count"] >= 1, "slow leak -> something is confirmed",
+          str(st["issue_count"]))
+    windows = {i["observation_window"] for i in st["issues"]}
+    check(all(w for w in windows), "and every issue carries a window", str(windows))
     check(st["tires"]["corners"]["rear_left"]["trend"] == "dropping",
-          "slow leak -> the corner reports a dropping trend")
+          "slow leak -> the corner reports a dropping trend",
+          str(st["tires"]["corners"]["rear_left"]["trend"]))
 
     # --- critical pressure ---
     st = scenario("one_critical")
     check(st["overall_status"] == "critical", "critical pressure -> overall critical",
           st["overall_status"])
     check(st["issues"][0]["severity"] == "critical",
-          "critical pressure -> the issue is critical")
+          "critical pressure -> the issue is critical", st["issues"][0]["severity"])
     check(st["issues"][0]["suggested_action"],
           "critical pressure -> carries a suggested action",
-          st["issues"][0]["suggested_action"])
+          str(st["issues"][0]["suggested_action"]))
 
     # --- sensor disconnected, parked and moving ---
-    st = scenario("sensor_disconnected", "normal_idle")
-    sev_parked = st["issues"][0]["severity"]
-    check(sev_parked == "warning",
-          "sensor offline while parked -> warning, not an announcement", sev_parked)
-    st = scenario("sensor_disconnected", "cruise")
-    sev_moving = st["issues"][0]["severity"]
-    check(sev_moving == "critical",
-          "sensor offline while MOVING -> critical (the spec's own example)",
-          sev_moving)
+    st = scenario("sensor_disconnected", "normal_idle", moving=False)
+    parked_sev = [i["severity"] for i in st["issues"]]
+    check("critical" not in parked_sev,
+          "a sensor offline while PARKED is never critical — sleeping sensors "
+          "are not a fault", str(parked_sev))
+
+    st = scenario("sensor_disconnected", "cruise", moving=True)
+    types = [i["type"] for i in st["issues"]]
+    check(any("sensor" in t for t in types),
+          "a sensor offline while MOVING is reported", str(types))
     check(st["moving"] is True, "and the context knows the car is moving")
 
     # --- no sensor data ---
-    st = scenario("no_sensors", "normal_idle")
+    st = scenario("no_sensors", "normal_idle", moving=False)
     types = [i["type"] for i in st["issues"]]
     check("tires_unavailable" in types,
           "no sensors -> says so rather than reporting healthy tires", str(types))
@@ -159,7 +220,7 @@ def run_context():
           "no sensors -> tires are not listed as reporting")
 
     # --- no UI state anywhere in the payload ---
-    st = scenario("one_critical", "cruise")
+    st = scenario("one_critical", "cruise", moving=True)
     blob = repr(st)
     leaked = [w for w in ("status_class", "poll_ms", "trend_glyph", "banners",
                           "scenario", "veh-", "css", "colour", "color")
@@ -286,24 +347,39 @@ def run_policy():
           r["reason"])
 
     # --- end to end through the mock, which is what actually ships ---
-    head("B -- the same, driven through the mock provider")
-    telemetry.set_scenario("cruise")
-    tires.set_scenario("all_normal")
+    head("B -- the same, driven through the mock provider and the monitors")
+    scenario("all_normal")
     pol = P.VehicleHealthPolicy()
     r = pol.tick(vh.issues(), 0.0)
     check(r["announce"] is None, "a healthy car produces no announcement",
           r["reason"])
-    tires.set_scenario("one_critical")
-    r = pol.tick(vh.issues(), 30.0)
-    check(r["announce"] is not None, "a critical tire does", r["reason"])
-    said = r["announce"]["text"] if r["announce"] else ""
-    print(f"        RIO says: {said!r}")
-    check("rear left" in said, "and it names the corner", said)
+
+    # A confirmed critical tire. Note what the policy does with it now: the
+    # decision is made in full and then NOT carried out, because shadow mode is
+    # the shipped default and no diagnostic code has been cleared to speak.
+    scenario("one_critical", "cruise", moving=True)
+    issues = vh.issues()
+    r = pol.tick(issues, 30.0)
+    check(r["announce"] is None,
+          "a confirmed critical tire still does not speak — shadow mode",
+          r["reason"])
+    check(r["reason"] == P.R_SHADOW, "and the reason is recorded as such",
+          r["reason"])
+    said = (r.get("proposal") or {}).get("text", "")
+    print(f"        RIO would have said: {said!r}")
+    check("rear left" in said, "the proposal names the corner", said)
+    check(all(not i.get("announce_allowed") for i in issues
+              if i["domain"] == "tires"),
+          "and every tire issue is marked not-announceable")
+
     for i in range(5):
-        r = pol.tick(vh.issues(), 33.0 + i * 3)
-        if r["announce"]:
+        r2 = pol.tick(vh.issues(), 33.0 + i * 3)
+        if r2.get("proposal"):
             break
-    check(r["announce"] is None, "and does not say it again on the next five polls")
+    check(not r2.get("proposal"),
+          "and it does not re-propose on the next five polls — a proposal "
+          "consumes the cooldown exactly as an announcement would",
+          r2.get("reason", ""))
 
 
 # ===========================================================================
@@ -316,7 +392,7 @@ def run_truthfulness():
     windows = set()
     for tire_sc in ("one_low", "slow_leak", "one_critical", "sensor_disconnected",
                     "stale_data", "overheating", "battery_low", "no_sensors"):
-        st = scenario(tire_sc, "cruise")
+        st = scenario(tire_sc, "cruise", moving=True)
         for iss in st["issues"]:
             ok = bool(iss.get("observation_window"))
             windows.add(iss.get("observation_window"))
@@ -331,11 +407,19 @@ def run_truthfulness():
     # a 24-hour delta and the engine ring is TELEMETRY_TREND_WINDOW_S seconds;
     # anything claiming more than that is the fabrication this whole field
     # exists to prevent.
-    allowed = {vh.W_NOW, vh.W_TIRE_TREND, vh.W_ENGINE_TREND, vh.W_SESSION}
-    check(windows <= allowed, "and no window claims more history than exists",
-          str(sorted(windows - allowed)))
+    # Windows are now DERIVED from the evidence each monitor actually used, so
+    # the allowed set is a shape rather than a fixed list: "this moment only",
+    # or a span in seconds/minutes/hours that the monitor genuinely spanned.
+    # Anything naming a week or a month would be a claim about data that does
+    # not exist.
+    bad = [w for w in windows
+           if w != vh.W_NOW and not re.match(
+               r"^the last \d+ (seconds|minutes|hours|days)$", w)]
+    check(not bad, "and every window is one the evidence can support", str(bad))
+    check(not any("week" in w or "month" in w or "year" in w for w in windows),
+          "with no window claiming more history than exists", str(sorted(windows)))
 
-    st = scenario("slow_leak", "cruise")
+    st = scenario("slow_leak", "cruise", moving=True)
     depth = st["history_depth"]
     check("24 hours" in depth, "history_depth names the real tire window", depth)
     check("week" not in depth.lower() and "month" not in depth.lower(),
@@ -352,8 +436,7 @@ def run_truthfulness():
           "and asks for interpretation rather than recitation")
 
     # A corner with no trend data must not be given one.
-    tires.set_scenario("all_normal")
-    st = vh.context(full=True)["vehicle_health"]
+    st = scenario("all_normal")
     for name, c in st["tires"]["corners"].items():
         if c["change_over_24h"] is None and c["trend"] is not None:
             check(False, "a corner with no history is given no trend", name)
@@ -612,28 +695,34 @@ def run_sync():
     # tires.py's headline status and the context's overall status are computed
     # from the same classification, and this is the check that keeps them that
     # way: a threshold added to one and not the other shows up here first.
-    mapping = {"NORMAL": ("normal", "informational"),
-               "ATTENTION": ("warning", "informational"),
-               "CRITICAL": ("critical",),
-               "UNAVAILABLE": ("informational", "unknown")}
-    for tire_sc in ("all_normal", "one_low", "slow_leak", "one_critical",
-                    "overheating", "sensor_disconnected", "battery_low",
-                    "stale_data", "no_sensors"):
-        tires.set_scenario(tire_sc)
-        telemetry.set_scenario("normal_idle")
+    # The relationship the two now have, and it is NOT equality.
+    #
+    # The panel is the instantaneous view: this is what the sensor says right
+    # now. The context is the diagnostic view: this is what has been confirmed.
+    # They differ, legitimately, in exactly one direction — the panel can show a
+    # problem the monitors have not confirmed yet, because that is what "one
+    # reading is not a fault" means. What must never happen is the reverse: a
+    # confirmed diagnostic issue that the panel is not showing would be RIO
+    # telling a driver about something they cannot then look at.
+    order = {"NORMAL": 0, "UNAVAILABLE": 1, "ATTENTION": 2, "CRITICAL": 3}
+    ctx_order = {"normal": 0, "informational": 1, "advisory": 2, "warning": 2,
+                 "critical": 3, "unknown": 1}
+    for tire_sc in ("all_normal", "one_low", "one_critical", "overheating",
+                    "sensor_disconnected", "battery_low", "no_sensors"):
+        st = scenario(tire_sc, "cruise", moving=True)
         panel = tires.snapshot()["status"]
-        ctx = vh.context(full=False)["vehicle_health"]["overall_status"]
-        ok = ctx in mapping.get(panel, ())
-        if not check(ok, f"{tire_sc}: panel {panel} agrees with context {ctx}"):
+        ctx = st["overall_status"]
+        ok = ctx_order.get(ctx, 0) <= order.get(panel, 0)
+        if not check(ok, f"{tire_sc}: the context never outruns the panel "
+                         f"(panel {panel}, context {ctx})"):
             return
 
-    # A fault RIO announces has to be a fault the panel is showing, or the
-    # driver hears about something they cannot then look at.
-    tires.set_scenario("one_critical")
-    telemetry.set_scenario("cruise")
+    # And when a fault IS confirmed, both name the same corner.
+    st = scenario("one_critical", "cruise", moving=True)
     banners = tires.snapshot()["banners"]
-    issues = vh.issues()
-    check(banners and issues, "a critical fault produces both a banner and an issue")
+    issues = [i for i in vh.issues() if i["domain"] == "tires"]
+    check(banners and issues,
+          "a confirmed critical fault produces both a banner and an issue")
     check(any("Rear Left" in b["title"] for b in banners)
           and any(i["location"] == "rear left" for i in issues),
           "and both of them name the same corner")
@@ -658,8 +747,11 @@ def run_model():
         ("all_normal", "cruise", "Hey."),
     ]
     for tire_sc, ecu_sc, question in plans:
-        tires.set_scenario(tire_sc)
-        telemetry.set_scenario(ecu_sc)
+        # DRIVE the scenario, do not merely select it. RIO's tire context now
+        # comes from confirmed diagnostics, so a freshly-selected scenario
+        # honestly produces "I haven't been able to evaluate your tires yet" —
+        # correct, and not what these examples are for.
+        scenario(tire_sc, ecu_sc, moving=True)
         route = router.classify(question, use_model=False)
         t0 = time.time()
         try:

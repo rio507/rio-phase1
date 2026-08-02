@@ -67,6 +67,7 @@ import vehicle_health_policy as policy
 # The severity vocabulary is the policy's, imported rather than restated. There
 # is exactly one ladder in this feature and the module that acts on it owns it.
 INFORMATIONAL = policy.INFORMATIONAL
+ADVISORY = policy.ADVISORY
 WARNING = policy.WARNING
 CRITICAL = policy.CRITICAL
 SEVERITY_RANK = policy.SEVERITY_RANK
@@ -78,7 +79,8 @@ SEVERITY_RANK = policy.SEVERITY_RANK
 NORMAL = "normal"
 UNKNOWN = "unknown"
 
-_STATUS_BY_RANK = {0: NORMAL, 1: INFORMATIONAL, 2: WARNING, 3: CRITICAL}
+_STATUS_BY_RANK = {0: NORMAL, 1: INFORMATIONAL, 2: ADVISORY, 3: WARNING,
+                   4: CRITICAL}
 
 # Windows, written as a person says them, because they are read out. A window is
 # a claim about the DATA, so each one is tied to the thing that produced it:
@@ -189,62 +191,65 @@ _CORNER_KEY = {"FL": "front_left", "FR": "front_right",
 _CORNER_SPOKEN = {"FL": "front left", "FR": "front right",
                   "RL": "rear left", "RR": "rear right"}
 
-# tires.py's note is the classification, in its own words. Keying off it rather
-# than re-deriving from the numbers is what keeps the two from disagreeing: if
-# the panel says "Losing Pressure Fast", RIO says the tire is losing air fast,
-# and there is no second copy of the threshold to drift.
-#
-#   note -> (type, severity, window, action)
-_TIRE_NOTE = {
-    "Possible Blowout": (
-        "possible_blowout", CRITICAL, W_NOW,
-        "Pull over somewhere safe and look at the tire before driving further."),
-    "Losing Pressure Fast": (
-        "rapid_pressure_loss", CRITICAL, W_TIRE_TREND,
-        "Stop and check it — this is a puncture, not a slow leak."),
-    "Pressure Critical": (
-        "critical_low_pressure", CRITICAL, W_NOW,
-        "Get air into it before driving further, or fit the spare."),
-    "Overheating": (
-        "tire_overheating", CRITICAL, W_NOW,
-        "Slow down and let it cool before carrying on."),
-    "Pressure Low": (
-        "low_pressure", WARNING, W_NOW,
-        "Top it up at the next stop."),
-    "Pressure High": (
-        "high_pressure", WARNING, W_NOW,
-        "Let a little out once the tires are cold."),
-    "Running Hot": (
-        "tire_running_hot", WARNING, W_NOW,
-        "Worth checking the pressure and the brake on that corner."),
-    "Pressure Dropping": (
-        "possible_slow_leak", WARNING, W_TIRE_TREND,
-        "Have it checked for a nail or a leaking valve in the next day or two."),
-    "Sensor Battery Low": (
-        "sensor_battery_low", INFORMATIONAL, W_NOW,
-        "Book the sensor battery for replacement — no hurry."),
-}
+# How long a monitor's evidence reaches back, said the way a person says it.
+# Derived from the evidence the monitor actually used rather than written as a
+# constant per issue type: the whole point of observation_window is that RIO
+# cannot claim more history than the data has, and a hardcoded phrase would be a
+# claim about the data rather than a report of it.
 
-# States that are about the SENSOR rather than the tire. Handled apart because
-# the severity of "I cannot see this corner" depends on whether the car is
-# moving, which is the one thing the tire provider cannot know.
-_TIRE_QUIET = {
-    "DISCONNECTED": ("tire_sensor_disconnected", "The sensor on the {name} tire "
-                     "has stopped answering."),
-    "NO_DATA": ("tire_sensor_missing", "There is no sensor reporting from the "
-                "{name} corner."),
-    "STALE": ("tire_sensor_stale", "The {name} sensor's last reading is old "
-              "enough that it may not reflect the tire now."),
+def _window_phrase(seconds: Optional[float]) -> str:
+    if not seconds or seconds <= 0:
+        return W_NOW
+    if seconds < 120:
+        return f"the last {int(round(seconds / 10.0)) * 10} seconds"
+    if seconds < 5400:
+        return f"the last {int(round(seconds / 60.0))} minutes"
+    if seconds < 86400:
+        return f"the last {int(round(seconds / 3600.0))} hours"
+    return f"the last {int(round(seconds / 86400.0))} days"
+
+
+# What each monitor's finding is called in the conversation layer, and which
+# line in vehicle_health_policy.LINE it would use if it were ever cleared to
+# speak. `type` is the announcement-path key; the driver-facing noun phrase
+# comes from the code catalogue, which owns the wording.
+_MONITOR_TYPE = {
+    "tire.low_pressure": "low_pressure",
+    "tire.critical_low_pressure": "critical_low_pressure",
+    "tire.slow_leak": "possible_slow_leak",
+    "tire.asymmetric_loss": "asymmetric_pressure_loss",
+    "tpms.sensor_connectivity": "tire_sensor_quiet",
+    "tpms.sensor_plausibility": "tire_sensor_implausible",
+    "tire.sensor_loss_during_decline": "tire_sensor_lost_driving",
+    "tire.inflation_event": "inflation_event",
+    "tpms.receiver_health": "tire_sensors_all_silent",
 }
 
 
 class TireSource(HealthSource):
-    """The four corners, read through tires.snapshot().
+    """The four corners, as the DIAGNOSTIC ENGINE understands them.
 
-    Reads only. Every threshold, every state name and the wording of every note
-    is decided in tires.py against config.py, and nothing here second-guesses
-    any of it — this class turns that classification into the vocabulary the
-    conversation and the announcement policy share.
+    What changed, and why it matters
+    --------------------------------
+    This class used to read tires.snapshot() and turn each corner's
+    instantaneous state into an issue. That was wrong in a way that only showed
+    up once anyone looked closely: a single reading became a `warning`, and one
+    missed poll became a `critical`. A tire that read low on one wake-up frame
+    was, as far as RIO was concerned, a tire with a problem.
+
+    Now the issues come from tire_diag, where a finding has to survive its
+    monitor's confirmation criteria before it is an Issue at all. tires.py's
+    classification is still exactly what the dashboard renders — it is the
+    instantaneous view and it is correct as that — but it is no longer what RIO
+    reasons about.
+
+    Readiness is part of the answer
+    -------------------------------
+    A monitor that has not run is not a monitor that passed. This class reports
+    that distinction rather than smoothing it over, because the alternative is
+    RIO saying "everything looks good" about four tires she has not yet been
+    able to evaluate. That is the single most damaging sentence this system
+    could produce, and it is the one a naive implementation produces by default.
     """
 
     domain = "tires"
@@ -257,9 +262,10 @@ class TireSource(HealthSource):
         self._snap = None
 
     def _read(self) -> dict:
-        # tires.snapshot() is a pure read of the provider — no history, no
-        # insight engine — so the only reason to hold it is to keep one context
-        # build from asking twice.
+        # tires.snapshot() is a pure read of the provider -- no history, no
+        # insight engine -- so the only reason to hold it is to keep one context
+        # build from asking twice. It is NOT what produces issues any more; it
+        # is the current-value view that sits alongside them.
         if self._snap is None:
             self._snap = tires.snapshot()
         return self._snap
@@ -285,95 +291,44 @@ class TireSource(HealthSource):
                 "sensor": "reporting" if raw.get("connected") else "not reporting",
             }
         return {"pressure_unit": "psi", "temperature_unit": "fahrenheit",
-                "corners": out}
+                "corners": out,
+                # The readiness view, in the conversation context. This is what
+                # lets RIO say "I do not have enough comparable readings yet to
+                # evaluate a slow leak, but the current pressure is not
+                # critically low" -- a sentence that is impossible to say
+                # honestly without both halves of it.
+                "monitors": _monitor_readiness()}
 
     def issues(self, ctx: dict) -> List[dict]:
-        snap = self._read()
-        driving = bool(ctx.get("driving"))
-        out: List[dict] = []
+        try:
+            from tire_diag import engine as diag
+            active = diag.active_issues()
+        except Exception as e:
+            print(f"[vehicle_health] diagnostic engine unavailable: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return []
 
-        # All four quiet at once is one receiver fault, not four tire faults --
-        # the same judgement tires._banners makes, and pointing the driver at
-        # four wheels when the thing to look at is the box would be worse than
-        # saying nothing.
-        tire_rows = snap.get("tires", [])
-        quiet = [t for t in tire_rows if t["state"] in _TIRE_QUIET]
-        if tire_rows and len(quiet) == len(tire_rows):
-            all_stale = all(t["state"] == "STALE" for t in tire_rows)
-            return [make_issue(
-                key="tires:receiver:stale" if all_stale else "tires:receiver:silent",
-                domain=self.domain,
-                type="tire_sensors_all_stale" if all_stale else "tire_sensors_all_silent",
-                severity=WARNING if driving else INFORMATIONAL,
-                message=("Every tire reading is old enough that it may not "
-                         "describe the tires now."
-                         if all_stale else
-                         "Nothing is reporting from any of the four tire sensors."),
-                observation_window=W_NOW,
-                suggested_action="The receiver, not the tires — check that first.",
-                spoken_fallback=("Your tire readings have all gone stale."
-                                 if all_stale else "I've lost all four tire sensors."),
-                evidence={"corners": [t["corner"] for t in quiet],
-                          "ages": [t.get("age_text", "") for t in tire_rows]})]
+        out = [_issue_from_diagnostic(i) for i in active]
 
-        for t in tire_rows:
-            corner = t["corner"]
-            raw = t.get("raw") or {}
-            name = t.get("name", corner)
-            spoken_loc = _CORNER_SPOKEN.get(corner, name.lower())
-
-            if t["state"] in _TIRE_QUIET:
-                type_, template = _TIRE_QUIET[t["state"]]
-                # The spec's "sensor disconnected while driving" critical. A
-                # sensor that drops out in the driveway is a dead battery; one
-                # that drops out at speed is a corner of the car nobody can see,
-                # on the channel whose failure mode is a blowout.
-                if t["state"] == "DISCONNECTED" and driving:
-                    sev, type_ = CRITICAL, "tire_sensor_lost_driving"
-                elif t["state"] == "DISCONNECTED":
-                    sev = WARNING
-                else:
-                    sev = INFORMATIONAL
-                out.append(make_issue(
-                    key=f"tires:{corner}:{t['state'].lower()}",
-                    domain=self.domain, type=type_, severity=sev,
-                    message=template.format(name=name.lower()),
-                    observation_window=W_NOW,
-                    suggested_action=("Worth a look at that sensor when you stop."
-                                      if sev != INFORMATIONAL else ""),
-                    location=spoken_loc,
-                    magnitude=float(SEVERITY_RANK[sev]),
-                    spoken_fallback=f"I've lost the sensor on the {spoken_loc} tire.",
-                    evidence={"corner": corner, "detail": t.get("detail", "")}))
-                continue
-
-            note = tires.bare_note(t)
-            if note not in _TIRE_NOTE:
-                continue
-            type_, sev, window, action = _TIRE_NOTE[note]
-            out.append(make_issue(
-                key=f"tires:{corner}:{type_}",
-                domain=self.domain, type=type_, severity=sev,
-                message=_tire_message(name, type_, raw),
-                observation_window=window,
-                suggested_action=action,
-                location=spoken_loc,
-                magnitude=_tire_magnitude(type_, raw),
-                value=_tire_value(type_, raw),
-                unit=("psi" if "pressure" in type_ or "blowout" in type_
-                      else "f" if "heat" in type_ or "hot" in type_ else ""),
-                spoken_fallback=_tire_message(name, type_, raw),
-                evidence={"corner": corner,
-                          "pressure_psi": raw.get("pressure_psi"),
-                          "target_psi": raw.get("target_psi"),
-                          "temp_f": raw.get("temp_f"),
-                          "change_psi_24h": raw.get("trend_psi_24h"),
-                          "detail": t.get("detail", "")}))
+        # Nothing confirmed. Before saying so, check that anything has actually
+        # been EVALUATED -- "no confirmed faults" and "no monitor has managed to
+        # run" are different answers and only one of them is reassuring.
+        if not out:
+            unevaluated = _unevaluated_issue()
+            if unevaluated is not None:
+                out.append(unevaluated)
         return out
 
 
 def _tire_status_word(state: str) -> str:
-    """tires.py's state -> the spec's lowercase status vocabulary."""
+    """tires.py's instantaneous state -> the spec's lowercase status vocabulary.
+
+    This describes the CURRENT READING of a corner, which is a different claim
+    from whether a diagnostic monitor has confirmed anything about it. Both are
+    in the context, side by side and clearly labelled, because "the pressure is
+    low right now" and "a low-pressure fault is confirmed" are both true things
+    a driver might be asking about and they are not the same thing.
+    """
     return {"NORMAL": "normal", "WARNING": "warning", "CRITICAL": "critical",
             "BATTERY_LOW": "normal", "STALE": "unknown",
             "DISCONNECTED": "unknown", "NO_DATA": "unknown"}.get(state, "unknown")
@@ -398,64 +353,240 @@ def _tire_trend_word(change: Optional[float]) -> Optional[str]:
     return "steady"
 
 
-def _tire_message(name: str, type_: str, raw: dict) -> str:
-    """One sentence of plain English about one corner.
+def _monitor_readiness() -> dict:
+    """Status and last_result per monitor, summarised for the conversation.
 
-    Deterministic, and deliberately about MEANING rather than numbers: the
-    figure is in `evidence` for RIO to reach for if it helps the driver, and
-    this sentence is what the announcement path falls back on if a type has no
-    line of its own.
+    Deliberately not the full per-corner matrix: thirty-three rows of monitor
+    state in a conversation turn is a cost paid on a question nobody asked. What
+    RIO needs is which monitors can currently judge, which are still gathering,
+    and why the ones that cannot, cannot.
     """
-    psi = raw.get("pressure_psi")
-    target = raw.get("target_psi")
-    temp = raw.get("temp_f")
-    change = raw.get("trend_psi_24h")
-    low = f"{name} is {abs(psi - target):.1f} PSI under its target" \
-        if (psi is not None and target is not None) else f"{name} is low"
+    try:
+        from tire_diag import engine as diag
+        from tire_diag import monitors as M
+    except Exception:
+        return {}
 
-    if type_ == "possible_blowout":
-        return f"{name} has lost most of its air and is at {psi:.0f} PSI."
-    if type_ == "rapid_pressure_loss":
-        return (f"{name} has lost {abs(change):.1f} PSI in the last day — "
-                f"that is a puncture rather than a slow leak.")
-    if type_ == "critical_low_pressure":
-        return f"{low} — low enough not to keep driving on."
-    if type_ == "tire_overheating":
-        return f"{name} is at {temp:.0f}°F, hot enough to damage the tire."
-    if type_ == "low_pressure":
-        return f"{low}."
-    if type_ == "high_pressure":
-        return f"{name} is over-inflated by {abs(psi - target):.1f} PSI."
-    if type_ == "tire_running_hot":
-        return f"{name} is running hotter than the others, at {temp:.0f}°F."
-    if type_ == "possible_slow_leak":
-        return (f"{name} has dropped {abs(change):.1f} PSI over the last "
-                f"24 hours, which looks like a slow leak.")
-    if type_ == "sensor_battery_low":
-        return f"The sensor in the {name.lower()} tire is low on battery."
-    return f"{name} needs attention."
+    rows = diag.engine().monitor_view()
+    by_monitor: dict = {}
+    for r in rows:
+        entry = by_monitor.setdefault(r["monitor_id"], {
+            "statuses": {}, "results": {}, "reasons": []})
+        entry["statuses"][r["status"]] = entry["statuses"].get(r["status"], 0) + 1
+        key = r["last_result"] or "never_run"
+        entry["results"][key] = entry["results"].get(key, 0) + 1
+        if r["status"] in M.NO_VERDICT and r["status_reason"]:
+            if r["status_reason"] not in entry["reasons"]:
+                entry["reasons"].append(r["status_reason"])
+
+    out = {}
+    for monitor_id, entry in by_monitor.items():
+        # The worst status wins the summary: one corner that cannot be evaluated
+        # is the thing worth saying, not the three that could.
+        order = (M.DATA_UNAVAILABLE, M.INHIBITED, M.NOT_READY, M.RUNNING,
+                 M.NOT_SUPPORTED, M.READY)
+        status = next((s for s in order if s in entry["statuses"]), M.NOT_READY)
+        out[monitor_id] = {
+            "status": status,
+            "evaluated_corners": entry["results"].get("PASSED", 0)
+                                 + entry["results"].get("FAILED_PENDING", 0)
+                                 + entry["results"].get("FAILED_CONFIRMED", 0),
+            "never_run_corners": entry["results"].get("never_run", 0),
+            "why_not": entry["reasons"][:2],
+        }
+    return out
 
 
-def _tire_magnitude(type_: str, raw: dict) -> float:
-    """How bad, in the units of the thing that is wrong. Higher is worse."""
-    psi, target = raw.get("pressure_psi"), raw.get("target_psi")
-    temp, change = raw.get("temp_f"), raw.get("trend_psi_24h")
-    if type_ in ("possible_blowout", "critical_low_pressure", "low_pressure"):
-        return max(0.0, (target - psi)) if (psi is not None and target is not None) else 0.0
-    if type_ == "high_pressure":
-        return max(0.0, (psi - target)) if (psi is not None and target is not None) else 0.0
-    if type_ == "rapid_pressure_loss" or type_ == "possible_slow_leak":
-        return abs(change) if change is not None else 0.0
-    if type_ in ("tire_overheating", "tire_running_hot"):
-        return max(0.0, temp - config.TIRE_TEMP_WARN_F) if temp is not None else 0.0
+# The monitors a driver is actually asking about when they ask whether their
+# tires are okay. If NEITHER of these has judged anything, "everything looks
+# normal" is not an answer RIO is entitled to give, however many other monitors
+# have run — a connectivity monitor reporting that all four sensors are talking
+# says nothing whatsoever about the pressure in the tires.
+_CORE_MONITORS = ("tire.low_pressure", "tire.critical_low_pressure")
+
+
+def _unevaluated_issue() -> Optional[dict]:
+    """"I have not been able to look at this yet", as an issue.
+
+    The spec's rule, and the one this whole readiness apparatus exists to
+    enforce: do not describe a system as healthy merely because its monitor has
+    not run. A car whose pressure monitors are NOT_READY is a car nobody has
+    evaluated, and saying "all four are where they should be" about it is the
+    single most damaging sentence this feature could produce.
+
+    Informational, so it never speaks. It exists to stop the one-line summary
+    that goes into EVERY conversation turn from claiming an all-clear nobody
+    established.
+    """
+    try:
+        from tire_diag import engine as diag
+    except Exception:
+        return None
+
+    rows = diag.engine().monitor_view()
+    if not rows:
+        return None
+
+    core = [r for r in rows if r["monitor_id"] in _CORE_MONITORS]
+    if any(r["last_result"] is not None for r in core):
+        return None
+
+    reasons = []
+    for r in core:
+        if r["status_reason"] and r["status_reason"] not in reasons:
+            reasons.append(r["status_reason"])
+    judged = sorted({r["monitor_id"] for r in rows
+                     if r["last_result"] is not None})
+    return make_issue(
+        key="tires:monitors:not_evaluated",
+        domain="tires", type="tire_monitors_not_ready",
+        severity=INFORMATIONAL,
+        message="Tire pressure has not been evaluated yet — "
+                + (reasons[0] if reasons else "not enough trusted samples")
+                + ". This is not the same as the tires being fine.",
+        observation_window=W_NOW,
+        suggested_action="",
+        spoken_fallback="I haven't been able to evaluate your tires yet.",
+        evidence={"reasons": reasons[:3],
+                  "monitors_with_a_verdict": judged,
+                  "monitors_total": len(rows)})
+
+
+def _issue_from_diagnostic(i: dict) -> dict:
+    """One confirmed diagnostic Issue, in the conversation layer's vocabulary.
+
+    The diagnostic code never crosses this boundary as a code. RIO says "your
+    rear-left tire may have a slow leak"; RIO-TIRE-POSSIBLE-LEAK-RL rides along
+    in a field the service view reads and the prompt never shows.
+    """
+    from tire_diag import codes as C
+
+    code = C.get(i.get("code") or "")
+    detail = i.get("detail") or {}
+    corner = i.get("corner")
+    spoken_loc = _CORNER_SPOKEN.get(corner or "", "")
+    name = {"FL": "Front Left", "FR": "Front Right",
+            "RL": "Rear Left", "RR": "Rear Right"}.get(corner or "", "")
+
+    window_s = detail.get("window_s") or detail.get("span_s")
+    if i.get("monitor_id") == "tpms.sensor_plausibility":
+        window_s = detail.get("window_s") or config.TIRE_DIAG_IMPLAUSIBLE_WINDOW_S
+
+    severity = i.get("severity") or (code.default_severity if code else WARNING)
+    message = _diagnostic_message(i, code, detail, name)
+
+    # Speech eligibility, decided here and enforced by the policy. Two gates:
+    # the per-code flag (every one of which is False in shadow mode) and the
+    # global shadow switch. The urgent fast path is the documented exception and
+    # is separately gated -- it is the only thing that can speak while the
+    # monitors are still being evaluated.
+    fast = bool(i.get("urgent")) and C.fast_path_eligible(i.get("code") or "")
+    allowed = fast or (not config.TIRE_DIAG_SHADOW_MODE
+                       and C.speech_eligible(i.get("code") or ""))
+
+    issue = make_issue(
+        key=i["issue_id"],
+        domain="tires",
+        type=_MONITOR_TYPE.get(i.get("monitor_id"), "tire_fault"),
+        severity=severity,
+        message=message,
+        observation_window=_window_phrase(window_s),
+        suggested_action=(code.suggested_action if code else ""),
+        location=spoken_loc,
+        magnitude=_diagnostic_magnitude(detail),
+        value=detail.get("pressure_psi") or detail.get("to_psi"),
+        unit="psi" if ("pressure_psi" in detail or "to_psi" in detail) else "",
+        spoken_fallback=message,
+        evidence={
+            "confirmed_at": i.get("confirmed_at"),
+            "confidence": i.get("confidence"),
+            "monitor": i.get("monitor_id"),
+            "monitor_runs_failed": i.get("fail_runs"),
+            "drive_cycles_failed": len(i.get("fail_cycles") or []),
+            "recurrence_count": (i.get("recurrence") or {}).get("count", 0),
+            "measurement": {k: v for k, v in detail.items()
+                            if k not in ("reasons",)},
+        })
+    # Fields the announcement path needs and the LLM never sees -- _issue_view()
+    # in context() drops everything except the documented set.
+    issue["issue_id"] = i["issue_id"]
+    issue["code"] = i.get("code")
+    issue["announce_allowed"] = allowed
+    issue["fast_path"] = fast
+    issue["audio"] = (_FAST_PATH_CLIP.get(i.get("monitor_id"), "tts")
+                      if fast else "tts")
+    issue["lifecycle"] = i.get("lifecycle")
+    return issue
+
+
+# Pre-rendered clips for the urgent fast path, by monitor. Same mechanism the
+# headway red tier uses and for the same reason: an ElevenLabs round trip is
+# 300-800 ms, and the entire argument for a fast path is that waiting is what it
+# exists to avoid. Rendered by tools/render_alerts.py.
+_FAST_PATH_CLIP = {
+    "tire.critical_low_pressure": "tire_critical",
+    "tire.sensor_loss_during_decline": "tire_sensor_lost",
+}
+
+
+def _diagnostic_message(i: dict, code, detail: dict, name: str) -> str:
+    """One sentence of plain English about a confirmed diagnostic finding.
+
+    Deterministic, and about MEANING rather than numbers -- the figures are in
+    `evidence` for RIO to reach for when they help. It also carries the honest
+    hedge: the code's driver_term says "a possible slow leak", not "a slow leak",
+    because that is what the evidence supports and the prompt is not allowed to
+    upgrade it.
+    """
+    term = code.driver_term if code else "a fault"
+    where = f"{name} " if name else ""
+    monitor = i.get("monitor_id")
+
+    if monitor == "tire.slow_leak":
+        change = abs(detail.get("change_psi") or 0.0)
+        peers = detail.get("peer_change_psi")
+        peer_txt = (f" while the other corners moved {peers:+.1f} PSI"
+                    if peers is not None else "")
+        return (f"{where}shows {term}: down {change:.1f} PSI across thermally "
+                f"comparable readings{peer_txt}.")
+    if monitor == "tire.asymmetric_loss":
+        return (f"{where}is losing pressure faster than the "
+                f"{detail.get('peer_corner', 'other')} corner on the same axle "
+                f"— a {abs(detail.get('gap_psi') or 0.0):.1f} PSI difference.")
+    if monitor == "tire.critical_low_pressure":
+        psi = detail.get("pressure_psi")
+        falling = " and still falling" if detail.get("falling") else ""
+        return (f"{where}is at {psi:.0f} PSI{falling} — below the level it is "
+                f"safe to drive on.")
+    if monitor == "tire.low_pressure":
+        psi = detail.get("pressure_psi")
+        thr = detail.get("threshold_psi")
+        return (f"{where}is at {psi:.1f} PSI, under the {thr:.1f} PSI it should "
+                f"not go below.")
+    if monitor == "tire.sensor_loss_during_decline":
+        return (f"{where}was losing pressure and its sensor has stopped "
+                f"reporting — that corner cannot be watched any more.")
+    if monitor == "tpms.sensor_connectivity":
+        return f"The {name.lower()} sensor has {term}."
+    if monitor == "tpms.sensor_plausibility":
+        n = detail.get("implausible_count")
+        return (f"The {name.lower()} sensor is {term} — {n} implausible reports "
+                f"in the window.")
+    if monitor == "tpms.receiver_health":
+        return "Nothing is reporting from any tire sensor — that is the receiver."
+    if monitor == "tire.inflation_event":
+        return (f"{where}was inflated by {detail.get('step_psi', 0):.1f} PSI.")
+    return f"{where}{term}."
+
+
+def _diagnostic_magnitude(detail: dict) -> float:
+    """How bad, in the issue's own units. Compared only against itself."""
+    for key in ("margin_psi", "excess_vs_peers_psi", "gap_psi", "silent_for_s",
+                "implausible_count", "step_psi"):
+        v = detail.get(key)
+        if v is not None:
+            return abs(float(v))
     return 0.0
-
-
-def _tire_value(type_: str, raw: dict) -> Optional[float]:
-    """The one number the spoken line takes, if it takes one."""
-    if type_ in ("tire_overheating", "tire_running_hot"):
-        return raw.get("temp_f")
-    return raw.get("pressure_psi")
 
 
 # ---------------------------------------------------------------------------

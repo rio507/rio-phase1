@@ -30,6 +30,9 @@ import telemetry
 import insights
 import vehicle_health
 import vehicle_health_policy
+from tire_diag import engine as tire_diag
+from tire_diag import codes as tire_codes
+from tire_diag import monitors as tire_monitors
 import framebuf
 import router as request_router
 import visual_qa
@@ -689,8 +692,49 @@ def vehicle_tires_endpoint():
     The dashboard polls this at the cadence the payload itself carries
     (`poll_ms`), and renders it verbatim — it does no arithmetic and holds no
     thresholds of its own.
+
+    This is also one of exactly two places the diagnostic engine is fed. The
+    other is /vehicle/health/announcement. A conversation turn deliberately does
+    NOT feed it: reports are deduplicated by their own timestamp so extra polls
+    add no evidence, but calling it from a turn would still tie the drive-cycle
+    and monitor-run bookkeeping to how talkative the driver is.
     """
-    return tires.snapshot()
+    snap = tires.snapshot()
+    _feed_diagnostics(snap)
+    return snap
+
+
+def _feed_diagnostics(snap: dict) -> None:
+    """Hand a tire snapshot to the diagnostic monitors. Never fatal.
+
+    Motion goes in the other direction first: direct TPMS sensors wake on
+    rotation, so the provider has to be told whether the wheels are turning, and
+    tires.py deliberately cannot find that out for itself.
+    """
+    try:
+        moving, speed = _vehicle_motion()
+        tires.set_motion(moving)
+        tire_diag.observe(snap, moving=moving, speed_mph=speed)
+    except Exception as e:
+        print(f"[tire_diag] observe failed: {type(e).__name__}: {e}", flush=True)
+
+
+def _vehicle_motion():
+    """-> (moving, speed_mph). Conservative: unknown speed is not moving.
+
+    The only thing this flag can do on its own is promote a quiet sensor to an
+    urgent condition, so guessing that the car is moving when nobody knows would
+    mean interrupting a parked driver about sensors that are asleep by design.
+    """
+    try:
+        snap = telemetry.snapshot(record=False)
+        for row in snap.get("rows", []):
+            if row["id"] == "vehicle_speed" and row.get("value") is not None:
+                speed = float(row["value"])
+                return speed >= config.TIRE_DIAG_DRIVE_START_MPH, speed
+    except Exception:
+        pass
+    return False, None
 
 
 @app.get("/vehicle/tires/scenario")
@@ -822,9 +866,32 @@ def vehicle_health_announcement_endpoint():
     if not getattr(config, "VEHICLE_HEALTH_ENABLED", True):
         return {"announce": None, "reason": "disabled",
                 "poll_ms": config.HEALTH_POLL_MS}
+
+    # Feed the monitors first, then ask. This poll and /vehicle/tires are the
+    # only two things that advance the diagnostic engine, and this one is the
+    # one that keeps running when nobody has the dashboard open.
+    _feed_diagnostics(tires.snapshot())
+
+    now = time.time()
     issues = vehicle_health.issues()
-    out = _health_policy.tick(issues, time.time())
+    out = _health_policy.tick(issues, now)
+
+    # The communication ledger is the ENGINE's, not the policy's, because it has
+    # to survive a restart: a driver who has already been told about a tire must
+    # not be told again because the process bounced. The policy stays pure and
+    # writes nothing — it decides, and the write happens here.
+    ann = out.get("announce")
+    if ann and ann.get("issue_id"):
+        tire_diag.engine().note_announced(ann["issue_id"], ann.get("severity"), now)
+    proposal = out.get("proposal")
+    if proposal and proposal.get("issue_id"):
+        tire_diag.engine().note_shadow_proposal(
+            proposal["issue_id"], proposal.get("text", ""),
+            proposal.get("severity"), proposal.get("would_have_fired_because", ""),
+            now)
+
     out["poll_ms"] = config.HEALTH_POLL_MS
+    out["shadow_mode"] = bool(config.TIRE_DIAG_SHADOW_MODE)
     # Enough state for the panel to stay in step with what RIO believes, without
     # it having to compute anything: same contract as every other payload here.
     out["overall_status"] = vehicle_health.overall_status(issues)
@@ -869,11 +936,78 @@ def vehicle_health_policy_endpoint():
     return {"state": _health_policy.state(), "log": _health_policy.log[-40:]}
 
 
+# ---------------------------------------------------------------------------
+# Tire diagnostics (tire_diag/) — OBD-inspired, not OBD-II
+# ---------------------------------------------------------------------------
+# RIO Tire Health is not an OBD-II system and emits no SAE powertrain codes.
+# These endpoints are the service view: what each monitor could and could not
+# evaluate, what it found, what has been confirmed, and the frozen evidence
+# behind each confirmation. Nothing here is shown to the driver — the
+# conversation layer gets driver_term and nothing else.
+
+@app.get("/vehicle/diagnostics")
+def vehicle_diagnostics_endpoint():
+    """Monitor readiness, issues and drive cycle. The whole diagnostic state.
+
+    `status` and `last_result` are separate fields on every monitor, and that is
+    the point of the view: a monitor that has not run has no result, and
+    reporting either as a pass would be the system claiming more certainty than
+    its evidence supports.
+    """
+    return tire_diag.state()
+
+
+@app.get("/vehicle/diagnostics/events")
+def vehicle_diagnostics_events_endpoint(limit: int = Query(default=100),
+                                        issue_id: str = Query(default=None)):
+    """The append-only record: candidates, confirmations, freeze frames,
+    resolutions, recurrences, relearns, and every announcement — including the
+    ones shadow mode only proposed."""
+    from tire_diag import store as tire_store
+    return {"events": tire_store.read_events(limit=limit, issue_id=issue_id),
+            "paths": tire_store.paths()}
+
+
+@app.get("/vehicle/diagnostics/catalogue")
+def vehicle_diagnostics_catalogue_endpoint():
+    """Every diagnostic code and every monitor definition, fully described.
+
+    A service view, deliberately verbose. These identifiers never reach the
+    driver: RIO says "your rear-left tire may have a slow leak", not
+    "RIO-TIRE-POSSIBLE-LEAK-RL is active".
+    """
+    return {"codes": tire_codes.service_view(),
+            "monitors": tire_monitors.definitions_view(),
+            "shadow_mode": bool(config.TIRE_DIAG_SHADOW_MODE)}
+
+
+@app.post("/vehicle/diagnostics/relearn")
+def vehicle_diagnostics_relearn_endpoint(corner: str = Query(default=None),
+                                         reason: str = Query(default=""),
+                                         by: str = Query(default="driver")):
+    """Sensors replaced, tires rotated, or a baseline deliberately reset.
+
+    Deletes nothing. Trend monitors go NOT_READY because they genuinely are;
+    absolute pressure monitoring stays live the moment a reliable reading
+    exists, and a relearn can never suppress a validated critical condition.
+    """
+    return tire_diag.engine().relearn(corner=corner, reason=reason, by=by)
+
+
 # --- Phase 2.5 session endpoints ---
 
 @app.post("/session/start")
 def session_start_endpoint(metadata: dict = Body(default=None, embed=True)):
     sid = sessions.start_session(metadata=metadata)
+    # A drive cycle rides on the session rather than inventing its own notion of
+    # a drive. sessions.py already knows when one starts and ends, including the
+    # untidy ending where the client simply vanishes — see _teardown_session.
+    try:
+        eng = tire_diag.engine()
+        eng.cycles.note_session_start(sid, active_issue_ids=eng.active_issue_ids())
+    except Exception as e:
+        print(f"[tire_diag] drive cycle start failed: {type(e).__name__}: {e}",
+              flush=True)
     return {"session_id": sid}
 
 
@@ -898,6 +1032,16 @@ def _teardown_session(session_id: str, reason: str = "closed") -> bool:
     key = _visual_key(session_id)
     framebuf.drop_ring(key)
     visual_qa.drop_session(key)
+    # The drive cycle ends with the drive. Note what does NOT happen here: no
+    # diagnostic issue is cleared, no monitor counter is reset and no history is
+    # dropped. A drive ending is not evidence that a tire was fixed, and a
+    # system where ending a session repaired the car would be one where the way
+    # to clear a fault is to close the tab.
+    try:
+        tire_diag.engine().cycles.note_session_end(session_id)
+    except Exception as e:
+        print(f"[tire_diag] drive cycle end failed: {type(e).__name__}: {e}",
+              flush=True)
     return closed
 
 

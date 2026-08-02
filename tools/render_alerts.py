@@ -32,14 +32,34 @@ AUDIO_DIR = Path(__file__).resolve().parent.parent / "static" / "audio"
 # Exactly the lines whose LINE_AUDIO is a clip id rather than "tts".
 CLIP_LINES = [k for k, v in live_policy.LINE_AUDIO.items() if v != "tts"]
 
+# The tire diagnostic fast path. Two conditions are allowed to interrupt a
+# driver before ordinary confirmation completes, and both are pre-rendered for
+# the same reason the headway red tier is: waiting on a TTS round trip is the
+# thing a fast path exists to avoid.
+#
+# The words live here rather than in vehicle_health_policy.LINE because they are
+# fixed clips, not templates -- a pre-rendered line cannot name a corner or a
+# pressure, so it says the thing that is true of all of them and the dashboard
+# carries the detail. That is a real constraint of the mechanism, not a
+# shortcut: a clip per corner per pressure is not a set anyone can render.
+TIRE_CLIPS = {
+    "tire_critical":
+        "Pull over when it's safe — one of your tires is dangerously low and "
+        "still going down.",
+    "tire_sensor_lost":
+        "I've lost the sensor on a tire that was already losing air. Check it "
+        "by hand when you stop.",
+}
+
 
 def render(force: bool = False) -> list:
     import voice   # imported late: it constructs an ElevenLabs client at import
 
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     out = []
-    for line in CLIP_LINES:
-        text = live_policy.LINE_TEXT[line]
+    everything = [(line, live_policy.LINE_TEXT[line]) for line in CLIP_LINES]
+    everything += sorted(TIRE_CLIPS.items())
+    for line, text in everything:
         path = AUDIO_DIR / f"{line}.mp3"
         if path.exists() and not force:
             out.append((line, path, path.stat().st_size, "kept"))
@@ -67,11 +87,12 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.list:
-        for line in CLIP_LINES:
+        listing = [(k, live_policy.LINE_TEXT[k]) for k in CLIP_LINES]
+        listing += sorted(TIRE_CLIPS.items())
+        for line, text in listing:
             p = AUDIO_DIR / f"{line}.mp3"
             size = p.stat().st_size if p.exists() else 0
-            print(f"  {line:16} {'OK ' if size else '-- '} {size:>7} B  "
-                  f"{live_policy.LINE_TEXT[line]!r}")
+            print(f"  {line:18} {'OK ' if size else '-- '} {size:>7} B  {text!r}")
         return 0
 
     if not os.getenv("ELEVENLABS_API_KEY") or not os.getenv("ELEVENLABS_VOICE_ID"):
