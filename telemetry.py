@@ -685,6 +685,18 @@ def _band(sensor_id: str) -> dict:
     return config.TELEMETRY_BANDS.get(_cfg_key(sensor_id), {})
 
 
+def band(sensor_id: str) -> dict:
+    """The configured limits for a channel. Read-only.
+
+    Public because vehicle_health.py needs to know HOW FAR past a limit a
+    reading is, not just that it is past one — "how much worse did this get" is
+    the whole of the announcement policy's worsening test. Going through here
+    rather than reading config.TELEMETRY_BANDS directly keeps the tire channels'
+    key aliasing (_cfg_key) in one place.
+    """
+    return dict(_band(sensor_id))
+
+
 def _classify(spec: SensorSpec, r: Optional[SensorReading],
               now: float, engine_running: bool) -> Tuple[str, str]:
     """-> (status, detail). One channel, everything decided.
@@ -825,6 +837,17 @@ class _Runtime:
                 self._started_at = now
             return max(0.0, now - self._started_at)
 
+    def peek(self, running: bool, now: float) -> float:
+        """The same answer update() would give, without starting the clock.
+
+        A read-only snapshot must not be able to decide that the engine started
+        at the moment somebody asked RIO a question.
+        """
+        with self._lock:
+            if not running or self._started_at is None:
+                return 0.0
+            return max(0.0, now - self._started_at)
+
     def reset(self) -> None:
         with self._lock:
             self._started_at = None
@@ -896,11 +919,26 @@ def _headline(rows: List[dict], any_reading: bool) -> Tuple[str, str]:
 # The one thing app.py calls
 # ---------------------------------------------------------------------------
 
-def snapshot() -> dict:
+def snapshot(record: bool = True) -> dict:
     """Everything the Vehicle Health column renders, in the shape it renders it.
 
     Nothing in here requires the caller to know which provider produced what,
     and nothing downstream is allowed to compute anything from it.
+
+    `record=False` makes this a pure read.
+
+    This is not a micro-optimisation, it is a correctness fix for a second
+    caller. A snapshot normally has three side effects: it pushes every value
+    into the 20 s trend ring, it advances the engine runtime clock, and it hands
+    a frame to the insight engine. Those are all correct ONCE PER POLL, at the
+    dashboard's 1 Hz cadence, because they are what makes a trend a trend.
+
+    vehicle_health.py reads this on a conversation turn and on the announcement
+    poll — cadences that have nothing to do with the sample rate. Left recording,
+    a driver who asked three questions in a row would fit a slope across nine
+    samples of a 20 s window, and the arrow on the panel would report a direction
+    caused by having been asked about. So the conversation layer reads with
+    record=False and observes without disturbing.
     """
     now = time.time()
     readings: Dict[str, SensorReading] = {}
@@ -925,8 +963,9 @@ def snapshot() -> dict:
                           and rpm_reading.value is not None
                           and rpm_reading.value >= config.TELEMETRY_ENGINE_RUNNING_RPM)
 
-    for sensor_id, r in readings.items():
-        _history.push(sensor_id, r.value, r.at or now)
+    if record:
+        for sensor_id, r in readings.items():
+            _history.push(sensor_id, r.value, r.at or now)
 
     rows = [_normalize(spec, readings.get(spec.id), now, engine_running)
             for spec in ALL_SENSORS]
@@ -939,13 +978,15 @@ def snapshot() -> dict:
     age = (now - newest) if newest else None
     stale = age is not None and age > config.TELEMETRY_STALE_AFTER_S
 
-    runtime_s = _runtime.update(engine_running, now)
+    runtime_s = _runtime.update(engine_running, now) if record \
+        else _runtime.peek(engine_running, now)
 
     # Hand the frame to the insight engine on the telemetry cadence rather than
     # on the insights cadence. The baselines want every sample; the log wants to
     # be read once every fifteen seconds. Those are different jobs and they get
     # different clocks.
-    insights.observe(_frame(rows, readings, engine_running, now))
+    if record:
+        insights.observe(_frame(rows, readings, engine_running, now))
 
     ecu = _ecu()
     return {

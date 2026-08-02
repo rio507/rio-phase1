@@ -203,6 +203,18 @@ TIRE_TEMP_CRITICAL_F = 180.0
 # threshold that can flag a puncture while the pressure is still in band.
 TIRE_TREND_LEAK_PSI_24H = -1.5
 
+# Loss over 24 hours that is not a leak any more. TIRE_TREND_LEAK_PSI_24H catches
+# a puncture on the day it happens; this catches one that will not last the
+# journey — 6 PSI a day is a tire that will be flat before tomorrow morning, and
+# it is the difference between "check it soon" and RIO saying something out loud.
+TIRE_RAPID_LOSS_PSI_24H = -6.0
+
+# Below this the tire is not under-inflated, it is failing. A 15 PSI tire at road
+# speed is running on its sidewall and building heat faster than it can shed it;
+# the distinction from TIRE_PRESSURE_CRITICAL_DELTA exists so the words RIO uses
+# can be "pull over" rather than "worth stopping".
+TIRE_BLOWOUT_PSI = 15.0
+
 # Sensor battery. TPMS cells are 5-10 year lithium units that fall off a cliff
 # rather than fading, so this is "book the replacement", not "urgent".
 TIRE_BATTERY_LOW_PCT = 20.0
@@ -430,3 +442,44 @@ INSIGHTS_NOMINAL_COOLDOWN_S = 10800.0
 # payload and labelled as such on screen. A demo that silently fabricates
 # history it presents as measured is the one thing this layer must never do.
 INSIGHTS_SEED_DEMO = True
+
+
+# ---------------------------------------------------------------------------
+# Vehicle health — the conversation layer and the announcement channel
+# ---------------------------------------------------------------------------
+# What lives here and what deliberately does not.
+#
+# HERE: the cadences and the plumbing — how often the browser asks whether RIO
+# has something to say, and how much of the health picture a conversation turn
+# is allowed to cost.
+#
+# NOT HERE: the severity threshold that makes RIO speak, the cooldowns, and the
+# words. Those are in vehicle_health_policy.py's PROVISIONAL block, for the same
+# reason headway/live_policy.py keeps its own: that module imports NOTHING, and a
+# `import config` in it would be a hole in the firewall the whole design rests
+# on. Everything in it is a module constant and is tuned there.
+
+VEHICLE_HEALTH_ENABLED = True
+
+# How often the browser asks the server whether a critical announcement is due.
+# Sent down in the payload rather than written into the JavaScript, like every
+# other cadence in this codebase. This is also the policy's tick rate: the
+# server decides, the client only speaks, so nothing happens between polls.
+#
+# 3 s, not 1 s: the tire poll is already 5 s and a pressure that crosses a
+# threshold is not a millisecond-critical event the way a closing gap is. The
+# thing that must be fast is the arbiter cutting in once the decision is made,
+# and that is client-side and immediate.
+HEALTH_POLL_MS = 3000
+
+# Speed above which a tire sensor going quiet stops being a maintenance note and
+# becomes something RIO says out loud. A sensor that drops out in the driveway is
+# a dead battery; one that drops out at 60 mph is a corner of the car nobody can
+# see any more, on the one channel where the failure mode is a blowout.
+HEALTH_DRIVING_MPH = 5.0
+
+# How many issues the full health context may carry into a conversation turn.
+# A driver who asks "is anything wrong" wants the answer, not a fault log, and
+# the issue list is already sorted worst-first — so the cut falls on the ones
+# that were never going to be mentioned.
+HEALTH_MAX_ISSUES = 6

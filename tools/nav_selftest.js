@@ -354,6 +354,81 @@ section('speech arbiter — one mouth');
     }
 
     // -----------------------------------------------------------------------
+    // Vehicle health (P2). Inserted between the safety line and the near-tier
+    // turn: a possible blowout outranks a junction and yields to a closing gap.
+    // The policy that decides whether anything at this tier EVER fires is
+    // server-side and deterministic (vehicle_health_policy.py, covered by
+    // tools/vehicle_health_selftest.py); what is asserted here is only the
+    // ladder — that inserting a tier did not reorder the ones that existed.
+    // -----------------------------------------------------------------------
+    section('arbiter — vehicle health sits between safety and navigation');
+    {
+      const P = speech.P;
+      ok(P.SAFETY < P.VEHICLE_HEALTH && P.VEHICLE_HEALTH < P.TURN_NEAR
+         && P.TURN_NEAR < P.NAV && P.NAV < P.CONVO,
+         'the ladder is safety > vehicle health > near turn > nav > conversation');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const ends = [];
+      const near = item({ priority: speech.P.TURN_NEAR, group: 'nav:m3', id: 'near',
+                          onDone: r => ends.push('near:' + r) });
+      const health = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                            id: 'health:blowout',
+                            text: "Pull over when it's safe." });
+      arb.say(near); await wait();
+      arb.say(health); await wait();
+      ok(arb.state().speaking.id === 'health:blowout',
+         'a critical health announcement cuts through a turn announcement');
+      ok(ends[0] === 'near:preempted',
+         'and the turn is dropped rather than resumed behind it');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const health = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                            id: 'health:blowout' });
+      const hw = item({ priority: speech.P.SAFETY, group: 'headway', id: 'too_close' });
+      arb.say(health); await wait();
+      arb.say(hw); await wait();
+      ok(arb.state().speaking.id === 'too_close',
+         'a gap warning still pre-empts vehicle health — never above safety');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer' });
+      const health = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                            id: 'health:crit' });
+      arb.say(convo); await wait();
+      arb.say(health); await wait();
+      ok(arb.state().speaking.id === 'health:crit',
+         'and it interrupts casual conversation, which is the whole point');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const ends = [];
+      const first = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                           id: 'health:low', onDone: r => ends.push('low:' + r) });
+      const second = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                            id: 'health:blowout' });
+      arb.say(first); await wait();
+      arb.say(second); await wait();
+      ok(ends[0] === 'low:superseded' && arb.state().speaking.id === 'health:blowout',
+         'a worse fault replaces the announcement still being spoken');
+    }
+    {
+      const arb = speech.makeArbiter();
+      const hw = item({ priority: speech.P.SAFETY, group: 'headway', id: 'hw' });
+      const nav = item({ priority: speech.P.NAV, group: 'nav:m0', id: 'far' });
+      const health = item({ priority: speech.P.VEHICLE_HEALTH, group: 'health',
+                            id: 'health:crit' });
+      const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer' });
+      arb.say(hw); await wait();
+      arb.say(nav); arb.say(convo); arb.say(health); await wait();
+      ok(arb.state().queued.map(i => i.id).join(',') === 'health:crit,far,answer',
+         'queued behind a warning: health, then the turn, then conversation');
+    }
+
+    // -----------------------------------------------------------------------
     // Optional: the same progression checks against a real Google route.
     // -----------------------------------------------------------------------
     const fixture = process.argv[2];

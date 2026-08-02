@@ -44,12 +44,20 @@ than no tire panel. The browser is a renderer. If you find yourself wanting to
 compute something in static/rio_vehicle.js, it belongs in this file or in
 telemetry.py.
 
-RIO does not talk about tires
------------------------------
-Deliberately, in this phase. There is no arbiter call here and no voice path.
-Tire-aware speech is a later phase and will go out through the speech arbiter at
-coaching priority like everything else with a mouth — see static/rio_speech.js.
-Display only, for now.
+RIO does talk about tires now — and still not from this file
+------------------------------------------------------------
+The earlier version of this header said tire-aware speech was a later phase and
+would go out through the speech arbiter when it arrived. It has arrived, and the
+sentence about this file is unchanged: there is no arbiter call here and no
+voice path here. vehicle_health.py reads snapshot() and normalizes it into the
+context RIO reasons about; vehicle_health_policy.py decides whether a fault is
+worth interrupting for and owns the words; static/rio_health.js submits that
+decision to the existing arbiter at VEHICLE_HEALTH priority. What this file
+gained is two extra CRITICAL notes (Possible Blowout, Losing Pressure Fast) so
+that the dashboard and RIO cannot describe the same tire differently.
+
+The rule the split protects is unchanged: this is still the only place in the
+codebase that knows what 29 PSI means.
 """
 from __future__ import annotations
 
@@ -393,6 +401,20 @@ def _classify(r: Optional[TireReading], now: float) -> tuple:
     delta = r.pressure_psi - target
     against = f"{_psi_text(r.pressure_psi)} PSI against a {target:.1f} PSI target"
 
+    # Two refinements of CRITICAL, added when RIO gained a mouth for this panel.
+    # Both are the SAME state and the same severity as the pressure-critical
+    # branch below -- the column colours and the banner do not change -- and they
+    # exist because "the tire is dangerously low" and "the tire is failing right
+    # now" call for different words out loud, and the dashboard and RIO must not
+    # be able to disagree about which one it is. Ordered worst-first, so a tire
+    # that is both is described as the worse of the two.
+    if r.pressure_psi <= config.TIRE_BLOWOUT_PSI:
+        return "CRITICAL", "Possible Blowout", \
+            f"{_psi_text(r.pressure_psi)} PSI · pull over as soon as it is safe"
+    if r.trend_psi_24h is not None and r.trend_psi_24h <= config.TIRE_RAPID_LOSS_PSI_24H:
+        return "CRITICAL", "Losing Pressure Fast", \
+            f"{_signed_psi(r.trend_psi_24h)} over the last 24 hours · {against}"
+
     if delta <= -config.TIRE_PRESSURE_CRITICAL_DELTA:
         return "CRITICAL", "Pressure Critical", against + " · do not drive on it"
     if r.temp_f is not None and r.temp_f >= config.TIRE_TEMP_CRITICAL_F:
@@ -600,6 +622,19 @@ def snapshot() -> dict:
         "scenario": scenario,
         "scenarios": MockTireProvider.scenarios() if scenario is not None else [],
     }
+
+
+def bare_note(tire: dict) -> str:
+    """The note on a normalized corner, without the warning glyph.
+
+    The glyph travels with the note so the browser never has to know which
+    states deserve one (see _normalize). Anything that wants to READ the note --
+    the banner builder, and now vehicle_health.py, which keys its issue types
+    off it -- has to take it back off, and doing that in one place is what stops
+    the non-breaking space in _WARN_GLYPH from being a bug in every caller that
+    tries it with an ordinary one.
+    """
+    return (tire.get("note") or "").replace(_WARN_GLYPH, "").strip()
 
 
 def current_scenario() -> Optional[str]:

@@ -33,9 +33,14 @@
  * anywhere in this file — adding boost, transmission temperature or suspension
  * travel is a row in telemetry.py's SENSORS table and nothing here.
  *
- * RIO does not speak about telemetry in this phase. Nothing here touches
- * RIO.speech — the arbiter is not involved, deliberately, and an insight is not
- * an alert. See the headers of telemetry.py and insights.py.
+ * This file still does not speak. Nothing here touches RIO.speech — the arbiter
+ * is not involved, deliberately, and an insight is not an alert. See the headers
+ * of telemetry.py and insights.py.
+ *
+ * RIO does now talk about the car, and it happens in rio_health.js, which is a
+ * separate file for exactly this reason: rendering everything and announcing
+ * almost nothing are opposite jobs, and a file that did both would end up
+ * speaking whatever it had just drawn.
  */
 (function (root) {
   'use strict';

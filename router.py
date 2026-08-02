@@ -42,6 +42,20 @@ READ_TEXT = "read_visible_text"
 CLARIFY = "clarification_required"
 NON_VISUAL = "non_visual_question"
 
+# A question about the CAR rather than about the world outside it. Not in the
+# visual spec's vocabulary because it is not a visual question at all — it is
+# routed here, in the one router, because a driver does not know or care that
+# "what's that up ahead" and "how are my tires" are answered by different
+# subsystems, and a second classifier would eventually disagree with this one
+# about which of them a sentence belongs to.
+#
+# It is answered on the ordinary conversation path (is_visual() is False for
+# it). What the classification actually buys is two things the plain path cannot
+# do for itself: the full vehicle-health structure gets injected into the turn
+# instead of the one-line summary, and the announcement policy is told the
+# driver asked — which is one of the spec's cooldown resets.
+VEHICLE_HEALTH = "vehicle_health_question"
+
 # Not in the spec's list, and needed: the spec names the type for "RIO must ask
 # which one", but a clarification is a two-turn exchange and the second turn --
 # the driver answering -- is a different thing to route. It never comes from the
@@ -50,6 +64,9 @@ CLARIFY_RESPONSE = "clarification_response"
 
 PHASE_A_TYPES = {SCENE, OBJECT, FOLLOW_UP, NON_VISUAL}
 PHASE_B_TYPES = {COMPARISON, LANDMARK, READ_TEXT, CLARIFY, CLARIFY_RESPONSE}
+# Neither phase: a different axis entirely. Grouped so `classify` can be asked
+# "is this one of the non-visual specialisations" without listing them.
+NON_VISUAL_TYPES = {NON_VISUAL, VEHICLE_HEALTH}
 
 # Below this the rules do not trust themselves and the model is asked.
 RULE_CONFIDENCE_MIN = 0.6
@@ -119,6 +136,47 @@ _READ_TEXT_PATTERNS = [
     r"\bread (the|that|it)\b",
     r"\bwhat'?s (written|printed) on\b",
     r"\bwhat (sign|plate|number plate|licence plate|license plate)\b",
+]
+
+# --- vehicle health ---------------------------------------------------------
+# The car, not the road. Two groups, because they fail differently.
+#
+# The first is unambiguous: it names a system. "How are my tires", "what's my
+# oil pressure", "is the battery ok". These can be matched anywhere in the
+# sentence because nothing else in this router wants the word "tire".
+#
+# The second is the spec's own examples and they are NOT unambiguous in
+# isolation -- "is everything okay?" is also something you say to a friend who
+# went quiet. They are matched only as a whole utterance (anchored, short), and
+# the reading is deliberate: a driver who says nothing but "is anything wrong?"
+# in a car is asking about the car. Both readings end up on the conversation
+# path either way; what a false positive costs is a larger injected context, and
+# what a false negative costs is RIO answering "how are my tires" from a
+# one-line summary. That asymmetry is why the anchored group exists at all.
+_HEALTH_PATTERNS = [
+    # System named outright.
+    r"\bhow (are|is|'?s) (my|the) (tyres?|tires?|battery|engine|oil|coolant|car|camaro)\b",
+    r"\b(tyre|tire) (pressure|health|temperature|temps?)\b",
+    r"\bwhich (tyre|tire|one) is (low|flat|leaking|down)\b",
+    r"\bhow much air\b",
+    r"\bare my (tyres?|tires?) (ok|okay|alright|healthy|good|fine|low|flat)\b",
+    r"\b(is|are) (my|the) (battery|oil|coolant|engine|tyres?|tires?)\b",
+    r"\bwhat'?s (my|the) (tyre|tire|oil|coolant|fuel|battery)\b",
+    r"\b(oil|fuel) pressure\b",
+    r"\bcheck engine\b",
+    r"\bvehicle health\b",
+    r"\b(health|status) report\b",
+    r"\bhow'?s (she|the camaro|the car) (running|doing|holding up)\b",
+    r"\banything wrong with (the|my) (car|camaro|tyres?|tires?|engine)\b",
+    r"\bis (the|my) (car|camaro) (ok|okay|alright|healthy|fine)\b",
+    # The spec's broad ones. Anchored: the whole utterance, or nearly.
+    r"^\s*is everything (ok|okay|alright|fine|good)\b",
+    r"^\s*is (there )?anything wrong\b",
+    r"^\s*((is|are) there )?any (issues?|problems?|faults?)\b",
+    r"^\s*what should i be worried about\b",
+    r"^\s*(give me|i want|can i get) a (vehicle |car )?health report\b",
+    r"^\s*(any|anything) (i should|to) (know|worry) about\b",
+    r"^\s*everything (ok|okay|alright|good|fine)\b",
 ]
 
 _LANDMARK_PATTERNS = [
@@ -243,6 +301,15 @@ def classify(question: str, has_referent: bool = False,
     has_demo = bool(re.search(_DEMONSTRATIVE, text))
     has_side = bool(re.search(r"\b(%s)\b" % _SIDE_WORDS, text))
 
+    # The car, before anything about the world outside it. It sits here — ahead
+    # even of the Phase B types — because a health question is the one class
+    # that must never reach the camera: "is everything okay?" answered from a
+    # photograph of the road is RIO confidently describing traffic while the
+    # driver is asking about a tire. It is also the cheapest branch to be wrong
+    # in, since both outcomes stay on the conversation path.
+    if _any(_HEALTH_PATTERNS, text):
+        return _result(VEHICLE_HEALTH, None, 0.85, "rules", t0)
+
     # Phase B types first: they are more specific than the Phase A ones and
     # would otherwise be swallowed by them ("what does that sign say" contains
     # "what does that").
@@ -296,6 +363,7 @@ def _result(request_type, reference, confidence, method, t0) -> dict:
         "confidence": confidence,
         "method": method,
         "phase_b": request_type in PHASE_B_TYPES,
+        "vehicle_health": request_type == VEHICLE_HEALTH,
         "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
     }
 
@@ -309,6 +377,9 @@ Types:
 - object_comparison: comparing two visible things
 - location_or_landmark_question: asking where they are or about a place/building
 - read_visible_text: asking what a sign, plate or label says
+- vehicle_health_question: asking about the condition of THEIR OWN car — tires,
+  pressure, battery, oil, coolant, temperature, whether anything is wrong with
+  it, or for a status report on it
 - non_visual_question: anything not about what is currently visible
 
 An active visual referent {referent_state}.
@@ -339,7 +410,7 @@ def _classify_with_model(question: str, has_referent: bool):
             return None
         obj = json.loads(m.group(0))
         rt = str(obj.get("request_type") or "").strip()
-        if rt not in PHASE_A_TYPES | PHASE_B_TYPES:
+        if rt not in PHASE_A_TYPES | PHASE_B_TYPES | NON_VISUAL_TYPES:
             return None
         ref = obj.get("object_reference")
         ref = str(ref).strip() if ref and str(ref).lower() != "null" else None
@@ -350,4 +421,15 @@ def _classify_with_model(question: str, has_referent: bool):
 
 
 def is_visual(request_type: str) -> bool:
-    return request_type != NON_VISUAL
+    """Does this question need the camera?
+
+    A vehicle-health question does not, and saying so here is what keeps it off
+    the expensive path: /talk and /ask both use this to decide whether to
+    prepare a visual turn, so a health question falls through to the ordinary
+    conversation path exactly as a greeting does.
+    """
+    return request_type not in NON_VISUAL_TYPES
+
+
+def is_vehicle_health(request_type: str) -> bool:
+    return request_type == VEHICLE_HEALTH

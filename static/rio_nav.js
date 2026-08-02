@@ -73,10 +73,15 @@
     // Tier -> how RIO treats the announcement. The near tier is the only nav
     // line that outranks other nav lines, and the TTLs are the window in which
     // each is still true: a "near" line 3 s stale is a turn already missed.
+    //
+    // Named, not numbered. These used to be the literals 2 and 3, which was
+    // fine until a tier was inserted above them and the numbers meant something
+    // else — the ladder lives in rio_speech.js and this file should not hold a
+    // second, silent copy of it.
     var TIER_RULES = {
-      far: { priority: 3, ttlMs: 12000 },
-      mid: { priority: 3, ttlMs: 6000 },
-      near: { priority: 2, ttlMs: 3000 },
+      far: { priority: RIO.speech.P.NAV, ttlMs: 12000 },
+      mid: { priority: RIO.speech.P.NAV, ttlMs: 6000 },
+      near: { priority: RIO.speech.P.TURN_NEAR, ttlMs: 3000 },
     };
 
     var engine = null;         // rio_navcore engine for the active route

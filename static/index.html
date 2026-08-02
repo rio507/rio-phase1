@@ -1299,11 +1299,14 @@
   </section>
 
   <!-- ============ COLUMN 5 - VEHICLE HEALTH ============
-       Display only. RIO does not speak about telemetry in this phase — there is
-       no arbiter call anywhere in this column and no voice path. A predictive
-       insight is a line in a log, not an alert. Telemetry-aware speech is a
-       later phase and will go out through static/rio_speech.js at coaching
-       priority like everything else with a mouth.
+       Display only, and it stayed that way when RIO gained a voice for the car.
+       There is still no arbiter call anywhere in this column and no voice path
+       in rio_vehicle.js: a predictive insight is a line in a log, not an alert.
+       What speaks is rio_health.js, which is a separate file with no render
+       function, driven by a server-side policy that only ever fires on a
+       CRITICAL fault — and it goes out through static/rio_speech.js like
+       everything else with a mouth. The column shows everything; RIO mentions
+       almost none of it.
 
        There is not one sensor name, threshold, unit or piece of wording in this
        markup — the three hosts below are empty and every node inside them is
@@ -2980,14 +2983,22 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_nav.js"></script>
 
-<!-- ---- Vehicle Health. Independent of everything above it: it owns one
-     column, polls two endpoints and speaks to nobody, so load order does not
-     matter and it deliberately has no handle on RIO.speech. ---- -->
+<!-- ---- Vehicle Health, in two halves that deliberately do not know about
+     each other:
+       rio_vehicle.js   the column. Polls two endpoints, renders what the server
+                        already worded, speaks to nobody, holds no handle on
+                        RIO.speech. Unchanged by the conversation layer.
+       rio_health.js    the mouth. Polls a third endpoint and hands whatever the
+                        server's deterministic policy decided is worth
+                        interrupting for to the arbiter above. It renders
+                        nothing and decides nothing.
+     rio_health.js needs RIO.speech, so it loads after it. ---- -->
 <script src="/static/rio_vehicle.js"></script>
+<script src="/static/rio_health.js"></script>
 <script>
 /* One mouth, one line on the HUD. Whatever the arbiter starts playing is what
-   the Voice Layer column shows — headway and navigation alike, which is the
-   point of there being an arbiter at all. */
+   the Voice Layer column shows — headway, navigation and vehicle health alike,
+   which is the point of there being an arbiter at all. */
 document.addEventListener('DOMContentLoaded', () => {
   const spoken = document.getElementById('spokenline');
   if (!spoken) return;

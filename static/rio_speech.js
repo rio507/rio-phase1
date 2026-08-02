@@ -10,10 +10,19 @@
  * of what is audible right now; callers own only the audio.
  *
  *   P1  safety — headway warnings. Pre-empts anything.
- *   P2  the near-tier turn. The one nav line that is genuinely time-critical:
+ *   P2  vehicle health, critical only. A possible blowout, a tire losing air
+ *       fast, oil pressure gone: things that end the drive badly if the next
+ *       four seconds are spent hearing about a turn instead. It sits BELOW the
+ *       gap warning because a collision is measured in seconds and a failing
+ *       tire in minutes, and ABOVE navigation because missing a junction costs
+ *       three minutes and missing this costs the car. The deterministic policy
+ *       that decides whether anything at this tier ever fires is server-side,
+ *       in vehicle_health_policy.py — this file only decides who gets the
+ *       mouth, exactly as it does for headway.
+ *   P3  the near-tier turn. The one nav line that is genuinely time-critical:
  *       four seconds out, saying it late is the same as not saying it.
- *   P3  every other nav announcement.
- *   P4  conversation — RIO answering the driver, including a visual answer
+ *   P4  every other nav announcement.
+ *   P5  conversation — RIO answering the driver, including a visual answer
  *       about something out of the window. Lowest on purpose: it is the only
  *       tier the driver can simply ask for again, and it is the longest, so a
  *       turn or a gap warning arriving mid-sentence must cut straight through
@@ -41,7 +50,11 @@
 (function (root) {
   'use strict';
 
-  var P = { SAFETY: 1, TURN_NEAR: 2, NAV: 3, CONVO: 4 };
+  /* Lower is more urgent. Callers name these rather than passing integers, so
+     inserting a tier is an edit here and nowhere else — which is what this
+     change was: VEHICLE_HEALTH went in at 2 and everything below it moved down
+     one, with every relative order preserved. */
+  var P = { SAFETY: 1, VEHICLE_HEALTH: 2, TURN_NEAR: 3, NAV: 4, CONVO: 5 };
 
   // A play() that never settles would leave RIO mute for the rest of the drive,
   // so every item is on a watchdog. Longer than any line RIO says.

@@ -28,6 +28,8 @@ import nav
 import tires
 import telemetry
 import insights
+import vehicle_health
+import vehicle_health_policy
 import framebuf
 import router as request_router
 import visual_qa
@@ -245,6 +247,12 @@ def _route_and_prepare(transcript: str, session_id: str):
             transcript,
             has_referent=sess.active_referent() is not None,
             pending_clarification=sess.pending_clarification() is not None)
+        if request_router.is_vehicle_health(route["request_type"]):
+            # The driver asked how the car is. One of the spec's cooldown
+            # resets, and it belongs here rather than in the health layer: this
+            # is the only place that knows a question was asked, and the policy
+            # is deliberately incapable of finding out on its own.
+            _health_policy.note_status_request(time.time())
         if not request_router.is_visual(route["request_type"]):
             return route, None
         return route, visual_qa.answer(key, transcript, route)
@@ -291,7 +299,8 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
         reply_parts = []
         audio_len = 0
 
-        tokens = va.stream() if va is not None else llm_interface.generate_stream(transcript)
+        tokens = va.stream() if va is not None \
+            else llm_interface.generate_stream(transcript, route)
 
         for token in tokens:
             buffer += token
@@ -373,7 +382,7 @@ async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=N
         # the ordinary way rather than refusing, so /ask is a complete
         # conversational endpoint and not a visual-only one.
         reply = await run_in_threadpool(
-            lambda: "".join(llm_interface.generate_stream(question)).strip())
+            lambda: "".join(llm_interface.generate_stream(question, route)).strip())
         return {"reply": reply, "request_type": (route or {}).get(
             "request_type", "non_visual_question"), "visual": False,
             "route": route}
@@ -769,6 +778,95 @@ def vehicle_telemetry_scenario_set_endpoint(name: str = Query(...)):
         return {"error": "unknown scenario", "name": name,
                 "scenarios": telemetry.scenarios()}
     return telemetry.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Vehicle health — the conversation context and the announcement channel
+# ---------------------------------------------------------------------------
+# The decision to speak is made HERE, on the server, in deterministic code. The
+# browser polls, and when an announcement is due it submits it to the speech
+# arbiter it already owns. That split is deliberate and it is the same one
+# navigation uses: the policy that decides is server-side and testable, the
+# mouth is client-side because that is where the audio device is.
+#
+# One policy instance for the process — the same single-driver assumption
+# `_last_talk` and nav's route registry already make.
+
+_health_policy = vehicle_health_policy.VehicleHealthPolicy()
+
+
+@app.get("/vehicle/health")
+def vehicle_health_endpoint(full: bool = Query(default=True)):
+    """The normalized vehicle health context.
+
+    The same object the conversation layer injects, exposed for the dashboard,
+    the acceptance tests and anyone debugging what RIO actually knows. Read-only
+    and side-effect free: it does not tick the announcement policy, so opening
+    this in a browser tab cannot consume an announcement the driver should have
+    heard.
+    """
+    return vehicle_health.context(full=full)
+
+
+@app.get("/vehicle/health/announcement")
+def vehicle_health_announcement_endpoint():
+    """Is there something the driver has to be told right now?
+
+    This is the tick. The policy is pure and clockless, so time is supplied
+    here, and everything it decides — including every silence and the reason for
+    it — comes back on the wire where the panel and the log can see it.
+
+    `announce` is null on almost every poll, which is the point: an announcement
+    is what a check engine light does, not what a dashboard does.
+    """
+    if not getattr(config, "VEHICLE_HEALTH_ENABLED", True):
+        return {"announce": None, "reason": "disabled",
+                "poll_ms": config.HEALTH_POLL_MS}
+    issues = vehicle_health.issues()
+    out = _health_policy.tick(issues, time.time())
+    out["poll_ms"] = config.HEALTH_POLL_MS
+    # Enough state for the panel to stay in step with what RIO believes, without
+    # it having to compute anything: same contract as every other payload here.
+    out["overall_status"] = vehicle_health.overall_status(issues)
+    out["issue_count"] = len(issues)
+    return out
+
+
+@app.get("/vehicle/health/voice")
+def vehicle_health_voice_endpoint(id: str = Query(...)):
+    """TTS for one announcement, addressed by the id the policy issued.
+
+    Deliberately not a text-to-speech endpoint, for exactly the reason
+    /nav/voice and /headway_voice are not: the browser sends an id into a table,
+    never a sentence. An id the policy never issued — or one it has since
+    retired — is refused, so the set of things RIO's voice can ever say
+    unprompted about the car is bounded by vehicle_health_policy.LINE and
+    nothing else can add to it.
+
+    The words ride back on X-Health-Text so the Voice Layer column shows what is
+    being spoken rather than its own reconstruction of it.
+    """
+    text = _health_policy.text_for(id)
+    if not text:
+        return {"error": "unknown or expired announcement", "id": id}
+    return StreamingResponse(
+        voice.synthesize_stream(text), media_type="audio/mpeg",
+        headers={
+            "X-Health-Text": quote(text, safe=""),
+            "Access-Control-Expose-Headers": "X-Health-Text",
+            "Cache-Control": "no-store",
+        })
+
+
+@app.get("/vehicle/health/policy")
+def vehicle_health_policy_endpoint():
+    """What the announcement policy is holding, and why it has been quiet.
+
+    Diagnostics. A silence with a reason attached is as informative as an
+    utterance — the same argument headway/live_policy.py's voice_log makes — and
+    without this the only way to know why RIO said nothing is to reproduce it.
+    """
+    return {"state": _health_policy.state(), "log": _health_policy.log[-40:]}
 
 
 # --- Phase 2.5 session endpoints ---
