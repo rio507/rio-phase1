@@ -112,8 +112,9 @@
   /* ---------- 5-column pipeline ---------- */
 
   /* Vehicle Health is the fifth column and is given slightly more than a share:
-     it carries the top-down vehicle with a readout block either side of it, and
-     below about 300px those blocks start wrapping their own two-word labels. */
+     its telemetry rows carry a name, a value, a status word and a trend arrow
+     on one line, and below about 300px "Throttle Position" starts wrapping
+     into the value column beside it. */
   .pipeline {
     display: grid;
     grid-template-columns: 1.3fr 1fr 1fr 1fr 1.2fr;
@@ -754,217 +755,265 @@
 
      Everything below is colour and geometry only. Not one threshold, not one
      number and not one piece of wording lives in this stylesheet or in
-     rio_tires.js — the server sends the state name, this decides what that
-     state looks like. See tires.py.
+     rio_vehicle.js — the server sends the status name, this decides what that
+     status looks like. See telemetry.py and insights.py.
 
      The palette is the dashboard's, unchanged: cyan is normal, amber is
-     "attention", red is "stop", and --text-dimmer means nobody is answering.
-     A dimmed tire is not a broken tire, and it must not look like one. */
+     "attention recommended", red is "immediate issue", and --text-dimmer means
+     nobody is answering. A dimmed row is not a failing sensor and it must not
+     look like one.
 
-  .veh-status {
-    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
-    padding: 9px 12px; margin-bottom: 14px;
+     No gauges, no circular meters, no vehicle graphic. A telemetry screen is a
+     list of channels, and the reason professional motorsport software looks
+     like this is that a list is the only layout where adding the twentieth
+     channel costs nothing. */
+
+  .veh-section {
+    margin: 16px 0 8px;
+    padding-bottom: 5px;
+    font-family: var(--font-ui); font-weight: 700;
+    font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* ---- status banner ----
+     The one-class-per-band shape #headwayhud uses, for the same reason: at a
+     glance the colour IS the message, so it drives the rail, the dot and the
+     headline together. */
+
+  .veh-banner {
+    padding: 10px 12px;
     background: var(--bg-1);
     border: 1px solid var(--border);
     border-left: 2px solid var(--text-dimmer);
     transition: border-left-color 120ms linear, box-shadow 120ms linear;
   }
-  .veh-status-text {
+  .veh-banner-head { display: flex; align-items: center; gap: 8px; }
+  .veh-dot {
+    width: 7px; height: 7px; flex: 0 0 7px;
+    border-radius: 50%;
+    background: var(--text-dimmer);
+  }
+  .veh-banner-text {
     font-family: var(--font-ui); font-weight: 700;
     font-size: 13px; letter-spacing: 0.16em; text-transform: uppercase;
     color: var(--text-dimmer);
   }
-  .veh-status-time {
-    flex: 0 0 auto;
-    font-family: var(--font-mono); font-size: 9.5px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dimmer); white-space: nowrap;
-  }
-  /* Same one-class-per-band shape as #headwayhud, for the same reason: the
-     colour IS the message at a glance, so it drives the rail and the label
-     together. */
-  .veh-status.veh-NORMAL      { border-left-color: var(--accent); }
-  .veh-status.veh-NORMAL .veh-status-text { color: var(--accent); }
-  .veh-status.veh-ATTENTION   { border-left-color: var(--amber); box-shadow: 0 0 14px rgba(255,184,77,0.22); }
-  .veh-status.veh-ATTENTION .veh-status-text { color: var(--amber); }
-  .veh-status.veh-CRITICAL    { border-left-color: var(--red); box-shadow: 0 0 18px rgba(255,107,107,0.34); }
-  .veh-status.veh-CRITICAL .veh-status-text { color: var(--red); }
-  .veh-status.veh-UNAVAILABLE .veh-status-text { color: var(--text-dimmer); }
 
-  /* The vehicle and its four corners. A grid rather than absolute positioning:
-     the readouts have to sit beside the wheels at 300px and at 390px without
-     anybody maintaining two sets of coordinates.
+  /* Live connection, last update, engine runtime — the three facts the spec
+     puts under the headline. Held at the smallest size in the column: they are
+     the answer to "is this panel still talking to anything", not something to
+     read on a healthy car. */
+  .veh-banner-meta {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 4px 8px;
+    margin-top: 9px; padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .veh-meta-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .veh-meta-key {
+    font-family: var(--font-mono); font-size: 8px;
+    letter-spacing: 0.18em; text-transform: uppercase;
+    color: var(--text-dimmer);
+  }
+  .veh-meta-val {
+    font-family: var(--font-mono); font-size: 10.5px;
+    color: var(--text); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .veh-meta-val.veh-link-live { color: var(--accent); }
+  .veh-meta-val.veh-link-lost { color: var(--text-dimmer); }
 
-     Two equal rows, blocks centred in them, car spanning both and stretched to
-     fill. That is what puts each readout level with its own wheel: the row
-     centres land at a quarter and three quarters of the map, which is exactly
-     where the axles are drawn in the SVG. Equal rows also mean a tire growing a
-     status line does not shunt the vehicle off-centre.
+  .veh-banner.veh-NORMAL { border-left-color: var(--accent); }
+  .veh-banner.veh-NORMAL .veh-banner-text { color: var(--accent); }
+  .veh-banner.veh-NORMAL .veh-dot {
+    background: var(--accent); box-shadow: 0 0 8px rgba(95,179,232,0.85);
+  }
+  .veh-banner.veh-ATTENTION {
+    border-left-color: var(--amber); box-shadow: 0 0 14px rgba(255,184,77,0.22);
+  }
+  .veh-banner.veh-ATTENTION .veh-banner-text { color: var(--amber); }
+  .veh-banner.veh-ATTENTION .veh-dot {
+    background: var(--amber); box-shadow: 0 0 8px rgba(255,184,77,0.85);
+  }
+  .veh-banner.veh-CRITICAL {
+    border-left-color: var(--red); box-shadow: 0 0 18px rgba(255,107,107,0.34);
+  }
+  .veh-banner.veh-CRITICAL .veh-banner-text { color: var(--red); }
+  .veh-banner.veh-CRITICAL .veh-dot {
+    background: var(--red); box-shadow: 0 0 8px rgba(255,107,107,0.9);
+  }
+  .veh-banner.veh-UNAVAILABLE .veh-banner-text { color: var(--text-dimmer); }
 
-     Auto side margins, so the whole group shrinks to its content and centres
-     rather than stretching the readouts away from the car on a wide phone. */
-  .tire-map {
-    display: grid;
-    grid-template-columns: 1fr auto 1fr;
-    grid-template-rows: 1fr 1fr;
-    gap: 12px 6px;
-    max-width: 380px; margin: 0 auto;
-  }
-  .tire-car {
-    grid-column: 2; grid-row: 1 / span 2;
-    justify-self: center; align-self: stretch;
-    height: 100%; width: auto;
-  }
-  .tire { align-self: center; }
-  .tire[data-corner="FL"] { grid-column: 1; grid-row: 1; }
-  .tire[data-corner="FR"] { grid-column: 3; grid-row: 1; }
-  .tire[data-corner="RL"] { grid-column: 1; grid-row: 2; }
-  .tire[data-corner="RR"] { grid-column: 3; grid-row: 2; }
+  /* ---- telemetry rows ----
+     Four columns, fixed: name, value, status, trend. Fixed rather than
+     content-sized because the whole readability of a list this long comes from
+     the numbers sharing an edge — a value column that shifts when one channel
+     gains a digit is a column the eye has to re-find on every row. */
 
-  /* Thin line art, one weight, no fill. The body is held below full brightness
-     so the wheels — the only part that ever carries a state — are what the eye
-     lands on. */
-  .tmap-body {
-    fill: none; stroke: var(--accent); stroke-width: 1.6;
-    stroke-linejoin: miter; stroke-linecap: square;
-    opacity: 0.55;
-  }
-  .tmap-wheel {
-    fill: rgba(95,179,232,0.10);
-    stroke: var(--accent); stroke-width: 1.6;
-  }
-  .tmap-wheel.st-WARNING, .tmap-wheel.st-BATTERY_LOW {
-    stroke: var(--amber); fill: rgba(255,184,77,0.20);
-  }
-  .tmap-wheel.st-CRITICAL { stroke: var(--red); fill: rgba(255,107,107,0.22); }
-  /* Dashed and unfilled: nothing is coming from this corner. Deliberately not
-     amber — a sensor that has gone quiet is a sensor fault, not a tire fault,
-     and colouring it like low pressure would be a lie about the car. */
-  .tmap-wheel.st-DISCONNECTED, .tmap-wheel.st-NO_DATA, .tmap-wheel.st-STALE {
-    stroke: var(--text-dimmer); fill: none; stroke-dasharray: 3 3;
-  }
+  .tm-list { display: flex; flex-direction: column; }
+  .tm-scroll { max-height: 430px; overflow-y: auto; }
 
-  .tire {
-    display: flex; flex-direction: column; gap: 2px; min-width: 0;
-    padding: 7px 8px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-  }
-  /* The accent rail faces the car, so the two columns of readouts frame the
-     vehicle instead of pointing away from it. */
-  .tire[data-corner="FL"], .tire[data-corner="RL"] {
-    text-align: right; border-right: 2px solid var(--border);
-  }
-  .tire[data-corner="FR"], .tire[data-corner="RR"] {
-    border-left: 2px solid var(--border);
-  }
-
-  .tire-corner {
-    font-family: var(--font-mono); font-size: 9.5px;
+  .tm-group {
+    margin: 11px 0 4px; padding-bottom: 3px;
+    font-family: var(--font-mono); font-size: 8px;
     letter-spacing: 0.22em; text-transform: uppercase;
     color: var(--text-dimmer);
+    border-bottom: 1px solid rgba(95,179,232,0.12);
   }
-  .tire-psi { display: flex; align-items: baseline; gap: 4px; }
-  .tire[data-corner="FL"] .tire-psi, .tire[data-corner="RL"] .tire-psi { justify-content: flex-end; }
-  .tire-psi b {
+  .tm-group:first-child { margin-top: 0; }
+
+  .tm-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 60px 12px;
+    align-items: baseline; gap: 8px;
+    padding: 4px 6px 4px 5px;
+    border-left: 2px solid transparent;
+    border-bottom: 1px solid rgba(95,179,232,0.06);
+  }
+  .tm-label {
+    font-family: var(--font-ui); font-weight: 600;
+    font-size: 12.5px; letter-spacing: 0.04em;
+    color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tm-value { display: flex; align-items: baseline; gap: 3px; justify-self: end; }
+  .tm-value b {
     font-family: var(--font-mono); font-weight: 500;
-    font-size: 19px; line-height: 1.15;
-    color: var(--text-bright);
+    font-size: 13px; color: var(--text-bright);
+    font-variant-numeric: tabular-nums;
   }
-  .tire-psi i {
+  .tm-value i {
     font-style: normal; font-family: var(--font-mono);
-    font-size: 8.5px; letter-spacing: 0.18em;
+    font-size: 8px; letter-spacing: 0.12em;
     color: var(--text-dimmer);
   }
-  .tire-temp { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); }
-
-  /* Connection and sensor battery. Present on every tire, per the spec, but
-     held at the bottom of the block and at the smallest size in the column:
-     they are the answer to "why is that corner dim", not something to read on
-     a healthy car. */
-  .tire-meta {
-    display: flex; gap: 6px; flex-wrap: wrap;
-    font-family: var(--font-mono); font-size: 8.5px;
+  .tm-status {
+    font-family: var(--font-mono); font-size: 8px;
     letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--text-dimmer);
+    color: var(--text-dimmer); text-align: right;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .tire[data-corner="FL"] .tire-meta, .tire[data-corner="RL"] .tire-meta { justify-content: flex-end; }
-  .tire-meta .lk-lost { color: var(--text-dim); }
-  .tire-meta .bt-low  { color: var(--amber); }
+  .tm-trend {
+    font-family: var(--font-mono); font-size: 11px; line-height: 1;
+    color: var(--text-dimmer); text-align: center;
+  }
 
-  .tire-note {
-    margin-top: 2px;
-    font-family: var(--font-mono); font-size: 9px;
-    letter-spacing: 0.1em; text-transform: uppercase; line-height: 1.35;
-    color: var(--text-dimmer);
+  /* One rule per status. No animation: a telemetry panel that pulses is a
+     telemetry panel a driver looks at, and the whole point of the colour is
+     that it does not need looking at. */
+  .tm-row.st-warning {
+    border-left-color: var(--amber);
+    background: rgba(255,184,77,0.05);
   }
-  .tire-note:empty { display: none; }
-
-  /* One rule per state, matching the wheel it belongs to. No animation: a tire
-     panel that pulses is a tire panel a driver looks at, and the whole point of
-     the colour is that it does not need looking at. */
-  .tire.st-WARNING {
-    border-color: rgba(255,184,77,0.55);
-    background: rgba(255,184,77,0.06);
+  .tm-row.st-warning .tm-status,
+  .tm-row.st-warning .tm-value b { color: var(--amber); }
+  .tm-row.st-critical {
+    border-left-color: var(--red);
+    background: rgba(255,107,107,0.06);
   }
-  .tire.st-WARNING .tire-psi b, .tire.st-WARNING .tire-note { color: var(--amber); }
-  .tire.st-CRITICAL {
-    border-color: rgba(255,107,107,0.60);
-    background: rgba(255,107,107,0.07);
-    box-shadow: inset 0 0 18px rgba(255,107,107,0.10);
-  }
-  .tire.st-CRITICAL .tire-psi b, .tire.st-CRITICAL .tire-note { color: var(--red); }
-  /* The pressure is fine and stays white — it is the sensor that needs
+  .tm-row.st-critical .tm-status,
+  .tm-row.st-critical .tm-value b { color: var(--red); }
+  /* The reading is fine and stays white — it is the sensor that needs
      attention, and colouring the number would say the wrong thing. */
-  .tire.st-BATTERY_LOW { border-color: rgba(255,184,77,0.34); }
-  .tire.st-BATTERY_LOW .tire-note { color: var(--amber); }
-  .tire.st-DISCONNECTED, .tire.st-NO_DATA, .tire.st-STALE { background: transparent; }
-  .tire.st-DISCONNECTED .tire-psi b, .tire.st-NO_DATA .tire-psi b,
-  .tire.st-STALE .tire-psi b { color: var(--text-dimmer); }
-  .tire.st-STALE .tire-temp, .tire.st-DISCONNECTED .tire-temp { color: var(--text-dimmer); }
+  .tm-row.st-sensor-low { border-left-color: rgba(255,184,77,0.34); }
+  .tm-row.st-sensor-low .tm-status { color: var(--amber); }
+  /* Nothing is coming from this channel. Deliberately not amber — a sensor
+     that has gone quiet is a wiring fault, not an engine fault, and colouring
+     it like a low reading would be a lie about the car. */
+  .tm-row.st-offline .tm-value b,
+  .tm-row.st-no-data .tm-value b,
+  .tm-row.st-stale .tm-value b { color: var(--text-dimmer); }
+  .tm-row.st-offline .tm-label,
+  .tm-row.st-no-data .tm-label,
+  .tm-row.st-stale .tm-label { color: var(--text-dim); }
+  /* The contextual modes. Blue, because they are the healthy states — they
+     describe the engine rather than grading it. */
+  .tm-row.st-idle .tm-status,
+  .tm-row.st-stopped .tm-status,
+  .tm-row.st-warming .tm-status,
+  .tm-row.st-charging .tm-status,
+  .tm-row.st-cranking .tm-status { color: var(--accent); }
 
-  /* Active issue, below the vehicle. Usually one; more than one only when there
-     is more than one critical, which the server decides. */
-  .tire-alert {
-    display: flex; flex-direction: column; gap: 3px;
-    padding: 9px 11px; margin-top: 12px;
+  .tm-row.tr-up .tm-trend, .tm-row.tr-down .tm-trend { color: var(--accent); }
+  /* Out of band AND still moving the wrong way. The one combination on the row
+     that means the situation is not under control. */
+  .tm-row.tr-abnormal .tm-trend { color: var(--red); }
+
+  /* ---- vehicle insights ----
+     A history, not a fault log. Closer to Apple Health: severity is a 4px rail
+     and a glyph rather than a shouting badge, and a healthy car still writes
+     entries — "nothing to report" and "no data" have to look different. */
+
+  .vi-list { display: flex; flex-direction: column; gap: 5px; }
+  .vi-scroll { max-height: 250px; overflow-y: auto; }
+
+  .vi-card {
+    padding: 7px 10px;
     background: var(--bg-1);
     border: 1px solid var(--border);
-    border-left: 2px solid var(--amber);
-    clip-path: var(--miter);
+    border-left: 2px solid var(--text-dimmer);
   }
-  .tire-alert-title {
-    font-family: var(--font-ui); font-weight: 600;
-    font-size: 12.5px; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--amber);
+  .vi-head { display: flex; align-items: baseline; gap: 6px; }
+  .vi-icon { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); }
+  .vi-when {
+    font-family: var(--font-mono); font-size: 8.5px;
+    letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--text-dimmer);
   }
-  .tire-alert-detail {
+  /* Seeded demo history, labelled on screen. Dashed like every other
+     development affordance in this dashboard, and for the same reason: an
+     entry the car did not measure must never look like one it did. */
+  .vi-seed {
+    margin-left: auto;
+    padding: 0 4px;
+    font-family: var(--font-mono); font-size: 7px;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--text-dimmer);
+    border: 1px dashed rgba(95,179,232,0.30);
+  }
+  .vi-text {
+    margin-top: 3px;
+    font-family: var(--font-ui); font-weight: 500;
+    font-size: 12.5px; line-height: 1.45; letter-spacing: 0.01em;
+    color: var(--text);
+  }
+  .vi-info { border-left-color: rgba(95,179,232,0.30); }
+  .vi-info .vi-icon { color: var(--accent); }
+  .vi-notice { border-left-color: var(--accent); }
+  .vi-notice .vi-icon { color: var(--accent); }
+  .vi-attention { border-left-color: var(--amber); }
+  .vi-attention .vi-icon { color: var(--amber); }
+  .vi-critical { border-left-color: var(--red); }
+  .vi-critical .vi-icon { color: var(--red); }
+  .vi-empty {
+    padding: 10px 2px;
     font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.06em; line-height: 1.45;
-    color: var(--text-dim);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--text-dimmer);
   }
-  .tire-alert.lv-critical {
-    border-left-color: var(--red);
-    box-shadow: 0 0 16px rgba(255,107,107,0.18);
-  }
-  .tire-alert.lv-critical .tire-alert-title { color: var(--red); }
-  .tire-alert.lv-info { border-left-color: var(--text-dimmer); }
-  .tire-alert.lv-info .tire-alert-title { color: var(--text-dim); }
 
-  .tire-foot { display: flex; gap: 6px; align-items: stretch; margin-top: 12px; }
-  /* Compact like .nav-btn: a desk control, not a drive-safe target. */
-  .tire-btn {
-    width: auto; flex: 1 1 auto; min-height: 0;
-    padding: 10px 12px; font-size: 11px; letter-spacing: 0.12em;
+  /* Thin, unobtrusive scrollbars on the two scrolling regions. The default
+     Chromium bar is 15px wide and eats a fifth of the status column. */
+  .tm-scroll, .vi-scroll { scrollbar-width: thin; scrollbar-color: rgba(95,179,232,0.35) transparent; }
+  .tm-scroll::-webkit-scrollbar, .vi-scroll::-webkit-scrollbar { width: 5px; }
+  .tm-scroll::-webkit-scrollbar-track, .vi-scroll::-webkit-scrollbar-track { background: transparent; }
+  .tm-scroll::-webkit-scrollbar-thumb, .vi-scroll::-webkit-scrollbar-thumb {
+    background: rgba(95,179,232,0.30);
   }
-  /* Dashed border and dimmed text, the same signal .nav-dev uses: this is a
-     development affordance and must never read as part of the driving surface.
-     It disappears on its own when a provider with no scenarios is live. */
-  .tire-scenario {
-    flex: 0 1 46%; min-width: 0;
-    padding: 0 8px;
-    font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.08em; text-transform: uppercase;
+
+  /* ---- dev controls ----
+     Dashed border and dimmed text, the same signal .nav-dev and the old tire
+     selector use: these are development affordances and must never read as
+     part of the driving surface. Each disappears on its own when a provider
+     with no scenarios is live, which is every real one. */
+  .veh-foot { display: flex; gap: 6px; margin-top: 12px; }
+  .veh-select {
+    flex: 1 1 0; min-width: 0; height: 30px;
+    padding: 0 6px;
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
     color: var(--text-dimmer);
     background: var(--bg-1);
     border: 1px dashed rgba(95,179,232,0.30);
@@ -972,8 +1021,17 @@
     -webkit-appearance: none; appearance: none;
     cursor: pointer;
   }
-  .tire-scenario:focus { outline: none; border-color: var(--border-strong); }
-  .tire-scenario option { background: var(--bg-1); color: var(--text); }
+  .veh-select:focus { outline: none; border-color: var(--border-strong); }
+  .veh-select option { background: var(--bg-1); color: var(--text); }
+
+  /* Stacked full-width on a phone the column is the whole screen, so the
+     scrolling regions can afford to be taller — a 430px cap that made sense
+     beside four other columns just adds a second scrollbar inside the one the
+     page already has. */
+  @media (max-width: 1000px), (orientation: portrait) {
+    .tm-scroll { max-height: none; }
+    .vi-scroll { max-height: 340px; }
+  }
 
   /* ---------- hold to talk ---------- */
 
@@ -1241,109 +1299,52 @@
   </section>
 
   <!-- ============ COLUMN 5 - VEHICLE HEALTH ============
-       Display only. RIO does not speak about tires in this phase — there is no
-       arbiter call anywhere in this column and no voice path. Tire-aware speech
-       is a later phase and will go out through static/rio_speech.js at coaching
+       Display only. RIO does not speak about telemetry in this phase — there is
+       no arbiter call anywhere in this column and no voice path. A predictive
+       insight is a line in a log, not an alert. Telemetry-aware speech is a
+       later phase and will go out through static/rio_speech.js at coaching
        priority like everything else with a mouth.
 
-       There is not one tire number, threshold or piece of wording in this
-       markup. Every string below is a placeholder the first poll overwrites;
-       the states, the numbers and the sentences are all decided in tires.py
-       against config.py. See static/rio_tires.js. -->
+       There is not one sensor name, threshold, unit or piece of wording in this
+       markup — the three hosts below are empty and every node inside them is
+       built from the telemetry array by static/rio_vehicle.js. That is what
+       makes the panel expandable: boost, transmission temperature, differential
+       temperature, brake temperature and suspension travel are rows in
+       telemetry.py's SENSORS table and nothing here changes when they land.
+
+       The statuses, the numbers, the trend arrows and the sentences are all
+       decided in telemetry.py and insights.py against config.py. -->
   <section class="col panel bracketed" id="vehcol">
     <div class="col-head">
       <div class="col-title">Vehicle Health</div>
-      <div class="col-sub">Tires &middot; TPMS Telemetry</div>
+      <div class="col-sub">Holley Terminator X &middot; Live Telemetry</div>
     </div>
 
-    <div class="veh-status" id="tirestatus">
-      <span class="veh-status-text" id="tirestatustext">Awaiting Sensors</span>
-      <span class="veh-status-time" id="tireupdated">&mdash;</span>
-    </div>
+    <!-- VehicleStatusBanner. Empty until the first poll; it carries the
+         headline, the state colour, and the live connection / last update /
+         engine runtime line. -->
+    <div id="vehbanner"></div>
 
-    <div class="tire-map">
+    <div class="veh-section">Real-Time Sensor Telemetry</div>
+    <!-- TelemetryList. One row per channel, grouped, generated. -->
+    <div class="tm-list tm-scroll" id="vehtelemetry"></div>
 
-      <div class="tire" data-corner="FL">
-        <div class="tire-corner">FL</div>
-        <div class="tire-psi"><b data-f="pressure">--</b><i data-f="unit">PSI</i></div>
-        <div class="tire-temp" data-f="temp">--</div>
-        <div class="tire-meta">
-          <span class="tire-link" data-f="link">--</span>
-          <span class="tire-batt" data-f="battery">--</span>
-        </div>
-        <div class="tire-note" data-f="note"></div>
-      </div>
+    <div class="veh-section">Vehicle Insights</div>
+    <!-- VehicleInsights. Newest first. Every sentence is written server-side
+         by insights.py's narrator; seeded demo entries are labelled. -->
+    <div class="vi-list vi-scroll" id="vehinsights"></div>
 
-      <!-- Top-down vehicle, inline. No external asset and no image: it has to
-           take the accent colour from the same custom properties as the rest of
-           the HUD, and the four wheels have to be individually addressable so a
-           corner can carry its own state. -->
-      <svg class="tire-car" viewBox="0 0 120 220" width="115" height="211"
-           role="img" aria-label="Top-down view of the vehicle with the four tires">
-        <g class="tmap-body">
-          <path d="M46 10 H74 L90 30 L94 96 L94 176 L86 208 H34 L26 176 L26 96 L30 30 Z"/>
-          <path d="M38 58 H82 L77 84 H43 Z"/>
-          <rect x="43" y="84" width="34" height="52"/>
-          <path d="M43 136 H77 L82 162 H38 Z"/>
-          <line x1="60" y1="10" x2="60" y2="30"/>
-        </g>
-        <!-- Axles at exactly a quarter and three quarters of the body, which is
-             where the readout blocks' centres land in the two grid rows either
-             side. Wheel centre = 55 and 165 of 220. Move these and the readouts
-             stop pointing at the tire they describe. -->
-        <rect class="tmap-wheel" data-wheel="FL" x="12" y="38"  width="14" height="34"/>
-        <rect class="tmap-wheel" data-wheel="FR" x="94" y="38"  width="14" height="34"/>
-        <rect class="tmap-wheel" data-wheel="RL" x="12" y="148" width="14" height="34"/>
-        <rect class="tmap-wheel" data-wheel="RR" x="94" y="148" width="14" height="34"/>
-      </svg>
-
-      <div class="tire" data-corner="FR">
-        <div class="tire-corner">FR</div>
-        <div class="tire-psi"><b data-f="pressure">--</b><i data-f="unit">PSI</i></div>
-        <div class="tire-temp" data-f="temp">--</div>
-        <div class="tire-meta">
-          <span class="tire-link" data-f="link">--</span>
-          <span class="tire-batt" data-f="battery">--</span>
-        </div>
-        <div class="tire-note" data-f="note"></div>
-      </div>
-
-      <div class="tire" data-corner="RL">
-        <div class="tire-corner">RL</div>
-        <div class="tire-psi"><b data-f="pressure">--</b><i data-f="unit">PSI</i></div>
-        <div class="tire-temp" data-f="temp">--</div>
-        <div class="tire-meta">
-          <span class="tire-link" data-f="link">--</span>
-          <span class="tire-batt" data-f="battery">--</span>
-        </div>
-        <div class="tire-note" data-f="note"></div>
-      </div>
-
-      <div class="tire" data-corner="RR">
-        <div class="tire-corner">RR</div>
-        <div class="tire-psi"><b data-f="pressure">--</b><i data-f="unit">PSI</i></div>
-        <div class="tire-temp" data-f="temp">--</div>
-        <div class="tire-meta">
-          <span class="tire-link" data-f="link">--</span>
-          <span class="tire-batt" data-f="battery">--</span>
-        </div>
-        <div class="tire-note" data-f="note"></div>
-      </div>
-
-    </div>
-
-    <div id="tirealerts"></div>
-
-    <div class="tire-foot">
-      <button id="tiresettings" class="hud-btn tire-btn" type="button"
-              title="Per-corner target pressures and alert thresholds — a later phase">
-        Tire Settings
-      </button>
-      <!-- Dev only. Hidden by rio_tires.js the moment a provider with no
-           scenarios is live, which is every real one. -->
-      <select id="tirescenario" class="tire-scenario"
-              aria-label="Mock provider scenario"
-              title="Development only — switches the mock provider's scenario"></select>
+    <!-- Dev only. Both hidden by rio_vehicle.js the moment a provider with no
+         scenarios is live. The tire mock keeps its own scenario list because
+         it is still a provider — its eight channels are rows in the list
+         above like any others. -->
+    <div class="veh-foot">
+      <select id="vehscenario" class="veh-select"
+              aria-label="Mock ECU scenario"
+              title="Development only — switches the mock Holley provider's scenario"></select>
+      <select id="tirescenario" class="veh-select"
+              aria-label="Mock TPMS scenario"
+              title="Development only — switches the mock tire provider's scenario"></select>
     </div>
   </section>
 
@@ -2980,9 +2981,9 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_nav.js"></script>
 
 <!-- ---- Vehicle Health. Independent of everything above it: it owns one
-     column, polls one endpoint and speaks to nobody, so load order does not
+     column, polls two endpoints and speaks to nobody, so load order does not
      matter and it deliberately has no handle on RIO.speech. ---- -->
-<script src="/static/rio_tires.js"></script>
+<script src="/static/rio_vehicle.js"></script>
 <script>
 /* One mouth, one line on the HUD. Whatever the arbiter starts playing is what
    the Voice Layer column shows — headway and navigation alike, which is the

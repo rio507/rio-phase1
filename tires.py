@@ -1,5 +1,16 @@
 """tires.py — TireHealthProvider: the seam between whatever measures the tires
-and the Vehicle Health column.
+and the rest of the system.
+
+Where this sits now
+-------------------
+The top-down tire graphic this file was written for is gone; the Vehicle Health
+column is a telemetry list. Nothing below changed when that happened, which was
+the point of the split. telemetry.py's TireTelemetryProvider calls snapshot()
+and turns each corner into two ordinary telemetry rows, so the per-corner target
+pressures, the nine named scenarios and the slow-leak detector all still run —
+they just come out as channels in a list instead of numbers beside a picture of
+a car. The tire thresholds stay in the tire half of config.py, and this remains
+the only place in the codebase that knows what 29 PSI means.
 
 The provider split
 ------------------
@@ -30,7 +41,8 @@ composed here. That is not tidiness for its own sake: a threshold duplicated in
 JavaScript is a threshold that will disagree with the one in config.py the first
 time somebody tunes it, and a tire panel that disagrees with itself is worse
 than no tire panel. The browser is a renderer. If you find yourself wanting to
-compute something in rio_tires.js, it belongs in this file.
+compute something in static/rio_vehicle.js, it belongs in this file or in
+telemetry.py.
 
 RIO does not talk about tires
 -----------------------------
@@ -131,7 +143,8 @@ class TireHealthProvider:
     def read(self) -> List[TireReading]:
         """Current readings, one per corner. May be short or empty: a corner
         with no entry is reported as NO_DATA rather than silently skipped, so
-        the vehicle graphic always draws four wheels."""
+        all four corners always have a row and a sensor going quiet is visible
+        instead of invisible."""
         raise NotImplementedError
 
 

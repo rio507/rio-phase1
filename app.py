@@ -26,6 +26,8 @@ import vision
 import perceive
 import nav
 import tires
+import telemetry
+import insights
 import framebuf
 import router as request_router
 import visual_qa
@@ -701,11 +703,72 @@ def vehicle_tires_scenario_set_endpoint(name: str = Query(...)):
     Returns a full snapshot rather than an acknowledgement so the panel repaints
     on the same round trip instead of showing the old state until the next poll.
     An unknown name changes nothing and says so.
+
+    Routed through telemetry.set_tire_scenario rather than tires.set_scenario
+    because the tire channels are rows in the telemetry list now, and the trend
+    window has to forget the pressures from the scenario being left behind.
     """
-    if not tires.set_scenario(name):
+    if not telemetry.set_tire_scenario(name):
         return {"error": "unknown scenario", "name": name,
                 "scenarios": tires.scenarios()}
     return tires.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Vehicle health — telemetry and insights
+# ---------------------------------------------------------------------------
+# Thin for the same reason the tire handlers above are thin. Every band, every
+# status word, every trend arrow and every sentence in the insight log is
+# decided in telemetry.py and insights.py against config.py; these handlers put
+# that on the wire and nothing else.
+#
+# Neither of these paths can speak. There is no arbiter call in telemetry.py, in
+# insights.py, or in static/rio_vehicle.js — a predictive observation is a line
+# in a log, not an alert, and this whole column is display-only in this phase.
+
+@app.get("/vehicle/telemetry")
+def vehicle_telemetry_endpoint():
+    """Every sensor on the car, already normalised and already worded.
+
+    The dashboard polls this at the cadence the payload itself carries
+    (`poll_ms`) and renders it verbatim — it does no arithmetic and holds no
+    thresholds of its own. Folding the frame into the insight engine happens
+    here as a side effect of the read, so the baselines see every sample rather
+    than only the ones somebody was looking at the log for.
+    """
+    return telemetry.snapshot()
+
+
+@app.get("/vehicle/insights")
+def vehicle_insights_endpoint():
+    """The VEHICLE INSIGHTS log, newest first.
+
+    Slower cadence than telemetry by an order of magnitude: these entries are
+    measured in hours and days, and an event log that repaints every second is
+    a log nobody can read a line of.
+    """
+    return insights.snapshot()
+
+
+@app.get("/vehicle/telemetry/scenario")
+def vehicle_telemetry_scenario_endpoint():
+    """Which mock scenario is live, and what else is on offer."""
+    return {"scenario": telemetry.current_scenario(),
+            "scenarios": telemetry.scenarios()}
+
+
+@app.post("/vehicle/telemetry/scenario")
+def vehicle_telemetry_scenario_set_endpoint(name: str = Query(...)):
+    """Switch the mock ECU's scenario. Development only.
+
+    Returns a full snapshot rather than an acknowledgement so the panel repaints
+    on the same round trip instead of showing the old state until the next poll.
+    An unknown name changes nothing and says so.
+    """
+    if not telemetry.set_scenario(name):
+        return {"error": "unknown scenario", "name": name,
+                "scenarios": telemetry.scenarios()}
+    return telemetry.snapshot()
 
 
 # --- Phase 2.5 session endpoints ---

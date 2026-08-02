@@ -222,3 +222,211 @@ TIRE_POLL_MS = 5000
 # Which mock scenario a fresh process starts in. Dev only — a real provider has
 # exactly one scenario, which is whatever the tires are actually doing.
 TIRE_DEFAULT_SCENARIO = "all_normal"
+
+
+# ---------------------------------------------------------------------------
+# Vehicle telemetry — the Holley sensor set and everything judged against it
+# ---------------------------------------------------------------------------
+# Same rule as the tire block above and for the same reason: every band, every
+# window and every glyph threshold the Vehicle Health column reacts to lives
+# here. telemetry.py reads them and hands the browser finished strings. There is
+# not one number below that also exists in static/rio_vehicle.js.
+
+# Which TelemetryProvider is live. "mock" until there is an ECU to talk to; the
+# real one is a Holley serial/CAN reader and lands beside MockHolleyProvider
+# without anything above this line changing.
+TELEMETRY_PROVIDER = "mock"
+TELEMETRY_DEFAULT_SCENARIO = "normal_idle"
+
+# How often the dashboard asks for telemetry. 1 s, an order of magnitude faster
+# than the tire poll: these are engine channels and a coolant needle that steps
+# once every five seconds does not read as live. Insights move far more slowly
+# and get their own, lazier cadence — an event log that repaints at 1 Hz is a
+# log nobody can read a line of.
+TELEMETRY_POLL_MS = 1000
+INSIGHTS_POLL_MS = 15000
+
+# Above this the engine is turning under its own power. This is the gate on
+# every band that is only meaningful on a running engine: oil pressure is 0 PSI
+# at key-on and that is correct, not critical, and a panel that shouts about it
+# is a panel the driver switches off. 400 rpm sits above a healthy crank
+# (~200-300) and well under any idle.
+TELEMETRY_ENGINE_RUNNING_RPM = 400.0
+
+# --- trend ------------------------------------------------------------------
+# Trend is the slope of a least-squares fit over this window, not a comparison
+# with the previous sample. Same lesson as the headway warnings: one-sample
+# differencing on a noisy channel produces an arrow that flickers up and down
+# every poll and means nothing. 20 s at a 1 s poll is 20 points — long enough
+# that sensor wander averages out, short enough that a coolant temperature
+# genuinely climbing shows an up arrow within half a minute.
+TELEMETRY_TREND_WINDOW_S = 20.0
+# Below this many samples in the window there is no fit worth doing and the row
+# shows a flat dash rather than guessing.
+TELEMETRY_TREND_MIN_SAMPLES = 5
+# How much a channel must move ACROSS THE WHOLE WINDOW before the arrow leaves
+# stable, in that channel's own units. Set per sensor because 0.1 is nothing to
+# a coolant temperature and a great deal to a battery voltage. Anything absent
+# here never shows a direction, only stable.
+TELEMETRY_TREND_DELTA = {
+    "battery_voltage": 0.12,
+    "rpm": 90.0,
+    "coolant_temp": 1.5,
+    "intake_air_temp": 1.5,
+    "map_kpa": 4.0,
+    "throttle_pct": 4.0,
+    "afr_target": 0.25,
+    "afr_wideband": 0.25,
+    "fuel_pressure": 1.2,
+    "oil_pressure": 2.5,
+    "oil_temp": 1.5,
+    "vehicle_speed": 3.0,
+    "tire_pressure": 0.35,
+    "tire_temp": 3.0,
+}
+
+# --- bands ------------------------------------------------------------------
+# Four optional edges per channel. None means "this channel has no limit in that
+# direction", which is the honest answer for most of them: there is no such
+# thing as too little intake air temperature.
+#
+# `running` marks a band that is only applied when the engine is turning. Oil
+# and fuel pressure and both AFR channels read zero or garbage on a stopped
+# engine, and judging them then would fill the panel with faults that are just
+# the key being off.
+TELEMETRY_BANDS = {
+    # Charging system. 13.2 is the floor of a working alternator at idle and
+    # 12.4 is a battery being drained rather than charged; 15.2 is an
+    # overcharge that boils electrolyte and kills electronics.
+    "battery_voltage": {"crit_low": 12.4, "warn_low": 13.2,
+                        "warn_high": 15.0, "crit_high": 15.2, "running": True},
+    # A small-block's redline. Warn a little under it because the number that
+    # matters to the driver is the one before the valves float.
+    "rpm":             {"warn_high": 6000.0, "crit_high": 6400.0},
+    # 225°F is where a 50/50 mix under a 16 psi cap is still fine but has no
+    # margin left; 240 is where it boils and the head gasket is next.
+    "coolant_temp":    {"warn_high": 225.0, "crit_high": 240.0},
+    # Charge air. 160°F is heat-soak that costs real power and pulls timing;
+    # 200 means the intake is cooking on a stopped car.
+    "intake_air_temp": {"warn_high": 160.0, "crit_high": 200.0},
+    "map_kpa":         {},
+    "throttle_pct":    {},
+    # Lean is what kills pistons; rich only wastes fuel. Hence the asymmetry:
+    # a tenth of a point lean of 15.2 gets attention, and it takes 11.0 the
+    # other way to say anything at all.
+    "afr_wideband":    {"crit_low": 10.5, "warn_low": 11.0,
+                        "warn_high": 15.2, "crit_high": 16.0, "running": True},
+    "afr_target":      {},
+    # A Terminator X Stealth returnless system holds ~58 psi. Under 48 the
+    # injectors stop flowing what the table thinks they flow; under 40 it is
+    # leaning out under load, which is the dangerous direction.
+    "fuel_pressure":   {"crit_low": 40.0, "warn_low": 48.0,
+                        "warn_high": 72.0, "running": True},
+    # The old rule is 10 psi per 1000 rpm. This panel does not know the rpm
+    # when it judges the pressure, so these are the idle-safe absolutes: under
+    # 20 psi hot is a bearing problem, under 12 is an engine about to stop
+    # being an engine. Anything subtler than that — pressure a few psi below
+    # where it normally sits at this rpm — is the insight engine's job, and it
+    # catches it weeks earlier than a band ever could.
+    "oil_pressure":    {"crit_low": 12.0, "warn_low": 20.0,
+                        "warn_high": 85.0, "running": True},
+    # Oil stops being oil somewhere past 260°F.
+    "oil_temp":        {"warn_high": 250.0, "crit_high": 275.0},
+    "vehicle_speed":   {},
+}
+
+# --- contextual modes -------------------------------------------------------
+# Not every state is a judgement. An engine at 900 rpm is not "normal", it is
+# idling, and a car at 0 mph is stopped — the spec asks for exactly those words
+# and they carry no severity at all. Each entry is (label, low, high); either
+# edge may be None. First match wins, and a mode only applies when the channel
+# is otherwise NORMAL: an actual fault always outranks a description.
+TELEMETRY_MODES = {
+    "rpm":           [("CRANKING", 1.0, 400.0), ("IDLE", 400.0, 1100.0)],
+    "throttle_pct":  [("IDLE", None, 3.0)],
+    "vehicle_speed": [("STOPPED", None, 0.5)],
+    # Below the thermostat the engine has not finished warming up. Saying
+    # NORMAL there would be true and useless; saying WARMING is what a driver
+    # actually wants to know in the first two minutes.
+    "coolant_temp":  [("WARMING", None, 170.0)],
+    "oil_temp":      [("WARMING", None, 160.0)],
+    # The alternator is charging. Blue, not amber — this is the healthy state,
+    # it is just worth naming.
+    "battery_voltage": [("CHARGING", 13.6, 15.0)],
+}
+
+# A reading older than this is not a reading. Far tighter than the tire
+# equivalent because an ECU that has stopped answering has stopped answering
+# now, not in three minutes.
+TELEMETRY_STALE_AFTER_S = 6.0
+
+
+# ---------------------------------------------------------------------------
+# Vehicle insights — the predictive layer
+# ---------------------------------------------------------------------------
+# Display only, and deliberately so. Nothing in insights.py touches the speech
+# arbiter and nothing raises a warning: a predictive observation is a line in a
+# log the driver reads when parked, not something that interrupts them. The
+# firewall that keeps the tire column silent applies here unchanged.
+
+INSIGHTS_ENABLED = True
+
+# Where the history that makes "yesterday" a real word lives. Beside the session
+# logs, because it is the same kind of thing: a record of drives that outlives
+# the process.
+INSIGHTS_DIR = "/workspace/rio-phase1/training_data/vehicle"
+
+# How much log to keep, and how much of it to send. The file is trimmed to the
+# first number on write; the panel gets the second.
+INSIGHTS_MAX_ENTRIES = 400
+INSIGHTS_FEED_LIMIT = 40
+
+# How long a channel must be sampled before that day counts as a day. At the
+# 1 Hz telemetry cadence this is five minutes of engine running.
+#
+# It is deliberately not a token number. A day that qualifies on twenty seconds
+# of data is a day of a cold engine cranking, and it lands in the baseline
+# weighing the same as an hour on the motorway — every deviation and drift
+# figure downstream inherits that lie. Measured: with this at 20, two minutes of
+# the warm-up scenario was enough to produce "Coolant Temp is consistently 32°F
+# below your normal baseline", which was arithmetically true and completely
+# false about the car.
+INSIGHTS_MIN_SAMPLES_PER_DAY = 300
+
+# Deviation: how far today's running mean has to sit from the historical
+# baseline before it is worth a sentence, per channel and in that channel's
+# units. These are "a mechanic would notice" numbers, not "a sensor moved" ones.
+INSIGHTS_DEVIATION_DELTA = {
+    "battery_voltage": 0.35,
+    "coolant_temp": 6.0,
+    "oil_pressure": 6.0,
+    "oil_temp": 10.0,
+    "fuel_pressure": 4.0,
+    "intake_air_temp": 15.0,
+    "afr_wideband": 0.4,
+}
+
+# Drift: slope across the daily baselines, expressed as total change over the
+# window. This is the detector the whole feature exists for — it is what says
+# a battery has been sliding for three weeks while every gauge still reads
+# normal, which is the difference between a booking and a tow.
+INSIGHTS_DRIFT_WINDOW_DAYS = 28
+INSIGHTS_DRIFT_MIN_DAYS = 6
+INSIGHTS_DRIFT_DELTA = {
+    "battery_voltage": 0.30,
+    "coolant_temp": 5.0,
+    "oil_pressure": 5.0,
+    "fuel_pressure": 3.5,
+}
+
+# The same observation must not be able to fill the log. One per kind per
+# channel per hour; the nominal "everything is fine" heartbeat far less often
+# than that, since it is the least interesting line in the file.
+INSIGHTS_COOLDOWN_S = 3600.0
+INSIGHTS_NOMINAL_COOLDOWN_S = 10800.0
+
+# Seed a demo history on an empty install: five days of plausible entries and
+# four weeks of daily baselines, every one of them flagged `seeded` in the
+# payload and labelled as such on screen. A demo that silently fabricates
+# history it presents as measured is the one thing this layer must never do.
+INSIGHTS_SEED_DEMO = True
