@@ -281,6 +281,22 @@ def test_04_no_resolve_on_one_good_sample():
           "though the healing progress is recorded",
           str(iss.get("healing_progress")))
 
+    # ...and is VOID the moment the monitor fails again. The announcement policy
+    # reads this to decide whether to stay quiet about a recovering fault, so a
+    # stale value here would silence one that is getting worse.
+    # `fail_runs` on the issue persists from the confirmation, so waiting on it
+    # would be satisfied instantly by history. What is wanted is a monitor run
+    # that failed NOW.
+    car.scenario("one_low")
+    car.step_until(lambda c: (c.monitor("tire.low_pressure", "RL") or {})
+                   .get("last_result") == M.FAILED_PENDING)
+    failing = car.issue("tire.low_pressure", "RL")
+    check(not failing.get("healing_progress"),
+          "healing progress is cleared the moment it fails again",
+          str(failing.get("healing_progress")))
+    check(failing.get("pass_runs") == 0, "and the passing-run count with it",
+          str(failing.get("pass_runs")))
+
 
 def test_05_resolves_after_healing_criteria():
     head("5 -- and resolves only once its configured healing criteria pass")

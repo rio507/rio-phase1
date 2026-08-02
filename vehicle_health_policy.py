@@ -112,6 +112,18 @@ ANNOUNCE_AT_RANK = SEVERITY_RANK[CRITICAL]
 # Ten minutes: long enough that a driver who heard it and chose to keep going is
 # not nagged, short enough that a fault on a two-hour drive is raised more than
 # once. A reminder is not a new alarm and it says the same words.
+#
+# A reminder is additionally gated on the issue NOT currently healing -- see
+# R_HEALING below. That gate exists because of something the shadow log showed
+# on the first drive it was run against: the driver added air, the pressure was
+# good from that moment, and the reminder fired four and a half minutes before
+# the healing criteria finished verifying it. RIO would have told them to stop
+# for a tire they had just dealt with.
+#
+# The naive fix is to make this number larger than the healing time. That is the
+# wrong fix: it is a coincidence between two unrelated constants, and it breaks
+# silently the next time either is tuned. The right statement is the one the
+# gate makes -- do not remind about a fault that is currently showing recovery.
 REMIND_S = 600.0
 
 # Nothing at all inside this window of the previous announcement, whatever it is
@@ -164,6 +176,12 @@ R_REMINDER = "reminder"
 R_NOTHING = "nothing_to_say"
 R_BELOW_THRESHOLD = "below_announce_threshold"
 R_ALREADY = "suppressed_already_announced"
+# The fault is still ACTIVE, but it is currently passing its monitor and working
+# through its healing criteria. It has not been verified as repaired -- that is
+# what the healing criteria are for and they are deliberately slow -- but it is
+# no longer the right moment to tell somebody to pull over. A reminder here is
+# the system nagging about a problem the driver has already dealt with.
+R_HEALING = "suppressed_while_healing"
 R_MIN_GAP = "suppressed_by_min_gap"
 R_POST_REQUEST = "suppressed_after_status_request"
 R_NO_LINE = "suppressed_no_line_for_type"
@@ -385,12 +403,23 @@ class VehicleHealthPolicy:
         # Every candidate is examined, not just the worst one: the worst may be
         # a fault already announced ten seconds ago while the second is brand
         # new, and the new one is the news.
-        chosen, why = None, R_ALREADY
-        for issue in candidates:
+        #
+        # When none of them speaks, the reason reported is the WORST candidate's
+        # actual reason — candidates are sorted worst-first, so that is the one
+        # a person reading the log is asking about. This used to be a hardcoded
+        # R_ALREADY, which was true while "already announced" was the only way
+        # to stay quiet and became a lie the moment it was not: a fault
+        # suppressed because it is healing would have been logged as suppressed
+        # by a cooldown, and the tuning data would have said the opposite of
+        # what happened.
+        chosen, why = None, R_NOTHING
+        for idx, issue in enumerate(candidates):
             reason = self._why_speak(issue, t)
             if reason in SPEAK_REASONS:
                 chosen, why = issue, reason
                 break
+            if idx == 0:
+                why = reason
 
         if chosen is None:
             return self._quiet(why, t)
@@ -543,6 +572,21 @@ class VehicleHealthPolicy:
             return R_WORSENED
 
         if (t - st["announced_t"]) >= REMIND_S:
+            # ...unless it is currently healing. `healing_runs` is how many
+            # consecutive passing monitor runs the issue has accumulated; above
+            # zero means the fault is measurably better right now, whether or
+            # not the healing criteria have finished proving it.
+            #
+            # Note this is NOT the same as the issue being resolved. It is
+            # deliberately weaker: resolution needs a stable period as well as a
+            # run count, and it should, because one good reading is how a warm
+            # tire on a motorway "fixes" a leak. But the bar for *staying quiet*
+            # is rightly lower than the bar for *declaring it repaired* — the
+            # cost of a wrong silence here is a reminder the driver gets ten
+            # minutes later instead, and the cost of a wrong reminder is RIO
+            # telling somebody to pull over for a tire they just inflated.
+            if int(issue.get("healing_runs") or 0) > 0:
+                return R_HEALING
             return R_REMINDER
 
         return R_ALREADY

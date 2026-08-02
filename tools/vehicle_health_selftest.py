@@ -242,11 +242,15 @@ def corners_status(state, corner):
 
 def issue(key="tires:RL:critical_low_pressure", severity="critical",
           magnitude=7.0, type_="critical_low_pressure", location="rear left",
-          value=26.0, unit="psi"):
-    return vh.make_issue(key=key, domain="tires", type=type_, severity=severity,
-                         message="scripted", observation_window=vh.W_NOW,
-                         location=location, magnitude=magnitude, value=value,
-                         unit=unit, spoken_fallback="Something is wrong.")
+          value=26.0, unit="psi", healing_runs=0):
+    out = vh.make_issue(key=key, domain="tires", type=type_, severity=severity,
+                        message="scripted", observation_window=vh.W_NOW,
+                        location=location, magnitude=magnitude, value=value,
+                        unit=unit, spoken_fallback="Something is wrong.")
+    # Consecutive passing monitor runs. Above zero means the fault is measurably
+    # better right now, whatever its lifecycle still says.
+    out["healing_runs"] = healing_runs
+    return out
 
 
 def run_policy():
@@ -284,6 +288,28 @@ def run_policy():
     r = pol.tick([issue()], 3.0 + P.REMIND_S)
     check(r["announce"] is not None and r["announce"]["reason"] == P.R_REMINDER,
           f"a reminder is allowed after {int(P.REMIND_S)}s",
+          r["reason"])
+
+    # --- ...but not while the fault is recovering ---
+    # The shadow log's first finding: the driver added air, the pressure was
+    # good from that moment, and the reminder fired four and a half minutes
+    # before the healing criteria finished verifying it. RIO would have told
+    # them to pull over for a tire they had just dealt with.
+    pol = P.VehicleHealthPolicy()
+    pol.tick([issue()], 0.0)
+    r = pol.tick([issue(healing_runs=1)], P.REMIND_S + 10)
+    check(r["announce"] is None,
+          "no reminder while the fault is passing its monitor again",
+          r["reason"])
+    check(r["reason"] == P.R_HEALING,
+          "and the silence is attributed to healing, not to a cooldown",
+          r["reason"])
+    # One passing run is NOT resolution -- the issue is still ACTIVE and still
+    # on the dashboard. The bar for staying quiet is deliberately lower than the
+    # bar for declaring a repair.
+    r = pol.tick([issue(healing_runs=0)], P.REMIND_S + 20)
+    check(r["announce"] is not None and r["announce"]["reason"] == P.R_REMINDER,
+          "and if it starts failing again the reminder comes straight back",
           r["reason"])
 
     # --- worsening beats the cooldown ---

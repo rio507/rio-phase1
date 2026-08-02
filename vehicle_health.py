@@ -511,6 +511,12 @@ def _issue_from_diagnostic(i: dict) -> dict:
     # in context() drops everything except the documented set.
     issue["issue_id"] = i["issue_id"]
     issue["code"] = i.get("code")
+    # Consecutive passing monitor runs. The announcement policy uses this to
+    # decline to REMIND about a fault that is currently recovering — see
+    # vehicle_health_policy.R_HEALING. It has to travel on the issue because the
+    # policy imports nothing and cannot ask the engine anything.
+    issue["healing_runs"] = int((i.get("healing_progress") or {})
+                                .get("passing_runs", 0) or 0)
     issue["announce_allowed"] = allowed
     issue["fast_path"] = fast
     issue["audio"] = (_FAST_PATH_CLIP.get(i.get("monitor_id"), "tts")

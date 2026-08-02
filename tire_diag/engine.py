@@ -427,6 +427,13 @@ class TireDiagnosticEngine:
         issue["confidence"] = out.confidence
         issue["reason"] = out.reason
         issue["detail"] = out.detail
+        # Any progress toward healing is void the moment the monitor fails
+        # again. Leaving it stale would leave an issue that is actively failing
+        # still advertising "2 of 2 passing runs" — which the announcement
+        # policy reads to decide whether to stay quiet, so a stale value there
+        # would silence a fault that is getting worse.
+        issue["pass_runs"] = 0
+        issue["healing_progress"] = {}
         issue["fail_runs"] = rec["fail_runs"]
         issue["fail_cycles"] = list(rec["fail_cycles"])
         issue["urgent"] = urgent

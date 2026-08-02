@@ -191,6 +191,29 @@ overstate how talkative the monitor really is.
 `vehicle_health_policy.py` still imports **nothing** — it composes the proposal
 and hands it back; `app.py` does the writing. The firewall is unchanged.
 
+### What the first shadow run changed
+
+The first drive run through this produced two proposals, and the second one was
+wrong: the driver had added air nine minutes earlier, the pressure had been good
+ever since, and the ten-minute reminder fired four and a half minutes before the
+healing criteria finished verifying the repair. RIO would have told them to pull
+over for a tire they had just dealt with.
+
+The fix is **not** to make `REMIND_S` longer than the healing time — that is a
+coincidence between two unrelated constants and it breaks silently the next time
+either is tuned. Reminders are gated on `healing_runs == 0`: do not remind about
+a fault that is currently passing its monitor.
+
+That bar is deliberately lower than resolution. Resolution needs a stable period
+*as well as* a run count, and it should, because one good reading is how a warm
+tire on a motorway "fixes" a leak. But the cost of a wrong silence is a reminder
+ten minutes later; the cost of a wrong reminder is the nag above.
+
+`healing_runs` travels on the issue dict because the policy imports nothing and
+cannot ask the engine anything. The engine clears `healing_progress` the moment
+a monitor fails again, so a fault that is getting worse cannot be silenced by a
+stale count.
+
 ### The one exception: the urgent fast path
 
 Two codes carry `fast_path=True` — `CRITICAL-PRESSURE-*` and
