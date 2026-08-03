@@ -14,8 +14,9 @@ from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, Query, Body, Form
-from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
+from fastapi import FastAPI, UploadFile, Query, Body, Form, Header, Request
+from fastapi.responses import (StreamingResponse, HTMLResponse, FileResponse,
+                               JSONResponse)
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
@@ -845,6 +846,34 @@ def vehicle_insights_endpoint():
     return insights.snapshot()
 
 
+@app.get("/vehicle/telemetry/source")
+def vehicle_telemetry_source_endpoint():
+    """Which producer the pipeline is listening to, and what else it could.
+
+    The spec's source selector. What it switches is the PROVIDER and nothing
+    else: the bands, the trend window, the staleness rule, the insight engine,
+    the diagnostic monitors, the conversation layer and the browser are
+    identical for every option in this list. That is the whole claim of the
+    canonical pipeline, and it is worth being able to check by hand.
+    """
+    return {"source": telemetry.source(), "sources": telemetry.sources()}
+
+
+@app.post("/vehicle/telemetry/source")
+def vehicle_telemetry_source_set_endpoint(name: str = Query(...)):
+    """Switch producers. No restart, and no state is discarded but the trend ring.
+
+    The ring goes because a slope fitted across the moment the source changed is
+    a slope across a discontinuity. Diagnostic issues, monitor counters, the
+    insight baselines and the announcement ledger all survive — switching what
+    you are listening to is not evidence that anything was repaired.
+    """
+    if not telemetry.set_source(name):
+        return {"error": "unknown source", "name": name,
+                "sources": telemetry.sources()}
+    return telemetry.snapshot(record=False)
+
+
 @app.get("/vehicle/telemetry/scenario")
 def vehicle_telemetry_scenario_endpoint():
     """Which mock scenario is live, and what else is on offer."""
@@ -1034,6 +1063,148 @@ def vehicle_diagnostics_relearn_endpoint(corner: str = Query(default=None),
     exists, and a relearn can never suppress a validated critical condition.
     """
     return tire_diag.engine().relearn(corner=corner, reason=reason, by=by)
+
+
+# ---------------------------------------------------------------------------
+# The canonical vehicle data API (§25)
+# ---------------------------------------------------------------------------
+# Versioned and vehicle-scoped, unlike everything above it, and deliberately so.
+# These are the routes a device outside this process posts to — today a laptop
+# bridge with a CANable in it, later a Jetson — and the whole migration story
+# rests on the contract not changing when the hardware does. The unversioned
+# /vehicle/* routes stay exactly as they are: they are the dashboard's, they are
+# read-only, and nothing outside this pod calls them.
+#
+# SINGLE VEHICLE, MULTI-VEHICLE CONTRACT. Every route takes a vehicle_id and
+# every payload carries one, so the contract is already right. The STATE behind
+# it is not: the announcement policy, both diagnostic engines and the ingestion
+# buffer are one-per-process, exactly as _last_talk and nav's route registry
+# have always been. Saying so here is cheaper than discovering it later.
+#
+# READ-ONLY POSTURE. There is no route below that asks a vehicle to do anything.
+# No code clearing, no readiness reset, no actuator test, no ECU write, no
+# Holley transmit — and no command channel a bridge could poll, which is the
+# part that would be easy to add by accident. vehicle/selftest.py asserts their
+# absence by parsing this file rather than by trusting this comment.
+
+import vehicle.ingest as vehicle_ingest                    # noqa: E402
+from vehicle.gateway import auth as gateway_auth           # noqa: E402
+from vehicle.providers import ingested as vehicle_ingested  # noqa: E402
+from vehicle.signals import registry as signal_registry    # noqa: E402
+
+
+def _gateway_credentials(gateway_id: str, token: str) -> tuple:
+    """Credentials from headers. One place, so no route invents its own scheme."""
+    return (gateway_id or "").strip(), (token or "").strip()
+
+
+@app.post("/api/v1/vehicle-gateways/register")
+def gateway_register_endpoint(body: dict = Body(...)):
+    """Admit a gateway and issue it a token.
+
+    The token comes back exactly once and is stored hashed — see
+    vehicle/gateway/auth.py. A bridge that loses it re-registers.
+
+    Registration is REFUSED when no bootstrap key is configured, rather than
+    allowed. An unconfigured deployment that accepts any device is worse than
+    one that accepts none, because the first failure is silent.
+    """
+    try:
+        out = gateway_auth.register(
+            device_name=str(body.get("device_name") or ""),
+            vehicle_id=str(body.get("vehicle_id") or config.VEHICLE_ID),
+            registration_key=str(body.get("registration_key") or ""),
+            hardware_type=str(body.get("hardware_type") or "unknown"),
+            firmware_type=str(body.get("firmware_type") or "unknown"),
+            bridge_version=str(body.get("bridge_version") or "0.0.0"),
+            gateway_id=body.get("gateway_id"))
+    except gateway_auth.AuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=403)
+    return out
+
+
+@app.post("/api/v1/vehicle-gateways/heartbeat")
+def gateway_heartbeat_endpoint(body: dict = Body(...),
+                               x_gateway_id: str = Header(default=""),
+                               x_gateway_token: str = Header(default="")):
+    """"I am still here, and this is what I think of myself."
+
+    The bridge reports its own view — CAN state, network state, how many events
+    are stuck in its outbox. The cloud records that verbatim and forms its own
+    opinion of the link from when it last heard, because a bridge that believes
+    its network is fine and has not been heard from in five minutes is exactly
+    the disagreement worth surfacing.
+    """
+    gid, token = _gateway_credentials(x_gateway_id, x_gateway_token)
+    try:
+        rec = gateway_auth.authenticate(gid, token)
+        gateway_auth.authorize_vehicle(rec, str(body.get("vehicle_id") or ""))
+        return gateway_auth.heartbeat(gid, body)
+    except gateway_auth.AuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+
+
+@app.get("/api/v1/vehicle-gateways")
+def gateway_list_endpoint(vehicle_id: str = Query(default=None)):
+    """Every gateway and what the cloud believes about it. Never a credential."""
+    return {"gateways": gateway_auth.gateways(vehicle_id),
+            "registration_configured": gateway_auth.registration_enabled(),
+            "stale_after_s": config.VEHICLE_GATEWAY_STALE_S}
+
+
+@app.post("/api/v1/vehicle-telemetry/batches")
+async def telemetry_batch_endpoint(request: Request,
+                                   x_gateway_id: str = Header(default=""),
+                                   x_gateway_token: str = Header(default="")):
+    """Canonical telemetry, in batches. The one door vehicle data comes through.
+
+    Read as raw bytes rather than a parsed body so the size ceiling is applied
+    BEFORE the JSON is materialised — a payload ten times the limit should cost
+    a length check, not a parse.
+
+    Per-event results, not a single verdict: one undecodable frame in two
+    hundred good readings must not cost the two hundred, and a bridge needs to
+    know which ids to stop resending without throwing away its backlog.
+    """
+    raw = await request.body()
+    if len(raw) > config.VEHICLE_INGEST_MAX_BYTES:
+        return JSONResponse(
+            {"error": f"payload is {len(raw)} bytes, over the "
+                      f"{config.VEHICLE_INGEST_MAX_BYTES} limit"},
+            status_code=413)
+    try:
+        import json as _json
+        body = _json.loads(raw or b"{}")
+    except Exception as e:
+        return JSONResponse({"error": f"malformed JSON: {e}"}, status_code=400)
+
+    gid, token = _gateway_credentials(x_gateway_id, x_gateway_token)
+    try:
+        return await run_in_threadpool(vehicle_ingest.ingest_batch, body, gid, token)
+    except vehicle_ingest.IngestError as e:
+        return JSONResponse({"error": str(e)}, status_code=e.status)
+
+
+@app.get("/api/v1/vehicle-telemetry/stats")
+def telemetry_stats_endpoint():
+    """What the ingestion layer has seen. Diagnostics for a bridge under test."""
+    return vehicle_ingest.stats()
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/signals")
+def vehicle_signals_endpoint(vehicle_id: str):
+    """The canonical registry, and which of it this vehicle has ever produced.
+
+    The capability report §32.7 asks for. A signal that has never arrived is
+    NOT a fault — most vehicles do not expose most PIDs — and separating
+    "unsupported" from "missing" here is what stops the panel showing an empty
+    row that looks exactly like a sensor that has died.
+    """
+    cap = vehicle_ingested.buffer().capability()
+    return {"vehicle_id": vehicle_id,
+            "signals": signal_registry.view(),
+            "supported": cap["supported"],
+            "unsupported": cap["unsupported"]}
 
 
 # --- Phase 2.5 session endpoints ---

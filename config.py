@@ -286,7 +286,15 @@ TELEMETRY_TREND_DELTA = {
     "coolant_temp": 1.5,
     "intake_air_temp": 1.5,
     "map_kpa": 4.0,
+    "maf_gs": 3.0,
     "throttle_pct": 4.0,
+    "engine_load": 5.0,
+    # Tighter than the other percentages on purpose. A long-term fuel trim
+    # that has moved 1.5% in twenty seconds is not drifting, it is being
+    # driven somewhere — and the arrow is the only place on the row that
+    # says which.
+    "stft_b1": 2.5,
+    "ltft_b1": 1.5,
     "afr_target": 0.25,
     "afr_wideband": 0.25,
     "fuel_pressure": 1.2,
@@ -322,7 +330,23 @@ TELEMETRY_BANDS = {
     # 200 means the intake is cooking on a stopped car.
     "intake_air_temp": {"warn_high": 160.0, "crit_high": 200.0},
     "map_kpa":         {},
+    "maf_gs":          {},
     "throttle_pct":    {},
+    # Load is context, not a fault. An engine at 95% load is working hard,
+    # which is what engines are for.
+    "engine_load":     {},
+    # Fuel trim is the one channel on this panel where the SIGN carries as
+    # much as the magnitude, and the band is symmetric because both
+    # directions are real faults: positive is the ECU adding fuel to cover
+    # air it did not meter, negative is it pulling fuel back from a leaking
+    # injector or a failing MAF. +/-10% is the number a technician reaches
+    # for; +/-25% is where the ECU runs out of authority and sets a code of
+    # its own, which is the moment RIO stops being early and starts merely
+    # agreeing with the dashboard.
+    "stft_b1":         {"crit_low": -25.0, "warn_low": -10.0,
+                        "warn_high": 10.0, "crit_high": 25.0, "running": True},
+    "ltft_b1":         {"crit_low": -25.0, "warn_low": -10.0,
+                        "warn_high": 10.0, "crit_high": 25.0, "running": True},
     # Lean is what kills pistons; rich only wastes fuel. Hence the asymmetry:
     # a tenth of a point lean of 15.2 gets attention, and it takes 11.0 the
     # other way to say anything at all.
@@ -416,6 +440,7 @@ INSIGHTS_DEVIATION_DELTA = {
     "fuel_pressure": 4.0,
     "intake_air_temp": 15.0,
     "afr_wideband": 0.4,
+    "ltft_b1": 3.0,
 }
 
 # Drift: slope across the daily baselines, expressed as total change over the
@@ -429,6 +454,10 @@ INSIGHTS_DRIFT_DELTA = {
     "coolant_temp": 5.0,
     "oil_pressure": 5.0,
     "fuel_pressure": 3.5,
+    # The drift detector's best channel. A long-term trim that has climbed
+    # 2.5% across four weeks is a vacuum leak developing, and it passes
+    # every band in TELEMETRY_BANDS on every single one of those days.
+    "ltft_b1": 2.5,
 }
 
 # The same observation must not be able to fill the log. One per kind per
@@ -708,3 +737,95 @@ TIRE_DIAG_DRIVE_END_PARKED_S = 300.0
 # individual code says -- the announcement RIO would have made is written to the
 # shadow log instead. The urgent fast path is the documented exception.
 TIRE_DIAG_SHADOW_MODE = True
+
+
+# ---------------------------------------------------------------------------
+# Vehicle data layer — canonical ingestion, gateways, and the engine domain
+# ---------------------------------------------------------------------------
+# The cloud side of the OBD-II / Holley work. Same rule as every block above:
+# every threshold, cadence and limit the vehicle data layer reacts to lives
+# here, and the bridge that will one day run in the car reads its own copy from
+# its own config file rather than importing this one.
+#
+# NOT HERE, deliberately: anything the diagnostic framework in diag/ needs. That
+# package imports no config at all — two domains cannot share one module-level
+# constant, and a framework that reached for config would have to know which
+# domain was asking. Domains pass their tunables in.
+
+# Where the vehicle data layer keeps what it knows. Beside the insight baselines
+# and the tire diagnostic record, because it is the same kind of thing: a record
+# of drives that outlives the process.
+VEHICLE_DIAG_DIR = "/workspace/rio-phase1/training_data/vehicle"
+
+# The single vehicle this prototype watches. Every stateful thing in this
+# codebase already assumes one driver and one car — the announcement policy, the
+# diagnostic engines, nav's route registry, _last_talk — and this constant makes
+# that assumption something you can read rather than something you discover.
+# The API accepts a vehicle_id on every route so the contract is already
+# multi-vehicle; the STATE behind it is not, and pretending otherwise would be
+# the more expensive lie.
+VEHICLE_ID = "vehicle_prototype_01"
+
+# --- gateway registration and authentication --------------------------------
+# The bootstrap key that admits a new gateway. From the environment, never from
+# the source tree. UNSET MEANS REGISTRATION IS REFUSED: an unconfigured
+# deployment that accepts any device is worse than one that accepts none,
+# because the first failure is silent and the second is immediate.
+VEHICLE_GATEWAY_REGISTRATION_KEY = os.getenv("RIO_GATEWAY_REGISTRATION_KEY", "")
+
+# How long since a heartbeat before the cloud stops calling the link connected.
+# Three missed beats at the 10 s active cadence in the bridge spec.
+VEHICLE_GATEWAY_STALE_S = 35.0
+
+# --- ingestion --------------------------------------------------------------
+# Batches per minute per gateway, and how many may arrive at once. Sized in
+# BATCHES rather than events on purpose: a bridge uploading a backlog after a
+# tunnel sends few large batches, and a per-event limit would throttle exactly
+# the recovery behaviour the outbox exists to produce.
+VEHICLE_INGEST_RATE_PER_MIN = 240.0
+VEHICLE_INGEST_BURST = 60.0
+
+# Hard ceilings on one batch. A payload larger than this is refused whole rather
+# than half-processed — a partially accepted batch is the one shape the outbox's
+# retry logic cannot reason about.
+VEHICLE_INGEST_MAX_EVENTS = 2000
+VEHICLE_INGEST_MAX_BYTES = 4 * 1024 * 1024
+
+# How many event ids are remembered for deduplication. At ten signals and a few
+# hertz this is roughly the last hour of a drive, which comfortably covers a
+# bridge retrying a batch it never saw acknowledged.
+VEHICLE_INGEST_DEDUP_MAX = 20000
+
+# How long an ingested reading stays current before the panel calls it stale.
+# Matches TELEMETRY_STALE_AFTER_S: a channel arriving over a network is judged
+# by the same clock as one arriving from a mock, or the two sources would
+# disagree about what "live" means.
+VEHICLE_INGEST_STALE_AFTER_S = TELEMETRY_STALE_AFTER_S
+
+# The rolling window of raw canonical events kept in memory, for the early-fault
+# snapshot that has to reach BACKWARDS from the moment a code appears. The trend
+# ring in telemetry.py is 20 s and is cleared whenever a scenario changes, so it
+# cannot answer "what was happening a minute before this code was set" — this
+# can. Three minutes at ~12 channels and 1 Hz is a few thousand small dicts.
+VEHICLE_EVENT_RING_S = 180.0
+VEHICLE_EVENT_RING_MAX = 8000
+
+# --- source selection -------------------------------------------------------
+# Which producer the telemetry pipeline is listening to. The interpretation
+# pipeline is identical for every one of them — see vehicle/__init__.py — and
+# switching does not restart anything.
+#
+#   mock_holley   the in-process Holley mock, read directly. The original path.
+#   simulation    the same physics, pushed through the canonical ingestion API.
+#   live_obd      a bridge on a CAN OBD-II vehicle.
+#   live_holley   a bridge listening passively to a Holley bus.
+#   replay        a recorded canonical log, played back.
+VEHICLE_SOURCE_DEFAULT = "mock_holley"
+
+# --- powertrain diagnostic monitors ----------------------------------------
+# The engine-domain equivalent of the TIRE_DIAG_* block above, and shadowed for
+# the same reason with one difference that matters: the tire monitors have
+# shadow logs from real drives behind them, and these have never seen a vehicle
+# at all. That is why clearance is per domain now.
+VEHICLE_DIAG_ENABLED = True
+VEHICLE_DIAG_SHADOW_MODE = True

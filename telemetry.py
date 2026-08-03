@@ -156,8 +156,17 @@ SENSORS: Tuple[SensorSpec, ...] = (
     SensorSpec("afr_target",       "Air Fuel Ratio",   ":1",   1, INDUCTION),
     SensorSpec("afr_wideband",     "Wideband O₂",      ":1",   1, INDUCTION),
     SensorSpec("map_kpa",          "MAP",              "kPa",  0, INDUCTION),
+    SensorSpec("maf_gs",           "Mass Air Flow",    "g/s",  1, INDUCTION),
     SensorSpec("throttle_pct",     "Throttle Position", "%",   0, INDUCTION),
+    SensorSpec("engine_load",      "Engine Load",      "%",    0, INDUCTION),
     SensorSpec("intake_air_temp",  "Intake Air Temp",  "°F",   0, INDUCTION),
+    # The two fuel trims are what make a lean condition visible BEFORE the ECU
+    # sets a code for it. They are the single most useful pair on this panel for
+    # the early-detection story: a long-term trim that has been climbing for a
+    # week is a vacuum leak nobody has noticed yet, and it passes every band on
+    # every one of those days.
+    SensorSpec("stft_b1",          "Short Term Fuel Trim", "%", 1, INDUCTION),
+    SensorSpec("ltft_b1",          "Long Term Fuel Trim",  "%", 1, INDUCTION),
 
     SensorSpec("rpm",              "Engine RPM",       "",     0, DRIVELINE),
     SensorSpec("vehicle_speed",    "Vehicle Speed",    "mph",  0, DRIVELINE),
@@ -334,6 +343,12 @@ class Scenario:
     charging_fault: bool = False
     overheat: bool = False
     dropout: Tuple[str, ...] = ()
+    # Long-term fuel trim climbing away from zero, in percent per minute. This
+    # is what an unmetered-air leak looks like from the outside: the ECU keeps
+    # adding fuel to hold stoichiometric, the trim records how much, and every
+    # other channel on the panel stays exactly where it was. It is the cleanest
+    # example in the whole mock of a fault that no fixed band can catch.
+    trim_drift_pct_per_min: float = 0.0
 
 
 SCENARIOS: Tuple[Scenario, ...] = (
@@ -346,6 +361,8 @@ SCENARIOS: Tuple[Scenario, ...] = (
              overheat=True),
     Scenario("sensor_dropout",  "Sensor Dropout", _in_cruise, warm_offset_s=1200.0,
              dropout=("coolant_temp", "oil_pressure")),
+    Scenario("fuel_trim_drift", "Fuel Trim Drift", _in_idle,
+             trim_drift_pct_per_min=1.4),
 )
 
 
@@ -477,6 +494,41 @@ class MockHolleyProvider(TelemetryProvider):
         # Heat soak at rest, scrubbed away by airflow once moving.
         iat = AMBIENT_F + 2.5 + 9.0 * math.exp(-speed / 12.0) + _wander("intake_air_temp", t, 0.5)
 
+        # Calculated load, the way the standard defines it: how much air the
+        # engine is drawing against how much it could draw at this rpm. On a
+        # naturally aspirated engine that tracks manifold pressure almost
+        # exactly, which is why the two rows move together on the panel and why
+        # a disagreement between them is worth a cross-signal finding.
+        if running:
+            engine_load = max(0.0, min(100.0,
+                                       100.0 * (map_kpa - 20.0) / (BARO_KPA - 20.0)))
+            engine_load += _wander("engine_load", t, 0.8)
+            # Speed density: airflow rises with rpm and with manifold pressure,
+            # and falls as the charge gets hotter and thinner.
+            maf = (rpm * map_kpa * 4.0e-4) * (540.0 / (iat + 460.0))
+            maf = max(0.0, maf + _wander("maf_gs", t, 0.4))
+        else:
+            engine_load = None
+            maf = None
+
+        # Fuel trims. The short-term trim is the closed-loop correction the ECU
+        # is applying right now and it oscillates by design — a wideband that
+        # holds perfectly still is a wideband that has stopped working. The
+        # long-term trim is what the ECU has LEARNED, and it is the one that
+        # matters here: it moves slowly, it survives a key cycle, and it is the
+        # earliest number on the car that says something has changed.
+        if running:
+            # Open loop under power: the ECU stops trimming and follows the
+            # table, so both trims go to zero. Reporting a live correction there
+            # would be inventing one.
+            open_loop = tp > 0.55
+            drift = sc.trim_drift_pct_per_min * (run_s - sc.warm_offset_s) / 60.0
+            drift = max(-60.0, min(60.0, drift))
+            ltft = 0.0 if open_loop else (1.8 + drift + _wander("ltft_b1", t, 0.35))
+            stft = 0.0 if open_loop else (_wander("stft_b1", t, 3.2) - 0.4)
+        else:
+            ltft = stft = None
+
         # Charging system. Sags hard at crank, then holds regulated voltage with
         # a little ripple; the fault scenario is an alternator that has stopped
         # keeping up and is slowly draining the battery instead.
@@ -501,7 +553,11 @@ class MockHolleyProvider(TelemetryProvider):
             "coolant_temp": coolant,
             "intake_air_temp": iat,
             "map_kpa": map_kpa,
+            "maf_gs": maf,
             "throttle_pct": throttle,
+            "engine_load": engine_load,
+            "stft_b1": stft,
+            "ltft_b1": ltft,
             "afr_target": afr_target,
             "afr_wideband": afr_wb,
             "fuel_pressure": fuel_press,
@@ -588,27 +644,163 @@ class TireTelemetryProvider(TelemetryProvider):
 # The live providers
 # ---------------------------------------------------------------------------
 
-def _build_providers() -> List[TelemetryProvider]:
-    kind = getattr(config, "TELEMETRY_PROVIDER", "mock")
-    if kind != "mock":
-        # Not fatal. A car with a misconfigured provider name should still show
-        # a telemetry panel that says it has nothing, not a 500 on every poll.
-        print(f"[telemetry] unknown provider {kind!r}; falling back to mock", flush=True)
-    return [MockHolleyProvider(), TireTelemetryProvider()]
+class IngestedProvider(TelemetryProvider):
+    """Everything that arrived over the canonical ingestion API.
+
+    This is the class that makes "the health engine does not care where a signal
+    came from" true rather than aspirational. A CANable bridge on a real car, a
+    passive Holley capture, a replay of a recorded drive and the simulator all
+    POST the same canonical events; they land in vehicle/providers/ingested.py's
+    buffer; and this reads that buffer through the same two methods
+    MockHolleyProvider implements. Not one line below this class knows the
+    difference.
+
+    `source_types` narrows it to one producer, which is what the dashboard's
+    source selector switches. Left empty it accepts whatever is arriving, which
+    is the right behaviour on a car where the bridge is reporting OBD-II and
+    Holley at once.
+
+    available() is FALSE when nothing has arrived, and that is the important
+    half. "There is no bridge connected" and "there is a bridge and the engine
+    is fine" are different answers, the banner says different things about them,
+    and vehicle_health.py raises an explicit `engine_unavailable` issue rather
+    than letting an empty panel read as a healthy one.
+    """
+
+    def __init__(self, name: str, label: str, source_types=()):
+        self.name = name
+        self.label = label
+        self._source_types = tuple(source_types)
+
+    def available(self) -> bool:
+        from vehicle.providers import ingested
+        return bool(ingested.readings(list(self._source_types) or None))
+
+    def read(self) -> List[SensorReading]:
+        from vehicle.providers import ingested
+        out = []
+        for row in ingested.readings(list(self._source_types) or None):
+            out.append(SensorReading(
+                row["telemetry_id"], row["value"], ok=row["ok"], at=row["at"],
+                detail=row["detail"]))
+        return out
 
 
-_providers: List[TelemetryProvider] = _build_providers()
+# ---------------------------------------------------------------------------
+# Which producer the pipeline is listening to
+# ---------------------------------------------------------------------------
+# The spec's source selector, and the reason it is a registry rather than an if
+# statement: `config.TELEMETRY_PROVIDER` used to be read and then ignored — any
+# value but "mock" printed a warning and produced the mock anyway — so there was
+# no way to point this pipeline at anything, and "switching sources does not
+# require a backend restart" was not a property the code had.
+#
+# Note what does NOT change when the source does: the bands, the trend window,
+# the staleness rule, the insight engine, the conversation layer, the browser.
+# The provider changes and nothing else, which is the whole claim.
+
+@dataclass(frozen=True)
+class Source:
+    name: str
+    label: str
+    build: object            # () -> TelemetryProvider
+    detail: str = ""
+
+
+SOURCES: Tuple[Source, ...] = (
+    Source("mock_holley", "Holley Terminator X (Mock)",
+           lambda: MockHolleyProvider(),
+           "In-process mock, read directly. The original development path."),
+    Source("simulation", "Simulation",
+           lambda: IngestedProvider("simulation", "Simulation",
+                                    ("dashboard_simulator",)),
+           "The same physics, pushed through the canonical ingestion API."),
+    Source("live_obd", "Live OBD-II",
+           lambda: IngestedProvider("live_obd", "Live OBD-II", ("obd2_can",)),
+           "A bridge on a CAN OBD-II vehicle."),
+    Source("live_holley", "Live Holley",
+           lambda: IngestedProvider("live_holley", "Live Holley",
+                                    ("holley_terminator_x",)),
+           "A bridge listening passively to a Holley bus."),
+    Source("replay", "Recorded Replay",
+           lambda: IngestedProvider("replay", "Recorded Replay",
+                                    ("recorded_replay",)),
+           "A recorded canonical log, played back."),
+)
+
+SOURCE_BY_NAME: Dict[str, Source] = {s.name: s for s in SOURCES}
+
+
+def _resolve_source(name: str) -> str:
+    if name in SOURCE_BY_NAME:
+        return name
+    # Not fatal. A misconfigured source name should still show a telemetry panel
+    # that says what it has, not a 500 on every poll.
+    print(f"[telemetry] unknown source {name!r}; falling back to "
+          f"{SOURCES[0].name}", flush=True)
+    return SOURCES[0].name
+
+
+_source_name: str = _resolve_source(getattr(config, "VEHICLE_SOURCE_DEFAULT",
+                                            "mock_holley"))
+_source_lock = threading.Lock()
+
+
+def _build_providers(source_name: str) -> List[TelemetryProvider]:
+    """The ECU source, plus the tire receiver.
+
+    The tires are not a source and are not switched: TPMS is a separate
+    subsystem with its own radio, and a car whose OBD bridge was unplugged still
+    has four tires being watched. Bundling them into the source selector would
+    make unplugging the bridge look like losing the tires.
+    """
+    return [SOURCE_BY_NAME[source_name].build(), TireTelemetryProvider()]
+
+
+_providers: List[TelemetryProvider] = _build_providers(_source_name)
 
 
 def providers() -> List[TelemetryProvider]:
     return _providers
 
 
-def _ecu() -> Optional[MockHolleyProvider]:
-    for p in _providers:
-        if isinstance(p, MockHolleyProvider):
-            return p
-    return None
+def source() -> str:
+    return _source_name
+
+
+def sources() -> List[dict]:
+    return [{"name": s.name, "label": s.label, "detail": s.detail}
+            for s in SOURCES]
+
+
+def set_source(name: str) -> bool:
+    """Point the pipeline at a different producer. -> False on an unknown name.
+
+    Clears the trend history and the runtime clock, for the same reason
+    set_scenario does: a slope fitted across the moment the source changed is a
+    slope across a discontinuity, and it would report a spectacular direction
+    for a channel that simply came from somewhere else.
+    """
+    global _providers, _source_name
+    if name not in SOURCE_BY_NAME:
+        return False
+    with _source_lock:
+        if name != _source_name:
+            _source_name = name
+            _providers = _build_providers(name)
+            _history.reset()
+            _runtime.reset()
+    return True
+
+
+def _ecu() -> Optional[TelemetryProvider]:
+    """The active source provider, whatever it is.
+
+    Used only for the banner's label and for the dev scenario controls, both of
+    which ask politely: a provider with no scenarios (which is every real one)
+    simply has no set_scenario, and the selector disappears from the panel.
+    """
+    return _providers[0] if _providers else None
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1184,12 @@ def snapshot(record: bool = True) -> dict:
     return {
         "provider": ecu.name if ecu else "none",
         "provider_label": ecu.label if ecu else "No Provider",
+        # Which producer the pipeline is listening to, and what else it could
+        # listen to. The interpretation below this line is identical for every
+        # one of them — see the SOURCES table.
+        "source": _source_name,
+        "source_label": SOURCE_BY_NAME[_source_name].label,
+        "sources": sources(),
         "available": live_providers > 0 and any_reading,
         "status": status,
         "status_text": status_text,
@@ -1009,8 +1207,8 @@ def snapshot(record: bool = True) -> dict:
         # The browser takes its cadence from the server so the poll rate is one
         # number in one place like every other tunable.
         "poll_ms": config.TELEMETRY_POLL_MS,
-        "scenario": ecu.scenario if ecu else None,
-        "scenarios": MockHolleyProvider.scenarios() if ecu else [],
+        "scenario": current_scenario(),
+        "scenarios": scenarios(),
         # The tire mock keeps its own scenario list. Both selectors are dev-only
         # and both disappear the moment a provider with no scenarios is live.
         "tire_scenario": tires.current_scenario(),
@@ -1046,11 +1244,19 @@ def _frame(rows: List[dict], readings: Dict[str, SensorReading],
 
 def current_scenario() -> Optional[str]:
     ecu = _ecu()
-    return ecu.scenario if ecu else None
+    return getattr(ecu, "scenario", None) if ecu else None
 
 
 def scenarios() -> List[dict]:
-    return MockHolleyProvider.scenarios() if _ecu() else []
+    """What the active source can be told to do. Empty for every real one.
+
+    Asked of the provider rather than assumed of the class: a live bridge has
+    exactly one scenario, which is whatever the engine is actually doing, and
+    the selector removes itself from the panel when this list is empty.
+    """
+    ecu = _ecu()
+    fn = getattr(ecu, "scenarios", None) if ecu else None
+    return fn() if callable(fn) else []
 
 
 def set_scenario(name: str) -> bool:
@@ -1062,7 +1268,8 @@ def set_scenario(name: str) -> bool:
     arrow on a channel that simply jumped.
     """
     ecu = _ecu()
-    if not ecu or not ecu.set_scenario(name):
+    setter = getattr(ecu, "set_scenario", None) if ecu else None
+    if not callable(setter) or not setter(name):
         return False
     _history.reset()
     _runtime.reset()
