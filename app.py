@@ -1433,6 +1433,67 @@ def vehicle_dtc_endpoint():
     return dtc_service.service().section()
 
 
+@app.get("/vehicle/conditions")
+def vehicle_conditions_endpoint():
+    """RIO-Observed Conditions (§27.5), already worded and already ordered.
+
+    Everything RIO has inferred, and nothing the vehicle reported — the codes
+    have their own section and mixing them would undo the one distinction this
+    whole feature rests on.
+
+    Each condition carries what §27.5 asks for: the observation, its provenance,
+    a confidence, the signals behind it, when it was first seen, and whether a
+    cause has been confirmed. That last field is always "not confirmed" unless a
+    person put something there, and the browser prints it rather than deciding
+    it.
+    """
+    from vehicle.signals import provenance as prov
+
+    issues = vehicle_health.issues()
+    conditions, gaps = [], []
+    for i in issues:
+        if i["domain"] == "diagnostics":
+            continue
+        itype = i.get("type") or ""
+        row = {
+            "observation": i["message"],
+            "domain": i["domain"],
+            "type": itype,
+            "severity": i["severity"],
+            "severity_rank": i["severity_rank"],
+            "state": i["severity"],
+            "where": i["location"] or None,
+            "observation_window": i["observation_window"],
+            "provenance": prov.RIO_OBSERVED_PATTERN,
+            "provenance_label": prov.display(prov.RIO_OBSERVED_PATTERN),
+            "confidence": (i.get("evidence") or {}).get("confidence"),
+            "supporting_signals": sorted(
+                (i.get("evidence") or {}).get("measurement", {}).keys()),
+            "first_observed_at": (i.get("evidence") or {}).get("confirmed_at"),
+            "possible_explanation": i["suggested_action"] or None,
+            "cause_confirmed": False,
+        }
+        if itype.endswith("_unavailable") or "not_ready" in itype \
+                or "not_evaluated" in itype:
+            gaps.append(row)
+        else:
+            conditions.append(row)
+
+    return {
+        "conditions": conditions,
+        "count": len(conditions),
+        # What RIO could not look at, kept apart from what it found. A panel
+        # that listed them together would make an unmonitored car look like a
+        # troubled one — and hiding them would be worse still.
+        "coverage_gaps": gaps,
+        "gap_count": len(gaps),
+        "empty_state": "RIO has not observed anything unusual.",
+        "empty_state_caveat": ("This covers only what RIO can currently see. "
+                               "It is not a statement about the whole vehicle."),
+        "poll_ms": config.HEALTH_POLL_MS,
+    }
+
+
 @app.get("/vehicle/dtc/catalogue")
 def vehicle_dtc_catalogue_endpoint():
     """Every code RIO has a definition for. A service view.
