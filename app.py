@@ -874,6 +874,97 @@ def vehicle_telemetry_source_set_endpoint(name: str = Query(...)):
     return telemetry.snapshot(record=False)
 
 
+# --- the in-process producers, and the link they talk over ------------------
+# Development controls. The simulator and the replay both build canonical events
+# and hand them to the same ingestion path a bridge posts to — they are not a
+# shortcut into the pipeline, which is the entire reason they are worth having.
+#
+# The fault injector sits between building and ingesting, because that is where
+# a link lives. It can delay, drop, duplicate, reorder and skew; it can never
+# fabricate a reading.
+
+from vehicle import faults as vehicle_faults              # noqa: E402
+from vehicle import producers as vehicle_producers        # noqa: E402
+from vehicle.producers import replay as vehicle_replay    # noqa: E402
+from vehicle.producers import simulator as vehicle_sim    # noqa: E402
+
+
+@app.get("/vehicle/producers")
+def vehicle_producers_endpoint():
+    """What the in-process producers are doing, and what the link is doing to
+    them. Diagnostics for the §27.9 scenario list."""
+    return vehicle_producers.stats()
+
+
+@app.get("/vehicle/simulator/scenario")
+def vehicle_simulator_scenario_endpoint():
+    sim = vehicle_sim.simulator()
+    return {"scenario": sim.scenario, "scenarios": sim.scenarios(),
+            "stats": sim.stats()}
+
+
+@app.post("/vehicle/simulator/scenario")
+def vehicle_simulator_scenario_set_endpoint(name: str = Query(...)):
+    """Switch the simulated vehicle's condition. Development only.
+
+    The clock restarts with the scenario: every one of them is a function of
+    elapsed time, and an overheat that remembered where it got to an hour ago
+    would jump 60°F between two consecutive readings — which the range check
+    would then correctly refuse as an impossible step.
+    """
+    sim = vehicle_sim.simulator()
+    if not sim.set_scenario(name):
+        return {"error": "unknown scenario", "name": name,
+                "scenarios": sim.scenarios()}
+    return {"scenario": sim.scenario, "scenarios": sim.scenarios()}
+
+
+@app.get("/vehicle/faults")
+def vehicle_faults_endpoint():
+    return vehicle_faults.injector().stats()
+
+
+@app.post("/vehicle/faults")
+def vehicle_faults_set_endpoint(mode: str = Query(...)):
+    """Break the link on purpose. Development only.
+
+    Clearing a cloud disconnect RELEASES what it held rather than discarding it,
+    because that is what a reconnecting bridge does — the outbox empties. That
+    release is also how the out-of-order path gets exercised for real.
+    """
+    inj = vehicle_faults.injector()
+    if not inj.set_mode(mode):
+        return {"error": "unknown fault mode", "mode": mode,
+                "modes": [m["name"] for m in inj.stats()["modes"]]}
+    return inj.stats()
+
+
+@app.post("/vehicle/replay/load")
+def vehicle_replay_load_endpoint(path: str = Query(...)):
+    """Load a recorded canonical log. Nothing is sent until it is started."""
+    return vehicle_replay.replay().load(path)
+
+
+@app.post("/vehicle/replay/start")
+def vehicle_replay_start_endpoint(speed: float = Query(default=1.0),
+                                  loop: bool = Query(default=False),
+                                  session_id: str = Query(default=None)):
+    """Play it back. `speed` compresses the relative timing only.
+
+    A two-hour drive at 120x is a minute and every monitor sees the same values
+    in the same order, which is what makes an hour-long slow-leak window
+    testable. What it does not do is change the observed_at spacing: a monitor
+    asking how long something took gets the answer the drive gave.
+    """
+    return vehicle_replay.replay().start(time.time(), speed=speed, loop=loop,
+                                         session_id=session_id)
+
+
+@app.post("/vehicle/replay/stop")
+def vehicle_replay_stop_endpoint():
+    return vehicle_replay.replay().stop()
+
+
 @app.get("/vehicle/telemetry/scenario")
 def vehicle_telemetry_scenario_endpoint():
     """Which mock scenario is live, and what else is on offer."""

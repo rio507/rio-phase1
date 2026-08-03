@@ -117,10 +117,20 @@ class IngestionBuffer:
         return {"applied": applied, "superseded_by_newer": superseded}
 
     def _trim(self) -> None:
-        cutoff = time.time() - config.VEHICLE_EVENT_RING_S
         # Trimmed by RECEIVED time, not observed: a replay of last week's drive
         # must not evaporate the moment it lands, and a bridge emptying its
         # outbox is delivering old observations that are new information.
+        #
+        # And relative to the newest RECEIVED event rather than to the wall
+        # clock, which is not a subtlety: a test driving synthetic time, and a
+        # replay whose recording is stamped in the past, both hand this buffer
+        # events the wall clock considers ancient. Trimming against time.time()
+        # emptied the ring on the way in, so the early-fault snapshot would have
+        # had nothing to reach back into on exactly the runs that needed it.
+        newest = self._last_received_ts
+        if newest is None:
+            return
+        cutoff = newest - config.VEHICLE_EVENT_RING_S
         i = 0
         for i, e in enumerate(self._ring):
             if (e.get("received_ts") or 0.0) >= cutoff:

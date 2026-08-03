@@ -488,6 +488,258 @@ def run_one_pipeline():
 
 
 # ===========================================================================
+# H. Producers
+# ===========================================================================
+
+def run_producers():
+    head("H -- the simulator and the replay go through the front door")
+
+    from vehicle.producers import physics
+    from vehicle.producers import replay as rep_mod
+    from vehicle.producers import simulator as sim_mod
+
+    # The claim that matters: the simulator does not have a private way in.
+    src = open(os.path.join(ROOT, "vehicle", "producers", "simulator.py")).read()
+    check("ingest_local" in src or "ingest." in src,
+          "the simulator hands its events to vehicle.ingest")
+    check("buffer()" not in src and "_latest" not in src,
+          "and never touches the ingestion buffer directly — a simulator that "
+          "did would look identical from the dashboard and prove nothing")
+
+    ingest.reset_for_test()
+    sim = sim_mod.Simulator()
+    sim.set_scenario("cruise")
+    t = 1_700_000_000.0
+    for i in range(20):
+        sim.tick(t + i)
+
+    st = ingest.stats()
+    check(st["events_received"] > 0, "the simulator produced events",
+          str(st["events_received"]))
+    check(st["source_types"] == {"dashboard_simulator": st["events_received"]},
+          "all of them labelled dashboard_simulator", str(st["source_types"]))
+
+    latest = ingested.buffer().latest()
+    ev = latest.get("powertrain.engine.coolant_temperature")
+    check(ev is not None, "coolant arrived through the canonical name")
+    check(ev and ev["provenance"] == P.SIMULATION,
+          "with provenance `simulation`, so nothing downstream can mistake it "
+          "for a measurement", ev["provenance"] if ev else "")
+    check(ev and ev["quality"] == Q.SIMULATION,
+          "and a quality that says the same", ev["quality"] if ev else "")
+    check(not Q.is_trustworthy(Q.SIMULATION),
+          "which is NOT trustworthy — a monitor must never tell a driver to "
+          "pull over because of a number nobody measured")
+
+    # Per-signal cadence. Emitting everything on every tick would produce a
+    # stream no real vehicle could produce, and would let a monitor be tuned
+    # against a luxury the hardware does not offer.
+    rpm_n = len(ingested.buffer().window(t - 1, t + 21, ["powertrain.engine.rpm"]))
+    cool_n = len(ingested.buffer().window(
+        t - 1, t + 21, ["powertrain.engine.coolant_temperature"]))
+    check(rpm_n > cool_n,
+          "rpm is emitted more often than coolant, as §12's rates require",
+          f"rpm {rpm_n} vs coolant {cool_n}")
+
+    # Scenarios that are about the CAR, not the link.
+    for name in ("overheating", "coolant_rapid_rise", "fuel_trim_drift",
+                 "start_voltage_decline", "unsupported_pids", "frozen_signal",
+                 "invalid_value", "ecu_no_response"):
+        check(name in physics.BY_NAME, f"scenario {name!r} exists")
+
+    ingest.reset_for_test()
+    s2 = sim_mod.Simulator()
+    s2.set_scenario("unsupported_pids")
+    for i in range(12):
+        s2.tick(t + i)
+    cap = ingested.buffer().capability()
+    check("powertrain.engine.mass_air_flow" in cap["unsupported"],
+          "an unsupported PID never arrives at all — absent, not null, which "
+          "is what puts it in the capability report rather than on the panel")
+
+    ingest.reset_for_test()
+    s3 = sim_mod.Simulator()
+    s3.set_scenario("invalid_value")
+    for i in range(12):
+        s3.tick(t + i)
+    ev = ingested.buffer().latest().get(
+        "powertrain.engine.coolant_temperature")
+    check(ev and ev["quality"] == Q.INVALID_RANGE,
+          "an impossible reading is stored and labelled invalid_range",
+          ev["quality"] if ev else "missing")
+
+    ingest.reset_for_test()
+    s4 = sim_mod.Simulator()
+    s4.set_scenario("ecu_no_response")
+    for i in range(12):
+        s4.tick(t + i)
+    got = [e for e in ingested.buffer().latest().values()
+           if e.get("value") is not None]
+    check(not got, "an ECU that has stopped answering produces no values at all",
+          str(len(got)))
+
+    # --- record and replay ------------------------------------------------
+    ingest.reset_for_test()
+    path = os.path.join(_TMP, "drive.jsonl")
+    rec = rep_mod.Recorder(path)
+    s5 = sim_mod.Simulator()
+    s5.set_scenario("overheating")
+    for i in range(60):
+        rec.write(s5.build(t + i))
+    check(rec.stats()["events"] > 100, "a drive was recorded",
+          str(rec.stats()["events"]))
+
+    rp = rep_mod.Replay()
+    loaded = rp.load(path)
+    check(loaded["events"] == rec.stats()["events"],
+          "and loads back whole", f"{loaded['events']}")
+    check(loaded["recorded_span_s"] and loaded["recorded_span_s"] > 50,
+          "with its original span intact", str(loaded["recorded_span_s"]))
+
+    ingest.reset_for_test()
+    rp.start(t, speed=10.0)
+    for i in range(12):
+        rp.tick(t + i)
+    ev = ingested.buffer().latest().get(
+        "powertrain.engine.coolant_temperature")
+    check(ev is not None, "the replay reaches the buffer")
+    check(ev and ev["source_type"] == S.RECORDED_REPLAY,
+          "labelled recorded_replay", ev["source_type"] if ev else "")
+    check(ev and ev["provenance"] == P.RECORDED_REPLAY,
+          "with replay provenance, so a report cannot present it as live")
+    check(ev and ev["metadata"].get("original_observed_at"),
+          "and the original timestamp kept, so the recording is still readable "
+          "as what it was")
+    check(ev and ev["value"] > 240.0,
+          "the overheat replays as an overheat — the values are untouched",
+          str(ev["value"]) if ev else "")
+
+    # A second replay of the same file must not be silently swallowed by
+    # deduplication. This is the most confusing failure this feature could have.
+    before = ingest.stats()["events_received"]
+    rp2 = rep_mod.Replay()
+    rp2.load(path)
+    rp2.start(t + 1000.0, speed=10.0)
+    for i in range(12):
+        rp2.tick(t + 1000.0 + i)
+    check(ingest.stats()["events_received"] > before,
+          "and replaying the same file again is NOT deduplicated away — the "
+          "event ids are re-minted",
+          f"{before} -> {ingest.stats()['events_received']}")
+
+
+# ===========================================================================
+# I. Injected transport faults
+# ===========================================================================
+
+def run_faults():
+    head("I -- the link can be broken on purpose, and never fabricates a reading")
+
+    from vehicle import faults, producers
+    from vehicle.producers import simulator as sim_mod
+
+    inj = faults.injector()
+    inj.reset()
+    ingest.reset_for_test()
+    sim = sim_mod.simulator()
+    sim.set_scenario("cruise")
+    sim.reset()
+    t = 1_700_100_000.0
+
+    check(inj.set_mode("not_a_mode") is False, "an unknown fault mode is refused")
+
+    # Gateway disconnect: the bridge stopped MEASURING. Lost, not delayed.
+    inj.set_mode(faults.GATEWAY_DISCONNECT)
+    before = ingest.stats()["events_received"]
+    for i in range(5):
+        producers.pump_simulation(t + i)
+    check(ingest.stats()["events_received"] == before,
+          "gateway disconnect: nothing arrives")
+    dropped = inj.stats()["dropped"]
+    check(dropped > 0, "and the events are counted as LOST", str(dropped))
+    inj.set_mode(faults.NONE)
+    producers.pump_simulation(t + 10)
+    arrived = ingest.stats()["events_received"] - before
+    check(inj.stats()["pending_release"] == 0 and arrived < dropped,
+          "and reconnecting delivers only what is measured from now on — a "
+          "bridge that stopped measuring has no backlog to conjure back",
+          f"{dropped} lost, {arrived} arrived after reconnect")
+
+    # Cloud disconnect: the bridge is fine and cannot upload. Held, not lost.
+    inj.reset()
+    ingest.reset_for_test()
+    sim.reset()
+    inj.set_mode(faults.CLOUD_DISCONNECT)
+    for i in range(5):
+        producers.pump_simulation(t + 100 + i)
+    held = inj.stats()["held"]
+    check(ingest.stats()["events_received"] == 0,
+          "cloud disconnect: nothing arrives either")
+    check(held > 0, "but the events are HELD, not dropped", str(held))
+    inj.set_mode(faults.NONE)
+    producers.pump_simulation(t + 200)
+    check(ingest.stats()["events_received"] >= held,
+          "and every one of them arrives on reconnect — this is the difference "
+          "between mourning data that is about to turn up and waiting for data "
+          "that is gone", f"{held} held, {ingest.stats()['events_received']} in")
+    check(inj.stats()["held"] == 0, "with nothing left in the outbox")
+
+    # Duplicate upload: a genuine retry, same ids.
+    inj.reset()
+    ingest.reset_for_test()
+    sim.reset()
+    inj.set_mode(faults.DUPLICATE_UPLOAD)
+    res = producers.pump_simulation(t + 300)
+    check(res["sent"] == 2 * res["built"],
+          "duplicate upload: every event is delivered twice",
+          f"built {res['built']} sent {res['sent']}")
+    check(res["accepted"] == res["built"],
+          "and exactly half are accepted — deduplication by event_id",
+          f"accepted {res['accepted']}")
+
+    # Out of order: a backlog draining behind the live stream.
+    inj.reset()
+    ingest.reset_for_test()
+    sim.reset()
+    inj.set_mode(faults.OUT_OF_ORDER)
+    producers.pump_simulation(t + 400)     # held
+    producers.pump_simulation(t + 402)     # sent, with t+400 behind it
+    st = ingest.stats()
+    check(st["superseded_by_newer"] > 0,
+          "out of order: a late reading arrives after a fresher one",
+          str(st["superseded_by_newer"]))
+    rpm = ingested.buffer().latest().get("powertrain.engine.rpm")
+    win = ingested.buffer().window(t + 399, t + 403, ["powertrain.engine.rpm"])
+    check(rpm is not None and len(win) >= 2,
+          "both are in the history, where the early-fault snapshot needs them",
+          str(len(win)))
+    newest = max(e["observed_ts"] for e in win)
+    check(abs(rpm["observed_ts"] - newest) < 1e-6,
+          "but the FRESHER one is current — otherwise every reconnection would "
+          "look like the engine dropping to idle")
+
+    # Clock skew: recorded, never corrected.
+    inj.reset()
+    ingest.reset_for_test()
+    sim.reset()
+    inj.set_mode(faults.CLOCK_SKEW)
+    producers.pump_simulation(t + 500)
+    skewed = [e for e in ingested.buffer().latest().values()
+              if e["metadata"].get("clock_skew_s")]
+    check(skewed, "clock skew is detected and recorded on the event",
+          str(len(skewed)))
+
+    inj.reset()
+    ingest.reset_for_test()
+
+    # And the whole point: no fault invents data.
+    fsrc = open(os.path.join(ROOT, "vehicle", "faults.py")).read()
+    check("make_event" not in fsrc and "random" not in fsrc,
+          "the injector cannot build an event — it only delays, drops, "
+          "duplicates, reorders and skews ones a producer genuinely made")
+
+
+# ===========================================================================
 # F. Read-only posture
 # ===========================================================================
 # Asserted by parsing the source. A comment saying "we never clear codes" is
@@ -654,7 +906,8 @@ def main():
     print(f"  store: {_TMP}")
 
     for t in (run_registry, run_units, run_schema, run_gateway, run_ingest,
-              run_one_pipeline, run_read_only, run_no_second_truth):
+              run_one_pipeline, run_producers, run_faults, run_read_only,
+              run_no_second_truth):
         try:
             t()
         except Exception as e:

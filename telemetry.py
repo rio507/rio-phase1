@@ -57,10 +57,8 @@ else with a mouth.
 """
 from __future__ import annotations
 
-import math
 import threading
 import time
-import zlib
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -69,6 +67,7 @@ from typing import Dict, List, Optional, Tuple
 import config
 import insights
 import tires
+from vehicle.producers import physics
 
 
 # ---------------------------------------------------------------------------
@@ -251,119 +250,19 @@ def _status_class(status: str) -> str:
 # ---------------------------------------------------------------------------
 # The mock ECU
 # ---------------------------------------------------------------------------
-# Correlated, not random. Every value below is derived from the same three
-# driver inputs — throttle, rpm, road speed — and from how long the engine has
-# been running, because that is how an engine actually works: MAP follows the
-# throttle plate, oil pressure follows rpm, oil temperature lags coolant, and
-# the alternator sags at crank and then holds ~14.2 V.
+# The engine model itself moved to vehicle/producers/physics.py, and it moved
+# for one reason: the canonical simulator needs the same model. Two engine models
+# drift, and "the simulator produces what the mock produces" would have become a
+# thing somebody hoped rather than a thing that was true. Now both call
+# physics.sample() and the identical numbers go down the direct path and the
+# ingestion path.
 #
-# A mock that jitters twelve independent numbers looks alive for about four
-# seconds and then looks wrong, because nothing agrees with anything. Worse, it
-# cannot exercise the insight engine at all: "fuel pressure drops during
-# aggressive acceleration" is only detectable if the fuel pressure is actually a
-# function of the throttle.
+# What is left here is the PROVIDER — the two methods this file's interface asks
+# for, and the scenario selection that is dev-only and disappears the moment a
+# real source is live.
 
-AMBIENT_F = 76.0
-THERMOSTAT_F = 191.0
-BARO_KPA = 99.0
-
-
-def _wander(sensor_id: str, t: float, amp: float) -> float:
-    """Smooth, deterministic sensor noise.
-
-    Two slow sines at frequencies derived from the channel's own name, so every
-    channel wanders differently and none of them wander together. Deterministic
-    because a mock you cannot get back to the state you were just looking at is
-    useless for building a UI — the same lesson MockTireProvider's named
-    scenarios encode.
-
-    crc32 rather than hash(): Python randomises string hashing per process, and
-    a mock whose noise changes shape on every restart is a mock that cannot be
-    used to reproduce anything.
-    """
-    if amp <= 0:
-        return 0.0
-    h = zlib.crc32(sensor_id.encode())
-    f1 = 0.09 + (h % 41) / 400.0
-    f2 = 0.021 + ((h >> 6) % 29) / 1100.0
-    p1 = (h % 628) / 100.0
-    p2 = ((h >> 11) % 628) / 100.0
-    return amp * (0.62 * math.sin(t * f1 + p1) + 0.38 * math.sin(t * f2 + p2))
-
-
-# --- driver inputs, per scenario -------------------------------------------
-
-def _in_idle(t):
-    return {"rpm": 880.0, "throttle": 0.8, "speed": 0.0}
-
-
-def _in_warmup(t):
-    # The first second and a half is the starter turning the engine over: low
-    # rpm, no oil pressure yet, and the battery dragged down to ~9.8 V. It is
-    # the one moment a healthy electrical system looks alarming, which is
-    # exactly why the panel needs to be able to say CRANKING.
-    if t < 1.6:
-        return {"rpm": 255.0, "throttle": 0.0, "speed": 0.0}
-    # Fast idle on a cold engine, decaying as the coolant comes up.
-    return {"rpm": 880.0 + 430.0 * math.exp(-(t - 1.6) / 45.0),
-            "throttle": 1.1, "speed": 0.0}
-
-
-def _in_cruise(t):
-    return {"rpm": 1850.0, "throttle": 14.0, "speed": 62.0}
-
-
-def _in_aggressive(t):
-    """A repeating pull: hard on the throttle, shift, coast, do it again.
-
-    Sixteen seconds, so a whole cycle is visible without waiting and the
-    conditioned baselines in insights.py collect both loaded and unloaded
-    samples of every channel within a minute of the scenario being selected.
-    """
-    ph = t % 16.0
-    if ph < 6.0:
-        f = ph / 6.0
-        return {"rpm": 2200.0 + 3500.0 * f,
-                "throttle": 18.0 + 74.0 * min(1.0, f * 2.5),
-                "speed": 35.0 + 55.0 * f}
-    if ph < 8.0:
-        return {"rpm": 3400.0, "throttle": 6.0, "speed": 90.0}
-    f = (ph - 8.0) / 8.0
-    return {"rpm": 3400.0 - 1650.0 * f, "throttle": 4.0, "speed": 90.0 - 52.0 * f}
-
-
-@dataclass(frozen=True)
-class Scenario:
-    name: str
-    label: str
-    inputs: object
-    # How long the engine had already been running when this scenario was
-    # selected. Warm scenarios start warm; only `warmup` starts from cold.
-    warm_offset_s: float = 900.0
-    charging_fault: bool = False
-    overheat: bool = False
-    dropout: Tuple[str, ...] = ()
-    # Long-term fuel trim climbing away from zero, in percent per minute. This
-    # is what an unmetered-air leak looks like from the outside: the ECU keeps
-    # adding fuel to hold stoichiometric, the trim records how much, and every
-    # other channel on the panel stays exactly where it was. It is the cleanest
-    # example in the whole mock of a fault that no fixed band can catch.
-    trim_drift_pct_per_min: float = 0.0
-
-
-SCENARIOS: Tuple[Scenario, ...] = (
-    Scenario("normal_idle",     "Normal Idle",   _in_idle),
-    Scenario("warmup",          "Cold Warm-Up",  _in_warmup, warm_offset_s=0.0),
-    Scenario("cruise",          "Cruise",        _in_cruise, warm_offset_s=1200.0),
-    Scenario("aggressive",      "Aggressive",    _in_aggressive, warm_offset_s=1500.0),
-    Scenario("charging_fault",  "Charging Fault", _in_idle, charging_fault=True),
-    Scenario("overheating",     "Overheating",   _in_cruise, warm_offset_s=1200.0,
-             overheat=True),
-    Scenario("sensor_dropout",  "Sensor Dropout", _in_cruise, warm_offset_s=1200.0,
-             dropout=("coolant_temp", "oil_pressure")),
-    Scenario("fuel_trim_drift", "Fuel Trim Drift", _in_idle,
-             trim_drift_pct_per_min=1.4),
-)
+Scenario = physics.Scenario
+SCENARIOS = physics.SCENARIOS
 
 
 class MockHolleyProvider(TelemetryProvider):
@@ -380,16 +279,16 @@ class MockHolleyProvider(TelemetryProvider):
 
     def __init__(self, scenario: str = None):
         self._lock = threading.Lock()
-        self._scenario = self._resolve(scenario or config.TELEMETRY_DEFAULT_SCENARIO)
+        self._scenario = physics.resolve(scenario or config.TELEMETRY_DEFAULT_SCENARIO)
         self._set_at = time.time()
-
-    @classmethod
-    def _resolve(cls, name: str) -> str:
-        return name if any(s.name == name for s in SCENARIOS) else SCENARIOS[0].name
+        # The last sample, for the scenarios whose fault is defined by what did
+        # NOT change — a frozen sensor reports the value it last had, and that
+        # is impossible to model without remembering it.
+        self._previous: Dict[str, Optional[float]] = {}
 
     @classmethod
     def scenarios(cls) -> List[dict]:
-        return [{"name": s.name, "label": s.label} for s in SCENARIOS]
+        return physics.catalogue()
 
     @property
     def scenario(self) -> str:
@@ -397,178 +296,32 @@ class MockHolleyProvider(TelemetryProvider):
             return self._scenario
 
     def set_scenario(self, name: str) -> bool:
-        if not any(s.name == name for s in SCENARIOS):
+        if name not in physics.BY_NAME:
             return False
         with self._lock:
             self._scenario = name
             # Reset the clock: warm-up must restart from cold every time it is
             # selected rather than resuming wherever it got to an hour ago.
             self._set_at = time.time()
+            self._previous = {}
         return True
 
     def available(self) -> bool:
         return True
 
-    # -- the physics -------------------------------------------------------
-
     def read(self) -> List[SensorReading]:
         with self._lock:
             name, set_at = self._scenario, self._set_at
-        sc = next(s for s in SCENARIOS if s.name == name)
+            previous = dict(self._previous)
         now = time.time()
-        t = now - set_at
-        run_s = sc.warm_offset_s + t
-
-        inp = sc.inputs(t)
-        rpm = inp["rpm"] + _wander("rpm", t, 9.0)
-        throttle = max(0.0, inp["throttle"] + _wander("throttle_pct", t, 0.25))
-        speed = max(0.0, inp["speed"] + _wander("vehicle_speed", t, 0.4 if inp["speed"] else 0.0))
-        tp = min(1.0, throttle / 100.0)
-        cranking = rpm < config.TELEMETRY_ENGINE_RUNNING_RPM and rpm > 50.0
-        running = rpm >= config.TELEMETRY_ENGINE_RUNNING_RPM
-
-        # Coolant: exponential approach to the thermostat, plus a little for
-        # load. Time constant ~3.5 minutes, which is about what a small block
-        # with a 180°F stat actually takes.
-        load = tp
-        warm_frac = 1.0 - math.exp(-max(0.0, run_s) / 210.0)
-        coolant = AMBIENT_F + (THERMOSTAT_F - AMBIENT_F) * warm_frac + 7.0 * load
-        if sc.overheat:
-            # Something has stopped rejecting heat. Crosses the warn band at
-            # ~20 s and the critical band at ~30 s, so a person who selects this
-            # scenario sees both transitions without having to wait for them,
-            # then holds — a scenario that runs away to 400°F stops being a
-            # demonstration of anything.
-            coolant += min(62.0, max(0.0, t * 1.6))
-        coolant += _wander("coolant_temp", t, 0.5)
-
-        # Oil runs hotter than coolant under load and lags it badly. Twice the
-        # time constant: oil is the last thing on the engine to come up to
-        # temperature, which is why the oil row keeps saying WARMING for a
-        # couple of minutes after the coolant row has stopped.
-        oil_target = coolant + 12.0 + 18.0 * load
-        oil_frac = 1.0 - math.exp(-max(0.0, run_s) / 430.0)
-        oil_temp = AMBIENT_F + (oil_target - AMBIENT_F) * oil_frac + _wander("oil_temp", t, 0.6)
-
-        # Oil pressure tracks rpm almost linearly until the pump reaches relief,
-        # and falls off as the oil thins with heat.
-        if running:
-            oil_press = 34.0 + rpm * 0.0145 - max(0.0, oil_temp - 200.0) * 0.055
-            oil_press = min(72.0, oil_press) + _wander("oil_pressure", t, 0.7)
-        else:
-            # Not turning, or only being turned by the starter. Zero is the
-            # correct reading and the band gate in config.py is what stops it
-            # being reported as a critical fault.
-            oil_press = 0.0
-
-        # Manifold pressure follows the throttle plate, with a little more
-        # vacuum at rpm when the plate is closed.
-        map_kpa = (40.0 + 58.0 * (tp ** 0.55)
-                   - 3.5 * (1.0 - tp) * min(1.0, rpm / 2500.0))
-        map_kpa = min(BARO_KPA, map_kpa) + _wander("map_kpa", t, 0.6)
-        if not running:
-            map_kpa = BARO_KPA - 0.4
-
-        # Commanded AFR out of the table: stoichiometric in closed loop, rich
-        # under power. The wideband tracks it with a small lag and a little
-        # error, which is what makes the two rows worth having separately —
-        # a wideband that has drifted away from the target is the earliest
-        # sign of a fuelling problem there is.
-        enrich = max(0.0, (tp - 0.55)) / 0.45
-        afr_target = 14.7 - 1.9 * enrich
-        afr_wb = afr_target + 0.02 + _wander("afr_wideband", t, 0.12) - 0.15 * enrich
-        if not running:
-            afr_target = None
-            afr_wb = None
-
-        # Returnless rail. Holds ~58 psi until the injectors ask for more than
-        # the pump can keep up with, and then sags. This mock sags a little more
-        # than a healthy system would — every band still passes, and the
-        # insight engine notices anyway. That gap is the entire thesis of the
-        # feature, so the mock has to contain an example of it.
-        if running:
-            fuel_press = 58.4 - 9.0 * max(0.0, tp - 0.45) / 0.55 + _wander("fuel_pressure", t, 0.35)
-        else:
-            fuel_press = 0.0
-
-        # Heat soak at rest, scrubbed away by airflow once moving.
-        iat = AMBIENT_F + 2.5 + 9.0 * math.exp(-speed / 12.0) + _wander("intake_air_temp", t, 0.5)
-
-        # Calculated load, the way the standard defines it: how much air the
-        # engine is drawing against how much it could draw at this rpm. On a
-        # naturally aspirated engine that tracks manifold pressure almost
-        # exactly, which is why the two rows move together on the panel and why
-        # a disagreement between them is worth a cross-signal finding.
-        if running:
-            engine_load = max(0.0, min(100.0,
-                                       100.0 * (map_kpa - 20.0) / (BARO_KPA - 20.0)))
-            engine_load += _wander("engine_load", t, 0.8)
-            # Speed density: airflow rises with rpm and with manifold pressure,
-            # and falls as the charge gets hotter and thinner.
-            maf = (rpm * map_kpa * 4.0e-4) * (540.0 / (iat + 460.0))
-            maf = max(0.0, maf + _wander("maf_gs", t, 0.4))
-        else:
-            engine_load = None
-            maf = None
-
-        # Fuel trims. The short-term trim is the closed-loop correction the ECU
-        # is applying right now and it oscillates by design — a wideband that
-        # holds perfectly still is a wideband that has stopped working. The
-        # long-term trim is what the ECU has LEARNED, and it is the one that
-        # matters here: it moves slowly, it survives a key cycle, and it is the
-        # earliest number on the car that says something has changed.
-        if running:
-            # Open loop under power: the ECU stops trimming and follows the
-            # table, so both trims go to zero. Reporting a live correction there
-            # would be inventing one.
-            open_loop = tp > 0.55
-            drift = sc.trim_drift_pct_per_min * (run_s - sc.warm_offset_s) / 60.0
-            drift = max(-60.0, min(60.0, drift))
-            ltft = 0.0 if open_loop else (1.8 + drift + _wander("ltft_b1", t, 0.35))
-            stft = 0.0 if open_loop else (_wander("stft_b1", t, 3.2) - 0.4)
-        else:
-            ltft = stft = None
-
-        # Charging system. Sags hard at crank, then holds regulated voltage with
-        # a little ripple; the fault scenario is an alternator that has stopped
-        # keeping up and is slowly draining the battery instead.
-        if sc.charging_fault:
-            # Starts just under the warn floor and keeps going down. The rate is
-            # chosen so the fall clears TELEMETRY_TREND_DELTA across one trend
-            # window: this scenario exists to show a channel that is out of band
-            # AND still heading the wrong way, which is the only thing on the
-            # panel that earns the ⚠ arrow.
-            volts = 13.05 - 0.009 * t + _wander("battery_voltage", t, 0.04)
-            volts = max(11.4, volts)
-        elif cranking:
-            volts = 9.8 + _wander("battery_voltage", t, 0.15)
-        elif running:
-            volts = 14.2 - 0.35 * load + _wander("battery_voltage", t, 0.06)
-        else:
-            volts = 12.6 + _wander("battery_voltage", t, 0.03)
-
-        raw = {
-            "battery_voltage": volts,
-            "rpm": rpm if rpm > 50.0 else 0.0,
-            "coolant_temp": coolant,
-            "intake_air_temp": iat,
-            "map_kpa": map_kpa,
-            "maf_gs": maf,
-            "throttle_pct": throttle,
-            "engine_load": engine_load,
-            "stft_b1": stft,
-            "ltft_b1": ltft,
-            "afr_target": afr_target,
-            "afr_wideband": afr_wb,
-            "fuel_pressure": fuel_press,
-            "oil_pressure": oil_press,
-            "oil_temp": oil_temp,
-            "vehicle_speed": speed,
-        }
+        values, dropped = physics.sample(physics.BY_NAME[name], now - set_at,
+                                         previous)
+        with self._lock:
+            self._previous = dict(values)
 
         out = []
-        for sensor_id, value in raw.items():
-            if sensor_id in sc.dropout:
+        for sensor_id, value in values.items():
+            if sensor_id in dropped:
                 # The sensor did not answer. Everything it would have said goes
                 # with it — a provider that kept serving the last value it heard
                 # would be inventing data, which is the one thing this layer
@@ -577,6 +330,14 @@ class MockHolleyProvider(TelemetryProvider):
                                          detail="Sensor not responding"))
                 continue
             out.append(SensorReading(sensor_id, value, ok=True, at=now))
+        # A channel that did not answer at all still has to be REPORTED as not
+        # answering, or a dropout looks identical to a channel nobody asked
+        # about. Absent-because-unsupported is a different case and is handled
+        # by simply not being here — see physics.Scenario.unsupported.
+        for sensor_id in dropped:
+            if sensor_id not in values:
+                out.append(SensorReading(sensor_id, None, ok=False, at=now,
+                                         detail="Sensor not responding"))
         return out
 
 
@@ -705,6 +466,20 @@ class Source:
     label: str
     build: object            # () -> TelemetryProvider
     detail: str = ""
+    # An in-process producer that has to be advanced before it can be read.
+    # None for the mock, which computes from the clock on every read, and for
+    # the live sources, whose producer is a bridge in a car.
+    pump: object = None       # (now: float) -> dict, or None
+
+
+def _pump_simulation(now):
+    from vehicle import producers
+    return producers.pump_simulation(now)
+
+
+def _pump_replay(now):
+    from vehicle import producers
+    return producers.pump_replay(now)
 
 
 SOURCES: Tuple[Source, ...] = (
@@ -714,7 +489,8 @@ SOURCES: Tuple[Source, ...] = (
     Source("simulation", "Simulation",
            lambda: IngestedProvider("simulation", "Simulation",
                                     ("dashboard_simulator",)),
-           "The same physics, pushed through the canonical ingestion API."),
+           "The same physics, pushed through the canonical ingestion API.",
+           pump=_pump_simulation),
     Source("live_obd", "Live OBD-II",
            lambda: IngestedProvider("live_obd", "Live OBD-II", ("obd2_can",)),
            "A bridge on a CAN OBD-II vehicle."),
@@ -725,7 +501,8 @@ SOURCES: Tuple[Source, ...] = (
     Source("replay", "Recorded Replay",
            lambda: IngestedProvider("replay", "Recorded Replay",
                                     ("recorded_replay",)),
-           "A recorded canonical log, played back."),
+           "A recorded canonical log, played back.",
+           pump=_pump_replay),
 )
 
 SOURCE_BY_NAME: Dict[str, Source] = {s.name: s for s in SOURCES}
@@ -1135,6 +912,23 @@ def snapshot(record: bool = True) -> dict:
     now = time.time()
     readings: Dict[str, SensorReading] = {}
     live_providers = 0
+
+    # An in-process producer is advanced HERE, and only on a recording snapshot.
+    # Same discipline as the trend ring and the insight engine below, and for
+    # the same reason: a conversation turn reads this at whatever cadence the
+    # driver is talking, and a simulator advanced by being asked about would
+    # report a drive whose length depended on how chatty somebody was.
+    #
+    # Never fatal. A producer that throws is a producer that has nothing to say
+    # this tick; the panel reports what it has rather than going down.
+    if record:
+        pump = SOURCE_BY_NAME[_source_name].pump
+        if pump is not None:
+            try:
+                pump(now)
+            except Exception as e:
+                print(f"[telemetry] producer {_source_name} tick failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
 
     for p in _providers:
         try:
