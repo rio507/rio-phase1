@@ -67,10 +67,16 @@ import vehicle_health_policy as P                       # noqa: E402
 
 from tire_diag import engine as diag                    # noqa: E402
 from tire_diag import store as diag_store               # noqa: E402
+from powertrain_diag import engine as pdiag             # noqa: E402
+from powertrain_diag import store as pdiag_store        # noqa: E402
+from vehicle.dtc import service as dtc_service          # noqa: E402
+from vehicle.producers import ecu as mock_ecu           # noqa: E402
 
-# The diagnostic record goes somewhere disposable. A test suite able to write
+# Every diagnostic record goes somewhere disposable. A test suite able to write
 # into a car's real fault history would be worse than no test suite.
 diag_store.reset_for_test(tempfile.mkdtemp(prefix="vh_selftest_"))
+pdiag_store.reset_for_test(tempfile.mkdtemp(prefix="vh_selftest_pt_"))
+dtc_service.service().reset_for_test(tempfile.mkdtemp(prefix="vh_selftest_dtc_"))
 
 ROOT = "/workspace/rio-phase1"
 
@@ -92,7 +98,7 @@ _CLOCK = [1_800_000_000.0]
 
 
 def scenario(tire_name, ecu_name="normal_idle", drive_s=420.0, dt=30.0,
-             moving=None):
+             moving=None, dtc_name="healthy"):
     """Put the car in a known state, DRIVE IT, and read the context out of it.
 
     The driving is the change this spec brought, and it is not a detail. RIO's
@@ -109,6 +115,15 @@ def scenario(tire_name, ecu_name="normal_idle", drive_s=420.0, dt=30.0,
     """
     telemetry.set_scenario(ecu_name)
     eng = diag.reset_engine(load=False)
+    # The powertrain monitors and the DTC layer are driven too, because app.py's
+    # announcement poll drives all three and a harness that only fed one would
+    # be testing a system that does not exist. Without this the two new health
+    # sources are never available, and "everything is normal" becomes an answer
+    # about a car nobody has looked at.
+    peng = pdiag.reset_engine(load=False)
+    svc = dtc_service.service()
+    svc.reset_for_test(tempfile.mkdtemp(prefix="vh_dtc_"))
+    mock_ecu.ecu().set_scenario(dtc_name, now=_CLOCK[0])
     t = _CLOCK[0]
     _CLOCK[0] += drive_s + 600.0        # never reuse a window between scenarios
     tires.set_scenario(tire_name, at=t)
@@ -121,6 +136,14 @@ def scenario(tire_name, ecu_name="normal_idle", drive_s=420.0, dt=30.0,
         t += dt
         tires.set_motion(moving, t)
         eng.observe(tires.snapshot(at=t), now=t, moving=moving, speed_mph=speed)
+        svc.scan(t, "vh-selftest", reason="test")
+        peng.observe(telemetry.snapshot(record=False), now=t, moving=moving,
+                     speed_mph=speed,
+                     dtc={"scanned": True, "responding": True,
+                          "codes": [r["code"] for r in svc.registry.active_codes()],
+                          "mil": svc.registry.mil(), "count": 0,
+                          "worst_health_severity": "advisory"},
+                     link={"source": "mock_holley"})
 
     return vh.context(full=True)["vehicle_health"]
 
@@ -139,8 +162,25 @@ def run_context():
     check(fresh["overall_status"] == "informational",
           "before any monitor has run, the car is NOT reported as normal",
           fresh["overall_status"])
-    check("not the same as the tires being fine" in fresh["summary"],
-          "and the summary says so in as many words", fresh["summary"])
+    # The tire monitors say so in as many words. The summary now leads with
+    # whichever unevaluated subsystem sorts first — there are three of them on a
+    # cold start, and that is more honest rather than less.
+    full = vh.context(full=True)["vehicle_health"]
+    messages = " | ".join(i["message"] for i in full["issues"])
+    check("not the same as the tires being fine" in messages,
+          "and the tire monitors say so in as many words", messages[:90])
+    check("normal" not in fresh["summary"].lower()
+          and "fine" not in fresh["summary"].lower(),
+          "while the summary refuses to claim anything is fine",
+          fresh["summary"])
+    unavailable = {i["domain"] for i in vh.issues()
+                   if i["type"].endswith("_unavailable")
+                   or "not_ready" in i["type"]}
+    check(len(unavailable) >= 2,
+          "and every subsystem that has not been looked at says so — a health "
+          "layer that only admitted the gaps it happened to notice would be "
+          "reporting on the parts it found easiest to check",
+          str(sorted(unavailable)))
 
     # --- all tires healthy ---
     st = scenario("all_normal")
@@ -737,7 +777,12 @@ def run_sync():
                     "sensor_disconnected", "battery_low", "no_sensors"):
         st = scenario(tire_sc, "cruise", moving=True)
         panel = tires.snapshot()["status"]
-        ctx = st["overall_status"]
+        # The TIRE half of the context. The overall status now also carries the
+        # vehicle's own codes and the engine monitors' findings, and comparing
+        # those against a tire panel would be comparing two different questions.
+        tire_issues = [i for i in vh.issues() if i["domain"] == "tires"]
+        ctx = vh._STATUS_BY_RANK.get(
+            max((i["severity_rank"] for i in tire_issues), default=0), "normal")
         ok = ctx_order.get(ctx, 0) <= order.get(panel, 0)
         if not check(ok, f"{tire_sc}: the context never outruns the panel "
                          f"(panel {panel}, context {ctx})"):

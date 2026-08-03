@@ -302,6 +302,20 @@ def _route_and_prepare(transcript: str, session_id: str):
             # is the only place that knows a question was asked, and the policy
             # is deliberately incapable of finding out on its own.
             _health_policy.note_status_request(time.time())
+        if request_router.is_diagnostic_report(route["request_type"]):
+            # ...and this one asked RIO to go and interrogate the car, which is
+            # a different thing and is why it is a different intent. Run here,
+            # on the threadpool this function is already on, so the answer is
+            # about a scan that just happened rather than one from four minutes
+            # ago.
+            #
+            # Never fatal: a report that fails leaves RIO answering from the
+            # ordinary health context, which is degraded rather than broken.
+            try:
+                route["diagnostic_report"] = _run_report(session_id).get("report")
+            except Exception as e:
+                print(f"[talk] diagnostic report failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
         if not request_router.is_visual(route["request_type"]):
             return route, None
         return route, visual_qa.answer(key, transcript, route)
@@ -1534,6 +1548,95 @@ def vehicle_dtc_ingest_endpoint(body: dict = Body(...),
         return JSONResponse({"error": str(e)}, status_code=401)
     svc = dtc_service.service()
     return svc._ingest_direct(body, time.time())
+
+
+# --- the diagnostic report --------------------------------------------------
+
+from vehicle import report as vehicle_report                # noqa: E402
+from vehicle import state as vehicle_state_mod              # noqa: E402
+
+
+def _vehicle_state_view(snap: dict = None) -> dict:
+    """§21's state, DERIVED from what already knows. See vehicle/state.py."""
+    snap = telemetry.snapshot(record=False) if snap is None else snap
+    try:
+        cycle = powertrain_diag.engine().cycles.state().get("current")
+    except Exception:
+        cycle = None
+    open_sessions = bool(sessions.active_sessions())
+    return vehicle_state_mod.derive(snap, open_sessions, cycle)
+
+
+def _run_report(session_id: str = None) -> dict:
+    """Build a report and run it. Everything it needs is handed in.
+
+    The report module imports nothing from the conversation layer, the
+    announcement policy or a model, and this is where that is arranged — so the
+    whole document is testable without a server, and cannot grow a dependency
+    on the thing that narrates it.
+    """
+    report = vehicle_report.store().create(config.VEHICLE_ID, session_id)
+    return report.run(
+        dtc_service=dtc_service.service(),
+        telemetry_snapshot=lambda: telemetry.snapshot(record=False),
+        vehicle_state=lambda snap: _vehicle_state_view(snap),
+        health_issues=vehicle_health.issues,
+        insight_feed=lambda: insights.snapshot().get("entries", []),
+        gateways=lambda: gateway_auth.gateways(config.VEHICLE_ID),
+        capability=lambda: vehicle_ingested.buffer().capability(),
+    )
+
+
+@app.post("/api/v1/vehicles/{vehicle_id}/diagnostic-reports")
+async def diagnostic_report_request_endpoint(vehicle_id: str,
+                                             session_id: str = Query(default=None)):
+    """Run a full diagnostic report (§25.9).
+
+    Synchronous today because the whole thing takes milliseconds against a
+    simulated ECU and a bridge's scan is a single upload. The PROGRESS contract
+    is here regardless — stage, stage_index and the full stage list come back on
+    every read — because the moment a real vehicle is on the other end this
+    becomes seconds of a driver watching a button, and "Checking Pending Codes"
+    is a more honest thing to show them than a spinner.
+    """
+    return await run_in_threadpool(_run_report, session_id)
+
+
+@app.get("/api/v1/diagnostic-reports/{report_id}")
+def diagnostic_report_status_endpoint(report_id: str):
+    """One report, with its progress (§25.10)."""
+    report = vehicle_report.store().get(report_id)
+    if report is None:
+        return JSONResponse({"error": "unknown report", "report_id": report_id},
+                            status_code=404)
+    return report.view()
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/diagnostic-reports")
+def diagnostic_report_list_endpoint(vehicle_id: str):
+    """Reports are vehicle history (§29.1) and are kept as such."""
+    return {"vehicle_id": vehicle_id, "reports": vehicle_report.store().list()}
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/health")
+def vehicle_health_api_endpoint(vehicle_id: str):
+    """Current vehicle health (§25.11), in the canonical API's shape.
+
+    The same object /vehicle/health returns — the conversation layer's context —
+    plus the derived vehicle state and the gateway view. One health picture, two
+    front doors, and deliberately not two computations of it.
+    """
+    ctx = vehicle_health.context(full=True)
+    ctx["vehicle_id"] = vehicle_id
+    ctx["vehicle_state"] = _vehicle_state_view()
+    ctx["gateways"] = gateway_auth.gateways(vehicle_id)
+    return ctx
+
+
+@app.get("/vehicle/state")
+def vehicle_state_endpoint():
+    """§21's eight states, derived rather than tracked. See vehicle/state.py."""
+    return _vehicle_state_view()
 
 
 @app.get("/api/v1/vehicles/{vehicle_id}/signals")

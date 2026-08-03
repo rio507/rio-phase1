@@ -56,6 +56,17 @@ NON_VISUAL = "non_visual_question"
 # driver asked — which is one of the spec's cooldown resets.
 VEHICLE_HEALTH = "vehicle_health_question"
 
+# "RIO, run a diagnostic report." A different request from "how is the car",
+# and the difference is not length: a health question is answered from what RIO
+# already knows, and this one GOES AND ASKS THE VEHICLE. It takes seconds, it
+# has progress states the driver watches, and it produces a document.
+#
+# Routed separately for exactly that reason. Folding it into VEHICLE_HEALTH
+# would have RIO answer "run a diagnostic report" from the context of a scan
+# that happened four minutes ago, which is a plausible-sounding answer to a
+# question the driver did not ask.
+DIAGNOSTIC_REPORT = "diagnostic_report_request"
+
 # Not in the spec's list, and needed: the spec names the type for "RIO must ask
 # which one", but a clarification is a two-turn exchange and the second turn --
 # the driver answering -- is a different thing to route. It never comes from the
@@ -66,7 +77,7 @@ PHASE_A_TYPES = {SCENE, OBJECT, FOLLOW_UP, NON_VISUAL}
 PHASE_B_TYPES = {COMPARISON, LANDMARK, READ_TEXT, CLARIFY, CLARIFY_RESPONSE}
 # Neither phase: a different axis entirely. Grouped so `classify` can be asked
 # "is this one of the non-visual specialisations" without listing them.
-NON_VISUAL_TYPES = {NON_VISUAL, VEHICLE_HEALTH}
+NON_VISUAL_TYPES = {NON_VISUAL, VEHICLE_HEALTH, DIAGNOSTIC_REPORT}
 
 # Below this the rules do not trust themselves and the model is asked.
 RULE_CONFIDENCE_MIN = 0.6
@@ -177,6 +188,22 @@ _HEALTH_PATTERNS = [
     r"^\s*(give me|i want|can i get) a (vehicle |car )?health report\b",
     r"^\s*(any|anything) (i should|to) (know|worry) about\b",
     r"^\s*everything (ok|okay|alright|good|fine)\b",
+]
+
+# Asking RIO to go and interrogate the car. Checked BEFORE the health patterns,
+# because "give me a diagnostic report" contains "report" and would otherwise be
+# swallowed by the broader health group — and the two produce genuinely
+# different behaviour.
+_DIAGNOSTIC_REPORT_PATTERNS = [
+    r"\brun a (full |complete |proper )?(diagnostic|diagnostics|scan)\b",
+    r"\b(diagnostic|diagnostics) (report|scan|check)\b",
+    r"\bfull (diagnostic|diagnostics|scan)\b",
+    r"\bscan (the |my )?(car|engine|vehicle|camaro)\b",
+    r"\bscan for (codes?|faults?|errors?|trouble codes?)\b",
+    r"\b(check|read|pull) (the |my |for )?(error |fault |trouble )?codes?\b",
+    r"\bare there any (error |fault |trouble )?codes?\b",
+    r"\bany (error|fault|trouble) codes?\b",
+    r"\bcheck (the |my )?(car|engine) for (codes?|faults?|problems?)\b",
 ]
 
 _LANDMARK_PATTERNS = [
@@ -307,6 +334,11 @@ def classify(question: str, has_referent: bool = False,
     # photograph of the road is RIO confidently describing traffic while the
     # driver is asking about a tire. It is also the cheapest branch to be wrong
     # in, since both outcomes stay on the conversation path.
+    # Asking RIO to interrogate the car, before asking RIO what it thinks.
+    # Both stay off the camera path; the difference is whether a scan is run.
+    if _any(_DIAGNOSTIC_REPORT_PATTERNS, text):
+        return _result(DIAGNOSTIC_REPORT, None, 0.85, "rules", t0)
+
     if _any(_HEALTH_PATTERNS, text):
         return _result(VEHICLE_HEALTH, None, 0.85, "rules", t0)
 
@@ -380,6 +412,8 @@ Types:
 - vehicle_health_question: asking about the condition of THEIR OWN car — tires,
   pressure, battery, oil, coolant, temperature, whether anything is wrong with
   it, or for a status report on it
+- diagnostic_report_request: asking RIO to actively interrogate the car — run a
+  diagnostic, scan for fault codes, read the error codes, do a full check
 - non_visual_question: anything not about what is currently visible
 
 An active visual referent {referent_state}.
@@ -432,4 +466,16 @@ def is_visual(request_type: str) -> bool:
 
 
 def is_vehicle_health(request_type: str) -> bool:
-    return request_type == VEHICLE_HEALTH
+    """Does this turn get the full health structure, and reset the cooldown?
+
+    True for a diagnostic report too. Both are the driver asking about the car,
+    both want the full context injected, and both are one of the spec's cooldown
+    resets — RIO must not announce, three seconds after answering, the very
+    thing she was just asked about.
+    """
+    return request_type in (VEHICLE_HEALTH, DIAGNOSTIC_REPORT)
+
+
+def is_diagnostic_report(request_type: str) -> bool:
+    """Does this turn require actually asking the vehicle?"""
+    return request_type == DIAGNOSTIC_REPORT

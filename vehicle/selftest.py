@@ -969,6 +969,177 @@ def run_dtc():
 
 
 # ===========================================================================
+# K. Vehicle state, and the diagnostic report
+# ===========================================================================
+
+def run_state():
+    head("K -- §21's vehicle state is DERIVED, not tracked")
+
+    from vehicle import state as VS
+
+    telemetry.set_source("mock_holley")
+    telemetry.set_scenario("cruise")
+    snap = telemetry.snapshot(record=False)
+    st = VS.derive(snap, session_open=True, drive_cycle={"cycle_id": "d1"})
+    check(st["state"] == VS.DRIVING, "cruising reads as driving", st["state"])
+    check(st["why"], "and every state carries WHY it was chosen", st["why"])
+
+    telemetry.set_scenario("normal_idle")
+    st = VS.derive(telemetry.snapshot(record=False), True, {"cycle_id": "d1"})
+    check(st["state"] == VS.STATIONARY_RUNNING,
+          "idling reads as stationary and running, not as driving", st["state"])
+
+    st = VS.derive({"available": False}, False, None)
+    check(st["state"] == VS.OFFLINE, "nothing reporting reads as offline",
+          st["state"])
+
+    # The claim this module exists to make: no state of its own.
+    src = open(os.path.join(ROOT, "vehicle", "state.py")).read()
+    for word in ("self.", "global ", "_last", "threading"):
+        check(word not in src,
+              f"state.py holds no state of its own ({word!r} appears nowhere) — "
+              f"a fourth authority on whether the car is being driven would "
+              f"disagree with the other three within a week")
+
+    # Speed unknown must not be reported as driving.
+    st = VS.derive({"available": True, "engine_running": True,
+                    "updated_at": time.time(),
+                    "rows": [{"id": "rpm", "value": 1800.0}]},
+                   True, {"cycle_id": "d1"})
+    check(st["state"] == VS.ENGINE_RUNNING,
+          "running with no road speed is engine_running, never driving — the "
+          "weaker claim is the corroborated one", st["state"])
+
+
+def run_report():
+    head("K -- the diagnostic report: organised by who is making the claim")
+
+    import insights
+    import vehicle_health
+
+    from vehicle import report as VR
+    from vehicle import state as VS
+    from vehicle.dtc import service as dtc_service
+    from vehicle.producers import ecu as ecu_mod
+
+    svc = dtc_service.service()
+    svc.reset_for_test(os.path.join(_TMP, "report_dtc"))
+    ecu = ecu_mod.ecu()
+    t = 1_700_500_000.0
+    ecu.set_scenario("pending_to_confirmed", now=t)
+    for at in (5, 25, 130):
+        svc.scan(t + at, "sess-r", reason="test")
+
+    telemetry.set_source("mock_holley")
+    telemetry.set_scenario("cruise")
+
+    rep = VR.store().create(VID, "sess-r")
+    out = rep.run(dtc_service=svc,
+                  telemetry_snapshot=lambda: telemetry.snapshot(record=False),
+                  vehicle_state=lambda s: VS.derive(s, True, {"cycle_id": "d1"}),
+                  health_issues=vehicle_health.issues,
+                  insight_feed=lambda: insights.snapshot().get("entries", []),
+                  gateways=lambda: [],
+                  capability=lambda: ingested.buffer().capability(),
+                  now=t + 200)
+
+    check(out["status"] == VR.COMPLETE, "the report completes", out["status"])
+    check(out["stage"] == "Complete" and out["stages"] == list(VR.STAGES),
+          "walking every §27.8 progress state", out["stage"])
+    check(out["stage_index"] == len(VR.STAGES) - 1, "and ending on the last")
+
+    body = out["report"]
+    check(set(body) >= {"vehicle", "early_detection", "confirmed_faults",
+                        "operating_data", "rio_observations", "summary"},
+          "with every §28 section present", str(sorted(body)))
+
+    # The split the whole document is organised around.
+    check(body["confirmed_faults"]["count"] >= 1,
+          "the vehicle's confirmed codes are in their own section",
+          str(body["confirmed_faults"]["count"]))
+    early = body["early_detection"]
+    check(early["detected_before_warning_light"] or early["repeated_pending"]
+          or early["count"] == 0,
+          "and the early-detection section is separate from them")
+    codes_in_obs = [f for f in body["rio_observations"]["findings"]
+                    if "P0" in str(f.get("message", ""))]
+    check(not codes_in_obs,
+          "no vehicle code leaks into RIO's observations — that split is what "
+          "the report is organised around", str(codes_in_obs))
+    for f in body["rio_observations"]["findings"]:
+        check(f["provenance"].startswith("rio_"),
+              "every RIO observation carries RIO provenance", f["provenance"])
+        break
+
+    # Coverage gaps are named, not silently omitted and not counted as findings.
+    obs = body["rio_observations"]
+    check("coverage_gaps" in obs,
+          "what RIO could NOT look at is its own list")
+    # Keyed on TYPE, not on wording, and the difference is instructive: a
+    # CONFIRMED receiver-health finding says "nothing is reporting from any tire
+    # sensor" and is a real observation about the car — the receiver is dead. A
+    # source being unavailable produces a nearly identical sentence and is not.
+    # Only the type tells them apart, which is why the split is made on type.
+    gap_in_findings = [f for f in obs["findings"]
+                       if (f.get("type") or "").endswith("_unavailable")
+                       or "not_ready" in (f.get("type") or "")
+                       or "not_evaluated" in (f.get("type") or "")]
+    check(not gap_in_findings,
+          "a subsystem that could not be looked at is not counted as an "
+          "observation about the car", str(gap_in_findings))
+    confirmed_findings = [f for f in obs["findings"]
+                          if f.get("type") == "tire_sensors_all_silent"]
+    if confirmed_findings:
+        check(True,
+              "while a CONFIRMED receiver fault, whose wording is nearly "
+              "identical, stays a finding — because a dead receiver IS a fact "
+              "about the car")
+    if obs["gap_count"]:
+        check("not able to evaluate" in body["summary"],
+              "and the SUMMARY says so out loud — a headline of 'nothing is "
+              "wrong' over three unchecked subsystems is the most confidently "
+              "misleading thing this system could produce",
+              body["summary"][:80])
+
+    # Never-supported is not missing.
+    od = body["operating_data"]
+    check("never_supported" in od and od["never_supported"],
+          "signals this vehicle has never produced are listed separately from "
+          "signals that are missing", str(len(od.get("never_supported", []))))
+
+    # The summary is deterministic.
+    rep2 = VR.store().create(VID, "sess-r")
+    out2 = rep2.run(dtc_service=svc,
+                    telemetry_snapshot=lambda: telemetry.snapshot(record=False),
+                    vehicle_state=lambda s: VS.derive(s, True, {"cycle_id": "d1"}),
+                    health_issues=vehicle_health.issues,
+                    insight_feed=lambda: insights.snapshot().get("entries", []),
+                    gateways=lambda: [],
+                    capability=lambda: ingested.buffer().capability(),
+                    now=t + 200)
+    check(out2["report"]["summary"] == body["summary"],
+          "and the plain-language summary is deterministic — a summary "
+          "GENERATED from this document could restate a hedge as a conclusion "
+          "and nothing downstream would know")
+    check("no physical cause has been confirmed" in body["summary"].lower()
+          or body["confirmed_faults"]["count"] == 0,
+          "and it refuses to name a cause", body["summary"][-90:])
+
+    # The module cannot reach the things that narrate it.
+    tree = ast.parse(open(os.path.join(ROOT, "vehicle", "report.py")).read())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    check(not (imported & {"openai", "llm_interface", "vehicle_health",
+                           "vehicle_health_policy", "app", "telemetry"}),
+          "report.py imports nothing it reports on and nothing that narrates "
+          "it — every dependency is passed in", str(sorted(imported)))
+
+
+# ===========================================================================
 # F. Read-only posture
 # ===========================================================================
 # Asserted by parsing the source. A comment saying "we never clear codes" is
@@ -1161,7 +1332,7 @@ def main():
 
     for t in (run_registry, run_units, run_schema, run_gateway, run_ingest,
               run_one_pipeline, run_producers, run_faults, run_dtc,
-              run_read_only, run_no_second_truth):
+              run_state, run_report, run_read_only, run_no_second_truth):
         try:
             t()
         except Exception as e:

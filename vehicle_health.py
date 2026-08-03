@@ -755,10 +755,290 @@ def _channel_magnitude(row: dict) -> float:
     return worst
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic trouble codes — what the VEHICLE says
+# ---------------------------------------------------------------------------
+# The proof that this layer was the right seam: a whole new subsystem arrives as
+# a class with three methods and a register_source() call. Not one line of
+# llm_interface.py, vehicle_health_policy.py, rio_prompts.py or the browser
+# changes, and RIO can talk about diagnostic trouble codes.
+
+class DTCSource(HealthSource):
+    """The vehicle's own diagnostic trouble codes.
+
+    Kept as its own domain rather than folded into `engine`, because the split
+    that matters in this whole feature is WHO IS MAKING THE CLAIM. A P-code is
+    the vehicle saying something; everything in EngineSource and
+    PowertrainSource is RIO saying something. §17.8 puts them under different
+    headings and this is the same line drawn one layer earlier, where the
+    conversation context is built — so the prompt cannot merge them by accident.
+    """
+
+    domain = "diagnostics"
+    label = "Vehicle Diagnostics"
+
+    def __init__(self):
+        self._section = None
+
+    def refresh(self) -> None:
+        self._section = None
+
+    def _read(self) -> dict:
+        if self._section is None:
+            from vehicle.dtc import service as dtc
+            self._section = dtc.service().section()
+        return self._section
+
+    def available(self) -> bool:
+        try:
+            sec = self._read()
+            # A scan has completed AND the vehicle answered. Before that, RIO
+            # genuinely does not know whether this car has codes, and the
+            # generic unavailable-issue in issues() says exactly that rather
+            # than letting an empty list read as an all-clear.
+            return bool(sec.get("scan_count")) and bool(sec.get("ecu_responding"))
+        except Exception:
+            return False
+
+    def state(self) -> dict:
+        sec = self._read()
+        cards = [c for g in sec.get("groups", []) for c in g["cards"]]
+        return {
+            "malfunction_indicator_lamp": ("on" if sec.get("mil_commanded_on")
+                                           else "off"),
+            "codes_reported": len(cards),
+            "scan_count": sec.get("scan_count"),
+            "last_scan_at": sec.get("last_scan_at"),
+            "services_supported": sec.get("services_supported") or {},
+            "codes": [{
+                "code": c["code"],
+                "description": c["description"],
+                "status": c["status_label"],
+                "category": c["dtc_category"],
+                "system": c["system_label"],
+                "detected_before_warning_light": c["early_detection"],
+                "first_seen_at": c["first_seen_at"],
+                "times_seen_pending": c["pending_scan_count"],
+                "drives_observed": c["drive_cycle_count_observed"],
+                "freeze_frame_available": c["freeze_frame_available"],
+                "what_this_means": c["what_this_means"],
+                "possible_causes": c["possible_causes"],
+                "cause_confirmed": c["confirmed_cause"] is not None,
+            } for c in cards],
+        }
+
+    def issues(self, ctx: dict) -> List[dict]:
+        from vehicle.dtc import catalog as DC
+        from vehicle.dtc import lifecycle as DL
+        from vehicle.dtc import service as dtc
+
+        out: List[dict] = []
+        svc = dtc.service()
+        for rec in svc.registry.active_codes():
+            card = svc.card(rec)
+            severity = DC.health_severity(rec.get("severity", ""))
+            out.append(_issue_from_code(card, severity))
+        return out
+
+
+def _issue_from_code(card: dict, severity: str) -> dict:
+    """One reported code, in the conversation layer's vocabulary.
+
+    The wording is the careful part. A DTC names a CONDITION and the temptation
+    is to phrase it as a diagnosis, because a diagnosis is a better sentence.
+    §16.3 forbids it by example: "RIO detected a pending engine fault before the
+    check-engine light turned on" is approved and "this component has failed" is
+    not, and the difference is the whole credibility of the feature.
+    """
+    code = card["code"]
+    desc = card["description"]
+    early = card.get("early_detection")
+    status = card.get("status_label")
+
+    if early and card["lifecycle"] == "pending_first_seen":
+        message = (f"The engine computer has flagged {code} — {desc} — and the "
+                   f"check-engine light is still off. It has observed the "
+                   f"condition and has not confirmed that it is persistent.")
+        spoken = ("I've picked up a pending engine code before the "
+                  "check-engine light came on.")
+    elif card["lifecycle"] == "pending_repeated":
+        message = (f"{code} ({desc}) has appeared again on a later scan. Still "
+                   f"not a confirmed diagnosis, but the recurrence makes it "
+                   f"worth looking at.")
+        spoken = "That pending engine code has shown up again."
+    elif card["lifecycle"] == "permanent_if_applicable":
+        message = (f"{code} ({desc}) is stored as a permanent code. It cannot "
+                   f"be cleared by a scan tool and will clear itself only after "
+                   f"the vehicle's own monitors pass.")
+        spoken = "There's a permanent code stored in the engine computer."
+    else:
+        lamp = ("with the check-engine light on" if card.get("mil_commanded_on")
+                else "with the check-engine light off")
+        message = (f"The engine computer has confirmed {code} — {desc} — "
+                   f"{lamp}.")
+        spoken = "The engine computer has confirmed a fault code."
+
+    causes = card.get("possible_causes") or []
+    if causes:
+        message += (" Possible causes include " + ", ".join(causes[:3]).lower()
+                    + " — none of them confirmed.")
+
+    return make_issue(
+        key=f"dtc:{code}",
+        domain="diagnostics",
+        type=f"dtc_{card['lifecycle']}",
+        severity=severity,
+        message=message,
+        # The window a code supports is exactly when it was first and last
+        # seen. Nothing about a DTC licenses a claim about weeks.
+        observation_window=_window_phrase(
+            (card.get("last_seen_at") or 0) - (card.get("first_seen_at") or 0)),
+        suggested_action=("Have the code read and investigated at a workshop."
+                          if severity in (WARNING, CRITICAL) else ""),
+        location="",
+        magnitude=float(card.get("pending_scan_count") or 0)
+        + float(card.get("recurrence_count") or 0),
+        spoken_fallback=spoken,
+        evidence={
+            "code": code,
+            "status": status,
+            "detected_before_warning_light": early,
+            "check_engine_light": ("on" if card.get("mil_commanded_on")
+                                   else "off"),
+            "times_seen_pending": card.get("pending_scan_count"),
+            "drives_observed": card.get("drive_cycle_count_observed"),
+            "freeze_frame_available": card.get("freeze_frame_available"),
+            "possible_causes": causes,
+            "cause_confirmed": card.get("confirmed_cause") is not None,
+            "reported_by": "vehicle ECU",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Powertrain monitors — what RIO says about the engine
+# ---------------------------------------------------------------------------
+
+class PowertrainSource(HealthSource):
+    """Confirmed findings from the engine monitors.
+
+    The same relationship TireSource has to tire_diag: the panel shows the
+    instantaneous reading, and this shows what a monitor has actually confirmed
+    across enough evidence to be worth saying out loud.
+    """
+
+    domain = "powertrain"
+    label = "Engine Diagnostics"
+
+    def available(self) -> bool:
+        try:
+            from powertrain_diag import engine as diag
+            return any(m["last_result"] is not None
+                       for m in diag.engine().monitor_view())
+        except Exception:
+            return False
+
+    def state(self) -> dict:
+        try:
+            from powertrain_diag import engine as diag
+            from diag import monitors as M
+        except Exception:
+            return {}
+        rows = diag.engine().monitor_view()
+        out = {}
+        for r in rows:
+            out[r["monitor_id"]] = {
+                "status": r["status"],
+                "last_result": r["last_result"],
+                "why_not": (r["status_reason"] if r["status"] in M.NO_VERDICT
+                            else None),
+            }
+        return {"monitors": out}
+
+    def issues(self, ctx: dict) -> List[dict]:
+        try:
+            from powertrain_diag import codes as PC
+            from powertrain_diag import engine as diag
+        except Exception as e:
+            print(f"[vehicle_health] powertrain engine unavailable: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return []
+
+        out = []
+        for i in diag.active_issues():
+            if i.get("monitor_id") == "engine.new_dtc":
+                # The codes reach RIO through DTCSource, in far more detail and
+                # with the right provenance. This monitor exists so a reported
+                # code takes part in the diagnostic lifecycle and the
+                # communication ledger — surfacing it here as well would be an
+                # issue list that has counted one fault twice, exactly as
+                # EngineSource excludes the tire channels.
+                continue
+            code = PC.get(i.get("code") or "")
+            detail = i.get("detail") or {}
+            out.append(make_issue(
+                key=i["issue_id"],
+                domain=self.domain,
+                type=i.get("monitor_id", "engine_fault").replace(".", "_"),
+                severity=i.get("severity") or WARNING,
+                message=_powertrain_message(i, code),
+                observation_window=_window_phrase(
+                    detail.get("window_s") or detail.get("held_s")),
+                suggested_action=(code.suggested_action if code else ""),
+                location="",
+                magnitude=_powertrain_magnitude(detail),
+                value=detail.get("coolant_temp") or detail.get("battery_voltage")
+                or detail.get("ltft_b1"),
+                unit=("°F" if detail.get("coolant_temp") is not None
+                      else "V" if detail.get("battery_voltage") is not None
+                      else "%" if detail.get("ltft_b1") is not None else ""),
+                spoken_fallback=(code.driver_term if code
+                                 else "something on the engine"),
+                evidence={
+                    "monitor": i.get("monitor_id"),
+                    "confirmed_at": i.get("confirmed_at"),
+                    "confidence": i.get("confidence"),
+                    "monitor_runs_failed": i.get("fail_runs"),
+                    "drive_cycles_failed": len(i.get("fail_cycles") or []),
+                    "recurrence_count": (i.get("recurrence") or {}).get("count", 0),
+                    "observed_by": "RIO",
+                    "measurement": detail,
+                }))
+        return out
+
+
+def _powertrain_message(issue: dict, code) -> str:
+    """One sentence about a confirmed engine finding.
+
+    Always says it is RIO's observation. A finding phrased like a code — "fault
+    detected in the cooling system" — is a finding a reader will attribute to the
+    vehicle, and RIO does not get to borrow the ECU's authority.
+    """
+    term = code.driver_term if code else "a fault"
+    reason = issue.get("reason") or ""
+    return f"RIO has observed {term}: {reason}."
+
+
+def _powertrain_magnitude(detail: dict) -> float:
+    """How bad, in the finding's own units. Compared only against itself."""
+    for key in ("delta_f", "held_s", "decline_v", "coolant_rate_f_per_min",
+                "silent_for_s"):
+        v = detail.get(key)
+        if v is not None:
+            try:
+                return abs(float(v))
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
 _ENGINE = EngineSource()
 
 register_source(TireSource())
 register_source(_ENGINE)
+# Order matters only for readability of the unavailable-issues; the issue list
+# itself is sorted worst-first in issues().
+register_source(DTCSource())
+register_source(PowertrainSource())
 
 
 def _refresh_all() -> None:
@@ -943,6 +1223,14 @@ def _issue_view(issue: dict) -> dict:
     can be tempted to read out loud."""
     return {
         "type": issue["type"],
+        "domain": issue["domain"],
+        # The single most important field in this structure, and the one worth
+        # spending a token on in every turn: did the VEHICLE say this, or did
+        # RIO work it out? A model given a merged list will merge them in its
+        # sentence, and "your car is reporting a fault" about a RIO baseline
+        # deviation is a false statement assembled from true ones.
+        "reported_by": ("the vehicle's own computer"
+                        if issue["domain"] == "diagnostics" else "RIO"),
         "severity": issue["severity"],
         "where": issue["location"] or None,
         "message": issue["message"],

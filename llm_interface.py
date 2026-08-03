@@ -37,6 +37,22 @@ def _health_block(route: dict) -> str:
     if not getattr(config, "VEHICLE_HEALTH_ENABLED", True):
         return ""
     try:
+        report = (route or {}).get("diagnostic_report")
+        if report:
+            # The driver asked RIO to interrogate the car, and it has been
+            # interrogated. The report's own plain-language summary is in here
+            # and is DETERMINISTIC — assembled from the report's fields, not
+            # generated. RIO narrates it; RIO does not replace it, because a
+            # summary generated from a summary can restate a hedge as a
+            # conclusion and nothing downstream would know.
+            return ("DIAGNOSTIC REPORT (just run, at the driver's request). "
+                    "Lead with `summary`. Codes under `confirmed_faults` and "
+                    "`early_detection` are what the VEHICLE reported; anything "
+                    "under `rio_observations` is what RIO inferred, and the two "
+                    "must not be blurred. Possible causes are possibilities — "
+                    "never state one as the cause:\n"
+                    + json.dumps(report, indent=1, default=str))
+
         is_health = request_router.is_vehicle_health(
             (route or {}).get("request_type", ""))
         if is_health:
