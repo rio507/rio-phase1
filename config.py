@@ -829,3 +829,28 @@ VEHICLE_SOURCE_DEFAULT = "mock_holley"
 # at all. That is why clearance is per domain now.
 VEHICLE_DIAG_ENABLED = True
 VEHICLE_DIAG_SHADOW_MODE = True
+
+# --- diagnostic trouble codes ----------------------------------------------
+# The append-only DTC record. Same shape and same reasoning as
+# TIRE_DIAG_MAX_EVENTS: trimmed only by age, never because a code went away.
+VEHICLE_DIAG_MAX_EVENTS = 4000
+
+# The early-fault snapshot (§16.7). Sixty seconds either side of the moment a
+# pending code first appears — the half BEFORE is the half no code reader can
+# ever give you, and it is the reason vehicle/providers/ingested.py keeps a ring
+# at all.
+#
+# The "after" half is captured later, when enough time has passed. A snapshot
+# that waited for it before storing anything would lose the "before" half to a
+# process restart in the intervening minute, which is exactly when it matters.
+VEHICLE_DTC_SNAPSHOT_BEFORE_S = 60.0
+VEHICLE_DTC_SNAPSHOT_AFTER_S = 60.0
+VEHICLE_DTC_SNAPSHOT_MAX = 200
+
+# Scan cadences (§16.4). Bounded and sequential — §13's bus etiquette is not
+# optional, and a scheduler that asked for everything at once would be the
+# fastest way to make a vehicle's own diagnostics unreliable.
+VEHICLE_DTC_MIL_POLL_S = 30.0       # Mode 01 PID 01: lamp state and code count
+VEHICLE_DTC_PENDING_POLL_S = 120.0  # Mode 07
+VEHICLE_DTC_STORED_POLL_S = 300.0   # Mode 03
+VEHICLE_DTC_PERMANENT_POLL_S = 0.0  # Mode 0A: drive start, report, drive end only

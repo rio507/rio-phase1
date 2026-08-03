@@ -740,6 +740,235 @@ def run_faults():
 
 
 # ===========================================================================
+# J. Diagnostic trouble codes
+# ===========================================================================
+
+def _dtc_rig():
+    from vehicle.dtc import service as dtc_service
+    from vehicle.producers import ecu as ecu_mod
+    svc = dtc_service.service()
+    svc.reset_for_test(os.path.join(_TMP, "dtc"))
+    ecu = ecu_mod.ecu()
+    ecu.reset()
+    return svc, ecu
+
+
+def run_dtc():
+    head("J -- diagnostic trouble codes: parsing is complete, explaining is not")
+
+    from vehicle.dtc import catalog as C
+    from vehicle.dtc import lifecycle as L
+
+    # --- parsing ----------------------------------------------------------
+    check(C.decode(0x01, 0x71) == "P0171", "two bytes decode to a code",
+          str(C.decode(0x01, 0x71)))
+    check(C.decode(0x00, 0x00) is None,
+          "0x0000 is padding, not P0000 — reading it as a code would invent a "
+          "fault on a healthy car every time it was asked")
+    check(C.encode("P0171") == (0x01, 0x71), "and a code encodes back",
+          str(C.encode("P0171")))
+    round_trip = [c for c in ("P0171", "C1234", "B0010", "U0100", "P3456")
+                  if C.decode(*C.encode(c)) != c]
+    check(not round_trip, "the round trip holds across all four code letters",
+          str(round_trip))
+    check(C.is_manufacturer_specific("P1614")
+          and not C.is_manufacturer_specific("P0171"),
+          "manufacturer-specific codes are identified")
+
+    # --- explaining, honestly ---------------------------------------------
+    unknown = C.get("P0468")
+    check(not C.is_known("P0468"), "P0468 has no catalogue entry")
+    check(unknown.possible_causes == (),
+          "and RIO offers no possible causes for it — a guess dressed as a "
+          "definition is worse than an admission")
+    check("does not have a definition" in unknown.driver_explanation,
+          "it says so instead", unknown.driver_explanation[:50])
+    check(unknown.severity == C.WATCH,
+          "and is WATCH, not information — 'we do not know what this means' is "
+          "a reason to keep looking", unknown.severity)
+
+    known = C.get("P0171")
+    check(len(known.possible_causes) >= 3,
+          "a known code carries several possible causes, as a list",
+          str(len(known.possible_causes)))
+    check("MAF" not in known.description and "lean" in known.description.lower(),
+          "and its description names the CONDITION, not a component — P0171 is "
+          "'the mixture is lean', never 'the MAF is bad'", known.description)
+
+    # --- early detection --------------------------------------------------
+    svc, ecu = _dtc_rig()
+    t = 1_700_200_000.0
+    ecu.set_scenario("pending_mil_off", now=t)
+    svc.scan(t + 5, "sess-1", reason="test")
+    r = svc.scan(t + 25, "sess-1", reason="test")
+
+    rec = svc.registry.get("P0171")
+    check(rec is not None, "a pending code is recorded")
+    check(rec and rec["lifecycle"] == L.PENDING_FIRST_SEEN,
+          "as pending_first_seen", rec["lifecycle"] if rec else "")
+    check(rec and rec["early_detection"] is True,
+          "and flagged EARLY, because the lamp is off — the entire advantage "
+          "over a code reader")
+    check(rec and rec["mil_commanded_on"] is False, "with the lamp state recorded")
+    check(any(e["type"] == L.EV_PENDING_FIRST for e in r["events"]),
+          "a pending_first_seen event is emitted")
+    check(L.group_of(rec) == L.GROUP_EARLY
+          and L.display_status(rec) == L.LABEL_DETECTED_EARLY,
+          "and it lands in the section's first group, labelled Detected Early")
+
+    # The snapshot reaches BACKWARDS. Nothing else in the system could.
+    snap = svc.snapshots.get(rec["snapshot_id"]) if rec.get("snapshot_id") else None
+    check(snap is not None, "an early-fault snapshot was captured")
+    check(snap and snap["detected_at"] == t + 25,
+          "at the moment of detection", str(snap["detected_at"]) if snap else "")
+    check(snap and not snap["complete"],
+          "incomplete at first — the AFTER half has not happened yet, and "
+          "waiting for it before storing anything would lose the BEFORE half "
+          "to a restart in the intervening minute")
+    check(snap and snap["source"] == "rio_recorded_history",
+          "and labelled as RIO's own recording, never the ECU's")
+
+    # --- promotion preserves the evidence ---------------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("pending_to_confirmed", now=t)
+    svc.scan(t + 5, "sess-1", reason="test")
+    svc.scan(t + 25, "sess-1", reason="test")
+    first_seen = svc.registry.get("P0171")["first_seen_at"]
+    r = svc.scan(t + 130, "sess-1", reason="test")
+    rec = svc.registry.get("P0171")
+
+    check(rec["lifecycle"] == L.CONFIRMED, "the code was promoted to confirmed",
+          rec["lifecycle"])
+    check(rec["first_seen_at"] == first_seen,
+          "and its pending first-seen time is PRESERVED — that timestamp is the "
+          "evidence RIO saw it before the vehicle confirmed it")
+    check(rec["early_detection"] is True,
+          "the early-detection flag survives promotion — it is a fact about a "
+          "moment, not a current state")
+    promoted = [e for e in r["events"] if e["type"] == L.EV_PROMOTED]
+    check(promoted and promoted[0]["payload"]["was_detected_early"] is True,
+          "and the promotion event says it was caught early")
+    check(any(e["type"] == L.EV_MIL_CHANGED for e in r["events"]),
+          "the lamp coming on is its own event")
+    check(rec["freeze_frame_available"] and rec["freeze_frame"],
+          "the ECU's freeze frame is attached")
+    check(rec["freeze_frame"] is not svc.snapshots.get(rec["snapshot_id"]),
+          "and is a DIFFERENT object from RIO's snapshot — one is what the "
+          "vehicle recorded, the other is what RIO was watching")
+
+    # --- disappearance is not repair --------------------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("code_disappears", now=t)
+    for at in (5, 25, 130):
+        svc.scan(t + at, "sess-1", reason="test")
+    rec = svc.registry.get("P0171")
+    check(rec["lifecycle"] == L.NO_LONGER_REPORTED,
+          "a code that stops being reported is no_longer_reported",
+          rec["lifecycle"])
+    check(rec["lifecycle"] != L.REPAIR_VALIDATED,
+          "and NOT repair_validated — a code going away is not evidence that "
+          "anything was fixed")
+    check(svc.registry.get("P0171") is not None,
+          "it stays in the history, so 'has this happened before' is answerable")
+    check(L.group_of(rec) == L.GROUP_PREVIOUS,
+          "shown under Previously Observed", L.group_of(rec))
+
+    check(svc.registry.validate_repair("P0171", "MAF replaced and verified",
+                                       by="mechanic") is True,
+          "validating a repair takes explicit outside evidence")
+    check(svc.registry.get("P0171")["lifecycle"] == L.REPAIR_VALIDATED,
+          "and only then does it become repair_validated")
+    check(svc.registry.get("P0171")["provenance"] == P.REPAIR_VALIDATED,
+          "with provenance to match")
+
+    # --- recurrence -------------------------------------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("code_recurs", now=t)
+    for at in (5, 25, 130, 230):
+        svc.scan(t + at, "sess-1", reason="test")
+    rec = svc.registry.get("P0171")
+    check(rec["recurrence_count"] == 1, "a returning code counts its recurrence",
+          str(rec["recurrence_count"]))
+    check(len(rec["status_history"]) >= 2,
+          "and every status transition is on the record",
+          str(len(rec["status_history"])))
+
+    # --- unknown and manufacturer codes survive ---------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("unknown_code", now=t)
+    svc.scan(t + 5, "s", reason="test")
+    svc.scan(t + 25, "s", reason="test")
+    sec = svc.section()
+    codes = [c["code"] for g in sec["groups"] for c in g["cards"]]
+    check("P0468" in codes,
+          "an unrecognised code is stored and DISPLAYED, never dropped —"
+          " dropping it makes every other part of the feature simpler, which is "
+          "why it is the thing most likely to be got wrong", str(codes))
+
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("manufacturer_code", now=t)
+    svc.scan(t + 5, "s", reason="test")
+    svc.scan(t + 25, "s", reason="test")
+    card = svc.section()["groups"][0]["cards"][0]
+    check(card["manufacturer_specific"] is True, "a manufacturer code is flagged")
+    check(card["possible_causes"] == [],
+          "and offers no causes at all", str(card["possible_causes"]))
+    check(card["cause_status"] == "Not Confirmed",
+          "no card ever claims a confirmed cause on its own",
+          card["cause_status"])
+
+    # --- an unsupported service is not an empty result --------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("no_permanent_support", now=t)
+    svc.scan(t + 5, "s", reason="test")
+    svc.scan(t + 25, "s", reason="test")
+    sec = svc.section()
+    check(sec["services_supported"].get("permanent") is False,
+          "a vehicle that does not answer Mode 0A says so",
+          str(sec["services_supported"]))
+
+    # --- no answer at all is not a healthy car ----------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("no_response", now=t)
+    out = svc.scan(t + 5, "s", reason="test")
+    sec = svc.section()
+    check(out["scanned"] is False and out["ecu_responding"] is False,
+          "an ECU that does not answer is reported as not answering")
+    check(sec["ecu_responding"] is False,
+          "and the section says so, rather than showing an all-clear")
+    check("not the same as the vehicle being mechanically healthy"
+          in sec["empty_state_caveat"],
+          "and the empty state is a sentence about the CODES, with the caveat "
+          "attached server-side where it cannot be paraphrased away")
+
+    # --- grouping and ordering --------------------------------------------
+    svc, ecu = _dtc_rig()
+    ecu.set_scenario("multiple", now=t)
+    for at in (5, 25, 110):
+        svc.scan(t + at, "s", reason="test")
+    sec = svc.section()
+    titles = [g["key"] for g in sec["groups"]]
+    check(titles == [k for k in L.GROUP_ORDER if k in titles],
+          "groups render in §17.3's order", str(titles))
+    active = next(g for g in sec["groups"] if g["key"] == L.GROUP_ACTIVE)
+    sev = [c["severity"] for c in active["cards"]]
+    check(sev == sorted(sev, key=lambda s: -C.SEVERITY_RANK.get(s, 0)),
+          "and within a group, worst first", str(sev))
+
+    # Every field §17.5 asks for.
+    card = active["cards"][0]
+    required = ("code", "description", "status_label", "dtc_category", "system",
+                "source_ecu", "provenance", "severity", "mil_commanded_on",
+                "early_detection", "first_seen_at", "last_seen_at",
+                "first_seen_session", "last_seen_session", "pending_scan_count",
+                "drive_cycle_count_observed", "freeze_frame_available",
+                "related_signals", "possible_causes", "cause_status",
+                "lifecycle")
+    missing = [f for f in required if f not in card]
+    check(not missing, "every field §17.5 requires is on the card", str(missing))
+
+
+# ===========================================================================
 # F. Read-only posture
 # ===========================================================================
 # Asserted by parsing the source. A comment saying "we never clear codes" is
@@ -859,13 +1088,38 @@ def run_no_second_truth():
     for path in _py_files("vehicle"):
         if path.endswith("selftest.py"):
             continue
-        src = open(path).read()
+        # vehicle/dtc/ carries §17.7's four code-card severities, which are the
+        # specification's own vocabulary for a DTC and not a copy of the
+        # conversation layer's. What would be wrong is two INDEPENDENT ladders,
+        # so the translation between them is asserted below instead of the
+        # vocabulary being banned.
+        dtc = os.sep + os.path.join("vehicle", "dtc") + os.sep in path
         for word in ("warn_high", "crit_high", "warn_low", "crit_low",
-                     "SEVERITY_RANK", "ANNOUNCE_AT_RANK"):
-            if word in src:
+                     "ANNOUNCE_AT_RANK") + (() if dtc else ("SEVERITY_RANK",)):
+            if word in open(path).read():
                 offenders.append(f"{os.path.relpath(path, ROOT)}: {word}")
-    check(not offenders, "no band or severity ladder is duplicated in vehicle/",
-          str(offenders))
+    check(not offenders, "no band or announcement ladder is duplicated in "
+                         "vehicle/", str(offenders))
+
+    # The two severity vocabularies are tied together, not parallel. A code that
+    # reads "Urgent" on the dashboard and reaches the announcement policy as
+    # "advisory" is a system disagreeing with itself in front of the driver.
+    import vehicle_health_policy as VP
+
+    from vehicle.dtc import catalog as DC
+    unmapped = [s for s in DC.SEVERITY_RANK if s not in DC.HEALTH_SEVERITY]
+    check(not unmapped, "every DTC severity maps to a health severity",
+          str(unmapped))
+    unknown_target = [v for v in DC.HEALTH_SEVERITY.values()
+                      if v not in VP.SEVERITY_RANK]
+    check(not unknown_target,
+          "and every target is one the announcement policy already knows",
+          str(unknown_target))
+    order = [DC.HEALTH_SEVERITY[s] for s in
+             sorted(DC.SEVERITY_RANK, key=lambda s: DC.SEVERITY_RANK[s])]
+    check(order == sorted(order, key=lambda v: VP.SEVERITY_RANK[v]),
+          "with the two ladders in the same order — a translation, not a "
+          "reshuffle", str(order))
 
     # The plausible ranges in the registry are NOT bands and must not be
     # mistaken for them: they are the bound outside which a number is not a
@@ -906,8 +1160,8 @@ def main():
     print(f"  store: {_TMP}")
 
     for t in (run_registry, run_units, run_schema, run_gateway, run_ingest,
-              run_one_pipeline, run_producers, run_faults, run_read_only,
-              run_no_second_truth):
+              run_one_pipeline, run_producers, run_faults, run_dtc,
+              run_read_only, run_no_second_truth):
         try:
             t()
         except Exception as e:

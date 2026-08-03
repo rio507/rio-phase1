@@ -762,6 +762,23 @@ def _feed_diagnostics(snap: dict) -> None:
         print(f"[tire_diag] observe failed: {type(e).__name__}: {e}", flush=True)
 
 
+def _poll_dtc() -> None:
+    """Let the DTC scheduler ask for whatever is due. Never fatal.
+
+    Driven from the announcement poll rather than from the telemetry poll, for
+    the reason the diagnostic engine is: this is the loop that keeps running
+    when nobody has the dashboard open, and a diagnostic scan that only happened
+    while somebody was watching would find every pending code late.
+
+    The scheduler decides what is actually due — see vehicle/dtc/service.py on
+    why it is not "ask for everything every time".
+    """
+    try:
+        dtc_service.service().poll(time.time())
+    except Exception as e:
+        print(f"[dtc] poll failed: {type(e).__name__}: {e}", flush=True)
+
+
 def _vehicle_motion():
     """-> (moving, speed_mph). Conservative: unknown speed is not moving.
 
@@ -1033,6 +1050,7 @@ def vehicle_health_announcement_endpoint():
     # only two things that advance the diagnostic engine, and this one is the
     # one that keeps running when nobody has the dashboard open.
     _feed_diagnostics(tires.snapshot())
+    _poll_dtc()
 
     now = time.time()
     issues = vehicle_health.issues()
@@ -1280,6 +1298,146 @@ async def telemetry_batch_endpoint(request: Request,
 def telemetry_stats_endpoint():
     """What the ingestion layer has seen. Diagnostics for a bridge under test."""
     return vehicle_ingest.stats()
+
+
+# --- diagnostic trouble codes ----------------------------------------------
+# Modes 01, 02, 03, 07, 09 and 0A. There is no route here that changes anything
+# about the vehicle, and specifically no Mode 04: the prototype must not expose
+# or call the code-clearing service, and the way to guarantee that is for the
+# capability not to exist rather than for it to be guarded.
+
+from vehicle.dtc import catalog as dtc_catalog             # noqa: E402
+from vehicle.dtc import service as dtc_service             # noqa: E402
+from vehicle.producers import ecu as vehicle_ecu           # noqa: E402
+
+
+@app.get("/vehicle/dtc")
+def vehicle_dtc_endpoint():
+    """The Flagged Error Codes section (§17), already grouped and worded.
+
+    Rendered verbatim by the browser, like every other payload here. The
+    grouping, the status labels, the severity order and the empty-state sentence
+    are all decided server-side — a status label computed in JavaScript is a
+    status label that will one day disagree with the lifecycle that produced it.
+    """
+    return dtc_service.service().section()
+
+
+@app.get("/vehicle/dtc/catalogue")
+def vehicle_dtc_catalogue_endpoint():
+    """Every code RIO has a definition for. A service view.
+
+    Deliberately finite and deliberately incomplete. A code that is not in here
+    is still read, stored, displayed and reported — it simply says so rather
+    than guessing, which is the whole of §15's "unknown and manufacturer-specific
+    codes must still be stored and displayed".
+    """
+    return {"codes": dtc_catalog.view(),
+            "severity_labels": dtc_catalog.SEVERITY_LABEL,
+            "systems": dtc_catalog.SYSTEM_LABEL}
+
+
+@app.get("/vehicle/dtc/snapshot")
+def vehicle_dtc_snapshot_endpoint(id: str = Query(...)):
+    """RIO's own recording of the minute either side of a code appearing.
+
+    Labelled `rio_recorded_history` in the payload and NEVER merged with the
+    ECU's freeze frame, which is on the code's own record. One is what the
+    vehicle chose to preserve; the other is what RIO happened to be watching,
+    and presenting them alike would give RIO's observations the vehicle's
+    authority.
+    """
+    snap = dtc_service.service().snapshots.get(id)
+    if snap is None:
+        return {"error": "unknown snapshot", "id": id}
+    return snap
+
+
+@app.get("/vehicle/ecu/scenario")
+def vehicle_ecu_scenario_endpoint():
+    return vehicle_ecu.ecu().stats()
+
+
+@app.post("/vehicle/ecu/scenario")
+def vehicle_ecu_scenario_set_endpoint(name: str = Query(...)):
+    """Switch what the simulated ECU reports. Development only."""
+    e = vehicle_ecu.ecu()
+    if not e.set_scenario(name, now=time.time()):
+        return {"error": "unknown scenario", "name": name,
+                "scenarios": e.scenarios()}
+    return e.stats()
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/dtcs")
+def vehicle_dtcs_endpoint(vehicle_id: str):
+    """Codes the vehicle is currently reporting, worst first (§25.6)."""
+    svc = dtc_service.service()
+    return {"vehicle_id": vehicle_id,
+            "dtcs": [svc.card(r) for r in svc.registry.active_codes()],
+            "mil_commanded_on": svc.registry.mil(),
+            "stats": svc.stats()}
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/dtcs/history")
+def vehicle_dtcs_history_endpoint(vehicle_id: str):
+    """Every code this vehicle has ever reported (§25.7).
+
+    Including the ones that stopped being reported. A code that went away is
+    still the vehicle's history, and "has this happened before" is only
+    answerable because nothing here deletes it.
+    """
+    svc = dtc_service.service()
+    return {"vehicle_id": vehicle_id,
+            "dtcs": [svc.card(r) for r in svc.registry.records()],
+            "events": svc.events(limit=200)}
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/dtcs/{code}")
+def vehicle_dtc_detail_endpoint(vehicle_id: str, code: str):
+    """One code in full (§25.8)."""
+    svc = dtc_service.service()
+    rec = svc.registry.get(code)
+    if rec is None:
+        return JSONResponse({"error": "unknown code for this vehicle",
+                             "code": code}, status_code=404)
+    card = svc.card(rec)
+    card["rio_snapshot"] = svc.snapshots.get(rec.get("snapshot_id") or "")
+    return card
+
+
+@app.post("/api/v1/vehicles/{vehicle_id}/dtc-scans")
+def vehicle_dtc_scan_endpoint(vehicle_id: str,
+                              session_id: str = Query(default=None),
+                              reason: str = Query(default="driver_requested")):
+    """Ask the vehicle for its codes now (§25.5).
+
+    A READ. Modes 03, 07 and 0A return what the ECU has stored; none of them
+    changes it. §16.4 lists the moments that justify asking out of turn — the
+    drive started, the lamp changed, the driver asked — and this is how they are
+    honoured, because a cadence alone would miss every one of them.
+    """
+    return dtc_service.service().scan(time.time(), session_id, reason=reason)
+
+
+@app.post("/api/v1/vehicle-diagnostics/dtcs")
+def vehicle_dtc_ingest_endpoint(body: dict = Body(...),
+                                x_gateway_id: str = Header(default=""),
+                                x_gateway_token: str = Header(default="")):
+    """A scan performed by a gateway and uploaded (§25.4).
+
+    The bridge does the talking to the vehicle; the cloud does the deciding. The
+    payload is the same shape the simulated ECU produces, and it goes through
+    the same registry — so a code's lifecycle is identical whether it was found
+    by a CANable in a car or by a scenario on a laptop.
+    """
+    gid, token = _gateway_credentials(x_gateway_id, x_gateway_token)
+    try:
+        rec = gateway_auth.authenticate(gid, token)
+        gateway_auth.authorize_vehicle(rec, str(body.get("vehicle_id") or ""))
+    except gateway_auth.AuthError as e:
+        return JSONResponse({"error": str(e)}, status_code=401)
+    svc = dtc_service.service()
+    return svc._ingest_direct(body, time.time())
 
 
 @app.get("/api/v1/vehicles/{vehicle_id}/signals")
