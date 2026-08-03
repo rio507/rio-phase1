@@ -12,13 +12,17 @@ Readable and namespaced on purpose: RIO-<system>-<condition>-<location>. A code
 in a log should be legible without a lookup table, which is the one thing the
 P-code space is worst at.
 
-WHAT A CODE OWNS
-----------------
-Everything that is true of the condition regardless of which tire has it: which
-monitor raises it, what it is about, how bad it is by default, what to call it
-to a driver, what to call it to a technician, what to do about it, what has to
-be true to confirm it, what has to be true to heal it, what evidence to freeze,
-and — separately from all of that — whether RIO is allowed to say it out loud.
+WHAT THIS FILE IS NOW
+---------------------
+The tire domain's CONTENT. The DiagnosticCode dataclass and the CodeCatalog that
+holds it moved to diag/codes.py when the powertrain monitors needed the same
+shape. What is left is the part that is genuinely about tires: nine per-corner
+conditions, one system-level condition, and the words for each.
+
+The module-level functions below delegate to the catalogue. They are kept
+because vehicle_health.py and app.py already call them, and because a domain
+reading `C.get(code)` should not have to know whether the catalogue is a module
+or an object.
 
 WHAT A CODE IS NOT
 ------------------
@@ -37,69 +41,30 @@ have made. Turning one on is a one-line edit here, after reading those logs.
 
 `fast_path` is the separate, narrower permission: an urgent condition that
 speaks immediately through the pre-rendered clip mechanism rather than waiting
-for ordinary confirmation. Only two codes have it, and both are gated by
+for ordinary confirmation. Only two conditions have it, and both are gated by
 validation rules in monitors.py that a single bad packet cannot pass.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-# Severity, in the vocabulary the conversation layer already speaks. `advisory`
-# is new here and sits between informational and warning: the spec asks for it,
-# and it is the level for "this is real, it is on the dashboard, and it belongs
-# in a drive-start briefing rather than in the middle of one".
-INFORMATIONAL = "informational"
-ADVISORY = "advisory"
-WARNING = "warning"
-CRITICAL = "critical"
+import config
 
-SEVERITY_RANK = {INFORMATIONAL: 1, ADVISORY: 2, WARNING: 3, CRITICAL: 4}
+from diag import shadow
+from diag.codes import (ADVISORY, CRITICAL, INFORMATIONAL, SEVERITY_RANK,
+                        WARNING, CodeCatalog, DiagnosticCode)
+
+DOMAIN = "tires"
+
+# The tire domain's speech clearance, declared once at import. A getter rather
+# than a value so config stays the single source of truth — see diag/shadow.py.
+shadow.register(DOMAIN, lambda: bool(config.TIRE_DIAG_SHADOW_MODE))
 
 CORNERS = ("FL", "FR", "RL", "RR")
 CORNER_SPOKEN = {"FL": "front left", "FR": "front right",
                  "RL": "rear left", "RR": "rear right"}
 CORNER_TECH = {"FL": "front-left", "FR": "front-right",
                "RL": "rear-left", "RR": "rear-right"}
-
-
-@dataclass(frozen=True)
-class DiagnosticCode:
-    """One diagnostic condition, everything that is true of it everywhere.
-
-    Per-corner codes are generated from a template (see CODES below) so that
-    four ids cannot drift apart in wording — a typo in one corner's suggested
-    action is a wrong instruction that only one quarter of drivers ever see.
-    """
-
-    code: str
-    monitor_id: str
-    component_type: str                 # tire | tpms_sensor | tpms_system
-    corner: Optional[str]               # None for system-level codes
-    default_severity: str
-
-    # What a person is told. `driver_term` is a noun phrase, not a sentence:
-    # the sentence is assembled where the tire is known.
-    driver_term: str
-    technician_description: str
-    suggested_action: str
-
-    # Confirmation and healing live on the MONITOR, which owns the evidence.
-    # These are the code's summary of them, for the service view and for tests
-    # that want to assert the contract without reading the monitor.
-    confirmation_summary: str
-    healing_summary: str
-
-    freeze_frame_fields: Tuple[str, ...]
-
-    # The two permissions, deliberately separate. `speak` is ordinary
-    # announcement eligibility and is False on everything (shadow mode).
-    # `fast_path` is the urgent exception and is narrower still.
-    speak: bool = False
-    fast_path: bool = False
-
-    def spoken_location(self) -> str:
-        return CORNER_SPOKEN.get(self.corner or "", "")
 
 
 # Freeze-frame field sets. Named rather than repeated, because "what evidence
@@ -232,16 +197,17 @@ def _build() -> Dict[str, DiagnosticCode]:
             code = f"RIO-{'TPMS' if component.startswith('tpms') else 'TIRE'}-{suffix}-{corner}"
             out[code] = DiagnosticCode(
                 code=code, monitor_id=monitor, component_type=component,
-                corner=corner, default_severity=severity,
+                subject=corner, default_severity=severity,
                 driver_term=term,
                 technician_description=f"{CORNER_TECH[corner]}: {tech}",
                 suggested_action=action, confirmation_summary=conf,
                 healing_summary=heal, freeze_frame_fields=ff,
-                speak=speak, fast_path=fast)
+                speak=speak, fast_path=fast,
+                spoken_subject=CORNER_SPOKEN[corner])
     for (code, monitor, component, severity, term, tech, action,
          conf, heal, ff, speak, fast) in _SYSTEM:
         out[code] = DiagnosticCode(
-            code=code, monitor_id=monitor, component_type=component, corner=None,
+            code=code, monitor_id=monitor, component_type=component, subject=None,
             default_severity=severity, driver_term=term,
             technician_description=tech, suggested_action=action,
             confirmation_summary=conf, healing_summary=heal,
@@ -249,13 +215,10 @@ def _build() -> Dict[str, DiagnosticCode]:
     return out
 
 
-CODES: Dict[str, DiagnosticCode] = _build()
+CATALOG = CodeCatalog(_build())
 
-# monitor_id + corner -> code. The engine works in monitors and corners; the
-# code is what it writes down.
-_BY_MONITOR: Dict[Tuple[str, Optional[str]], List[str]] = {}
-for _c in CODES.values():
-    _BY_MONITOR.setdefault((_c.monitor_id, _c.corner), []).append(_c.code)
+# The dictionary the tests and the service view already read by name.
+CODES: Dict[str, DiagnosticCode] = CATALOG.codes
 
 
 def code_for(monitor_id: str, corner: Optional[str] = None,
@@ -267,24 +230,16 @@ def code_for(monitor_id: str, corner: Optional[str] = None,
     and "about to stop talking" are one monitor's two findings and two quite
     different things to tell somebody.
     """
-    candidates = _BY_MONITOR.get((monitor_id, corner)) or []
-    if not candidates:
-        return None
-    if variant:
-        for c in candidates:
-            if variant.upper() in c:
-                return CODES[c]
-    return CODES[sorted(candidates)[0]]
+    return CATALOG.code_for(monitor_id, corner, variant)
 
 
 def get(code: str) -> Optional[DiagnosticCode]:
-    return CODES.get(code)
+    return CATALOG.get(code)
 
 
 def speech_eligible(code: str) -> bool:
     """May RIO announce this at all? False for everything, in shadow mode."""
-    c = CODES.get(code)
-    return bool(c and c.speak)
+    return CATALOG.speech_eligible(code)
 
 
 def fast_path_eligible(code: str) -> bool:
@@ -296,25 +251,14 @@ def fast_path_eligible(code: str) -> bool:
     after passing every validation gate in monitors.py, which no single bad
     packet can do.
     """
-    c = CODES.get(code)
-    return bool(c and c.fast_path)
+    return CATALOG.fast_path_eligible(code)
 
 
 def service_view() -> List[dict]:
     """Every code and what it means. For a diagnostic or service view only —
     never for the conversation layer, which gets driver_term and nothing else."""
-    return [{
-        "code": c.code,
-        "monitor": c.monitor_id,
-        "component": c.component_type,
-        "corner": c.corner,
-        "default_severity": c.default_severity,
-        "driver_term": c.driver_term,
-        "technician_description": c.technician_description,
-        "suggested_action": c.suggested_action,
-        "confirmation": c.confirmation_summary,
-        "healing": c.healing_summary,
-        "freeze_frame_fields": list(c.freeze_frame_fields),
-        "speech_eligible": c.speak,
-        "fast_path_eligible": c.fast_path,
-    } for c in sorted(CODES.values(), key=lambda x: x.code)]
+    rows = CATALOG.service_view()
+    for row in rows:
+        # The tire half of the codebase has always called a subject a corner.
+        row["corner"] = row["subject"]
+    return rows
