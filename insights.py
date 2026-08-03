@@ -855,6 +855,23 @@ class InsightEngine:
             rows = sorted(self._entries, key=lambda e: e.get("at", 0.0), reverse=True)[:limit]
         return [_present(e, now) for e in rows]
 
+    def baseline(self, key: str, now: float = None):
+        """-> (mean, n_days, seeded) for one channel or conditioned channel.
+
+        The read side of the thing this file has been accumulating all along.
+        The powertrain monitors ask "what does THIS car normally do at cruise",
+        and the answer has been sitting in baselines.json for weeks — building a
+        second baseline layer for them would have produced two answers to one
+        question.
+
+        `seeded` rides along and must not be dropped by the caller. A monitor
+        that raised a finding against fabricated demo history, without saying
+        so, would be exactly the failure the seeding flag exists to prevent.
+        """
+        today = _day_key(now or time.time())
+        with self._lock:
+            return self._baseline_mean(key, today)
+
     def stats(self) -> dict:
         with self._lock:
             days = self._baselines.get("days", {})
@@ -945,6 +962,17 @@ def observe(frame: dict) -> None:
         engine().observe(frame)
     except Exception as e:
         print(f"[insights] observe failed: {type(e).__name__}: {e}", flush=True)
+
+
+def baseline(key: str, now: float = None):
+    """-> (mean, n_days, seeded). Never raises: a baseline layer that could take
+    a diagnostic monitor down with it is worse than no baseline layer."""
+    try:
+        return engine().baseline(key, now)
+    except Exception as e:
+        print(f"[insights] baseline({key!r}) failed: {type(e).__name__}: {e}",
+              flush=True)
+        return None, 0, False
 
 
 def snapshot() -> dict:

@@ -268,7 +268,19 @@ class DiagnosticEngine:
                 fresh = bool(new.get(subject)) if subject else bool(new)
                 spaced = (now - self._last_run_at.get(key, -1e9)) \
                     >= self.MIN_RUN_SPACING_S
-                if not fresh and not (spaced and self._needs_time_based_run(d)):
+                # A subsystem outage is exactly when a monitor's STATUS most
+                # needs to be right, and it is the one time no new evidence will
+                # ever arrive to trigger a run. Without this, a monitor keeps
+                # advertising the READY it had before the link died — which is
+                # the opposite of what `status` means, and it means it for as
+                # long as the outage lasts.
+                #
+                # The run itself changes nothing: the gate inhibits on the way
+                # in, so no verdict is reached and no count advances. What it
+                # updates is the honest answer to "could you look right now".
+                outage = not system_healthy and spaced
+                if not fresh and not outage \
+                        and not (spaced and self._needs_time_based_run(d)):
                     continue
 
                 inp = self._build_input(d, subject, now, ctx, system_healthy)

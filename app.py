@@ -34,6 +34,9 @@ import vehicle_health_policy
 from tire_diag import engine as tire_diag
 from tire_diag import codes as tire_codes
 from tire_diag import monitors as tire_monitors
+from powertrain_diag import engine as powertrain_diag
+from powertrain_diag import codes as powertrain_codes
+from powertrain_diag import monitors as powertrain_monitors
 import framebuf
 import router as request_router
 import visual_qa
@@ -762,6 +765,70 @@ def _feed_diagnostics(snap: dict) -> None:
         print(f"[tire_diag] observe failed: {type(e).__name__}: {e}", flush=True)
 
 
+def _dtc_view() -> dict:
+    """What the engine's DTC monitor is told. A view, never a decision.
+
+    Assembled here rather than fetched by powertrain_diag, so that domain cannot
+    reach sideways into the DTC service — the same reason its monitors are
+    handed their baselines instead of reading them.
+    """
+    try:
+        svc = dtc_service.service()
+        active = svc.registry.active_codes()
+        stats = svc.stats()
+        worst = None
+        for rec in active:
+            cand = dtc_catalog.health_severity(rec.get("severity", ""))
+            if worst is None or (vehicle_health_policy.SEVERITY_RANK.get(cand, 0)
+                                 > vehicle_health_policy.SEVERITY_RANK.get(worst, 0)):
+                worst = cand
+        return {"scanned": stats["scans"] > 0,
+                "responding": stats["ecu_responding"],
+                "codes": [r["code"] for r in active],
+                "mil": svc.registry.mil(),
+                "count": svc.registry.meta().get("dtc_count_reported"),
+                "worst_health_severity": worst}
+    except Exception as e:
+        print(f"[dtc] view failed: {type(e).__name__}: {e}", flush=True)
+        return {}
+
+
+def _link_view() -> dict:
+    """What the transport currently looks like, for the connection monitor."""
+    try:
+        gws = gateway_auth.gateways(config.VEHICLE_ID)
+        live = next((g for g in gws if g["link"] == "connected"), None)
+        hb = (live or {}).get("heartbeat") or {}
+        return {"source": telemetry.source(),
+                "can_state": hb.get("can_state"),
+                "network_state": hb.get("network_state"),
+                "outbox_pending": hb.get("outbox_pending"),
+                "gateways": len(gws)}
+    except Exception:
+        return {"source": telemetry.source()}
+
+
+def _feed_engine_diagnostics() -> None:
+    """Hand the current engine picture to the powertrain monitors. Never fatal.
+
+    Fed from the announcement poll for the reason the tire monitors are: this is
+    the loop that keeps running when nobody has the dashboard open, and a
+    monitor that only advanced while somebody was watching would have its
+    confirmation counts measure attention rather than persistence.
+
+    record=False, deliberately. This read must not add a sample to the trend
+    ring or advance the simulator — see telemetry.snapshot's docstring.
+    """
+    try:
+        moving, speed = _vehicle_motion()
+        powertrain_diag.observe(telemetry.snapshot(record=False),
+                                moving=moving, speed_mph=speed,
+                                dtc=_dtc_view(), link=_link_view())
+    except Exception as e:
+        print(f"[powertrain_diag] observe failed: {type(e).__name__}: {e}",
+              flush=True)
+
+
 def _poll_dtc() -> None:
     """Let the DTC scheduler ask for whatever is due. Never fatal.
 
@@ -1051,6 +1118,7 @@ def vehicle_health_announcement_endpoint():
     # one that keeps running when nobody has the dashboard open.
     _feed_diagnostics(tires.snapshot())
     _poll_dtc()
+    _feed_engine_diagnostics()
 
     now = time.time()
     issues = vehicle_health.issues()
@@ -1148,6 +1216,18 @@ def vehicle_diagnostics_events_endpoint(limit: int = Query(default=100),
             "paths": tire_store.paths()}
 
 
+@app.get("/vehicle/diagnostics/engine")
+def vehicle_diagnostics_engine_endpoint():
+    """The powertrain domain's diagnostic state.
+
+    The same shape /vehicle/diagnostics returns for the tires, because it is
+    literally the same code — powertrain_diag is an instance of diag/, not a
+    second diagnostic system. `status` and `last_result` are separate fields on
+    every monitor here for the same reason they are there.
+    """
+    return powertrain_diag.state()
+
+
 @app.get("/vehicle/diagnostics/catalogue")
 def vehicle_diagnostics_catalogue_endpoint():
     """Every diagnostic code and every monitor definition, fully described.
@@ -1155,10 +1235,26 @@ def vehicle_diagnostics_catalogue_endpoint():
     A service view, deliberately verbose. These identifiers never reach the
     driver: RIO says "your rear-left tire may have a slow leak", not
     "RIO-TIRE-POSSIBLE-LEAK-RL is active".
+
+    Both domains, side by side, with their own shadow flags. Those flags are
+    separate because the tire monitors have shadow logs from real drives behind
+    them and the engine monitors have never seen a vehicle — and one boolean
+    would clear both in the same edit.
     """
-    return {"codes": tire_codes.service_view(),
-            "monitors": tire_monitors.definitions_view(),
-            "shadow_mode": bool(config.TIRE_DIAG_SHADOW_MODE)}
+    from diag import shadow as diag_shadow
+    return {"domains": {
+        "tires": {"codes": tire_codes.service_view(),
+                  "monitors": tire_monitors.definitions_view(),
+                  "shadow_mode": diag_shadow.is_shadowed("tires")},
+        "powertrain": {"codes": powertrain_codes.service_view(),
+                       "monitors": powertrain_monitors.definitions_view(),
+                       "shadow_mode": diag_shadow.is_shadowed("powertrain")},
+    },
+        "shadow_by_domain": diag_shadow.registered(),
+        # The original shape, for anything already reading it.
+        "codes": tire_codes.service_view(),
+        "monitors": tire_monitors.definitions_view(),
+        "shadow_mode": bool(config.TIRE_DIAG_SHADOW_MODE)}
 
 
 @app.post("/vehicle/diagnostics/relearn")

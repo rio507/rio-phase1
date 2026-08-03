@@ -854,3 +854,134 @@ VEHICLE_DTC_MIL_POLL_S = 30.0       # Mode 01 PID 01: lamp state and code count
 VEHICLE_DTC_PENDING_POLL_S = 120.0  # Mode 07
 VEHICLE_DTC_STORED_POLL_S = 300.0   # Mode 03
 VEHICLE_DTC_PERMANENT_POLL_S = 0.0  # Mode 0A: drive start, report, drive end only
+
+
+# ---------------------------------------------------------------------------
+# Powertrain diagnostic monitors (powertrain_diag/) — instances of diag/
+# ---------------------------------------------------------------------------
+# The engine-domain equivalent of the TIRE_DIAG_* block, and it is short for a
+# reason: the lifecycle, the healing, the freeze frames and the shadow machinery
+# are all inherited from diag/, so what is left here is genuinely only "how much
+# evidence is enough" for nine engine monitors.
+#
+# PROVISIONAL, and more so than the tire block. Those numbers have shadow logs
+# from real drives behind them. These have never seen a vehicle at all — which
+# is exactly why shadow clearance became per-domain.
+#
+# WHERE A LIMIT IS NOT HERE. The coolant ceiling, the charging floor and the
+# fuel-trim limit are NOT repeated in this block: the monitors read them from
+# TELEMETRY_BANDS, which is where the panel reads them. A monitor that held its
+# own copy would disagree with the row above it the first time somebody tuned
+# one of them, and a driver looking at an amber coolant row while RIO says
+# nothing is the exact failure this whole convention exists to prevent.
+
+# How long a channel's reading stays evidence. Far tighter than the tire
+# equivalent, because an ECU that has stopped answering has stopped answering
+# now, not in three minutes — the same reasoning as TELEMETRY_STALE_AFTER_S.
+POWERTRAIN_SAMPLE_MAX_AGE_S = 30.0
+
+# A monitor run needs new evidence, and engine channels arrive far faster than
+# TPMS reports do.
+POWERTRAIN_MIN_RUN_SPACING_S = 5.0
+
+# --- coolant ---------------------------------------------------------------
+# How long above the fixed ceiling before it is a finding rather than a spike.
+# A momentary reading past the limit on one sample is a sensor; twenty seconds
+# of it is an engine.
+POWERTRAIN_COOLANT_LIMIT_HOLD_S = 20.0
+# Rate of rise. A healthy engine warming up climbs fast and then stops; one that
+# has lost coolant climbs at this rate and keeps going, and the difference is
+# visible a long way before any ceiling.
+POWERTRAIN_COOLANT_RISE_F_PER_MIN = 7.0
+POWERTRAIN_COOLANT_RISE_WINDOW_S = 120.0
+POWERTRAIN_COOLANT_RISE_MIN_SAMPLES = 8
+# Contextual: how far above THIS car's own conditioned baseline counts. Smaller
+# than any fixed band, because the whole point is to notice while everything
+# still passes.
+# ...measured over this window rather than the whole ring. A conditioned mean
+# is a claim about how the car is running NOW; averaging in everything still
+# in memory would smear a change across the moment it happened and delay the
+# finding by exactly as long as the ring is deep.
+POWERTRAIN_COOLANT_CONTEXT_WINDOW_S = 120.0
+POWERTRAIN_COOLANT_CONTEXT_DELTA_F = 8.0
+POWERTRAIN_COOLANT_CONTEXT_MIN_DAYS = 3
+
+# --- charging --------------------------------------------------------------
+# How long below the charging floor, engine running, before it is a finding.
+POWERTRAIN_CHARGING_HOLD_S = 30.0
+# Cranking voltage: the absolute floor, and how much decline across the recorded
+# start history counts as a trend. The second is the interesting one — a battery
+# losing capacity holds its running voltage perfectly and drops a little further
+# every time the starter loads it.
+POWERTRAIN_START_V_FLOOR = 9.0
+POWERTRAIN_START_V_DECLINE_V = 0.6
+POWERTRAIN_START_EVENTS_MIN = 4
+POWERTRAIN_START_EVENTS_KEEP = 40
+
+# --- fuel trim -------------------------------------------------------------
+# How long a long-term trim has to sit past its band, warm and in closed loop,
+# before it is a finding. Long, deliberately: LTFT moves slowly by design and a
+# short window would just be measuring the drive.
+POWERTRAIN_LTFT_HOLD_S = 120.0
+POWERTRAIN_LTFT_MIN_SAMPLES = 10
+# Below this coolant temperature the engine is not warm and its trims mean
+# nothing yet.
+POWERTRAIN_WARM_COOLANT_F = 170.0
+
+# --- signal integrity ------------------------------------------------------
+# A channel that has not moved AT ALL for this long, on an engine that is
+# running, is stuck. The nastiest sensor failure there is: every plausibility
+# check passes and the number is in band.
+POWERTRAIN_FROZEN_S = 90.0
+POWERTRAIN_FROZEN_MIN_SAMPLES = 12
+# A step larger than this fraction of the channel's own plausible range, between
+# consecutive samples, is a discontinuity no physical process produces.
+POWERTRAIN_DISCONTINUITY_FRAC = 0.35
+
+# --- connection ------------------------------------------------------------
+# How long with no usable engine data at all before the link is the finding
+# rather than the engine.
+POWERTRAIN_NO_DATA_S = 30.0
+# Outbox depth a bridge reports before it is worth saying something.
+POWERTRAIN_OUTBOX_WARN = 500
+
+# --- confirmation and healing ----------------------------------------------
+POWERTRAIN_CONFIRM_RUNS = {
+    "engine.new_dtc": 1,                 # the ECU already confirmed it
+    "engine.coolant_hard_limit": 2,
+    "engine.coolant_rate_of_rise": 2,
+    "engine.coolant_contextual": 3,
+    "engine.charging_voltage": 3,
+    "engine.start_voltage_trend": 2,
+    "engine.fuel_trim_long_term": 3,
+    "engine.signal_integrity": 3,
+    "engine.connection": 2,
+}
+POWERTRAIN_CONFIRM_CYCLES = {
+    # Both of these are claims about how this car normally behaves, and a claim
+    # like that measured inside a single drive is mostly measuring the drive.
+    "engine.coolant_contextual": 1,
+    "engine.fuel_trim_long_term": 1,
+}
+POWERTRAIN_HEAL_RUNS = {
+    "engine.new_dtc": 2,
+    "engine.coolant_hard_limit": 3,
+    "engine.coolant_rate_of_rise": 3,
+    "engine.coolant_contextual": 3,
+    "engine.charging_voltage": 3,
+    "engine.start_voltage_trend": 2,
+    "engine.fuel_trim_long_term": 3,
+    "engine.signal_integrity": 3,
+    "engine.connection": 2,
+}
+POWERTRAIN_HEAL_STABLE_S = {
+    "engine.new_dtc": 300.0,
+    "engine.coolant_hard_limit": 300.0,
+    "engine.coolant_rate_of_rise": 300.0,
+    "engine.coolant_contextual": 1800.0,
+    "engine.charging_voltage": 600.0,
+    "engine.start_voltage_trend": 1800.0,
+    "engine.fuel_trim_long_term": 1800.0,
+    "engine.signal_integrity": 300.0,
+    "engine.connection": 120.0,
+}
