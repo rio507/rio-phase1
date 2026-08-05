@@ -48,6 +48,13 @@
   var wired = false;
   var lastSig = null;
 
+  /* Both supplied by the server on every conditions poll. The vehicle id is the
+     one the report endpoint is addressed with; the stages are §27.8's progress
+     states, in the server's order, so that the browser never has to hold its
+     own copy of either list. */
+  var vehicleId = null;
+  var knownStages = [];
+
   // ---- tiny DOM helpers --------------------------------------------------
 
   function el(tag, cls, text) {
@@ -270,13 +277,24 @@
 
   var reportBusy = false;
 
+  /* The last thing the server told us about a report, kept so that a re-render
+     triggered by something else — the vehicle id arriving, the button being
+     re-enabled — does not wipe a report the driver is still reading. */
+  var lastReportView = null;
+
   function renderReportProgress(view) {
+    if (view !== undefined) lastReportView = view;
+    view = lastReportView;
+
     var host = $('vehreport');
     if (!host) return;
     host.textContent = '';
 
     var btn = el('button', 'dtc-run', 'Run Diagnostic Report');
-    btn.disabled = reportBusy;
+    /* Disabled until the server has told us which vehicle this is. The id is
+       not guessed here: config.VEHICLE_ID is a server constant and a copy of it
+       in the browser is a copy that will one day be stale. */
+    btn.disabled = reportBusy || !vehicleId;
     btn.addEventListener('click', runReport);
     host.appendChild(btn);
 
@@ -326,24 +344,30 @@
   }
 
   async function runReport() {
-    if (reportBusy) return;
+    if (reportBusy || !vehicleId) return;
     reportBusy = true;
-    renderReportProgress({ stages: null, stage_index: 0, status: 'running' });
+    /* Show the stage list we already know while the request is in flight. The
+       POST is synchronous against a simulated ECU, so this is usually one
+       frame — but the moment a real vehicle is on the other end it is seconds
+       of a driver watching a button, and the stage list is what makes that
+       wait legible. */
+    renderReportProgress({ stages: knownStages, stage_index: 0,
+                           status: 'running' });
     try {
-      var vid = (RIO.vehicleId || 'vehicle_prototype_01');
-      var sid = (typeof RIO !== 'undefined' && RIO.getSessionId)
-        ? RIO.getSessionId() : null;
-      var url = '/api/v1/vehicles/' + encodeURIComponent(vid)
-        + '/diagnostic-reports' + (sid ? '?session_id=' + encodeURIComponent(sid) : '');
+      /* RIO.url appends the drive's session_id when one is active, which is how
+         every other call on this page carries it. A report taken during a drive
+         belongs to that drive. */
+      var url = RIO.url('/api/v1/vehicles/' + encodeURIComponent(vehicleId)
+                        + '/diagnostic-reports');
       var r = await fetch(url, { method: 'POST' });
-      renderReportProgress(await r.json());
-    } catch (e) {
-      renderReportProgress({ status: 'failed', error: String(e), stages: [] });
-    } finally {
+      var view = await r.json();
+      if (view && view.stages && view.stages.length) knownStages = view.stages;
       reportBusy = false;
-      /* Re-enable the button without discarding what came back. */
-      var btn = document.querySelector('#vehreport .dtc-run');
-      if (btn) btn.disabled = false;
+      renderReportProgress(view);
+    } catch (e) {
+      reportBusy = false;
+      renderReportProgress({ status: 'failed', error: String(e),
+                             stages: knownStages });
     }
   }
 
@@ -383,8 +407,18 @@
         fetch('/vehicle/dtc', { cache: 'no-store' }).then(function (r) { return r.json(); }),
         fetch('/vehicle/conditions', { cache: 'no-store' }).then(function (r) { return r.json(); })
       ]);
-      if (results[1] && results[1].poll_ms) pollMs = results[1].poll_ms;
-      mount(results[0], results[1]);
+      var cond = results[1] || {};
+      if (cond.poll_ms) pollMs = cond.poll_ms;
+      if (cond.report_stages && cond.report_stages.length) {
+        knownStages = cond.report_stages;
+      }
+      /* The first poll is what makes the report button usable. Re-render it
+         then — and only then, so a report already on screen is left alone. */
+      if (cond.vehicle_id && cond.vehicle_id !== vehicleId) {
+        vehicleId = cond.vehicle_id;
+        if (!reportBusy) renderReportProgress(undefined);
+      }
+      mount(results[0], cond);
       schedule(pollMs || DEFAULT_MS);
     } catch (e) {
       schedule(RETRY_MS);

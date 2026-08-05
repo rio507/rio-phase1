@@ -1491,6 +1491,13 @@ def vehicle_conditions_endpoint():
         "empty_state_caveat": ("This covers only what RIO can currently see. "
                                "It is not a statement about the whole vehicle."),
         "poll_ms": config.HEALTH_POLL_MS,
+        # The panel addresses the report endpoint with this, rather than holding
+        # its own copy of config.VEHICLE_ID — a constant duplicated into the
+        # browser is a constant that will one day be stale.
+        "vehicle_id": config.VEHICLE_ID,
+        # §27.8's progress states, in order, so the report button can show the
+        # list of questions it is about to ask before the first answer lands.
+        "report_stages": list(vehicle_report.STAGES),
     }
 
 
