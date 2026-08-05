@@ -701,6 +701,68 @@ def test_16_shadow_is_per_domain():
           f"{os.path.basename(tire_store.paths()['state'])}")
 
 
+def test_17_integrity_does_not_cry_wolf():
+    head("17 -- signal integrity stays quiet about ordinary driving")
+
+    # Both of these were found by tools/vehicle_acceptance.py and both were the
+    # same shape: a monitor reporting a fault about a car that was behaving
+    # perfectly normally. They are the reason this domain is in shadow mode, and
+    # they are pinned here so that a later tuning pass cannot bring them back.
+
+    # A parked car. Its speed is exactly zero and stays exactly zero, and so is
+    # a car's at a long traffic light — this used to be reported as a dead
+    # sensor on every idle scenario and every city drive.
+    _clear_baselines()
+    car = Car("fuel_trim_drift")
+    car.speed = 0.0
+    car.run_for(300, dt=2.0)
+    iss = car.issue("engine.signal_integrity")
+    frozen = ((iss or {}).get("detail") or {}).get("frozen") or []
+    check("vehicle_speed" not in frozen,
+          "a stationary vehicle's constant speed is not a frozen channel",
+          str(frozen))
+
+    # Starting an engine. Rpm goes from nothing to idle, oil pressure from zero
+    # to sixty, and the bus steps from a resting battery to a charging
+    # alternator with a dip to nine volts while the starter is loading it. Every
+    # one of those measured across the key turning is "further than any physical
+    # process allows", and the result was that the first minute of every drive
+    # of the day reported a lying sensor.
+    _clear_baselines()
+    car = Car("start_voltage_decline")
+    car.speed = 0.0
+    car.run_for(400, dt=2.0)
+    iss = car.issue("engine.signal_integrity")
+    jumpy = ((iss or {}).get("detail") or {}).get("discontinuous") or []
+    check("battery_voltage" not in jumpy,
+          "the resting-to-charging voltage step at a start is ordinary physics, "
+          "not an implausible jump", str(jumpy))
+    check(not jumpy,
+          "and neither is anything else that moves when an engine starts",
+          str(jumpy))
+
+    # The other half of the claim, and the one that matters more: none of that
+    # bought quiet by making the monitor blind. A channel that genuinely stops
+    # moving WHILE THE WHEELS ARE TURNING is still caught, which is the case
+    # test 12 covers, and a step taken with the engine running at both ends of
+    # it is still a step.
+    _clear_baselines()
+    car = Car("cruise").run_for(120, dt=2.0)
+    check(car.monitor("engine.signal_integrity")["last_result"] == DM.PASSED,
+          "a normal drive is clean to begin with")
+    snap = car.snapshot()
+    for row in snap["rows"]:
+        if row["id"] == "battery_voltage":
+            row["value"] = 9.2          # engine still running, bus collapses
+    car.t += 2.0
+    car.engine.observe(snap, now=car.t, moving=True, speed_mph=car.speed)
+    iss = car.issue("engine.signal_integrity")
+    jumpy = ((iss or {}).get("detail") or {}).get("discontinuous") or []
+    check("battery_voltage" in jumpy,
+          "but a bus that collapses mid-drive, engine running either side of "
+          "it, is still an impossible step", str(jumpy))
+
+
 # ---------------------------------------------------------------------------
 # LLM firewall
 # ---------------------------------------------------------------------------
@@ -786,6 +848,7 @@ def main():
         test_14_dtc_monitor,
         test_15_lifecycle_is_the_frameworks,
         test_16_shadow_is_per_domain,
+        test_17_integrity_does_not_cry_wolf,
         test_firewall,
     ]
     for t in tests:

@@ -620,6 +620,22 @@ _INTEGRITY_CHANNELS = ("coolant_temp", "rpm", "vehicle_speed", "battery_voltage"
 
 _BAD_STATUS = ("STALE", "OFFLINE")
 
+# Channels whose constancy means nothing while the vehicle is stationary.
+#
+# A parked car's speed is exactly 0 and stays exactly 0, and so is a car's at a
+# ninety-second traffic light. Reading that as a frozen sensor made every idle
+# scenario and every city drive produce a fault, which is the plainest kind of
+# false positive: the channel was telling the exact truth.
+#
+# The honest cost is stated rather than hidden. A speed sensor genuinely stuck
+# at zero looks, from this channel alone, exactly like a car that is not moving,
+# and `moving` is itself derived from this reading — so while the car is
+# stationary this check cannot tell those two apart. It therefore does not
+# guess. That is the same call the rest of this package makes everywhere else:
+# "we could not tell" is a worse headline than a fault and a much better one
+# than a wrong fault.
+_STATIONARY_CONSTANT = ("vehicle_speed",)
+
 
 def _eval_signal_integrity(inp: MonitorInput) -> Outcome:
     """Is any channel lying?
@@ -643,23 +659,48 @@ def _eval_signal_integrity(inp: MonitorInput) -> Outcome:
 
     frozen, jumpy, stale = [], [], []
     for channel in _INTEGRITY_CHANNELS:
-        points = series(inp, channel, window_s=config.POWERTRAIN_FROZEN_S)
-        if len(points) >= config.POWERTRAIN_FROZEN_MIN_SAMPLES:
-            span = points[-1][0] - points[0][0]
-            values = {round(v, 4) for _, v in points}
-            if span >= config.POWERTRAIN_FROZEN_S and len(values) == 1:
-                frozen.append(channel)
+        # A channel that is legitimately constant when the wheels are not
+        # turning is only evidence of anything while they are.
+        if channel not in _STATIONARY_CONSTANT or inp.moving:
+            points = series(inp, channel, window_s=config.POWERTRAIN_FROZEN_S)
+            if len(points) >= config.POWERTRAIN_FROZEN_MIN_SAMPLES:
+                span = points[-1][0] - points[0][0]
+                values = {round(v, 4) for _, v in points}
+                if span >= config.POWERTRAIN_FROZEN_S and len(values) == 1:
+                    frozen.append(channel)
 
         band = config.TELEMETRY_BANDS.get(channel) or {}
         hi = band.get("crit_high")
         lo = band.get("crit_low")
         if hi is not None and lo is not None and hi > lo:
             step_limit = (hi - lo) * config.POWERTRAIN_DISCONTINUITY_FRAC
-            full = series(inp, channel)
-            for (_, a), (_, b) in zip(full, full[1:]):
-                if abs(b - a) > step_limit:
+            # Only across pairs where the engine was running at BOTH ends.
+            #
+            # Starting an engine moves several of these channels further in one
+            # second than anything that happens afterwards, and all of it is
+            # ordinary physics: rpm goes from nothing to idle, oil pressure from
+            # zero to sixty, and the bus steps from a resting battery to a
+            # charging alternator — with a dip to nine volts in between while the
+            # starter is loading it. Measured across the key turning, every one
+            # of those is "further than any physical process allows", and the
+            # result was that the first minute of every drive of the day
+            # reported a lying sensor.
+            #
+            # The monitor's own premise is already a running engine — that is
+            # what it is inhibited on — so a step measured into or out of a
+            # stopped one is outside what it is entitled to judge. This does not
+            # weaken the check where it matters: a channel that jumps while the
+            # engine is running is caught exactly as before.
+            prev = None
+            for s in u:
+                v = s.values.get(channel)
+                if v is None:
+                    continue
+                if prev is not None and s.engine_running and prev[1] \
+                        and abs(float(v) - prev[0]) > step_limit:
                     jumpy.append(channel)
                     break
+                prev = (float(v), s.engine_running)
 
         last = u[-1].statuses.get(channel)
         if last in _BAD_STATUS:

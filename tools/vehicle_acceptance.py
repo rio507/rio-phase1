@@ -171,8 +171,27 @@ def _reset(scenario: str, ecu_scenario: str, t0: float) -> None:
     dtc_service.service().reset_for_test(os.path.join(_TMP, f"dtc{_run}"))
 
 
+def _motion(snap):
+    """(moving, speed_mph) from the snapshot, exactly as app.py derives it.
+
+    Asserted rather than assumed, because several monitors are gated on it and
+    telling them the car is doing 45 mph while the scenario has it idling in a
+    driveway is the harness inventing a vehicle that does not exist. It is also
+    how `vehicle_speed has not changed at all` survived a fix for it: the car was
+    parked, the monitor was told it was moving, and the exemption for a
+    stationary vehicle could never apply.
+
+    Conservative in the same direction app.py is: unknown speed is not moving.
+    """
+    for row in snap.get("rows", []):
+        if row["id"] == "vehicle_speed" and row.get("value") is not None:
+            speed = float(row["value"])
+            return speed >= config.TIRE_DIAG_DRIVE_START_MPH, speed
+    return False, None
+
+
 def drive(scenario="cruise", ecu_scenario="healthy", ticks=60, fault=None,
-          release_at=None, moving=True, speed_mph=45.0):
+          release_at=None):
     """Run one condition for `ticks` simulated seconds. -> everything observable.
 
     One tick is one second and does what the running server does in a second:
@@ -209,6 +228,7 @@ def drive(scenario="cruise", ecu_scenario="healthy", ticks=60, fault=None,
         for k in pump_total:
             pump_total[k] += res.get(k) or 0
         snap = telemetry.snapshot(record=False)
+        moving, speed_mph = _motion(snap)
         powertrain.observe(snap, now=CLOCK.t, moving=moving,
                            speed_mph=speed_mph)
         dtc_service.service().poll(CLOCK.t)
