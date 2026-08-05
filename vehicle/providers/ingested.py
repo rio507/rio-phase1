@@ -236,7 +236,20 @@ def readings(source_types: List[str] = None) -> List[dict]:
             # Manufacturer PIDs and undecoded Holley channels live here.
             continue
         qual = e.get("quality", Q.VALID)
-        age = now - (e.get("observed_ts") or now)
+        # DISTANCE from now, not elapsed since. A gateway whose clock runs fast
+        # stamps readings in the future, and `now - observed_ts` is then
+        # negative — which compares as fresher than fresh, forever. The §27.9
+        # clock-skew condition made that concrete: five minutes after the bridge
+        # went quiet the panel still read `live`, with every row showing the
+        # last values it saw, because none of them could ever age.
+        #
+        # schema.py records the skew and deliberately does not correct the
+        # timestamp: rewriting it would destroy the only evidence the clock is
+        # wrong. So the correction belongs here instead, and it is not really a
+        # correction — a reading ten minutes ahead of the clock is exactly as
+        # far from being a statement about NOW as one ten minutes behind it, and
+        # neither is grounds for saying the link is alive.
+        age = abs(now - (e.get("observed_ts") or now))
         usable = Q.is_usable(qual) and e.get("value") is not None
         out.append({
             "telemetry_id": tid,

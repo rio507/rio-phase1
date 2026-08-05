@@ -961,7 +961,14 @@ def snapshot(record: bool = True) -> dict:
 
     stamps = [r.at for r in readings.values() if r.at]
     newest = max(stamps) if stamps else None
-    age = (now - newest) if newest else None
+    # Distance from now, not elapsed since — the same rule the ingestion
+    # provider applies per reading, and here for the same reason. A gateway
+    # whose clock runs fast stamps readings in the future; `now - newest` is
+    # then negative, compares as fresher than fresh, and this banner says "Live"
+    # for as long as the skew lasts no matter how long ago the bridge went
+    # quiet. A timestamp ten minutes ahead of the clock is not evidence that
+    # anything is arriving.
+    age = abs(now - newest) if newest else None
     stale = age is not None and age > config.TELEMETRY_STALE_AFTER_S
 
     runtime_s = _runtime.update(engine_running, now) if record \
