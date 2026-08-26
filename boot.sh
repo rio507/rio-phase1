@@ -24,6 +24,26 @@
 # mtimes and dpkg timestamps, because the only record of what this script did
 # was scrollback in a terminal that had gone. Hence BOOT_LOG below.
 #
+# THERE ARE TWO COPIES OF THIS FILE, AND THEY DRIFT.
+# This one, in the repo, is the source. /workspace/boot.sh is a COPY, and it is
+# the path the header above, tools/preflight.py's --fix line and everyone's
+# muscle memory all point at -- because only /workspace survives a pod restart.
+#
+# On 2026-08-26 that copy turned out to be from 2026-07-29: 160 lines against
+# this file's 273, with no RF-DETR step, no detector-weight fetch, no boot log
+# and no preflight. It is, precisely, the version whose missing step 5c caused
+# the incident described in the paragraph above -- so following the documented
+# command would have re-provisioned the pod back into that state, and the only
+# symptom would have been a scene graph that stayed empty.
+#
+# So: after editing this file, copy it. Every time.
+#
+#   cp /workspace/rio-phase1/boot.sh /workspace/boot.sh
+#
+# Or run the repo copy directly, which is unambiguous and always current:
+#
+#   nohup bash /workspace/rio-phase1/boot.sh &
+#
 set -euo pipefail
 
 REPO=/workspace/rio-phase1
