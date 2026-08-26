@@ -260,7 +260,12 @@ class GoogleProvider(NavigationProvider):
     # -- routing -------------------------------------------------------------
     def route(self, origin_lat: float, origin_lng: float,
               destination: M.CanonicalDestination) -> M.CanonicalRoute:
-        if destination.provider_place_id and not (destination.latitude or destination.longitude):
+        # A place id in preference to coordinates even when both are known: a
+        # business's coordinates are a rooftop or a centroid, and the provider
+        # routes a place id to the entrance it knows about. "Arrive at the
+        # Getty Center" landing on the far side of the building is the
+        # difference.
+        if destination.provider_place_id:
             waypoint = {"placeId": destination.provider_place_id}
         elif destination.latitude or destination.longitude:
             waypoint = {"location": {"latLng": {"latitude": destination.latitude,
