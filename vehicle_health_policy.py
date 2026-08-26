@@ -42,10 +42,10 @@ anything that is not an id this module issued — the same contract /nav/voice
 and /headway_voice already hold.
 
 Numbers are written the way they are meant to be heard ("twenty-nine P S I",
-not "29 PSI"), and rounded the way a person says them, which is nav.py's
-format_distance discipline applied to pressure and temperature. "Twenty-nine
-point three P S I" is a machine talking, and this is the one channel where RIO
-interrupts to be listened to.
+not "29 PSI"), and rounded the way a person says them — navigation's
+precompute-every-sentence discipline (navigation/speech.py) applied to pressure
+and temperature. "Twenty-nine point three P S I" is a machine talking, and this
+is the one channel where RIO interrupts to be listened to.
 
 WHAT IT IS GIVEN
 ----------------
@@ -197,9 +197,9 @@ SPEAK_REASONS = (R_FIRST, R_WORSENED, R_RETURNED, R_REMINDER)
 # ===========================================================================
 # Numbers, written to be heard
 # ===========================================================================
-# nav.py rounds a distance the way a person says it before it is ever spoken
-# ("in 300 meters", never "in 287 meters"). The same rule, one step further:
-# these come back as words, because an alert is the worst possible place to
+# Navigation writes every sentence it can say before the drive starts, so
+# nothing formats language while the car is moving. The same rule, one step
+# further: these come back as WORDS, because an alert is the worst place to
 # discover that a synthesiser reads "29 PSI" as "twenty-nine pounds per square
 # inch" on one voice and "two nine P S I" on another. What is written here is
 # what is heard.
@@ -490,8 +490,8 @@ class VehicleHealthPolicy:
         """The words for an id this module issued, or None.
 
         This is what makes /vehicle/health/voice a lookup rather than a
-        text-to-speech endpoint, exactly as nav.announcement_text does for
-        /nav/voice. The browser addresses a decision; it never sends a sentence.
+        text-to-speech endpoint, exactly as navigation.speech.text_for does
+        for /nav/voice. The browser addresses a decision, never a sentence.
         """
         for aid, text in self._issued:
             if aid == announcement_id:

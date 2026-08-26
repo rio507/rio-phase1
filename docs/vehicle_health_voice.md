@@ -165,9 +165,9 @@ bounded by `vehicle_health_policy.LINE`. Same contract as `/nav/voice` and
 
 `"The rear left tire is down to twenty-six P S I."`
 
-`nav.py` rounds a distance the way a person says it before it is ever spoken
-("in 300 meters", never "in 287 meters") and composes it deterministically at
-decision time. The same discipline, one step further: pressures and temperatures
+Navigation composes every sentence it can say deterministically, before the
+drive starts, and never mid-drive (`navigation/speech.py`). The same discipline,
+one step further: pressures and temperatures
 come back as words, because an alert is the worst place to discover that a
 synthesiser reads "29 PSI" as "two nine P S I". Voltage keeps its tenth —
 12.1 V and 12.9 V are a dying battery and a healthy one.

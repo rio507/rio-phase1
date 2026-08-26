@@ -735,11 +735,27 @@ def run_priority():
     check(order.get("TURN_NEAR", 99) < order.get("NAV", 0) < order.get("CONVO", 0),
           "the rest of the ladder is unchanged: near turn > nav > conversation")
 
+    # The navigation side of the ladder lives in the speech planner now, not
+    # in the panel: rio_nav.js paints and plays audio, rio_navplan.js decides
+    # what is worth saying and at which tier.
     nav = open(os.path.join(ROOT, "static", "rio_nav.js")).read()
-    check("priority: 2" not in nav and "priority: 3" not in nav,
-          "rio_nav.js holds no hardcoded priority numbers any more")
-    check("RIO.speech.P.TURN_NEAR" in nav and "RIO.speech.P.NAV" in nav,
-          "it names the tiers instead")
+    plan = open(os.path.join(ROOT, "static", "rio_navplan.js")).read()
+    check("priority: 2" not in nav and "priority: 3" not in nav
+          and "priority: 2" not in plan and "priority: 3" not in plan,
+          "neither the nav panel nor the planner holds a hardcoded priority number")
+    check("P.TURN_NEAR" in plan and "P.NAV" in plan,
+          "the planner names the tiers, and takes them from the arbiter")
+
+    # The planner carries a fallback table for the case where it is built
+    # without an arbiter (the tests do exactly that). A fallback that disagreed
+    # with rio_speech.js would silently reorder the ladder, so it is checked
+    # against the real one rather than trusted.
+    fb = re.search(r"arbiter\.P\)\s*\|\|\s*\{([^}]*)\}", plan)
+    check(bool(fb), "the planner's fallback priority table is findable")
+    if fb:
+        fallback = {k: int(v) for k, v in re.findall(r"(\w+):\s*(\d+)", fb.group(1))}
+        check(all(order.get(k) == v for k, v in fallback.items()),
+              f"and it agrees with rio_speech.js ({fallback})")
 
     health = open(os.path.join(ROOT, "static", "rio_health.js")).read()
     check("RIO.speech.say(" in health,

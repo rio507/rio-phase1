@@ -10,3 +10,6 @@ uvicorn.log*
 training_data/
 runs/
 weights/
+
+# Local Claude Code settings — per-machine, not part of the project
+.claude/
