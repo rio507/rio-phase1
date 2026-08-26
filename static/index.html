@@ -605,6 +605,15 @@
   /* Desk controls. Deliberately last and deliberately dimmer: this row is for
      testing announcements without a car, and it should never read as part of
      the driving surface. */
+  .nav-state { margin-top: 2px; }
+  .nav-state b { font-size: 11px; letter-spacing: 0.04em; }
+  .nav-anchor {
+    margin-bottom: 8px; padding: 5px 8px; border: 1px dashed var(--border);
+    border-radius: 3px; font-size: 11px; color: var(--text-dim);
+    letter-spacing: 0.02em;
+  }
+  .nav-anchor b { color: var(--accent); font-weight: 500; }
+
   .nav-dev { display: flex; gap: 6px; margin-top: 10px; }
   .nav-dev input {
     min-width: 0;
@@ -1384,14 +1393,18 @@
     </div>
 
     <!-- ---- NAVIGATION ----
-         Google computes the route; RIO runs the progression against it. The
-         wiring is in static/rio_nav.js, the maneuver engine in
-         static/rio_navcore.js, and every announcement goes out through the
-         speech arbiter in static/rio_speech.js — there is only one mouth. -->
+         The provider computes the route; RIO tracks the car against it and
+         decides what is worth saying. The wiring is in static/rio_nav.js, the
+         deterministic tracker in static/rio_navcore.js, the speech planner and
+         visual-context lifecycle in static/rio_navplan.js, and every
+         announcement goes out through the arbiter in static/rio_speech.js —
+         there is only one mouth. Vision is optional throughout: with no
+         camera, no landmarks or no verification, RIO says "Take the next
+         left" and the drive is unaffected. -->
     <div class="panel nav-panel">
       <div class="nav-head">
         <div class="col-title">Navigation</div>
-        <div class="col-sub">Google Routes &middot; RIO Progression</div>
+        <div class="col-sub">Provider Route &middot; RIO Context</div>
       </div>
 
       <div class="nav-empty" id="navempty">No Route Set</div>
@@ -1416,6 +1429,24 @@
         <span class="nav-man-text" id="navmantext"></span>
         <span class="nav-man-dist" id="navmandist"></span>
       </div>
+
+      <!-- The four states worth showing, and they are four because they are
+           genuinely independent. A maneuver can be APPROACHING while its
+           visual context is still ACQUIRING; GPS can be STALE while the route
+           state is ON_ROUTE (a lost fix is not a wrong turn). Collapsing any
+           of these into a single "nav status" would hide exactly the
+           disagreement worth seeing. -->
+      <div class="nav-summary nav-state" id="navstate" style="display:none;">
+        <span><i>Maneuver</i><b id="navmanstate">&mdash;</b></span>
+        <span><i>GPS</i><b id="navgpsstate">&mdash;</b></span>
+        <span><i>Route</i><b id="navroutestate">&mdash;</b></span>
+        <span><i>Context</i><b id="navctxstate">&mdash;</b></span>
+      </div>
+
+      <!-- Debug, not driver-facing: which landmark was verified, with the
+           confidences that let it through. A drive where this is empty most of
+           the time is a drive where the gates are working. -->
+      <div class="nav-anchor" id="navanchor" style="display:none;"></div>
 
       <div class="nav-map bracketed" id="navmap">
         <div class="nav-map-idle" id="navmapidle">Awaiting Route</div>
@@ -3195,7 +3226,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 <!-- ---- Navigation. Loaded last, and in this order:
        rio_speech.js    the arbiter — must exist before anything asks to speak
-       rio_navcore.js   the maneuver engine — no DOM, node-testable
+       rio_navcore.js   the route tracker — no DOM, node-testable
+       rio_navplan.js   the speech planner and the context lifecycle — likewise
        rio_nav.js       the panel, the map, the simulator, the logging
      rio_nav.js subscribes to the headway block's position watch on
      DOMContentLoaded, so it has to be parsed after that block or RIO.headway
@@ -3208,6 +3240,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 <script src="/static/rio_speech.js"></script>
 <script src="/static/rio_navcore.js"></script>
+<script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>
 
 <!-- ---- Vehicle Health, in two halves that deliberately do not know about

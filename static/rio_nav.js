@@ -1,17 +1,18 @@
-/* rio_nav.js — the NAVIGATION panel: provider, bus, map, voice, dev simulator.
+/* rio_nav.js — the NAVIGATION panel: routing, the bus, the map, voice, sim.
  *
  * Layering, deliberately kept visible:
  *
- *   /nav/route  (server)      Google computes the route          — nav.py
- *   rio_navcore.js            we compute progression from GPS    — no DOM
- *   rio_speech.js             one mouth, priority-arbitrated     — no DOM
- *   this file                 everything that touches the page
+ *   /nav/route            the provider computes the route      — navigation/
+ *   rio_navcore.js        we track the car against it          — no DOM
+ *   rio_navplan.js        we decide what is worth saying       — no DOM
+ *   rio_speech.js         one mouth, priority-arbitrated       — no DOM
+ *   this file             everything that touches the page
  *
- * Nav events all go onto RIO.bus. Three things listen: the panel (paints), the
- * announcer (speaks, through the arbiter), and the logger (POSTs to /nav/event,
- * kind "nav" in the session JSONL). None of them knows about the others, which
- * is what makes the next provider — or a heads-up display, or a passenger
- * screen — an extra subscriber rather than an edit to the progression code.
+ * Everything goes onto RIO.bus. Three things listen: the panel (paints), the
+ * logger (POSTs to /nav/event, kind "nav" in the session JSONL), and the
+ * reroute handler. None of them knows about the others, which is what makes
+ * the next provider — or a heads-up display, or a passenger screen — an extra
+ * subscriber rather than an edit to the tracking code.
  *
  * GPS comes from the ONE Geolocation watch the headway loop already owns. A
  * second watchPosition would double the fixes, halve the battery, and give the
@@ -39,7 +40,6 @@
         ev.type = type;
         var lists = (subs[type] || []).concat(subs['*'] || []);
         for (var i = 0; i < lists.length; i++) {
-          // One broken subscriber must not take navigation down with it.
           try { lists[i](ev); } catch (e) { console.error('[nav] subscriber', e); }
         }
       },
@@ -62,6 +62,12 @@
     var elManIcon = $('navmanicon');
     var elManText = $('navmantext');
     var elManDist = $('navmandist');
+    var elStateRow = $('navstate');
+    var elManState = $('navmanstate');
+    var elGpsState = $('navgpsstate');
+    var elRouteState = $('navroutestate');
+    var elCtxState = $('navctxstate');
+    var elAnchor = $('navanchor');
     var elMapBox = $('navmap');
     var elMapIdle = $('navmapidle');
     var elSim = $('navsim');
@@ -70,32 +76,18 @@
 
     var MPH_TO_MS = 0.44704;
 
-    // Tier -> how RIO treats the announcement. The near tier is the only nav
-    // line that outranks other nav lines, and the TTLs are the window in which
-    // each is still true: a "near" line 3 s stale is a turn already missed.
-    //
-    // Named, not numbered. These used to be the literals 2 and 3, which was
-    // fine until a tier was inserted above them and the numbers meant something
-    // else — the ladder lives in rio_speech.js and this file should not hold a
-    // second, silent copy of it.
-    var TIER_RULES = {
-      far: { priority: RIO.speech.P.NAV, ttlMs: 12000 },
-      mid: { priority: RIO.speech.P.NAV, ttlMs: 6000 },
-      near: { priority: RIO.speech.P.TURN_NEAR, ttlMs: 3000 },
-    };
-
-    var engine = null;         // rio_navcore engine for the active route
-    var route = null;
-    var lastFix = null;        // {lat, lng, t, speed}
+    var tracker = null, planner = null, route = null;
+    var lastFix = null;
     var sim = { timer: null, s: 0, ms: 0 };
     var map = null, mapLine = null, mapDest = null, mapHost = null, mapsFailed = false;
-    var routing = false;
+    var routing = false, lastRerouteAt = -1e9, clockS = 0;
     // What the driver actually asked for, kept verbatim so a reroute asks for
-    // the same PLACE. Re-geocoding the label of a place picked from
-    // autocomplete can land on a different one of the same name.
+    // the same PLACE. Re-resolving the label of a place picked from a list can
+    // land on a different one of the same name.
     var lastRequest = null;
 
     function status(text) { if (elStatus) elStatus.textContent = text; }
+    function nowS() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000; }
 
     /* ---------------------------------------------------------------------
        Announcement audio. Its own element, unlocked in a user gesture like
@@ -103,6 +95,9 @@
        otherwise), and fetched as a blob rather than streamed so the exact
        sentence comes back with it on X-Nav-Text — the panel then shows the
        words being spoken instead of its own guess at them.
+
+       Note what is NOT sent: the sentence. The request is (route, maneuver,
+       call type, anchor) and the server looks it up in the route's own table.
        --------------------------------------------------------------------- */
     var navAudio = new Audio();
     navAudio.preload = 'auto';
@@ -121,24 +116,16 @@
       } catch (e) { navAudio.muted = false; }
     }
 
-    function announce(ev) {
-      if (!route) return;
-      var rules = TIER_RULES[ev.tier] || TIER_RULES.far;
+    function audioFor(candidate) {
       var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
       var stopped = false;
-      var cleanup = null;      // set once the audio blob exists; see stop()
-
-      RIO.speech.say({
-        priority: rules.priority,
-        group: 'nav:m' + ev.maneuver,
-        id: 'nav:m' + ev.maneuver + ':' + ev.tier,
-        text: ev.text,                    // the precomputed line, until the server's comes back
-        ttlMs: rules.ttlMs,
-        meta: { maneuver: ev.maneuver, tier: ev.tier },
+      var cleanup = null;
+      return {
         play: function () {
-          var url = '/nav/voice?route_id=' + encodeURIComponent(route.route_id)
-                  + '&m=' + ev.maneuver + '&tier=' + encodeURIComponent(ev.tier)
-                  + '&dist_m=' + Math.round(ev.remaining_m);
+          var url = '/nav/voice?route_id=' + encodeURIComponent(candidate.route_id)
+                  + '&m=' + encodeURIComponent(candidate.maneuver_id)
+                  + '&call=' + encodeURIComponent(candidate.call_type)
+                  + (candidate.anchor_id ? '&anchor=' + encodeURIComponent(candidate.anchor_id) : '');
           return fetch(url, ctl ? { signal: ctl.signal } : undefined)
             .then(function (r) {
               if (!r.ok) throw new Error('nav voice ' + r.status);
@@ -177,15 +164,23 @@
           try { navAudio.pause(); } catch (e) {}
           if (cleanup) { cleanup(); cleanup = null; }
         },
-        onDone: function (reason) {
-          // What actually came out of the mouth, as opposed to what the
-          // progression engine asked for. The gap between the two is the whole
-          // reason the arbiter is worth having a log of.
-          RIO.bus.emit('speech', {
-            maneuver: ev.maneuver, tier: ev.tier, reason: reason, text: ev.text,
-          });
-        },
-      });
+      };
+    }
+
+    /* Landmark verification. The candidate list is NOT sent — the server takes
+       it from the route, so the browser cannot introduce a landmark the map
+       never looked up. A failure here resolves to null, which is an ordinary
+       outcome: the primary call goes out with the canonical sentence. */
+    function verifyAnchor(request) {
+      if (!RIO.sessionId) return Promise.resolve(null);
+      return fetch(RIO.url('/nav/anchor/verify'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route_id: request.route_id,
+                               generation_id: request.generation_id,
+                               maneuver_id: request.maneuver_id }),
+      }).then(function (r) { return r.json(); })
+        .then(function (j) { return j || null; })
+        .catch(function () { return null; });
     }
 
     /* ---------------------------------------------------------------------
@@ -213,13 +208,14 @@
 
     // A glyph per maneuver family. Text, not icons: the panel is monospace and
     // an arrow that reads at a glance beats a sprite sheet.
-    function glyph(type) {
-      var t = String(type || '');
-      if (t.indexOf('LEFT') >= 0) return t.indexOf('U_TURN') >= 0 ? '↶' : '←';
-      if (t.indexOf('RIGHT') >= 0) return t.indexOf('U_TURN') >= 0 ? '↷' : '→';
+    function glyph(type, direction) {
+      var t = String(type || ''), d = String(direction || '');
       if (t === 'ARRIVE') return '◉';
-      if (t.indexOf('MERGE') >= 0 || t.indexOf('RAMP') >= 0 || t.indexOf('FORK') >= 0) return '↗';
-      if (t.indexOf('ROUNDABOUT') >= 0) return '↻';
+      if (t === 'UTURN') return d === 'LEFT' ? '↶' : '↷';
+      if (t === 'ROUNDABOUT') return '↻';
+      if (t === 'MERGE' || t === 'RAMP' || t === 'FORK' || t === 'KEEP') return '↗';
+      if (d === 'LEFT') return '←';
+      if (d === 'RIGHT') return '→';
       return '↑';
     }
 
@@ -227,28 +223,63 @@
       if (!route) {
         if (elSummary) elSummary.style.display = 'none';
         if (elMan) elMan.style.display = 'none';
+        if (elStateRow) elStateRow.style.display = 'none';
+        if (elAnchor) elAnchor.style.display = 'none';
         return;
       }
+      var first = route.maneuvers[0];
       if (elSummary) elSummary.style.display = '';
       if (elEta) elEta.textContent = fmtClock(route.eta_epoch);
-      if (elDist) elDist.textContent = fmtDistance(route.distance_m);
+      if (elDist) elDist.textContent = fmtDistance(route.total_distance_m);
       if (elLeft) elLeft.textContent = fmtDuration(route.duration_s);
       if (elMan) elMan.style.display = '';
-      if (elManIcon) elManIcon.textContent = glyph(route.maneuvers[0] && route.maneuvers[0].type);
-      if (elManText) elManText.textContent = route.maneuvers[0] ? route.maneuvers[0].instruction : '';
+      if (elStateRow) elStateRow.style.display = '';
+      if (elManIcon) elManIcon.textContent = glyph(first && first.type, first && first.direction);
+      if (elManText) elManText.textContent = first ? first.instruction : '';
       if (elManDist) elManDist.textContent = '';
     }
 
     function paintProgress(ev) {
-      if (elManIcon) elManIcon.textContent = glyph(ev.maneuver_type);
+      if (elManIcon) elManIcon.textContent = glyph(ev.maneuver_type, ev.direction);
       if (elManText) elManText.textContent = ev.instruction || '';
       if (elManDist) elManDist.textContent = fmtDistance(ev.to_maneuver_m);
       if (elLeft) elLeft.textContent = fmtDistance(ev.remaining_m) + ' left';
-      if (elEta && route) {
+      if (elEta) {
         // ETA re-based on the remaining distance at the speed being driven,
-        // rather than Google's static estimate frozen at route time.
+        // rather than the provider's estimate frozen at route time.
         var v = Math.max(3, ev.speed_ms || 0);
         elEta.textContent = fmtClock(Date.now() / 1000 + ev.remaining_m / v);
+      }
+      paintStates();
+    }
+
+    function paintStates() {
+      if (!tracker) return;
+      var st = tracker.state();
+      var ps = planner ? planner.state() : null;
+      if (elManState) elManState.textContent = st.maneuver_state || '—';
+      if (elGpsState) elGpsState.textContent = (st.gps_state || '').replace('GPS_', '') || '—';
+      if (elRouteState) elRouteState.textContent = (st.route_state || '').replace('OFF_ROUTE_', 'OFF/') || '—';
+      if (elCtxState) elCtxState.textContent = (ps && ps.context_state) || 'INACTIVE';
+      if (elAnchor) {
+        var a = ps && ps.anchor;
+        if (a) {
+          elAnchor.style.display = '';
+          elAnchor.innerHTML = '';
+          var b = document.createElement('b');
+          b.textContent = a.label;
+          elAnchor.appendChild(b);
+          elAnchor.appendChild(document.createTextNode(
+            ' · ' + a.relation.toLowerCase().replace('_', ' ') +
+            ' · id ' + a.identity_confidence.toFixed(2) +
+            ' · vis ' + a.visibility_confidence.toFixed(2) +
+            ' · rel ' + a.relation_confidence.toFixed(2)));
+        } else if (ps && ps.context_reason) {
+          elAnchor.style.display = '';
+          elAnchor.textContent = 'no anchor · ' + ps.context_reason;
+        } else {
+          elAnchor.style.display = 'none';
+        }
       }
     }
 
@@ -300,7 +331,7 @@
             styles: DARK_STYLE, backgroundColor: '#04060c',
           });
         }
-        var path = route.polyline.map(function (p) { return { lat: p[0], lng: p[1] }; });
+        var path = route.geometry.map(function (p) { return { lat: p[0], lng: p[1] }; });
         if (mapLine) mapLine.setMap(null);
         mapLine = new gm.Polyline({
           path: path, map: map, strokeColor: '#5fb3e8', strokeOpacity: 0.95, strokeWeight: 5,
@@ -352,9 +383,9 @@
        --------------------------------------------------------------------- */
     function onPosition(fix) {
       lastFix = fix;
+      clockS = fix.t;
       moveHost(fix.lat, fix.lng);
-      if (!engine) return;
-      engine.position(fix);
+      if (tracker) tracker.position(fix);
     }
 
     // The single Geolocation watch lives in the headway block; nav subscribes
@@ -363,34 +394,52 @@
     if (RIO.headway && RIO.headway.onPosition) {
       RIO.headway.onPosition(function (pos) {
         if (sim.timer) return;
+        var c = pos.coords;
         onPosition({
-          lat: pos.coords.latitude, lng: pos.coords.longitude,
-          speed: (typeof pos.coords.speed === 'number' && isFinite(pos.coords.speed))
-                 ? pos.coords.speed : null,
-          accuracy: pos.coords.accuracy,
-          t: performance.now() / 1000,
+          lat: c.latitude, lng: c.longitude,
+          // iOS routinely reports both of these as null. The tracker derives
+          // them from consecutive fixes when it can, and says which it used.
+          speed: (typeof c.speed === 'number' && isFinite(c.speed)) ? c.speed : null,
+          heading: (typeof c.heading === 'number' && isFinite(c.heading)) ? c.heading : null,
+          accuracy: c.accuracy,
+          t: nowS(),
         });
       });
     }
 
+    /* GPS staleness is the ABSENCE of fixes, so something has to run when
+       nothing arrives. One second, and it does nothing else. */
+    setInterval(function () {
+      if (!tracker) return;
+      clockS = sim.timer ? clockS : nowS();
+      var before = tracker.state().gps_state;
+      tracker.tick(clockS);
+      if (tracker.state().gps_state !== before) paintStates();
+    }, 1000);
+
     function attach(r) {
       route = r;
-      engine = RIO.navcore.create(r);
-      engine.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
+      tracker = RIO.navcore.create(r);
+      planner = RIO.navplan.create({
+        tracker: tracker, arbiter: RIO.speech, route: r,
+        audio: audioFor, verify: verifyAnchor,
+      });
+      tracker.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
+      planner.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
       paintRoute();
       drawRoute();
-      RIO.bus.emit('route_set', {
-        route_id: r.route_id, destination: r.destination, distance_m: r.distance_m,
-        duration_s: r.duration_s, n_maneuvers: r.maneuvers.length,
-        reroute_of: r.reroute_of || null,
+      RIO.bus.emit('NAV_ROUTE_ATTACHED', {
+        route_id: r.route_id, generation_id: r.generation_id,
+        journey_id: r.journey_id, destination: r.destination,
+        n_maneuvers: r.maneuvers.length, landmarks_state: r.landmarks_state,
       });
-      status('Route set · ' + r.destination.label);
-      // Progression needs fixes whether or not a drive is running, and the
-      // watch is shared, so asking for it twice is free.
+      status('Route set · ' + (r.destination.display_name || r.destination.formatted_address));
+      // Tracking needs fixes whether or not a drive is running, and the watch
+      // is shared, so asking for it twice is free.
       if (RIO.headway && RIO.headway.startWatch) RIO.headway.startWatch();
-      // A fix already in hand starts progression immediately rather than at the
+      // A fix already in hand starts tracking immediately rather than at the
       // next GPS tick, so a route set 200 m from a turn announces it now.
-      if (lastFix && !sim.timer) engine.position(lastFix);
+      if (lastFix && !sim.timer) tracker.position(lastFix);
     }
 
     /* ---------------------------------------------------------------------
@@ -431,7 +480,7 @@
       if (routing) return Promise.resolve();
       routing = true;
       if (!opts.reroute_of) lastRequest = opts;
-      status('Routing…');
+      status(opts.reroute_of ? 'Off route · rerouting…' : 'Routing…');
       return currentOrigin().then(function (origin) {
         return fetch(RIO.url('/nav/route'), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -439,6 +488,7 @@
             lat: origin.lat, lng: origin.lng,
             destination: opts.destination || '', place_id: opts.place_id || '',
             label: opts.label || '', reroute_of: opts.reroute_of || null,
+            reason: opts.reason || null,
           }),
         });
       }).then(function (r) { return r.json(); })
@@ -448,65 +498,99 @@
         })
         .catch(function (e) {
           status('No route · ' + (e && e.message ? e.message : e));
-          RIO.bus.emit('route_failed', { error: String(e && e.message || e),
-                                         destination: opts.destination || opts.label || '' });
+          RIO.bus.emit('NAV_ROUTE_FAILED', { error: String(e && e.message || e),
+                                             destination: opts.destination || opts.label || '' });
         })
         .then(function () { routing = false; });
     }
 
+    /* Free text in, one destination or a question out. RIO does not silently
+       pick between two plausible readings of "the Getty". */
+    function routeToQuery(text) {
+      status('Finding …');
+      return fetch(RIO.url('/nav/destination'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: text, lat: lastFix ? lastFix.lat : null,
+                               lng: lastFix ? lastFix.lng : null }),
+      }).then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j.status === 'ambiguous') {
+            status('Which one?');
+            paintSuggestions((j.candidates || []).map(function (c) {
+              return { place_id: c.provider_place_id, text: c.formatted_address,
+                       main: c.display_name, secondary: c.formatted_address };
+            }));
+            return;
+          }
+          if (j.status !== 'resolved') {
+            status('No route · could not find "' + text + '"');
+            return;
+          }
+          var d = j.destination;
+          return setRoute({ place_id: d.provider_place_id || '',
+                            destination: d.provider_place_id ? '' : d.formatted_address,
+                            label: d.display_name || d.formatted_address });
+        })
+        .catch(function (e) { status('No route · ' + (e && e.message || e)); });
+    }
+
     function clearRoute(reason) {
       stopSim();
-      if (engine) engine.stop();
-      engine = null; route = null; lastRequest = null;
+      if (planner) planner.stop();
+      if (tracker) tracker.stop();
+      tracker = null; planner = null; route = null; lastRequest = null;
       RIO.speech.clear('nav:');
       clearMap();
       paintRoute();
       status(reason || 'No Route Set');
     }
 
-    /* Reroute: Google gets asked for a new route from where we actually are.
-       We never patch the old one — a "shortest path back to the polyline"
+    /* Reroute: the provider is asked for a new route from where we actually
+       are. We never patch the old one — a "shortest path back to the polyline"
        invented here is exactly the kind of route RIO has no business
-       inventing. */
-    RIO.bus.on('reroute', function (ev) {
+       inventing. Debounced, because a reroute that fires on a flap is worse
+       than no reroute. */
+    RIO.bus.on('NAV_OFF_ROUTE_CONFIRMED', function (ev) {
       if (!route) return;
-      var dest = route.destination;
+      var debounce = (route.timing && route.timing.reroute_debounce_s) || 12;
+      if ((clockS - lastRerouteAt) < debounce) return;
+      lastRerouteAt = clockS;
       var prev = route.route_id;
-      status('Off route · rerouting…');
       RIO.speech.clear('nav:');
-      if (engine) engine.stop();
-      engine = null;
+      if (planner) planner.stop();
+      if (tracker) tracker.stop();
       setRoute({
-        destination: (lastRequest && lastRequest.destination) || dest.label,
+        destination: (lastRequest && lastRequest.destination) || '',
         place_id: (lastRequest && lastRequest.place_id) || '',
-        label: dest.label,
-        reroute_of: prev,
+        label: (lastRequest && lastRequest.label) || '',
+        reroute_of: prev, reason: 'off_route',
       });
     });
 
-    RIO.bus.on('arrived', function () {
-      status('Arrived · ' + (route ? route.destination.label : ''));
+    RIO.bus.on('NAV_ARRIVED', function () {
+      status('Arrived · ' + (route ? (route.destination.display_name || '') : ''));
       stopSim();
-      if (engine) engine.stop();
+      if (tracker) tracker.stop();
       if (elManDist) elManDist.textContent = '';
     });
 
-    RIO.bus.on('maneuver_approach', announce);
-    RIO.bus.on('progress', paintProgress);
+    RIO.bus.on('NAV_PROGRESS', paintProgress);
+    RIO.bus.on('NAV_ANCHOR_VERIFIED', paintStates);
+    RIO.bus.on('NAV_ANCHOR_REJECTED', paintStates);
 
     /* ---------------------------------------------------------------------
-       Session log. Everything except `progress`, which is a 1 Hz UI tick and
+       Session log. Everything except NAV_PROGRESS, which is a 1 Hz UI tick and
        would bury the events that matter in the JSONL.
        --------------------------------------------------------------------- */
-    var LOGGED = {
-      route_set: 1, route_failed: 1, maneuver_approach: 1, maneuver_complete: 1,
-      reroute: 1, arrived: 1, speech: 1, sim_start: 1, sim_end: 1,
-    };
+    var NOT_LOGGED = { NAV_PROGRESS: 1 };
     RIO.bus.on('*', function (ev) {
-      if (!LOGGED[ev.type] || !RIO.sessionId) return;
-      // route_set is written server-side by /nav/route with the full maneuver
-      // list; this one would be a thinner duplicate.
-      if (ev.type === 'route_set') return;
+      if (!RIO.sessionId) return;
+      if (String(ev.type).indexOf('NAV_') !== 0 || NOT_LOGGED[ev.type]) return;
+      // Route start, reroute completion and anchor verification are written
+      // server-side, where the whole route is in hand; these would be thinner
+      // duplicates.
+      if (ev.type === 'NAV_ROUTE_ATTACHED' || ev.type === 'NAV_ANCHOR_VERIFIED' ||
+          ev.type === 'NAV_ANCHOR_REJECTED') return;
       var payload = {};
       for (var k in ev) if (k !== 'type') payload[k] = ev[k];
       try {
@@ -519,7 +603,7 @@
     });
 
     /* ---------------------------------------------------------------------
-       Destination input + Places autocomplete
+       Destination input + autocomplete
        --------------------------------------------------------------------- */
     var suggestTimer = null, suggestions = [];
 
@@ -528,7 +612,7 @@
       if (!elSuggest) return;
       elSuggest.innerHTML = '';
       if (!suggestions.length) { elSuggest.style.display = 'none'; return; }
-      suggestions.forEach(function (s, i) {
+      suggestions.forEach(function (s) {
         var d = document.createElement('div');
         d.className = 'nav-sug';
         d.innerHTML = '<b></b><i></i>';
@@ -538,7 +622,7 @@
           elDest.value = s.text;
           paintSuggestions([]);
           unlock();
-          setRoute({ place_id: s.place_id, label: s.text });
+          setRoute({ place_id: s.place_id, label: s.main || s.text });
         });
         elSuggest.appendChild(d);
       });
@@ -556,7 +640,12 @@
           var u = '/nav/suggest?q=' + encodeURIComponent(q);
           if (lastFix) u += '&lat=' + lastFix.lat + '&lng=' + lastFix.lng;
           fetch(u).then(function (r) { return r.json(); })
-                  .then(function (j) { paintSuggestions(j.suggestions); })
+                  .then(function (j) {
+                    paintSuggestions((j.suggestions || []).map(function (c) {
+                      return { place_id: c.provider_place_id, text: c.formatted_address,
+                               main: c.display_name, secondary: c.formatted_address };
+                    }));
+                  })
                   .catch(function () { paintSuggestions([]); });
         }, 250);
       });
@@ -565,9 +654,7 @@
         e.preventDefault();
         paintSuggestions([]);
         unlock();
-        // Enter routes to what was typed — autocomplete is a convenience, not a
-        // gate. A plain address geocodes server-side.
-        if (elDest.value.trim()) setRoute({ destination: elDest.value.trim() });
+        if (elDest.value.trim()) routeToQuery(elDest.value.trim());
       });
       document.addEventListener('click', function (e) {
         if (elSuggest && !elSuggest.contains(e.target) && e.target !== elDest) paintSuggestions([]);
@@ -578,34 +665,36 @@
       elGo.addEventListener('click', function () {
         unlock();
         paintSuggestions([]);
-        if (elDest && elDest.value.trim()) setRoute({ destination: elDest.value.trim() });
+        if (elDest && elDest.value.trim()) routeToQuery(elDest.value.trim());
       });
     }
     if (elClear) elClear.addEventListener('click', function () { clearRoute(); });
 
     /* ---------------------------------------------------------------------
        Simulate drive — the desk mode.
-       Walks the host position along the route's own polyline at a set speed,
+       Walks the host position along the route's own geometry at a set speed,
        through the same onPosition() a real fix goes through. Nothing about the
-       progression, the tiers, the arbiter or the logging knows the difference,
+       tracking, the planner, the arbiter or the logging knows the difference,
        which is the point: what you hear at the desk is what you get in the car.
        --------------------------------------------------------------------- */
     function startSim() {
-      if (!engine || !route) { status('Set a route first'); return; }
+      if (!tracker || !route) { status('Set a route first'); return; }
       unlock();
       stopSim(true);
       var mph = parseFloat(elSimSpeed && elSimSpeed.value) || 30;
       sim.ms = Math.max(1, mph * MPH_TO_MS);
       sim.s = 0;
+      clockS = 0;
       if (elSim) { elSim.textContent = 'Stop Sim'; elSim.setAttribute('aria-pressed', 'true'); }
-      RIO.bus.emit('sim_start', { speed_ms: Math.round(sim.ms * 100) / 100, mph: mph,
-                                  route_id: route.route_id });
+      RIO.bus.emit('NAV_SIM_START', { speed_ms: Math.round(sim.ms * 100) / 100, mph: mph,
+                                      route_id: route.route_id });
       sim.timer = setInterval(function () {
-        if (!engine) { stopSim(); return; }
-        var p = engine.pointAt(sim.s);
+        if (!tracker) { stopSim(); return; }
+        var p = tracker.pointAt(sim.s);
         if (!p) { stopSim(); return; }
+        clockS += 1;
         onPosition({ lat: p.lat, lng: p.lng, speed: sim.ms, speedSource: 'sim',
-                     t: performance.now() / 1000 });
+                     accuracy: 5, t: clockS });
         if (p.done) { stopSim(); return; }
         sim.s += sim.ms;   // one second of travel per tick
       }, 1000);
@@ -615,7 +704,7 @@
       if (sim.timer) {
         clearInterval(sim.timer);
         sim.timer = null;
-        if (!quiet) RIO.bus.emit('sim_end', { along_m: Math.round(sim.s) });
+        if (!quiet) RIO.bus.emit('NAV_SIM_END', { along_m: Math.round(sim.s) });
       }
       if (elSim) { elSim.textContent = 'Simulate Drive'; elSim.setAttribute('aria-pressed', 'false'); }
     }
@@ -627,19 +716,24 @@
     }
 
     /* ---------------------------------------------------------------------
-       Public surface. `provider` is named for what it is: swapping in an
-       embedded or offline NavigationProvider means another object with these
-       four methods, and nothing else on the page changes.
+       Public surface. Swapping in an embedded or offline NavigationProvider is
+       a server-side change; nothing on this page needs to know which one
+       answered.
        --------------------------------------------------------------------- */
     RIO.nav = {
-      provider: 'web',
       setRoute: setRoute,
+      routeToQuery: routeToQuery,
       clearRoute: clearRoute,
       simulate: startSim,
       stopSimulation: stopSim,
       unlock: unlock,
       get route() { return route; },
-      state: function () { return engine ? engine.state() : null; },
+      state: function () {
+        if (!tracker) return null;
+        var st = tracker.state();
+        st.context = planner ? planner.state() : null;
+        return st;
+      },
     };
 
     paintRoute();

@@ -1112,6 +1112,19 @@ NAV_RELATION_ORDERED_MIN_M = 30.0     # below this margin, degrade to NEAR
 NAV_RELATION_ORDERED_MAX_M = 75.0     # beyond this the landmark is not "just" anything
 NAV_RELATION_MAX_LATERAL_M = 45.0     # off-route offset that still counts as roadside
 
+# How useful a class of landmark is to SAY, as distinct from how visible it is.
+# A fuel brand is the most useful thing on a corner: enormous, lit, standardised
+# nationally, and drivers already navigate by them. A convenience store is real
+# but weaker — smaller sign, more of them, more easily confused with the next
+# one along. Used only to rank candidates that have already passed every gate.
+NAV_ANCHOR_TYPE_USEFULNESS = {
+    "gas_station": 1.0,
+    "pharmacy": 0.9,
+    "coffee_shop": 0.85,
+    "fast_food_restaurant": 0.85,
+    "convenience_store": 0.75,
+}
+
 # --- anchor validation gates (§18) ------------------------------------------
 # Hard gates, all of them, before anything is ranked. Frequent rejection is the
 # design working: the fallback is ordinary navigation, which is fine, and a

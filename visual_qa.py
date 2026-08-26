@@ -300,12 +300,13 @@ def _data_url(jpeg: bytes) -> str:
 def _nav_context() -> Optional[dict]:
     """Where the car is headed, if a route is set. Never "what's coming next"."""
     try:
-        import nav
+        from navigation import service as navservice
 
-        route = nav.latest_route()
+        route = navservice.latest_route()
         if not route:
             return None
-        return {"destination": route.get("label") or route.get("destination"),
+        return {"destination": route.destination.display_name
+                               or route.destination.formatted_address,
                 "note": "route destination only; progress along the route is not known here"}
     except Exception:
         return None

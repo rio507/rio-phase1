@@ -143,13 +143,41 @@
       queue.splice(i, 0, item);
     }
 
+    /* Admission, checked at DEQUEUE and never only at creation.
+     *
+     * An announcement is true inside a window and false outside it, and the
+     * window can close while the line waits behind a safety warning. Two
+     * separate reasons it can close:
+     *
+     *   expired   its own TTL ran out;
+     *   invalid   the world moved on — the maneuver was passed, or the route
+     *             it belongs to was replaced by a reroute. Callers supply
+     *             valid() and the arbiter asks it the moment before speaking,
+     *             which is the only moment the answer is worth anything.
+     *
+     * Both drop the item silently. Nothing is ever spoken late and nothing
+     * catches up.
+     */
+    function admit(item) {
+      if (item.expiresAt && now() > item.expiresAt) {
+        drop(item, 'expired');
+        return false;
+      }
+      if (typeof item.valid === 'function') {
+        var ok = true;
+        try { ok = !!item.valid(); } catch (e) { ok = false; }
+        if (!ok) {
+          drop(item, 'invalid');
+          return false;
+        }
+      }
+      return true;
+    }
+
     function pump() {
       while (!current && queue.length) {
         var next = queue.shift();
-        if (next.expiresAt && now() > next.expiresAt) {
-          drop(next, 'expired');
-          continue;
-        }
+        if (!admit(next)) continue;
         start(next);
       }
     }
@@ -158,9 +186,13 @@
       P: P,
 
       /* item: {priority, group, id, text, play():Promise, stop(), ttlMs, maxMs,
-                meta, onDone(reason)}
+                meta, valid(), onDone(reason)}
+         `valid` is optional and is asked at dequeue, not at creation — see
+         admit(). Navigation supplies one; headway and conversation do not,
+         because a warning about the road ahead is either current or expired
+         and has no third state.
          reasons a caller can see: spoken | superseded | preempted | expired |
-         timeout | error | cleared */
+         invalid | timeout | error | cleared */
       say: function (item) {
         if (!item || typeof item.play !== 'function') return false;
         item.seq = ++seq;
@@ -180,11 +212,15 @@
           stopCurrent('superseded');
         }
 
-        if (!current) { start(item); return true; }
+        if (!current) {
+          if (admit(item)) start(item);
+          return true;
+        }
 
         if (item.priority < current.item.priority) {
           // Strictly more urgent than what is speaking: cut in. The interrupted
           // line is gone for good — see the header.
+          if (!admit(item)) return true;
           stopCurrent('preempted');
           start(item);
           return true;

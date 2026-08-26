@@ -56,6 +56,24 @@ ENRICH_PROMPT = (
     'Use "unknown" for anything you cannot see clearly. Do not guess.'
 )
 
+# Verification, not discovery. The model is handed the list the map produced and
+# asked only whether each entry is on screen — with a count, because two of the
+# same brand in one view is a rejection, and with a coarse side and box, because
+# depth wants somewhere to sample and the map already knows which side to expect.
+# Numbers rather than adjectives: "clearly visible" is not a threshold.
+LANDMARK_PROMPT = (
+    "This is a photo from a car's dashcam, looking forward along the road.\n"
+    "For EACH of these {n} businesses, say whether its sign or storefront is "
+    "visible in this image right now:\n{listing}\n"
+    "Reply with ONLY a JSON array of {n} objects, in the same order:\n"
+    '[{{"visible": true|false, "identity": 0.0-1.0, "clarity": 0.0-1.0, '
+    '"count": <how many separate ones of that brand you can see>, '
+    '"side": "left"|"right"|"ahead"}}]\n'
+    "identity is how sure you are it is that exact brand. clarity is how "
+    "clearly readable it is from here. Use false and 0.0 when unsure. "
+    "Do not guess."
+)
+
 RESOLVE_PROMPT = (
     "A driver riding in this car said: \"{phrase}\"\n"
     "Numbered boxes mark the road users the car is tracking:\n{legend}\n"
@@ -83,11 +101,12 @@ BODY_WORDS = {
 class VisionAdapter:
     """What the conversation path needs from a local vision model.
 
-    Two methods, both optional to implement usefully: an adapter that cannot
-    enrich returns {}, and one that cannot resolve returns None. The pipeline
-    degrades to geometry-only reference resolution rather than failing, which is
-    the behaviour that keeps a Qwen outage from taking visual conversation down
-    with it.
+    Three methods, all optional to implement usefully: an adapter that cannot
+    enrich returns {}, one that cannot resolve returns None, one that cannot
+    verify a landmark returns []. The pipeline degrades — to geometry-only
+    reference resolution, or to navigation with no contextual anchor — rather
+    than failing, which is what keeps a Qwen outage from taking visual
+    conversation or turn-by-turn down with it.
     """
 
     name = "none"
@@ -97,6 +116,22 @@ class VisionAdapter:
 
     def resolve(self, frame_jpeg: bytes, phrase: str, candidates: list):
         raise NotImplementedError
+
+    def landmark(self, frame_jpeg: bytes, labels: list) -> list:
+        """Which of these EXPECTED landmarks is visible in this frame?
+
+        Navigation's only question of the camera (docs/navigation_v1.md §14).
+        Note what it is not: it is not "what landmarks do you see". The map has
+        already said what should be there, so this is verification of a short
+        closed list — bounded, answerable, and safe to be wrong about, because
+        the answer "no" simply means RIO says "Take the next left" instead.
+
+        Returns one entry per label, in order:
+            {"visible": bool, "identity": 0-1, "clarity": 0-1,
+             "count": int, "side": "left"|"right"|"ahead"|None,
+             "box": [x1, y1, x2, y2] | None}
+        """
+        return []
 
 
 class QwenAdapter(VisionAdapter):
@@ -151,6 +186,27 @@ class QwenAdapter(VisionAdapter):
         if not n or n < 1 or n > len(candidates):
             return None, info
         return candidates[n - 1][0], info
+
+    def landmark(self, frame_jpeg: bytes, labels: list) -> list:
+        """Verify a short closed list of expected landmarks in one frame.
+
+        One generate for the whole list rather than one per label: the decode
+        is what costs, the list is at most four entries, and asking about them
+        together is also what lets the model report that it can see TWO Shell
+        signs — which is a rejection, and would be invisible to per-label
+        questions asked in isolation.
+        """
+        import io
+
+        from PIL import Image
+
+        if not labels:
+            return []
+        pil = Image.open(io.BytesIO(frame_jpeg)).convert("RGB")
+        listing = "\n".join(f"{i + 1}. {lbl}" for i, lbl in enumerate(labels))
+        prompt = LANDMARK_PROMPT.format(n=len(labels), listing=listing)
+        raw = self._generate([pil], prompt, 40 + 34 * len(labels))
+        return _parse_landmarks(raw, len(labels))
 
 
 _adapter = None
@@ -214,6 +270,55 @@ def _parse_enrichment(raw: str) -> dict:
     body = str(obj.get("body") or "").strip().lower().replace(" ", "_")
     if body in BODY_WORDS and body not in ("unknown", "other"):
         out["fine_label"] = body
+    return out
+
+
+def _parse_landmarks(raw: str, n: int) -> list:
+    """The landmark reply -> a fixed-length list of observations.
+
+    Anything malformed becomes "not visible", never a partial guess: a
+    verification step that answers "probably" when it failed to parse is worse
+    than one that answers "no", because "no" costs a sentence and "probably"
+    costs the driver's trust.
+    """
+    blank = {"visible": False, "identity": 0.0, "clarity": 0.0, "count": 0,
+             "side": None, "box": None}
+    try:
+        data = json.loads(_strip_fence(raw))
+    except Exception:
+        m = re.search(r"\[.*\]", _strip_fence(raw), re.S)
+        if not m:
+            return [dict(blank) for _ in range(n)]
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return [dict(blank) for _ in range(n)]
+    if not isinstance(data, list):
+        return [dict(blank) for _ in range(n)]
+    out = []
+    for i in range(n):
+        item = data[i] if i < len(data) and isinstance(data[i], dict) else {}
+        try:
+            ident = float(item.get("identity", 0.0) or 0.0)
+            clarity = float(item.get("clarity", 0.0) or 0.0)
+            count = int(item.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            ident = clarity = 0.0
+            count = 0
+        side = item.get("side")
+        side = side.lower() if isinstance(side, str) else None
+        box = item.get("box")
+        if not (isinstance(box, (list, tuple)) and len(box) == 4):
+            box = None
+        visible = bool(item.get("visible")) and ident > 0.0
+        out.append({
+            "visible": visible,
+            "identity": max(0.0, min(1.0, ident)),
+            "clarity": max(0.0, min(1.0, clarity)),
+            "count": max(count, 1 if visible else 0),
+            "side": side if side in ("left", "right", "ahead") else None,
+            "box": [float(v) for v in box] if box else None,
+        })
     return out
 
 

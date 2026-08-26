@@ -1,33 +1,35 @@
-/* rio_navcore.js — maneuver progression. The half of navigation RIO owns.
+/* rio_navcore.js — the deterministic route tracker. RIO's half of navigation.
  *
- * Google computes the route. This file watches the host position against that
- * route's polyline and decides three things, at ~1 Hz, with no network:
+ * The provider says where the turn is. This file says where the CAR is, at
+ * ~1 Hz, with no network, and everything it emits is derived from route
+ * geometry and GPS. Nothing in here has ever heard of a camera.
  *
- *   which maneuver is next, how close it is, and whether that is close enough
- *   to say something about.
+ * Why client-side, still. A turn announcement is worth nothing late. Putting a
+ * round trip between "you are four seconds from the turn" and RIO saying so
+ * makes the announcement's timing the network's timing. Tracking is also the
+ * one part of navigation that must keep working when signal drops: the route
+ * is already in hand, and following it needs no help.
  *
- * Why client-side. A turn announcement is worth nothing late. Putting a
- * round-trip between "you are 4 seconds from the turn" and RIO saying so means
- * the announcement's timing is the network's timing. Progression is also the
- * one part of navigation that must survive losing signal — the route is already
- * in hand, and following it needs no help.
+ * TWO STATE MACHINES, DELIBERATELY SEPARATE
+ * -----------------------------------------
+ *   maneuver:  UPCOMING -> APPROACHING -> IMMINENT -> EXECUTING -> PASSED
+ *   GPS:       GPS_OK | GPS_DEGRADED | GPS_STALE
+ *   route:     ON_ROUTE | OFF_ROUTE_CANDIDATE | OFF_ROUTE_CONFIRMED
  *
- * Tiers are TIME, not distance
- * ----------------------------
- * far 30 s / mid 12 s / near 4 s of travel at the current speed. 300 m of open
- * highway and 300 m of downtown are the same distance and completely different
- * warnings; seconds are what a driver actually needs to act. The spoken distance
- * is then the true remaining distance at the moment the tier fires (the server
- * formats it), so a slow approach says "in 90 meters" and a fast one says "in
- * 500 meters" from the same tier.
+ * The maneuver machine has no VISUAL_CONTEXT state and never will. Visual
+ * context has its own lifecycle in rio_navplan.js and the two run
+ * independently — maneuver_state APPROACHING alongside context_state ACQUIRING
+ * is the normal case, and collapsing them into one enum is how a camera
+ * failure starts being able to stall a turn instruction.
  *
- * Only the finest applicable tier fires, and tiers never run backwards for a
- * maneuver: a route set 100 m before a turn gets "turn right onto Lincoln", not
- * a countdown that starts too late to be true.
+ * GPS health is likewise NOT off-route. A stale fix means we no longer know
+ * where the car is; it does not mean the car left the route, and it must never
+ * cause a reroute. Rerouting because the sky went quiet under a bridge is how
+ * a navigation system loses a driver's trust in one move.
  *
- * No DOM, no fetch, no audio: it takes positions and emits events. That is what
- * lets tools/nav_selftest.js run a whole simulated drive under node and assert
- * the announcement order.
+ * No DOM, no fetch, no audio. It takes positions and emits events, which is
+ * what lets tools/nav_selftest.js drive an entire simulated journey under node
+ * against the code that ships.
  */
 (function (root) {
   'use strict';
@@ -35,32 +37,49 @@
   var RAD = Math.PI / 180;
   var M_PER_DEG = 111320;
 
-  var DEFAULTS = {
-    // Tier thresholds, seconds of time-to-maneuver. Overridden by the route's
-    // own tiers_s so the server stays the single source of the policy.
-    tiers: { far: 30, mid: 12, near: 4 },
-    // Below this, time-to-maneuver stops meaning anything: at 0.2 m/s every
-    // maneuver is hours away and nothing is ever announced — including the turn
-    // you are creeping towards in traffic. Treated as a floor, not a speed.
-    vFloorMs: 3.0,
-    // Used only when there is no speed at all (a fix with no speed field and no
-    // previous fix to difference). Logged as speed_source:"nominal" so a
-    // surprising announcement can be explained afterwards.
-    vNominalMs: 11.0,
-    // A maneuver is behind you once you are this far past its point.
-    completeEpsM: 8.0,
-    // Off-route: sustained, not instantaneous. One bad fix in a tunnel is not a
-    // wrong turn, and a reroute that fires on noise is worse than no reroute.
-    offRouteM: 45.0,
-    offRouteFixes: 3,
-    rerouteCooldownS: 10.0,
-    // Arrival: within this of the final point, or past it.
-    arriveM: 25.0,
-    // How far back/forward along the route the projection search looks. Bounded
-    // so a route that crosses itself cannot snap the position onto a later leg.
-    searchBackM: 80.0,
-    searchFwdM: 400.0,
+  var E = {
+    MANEUVER_SELECTED: 'NAV_MANEUVER_SELECTED',
+    MANEUVER_PASSED: 'NAV_MANEUVER_PASSED',
+    GPS_OK: 'NAV_GPS_OK',
+    GPS_DEGRADED: 'NAV_GPS_DEGRADED',
+    GPS_STALE: 'NAV_GPS_STALE',
+    OFF_ROUTE_CANDIDATE: 'NAV_OFF_ROUTE_CANDIDATE',
+    OFF_ROUTE_CONFIRMED: 'NAV_OFF_ROUTE_CONFIRMED',
+    ARRIVED: 'NAV_ARRIVED',
+    PROGRESS: 'NAV_PROGRESS'
   };
+
+  /* Fallbacks only. The real values arrive with the route, in `timing`, so the
+     browser holds no navigation policy of its own — tuning happens in
+     config.py and reaches the car with the next route. */
+  var DEFAULTS = {
+    gps_stale_timeout_s: 5.0,
+    gps_accuracy_limit_m: 30.0,
+    gps_degraded_bias_s: 2.0,
+    off_route_distance_m: 45.0,
+    off_route_persistence: 3,
+    reroute_debounce_s: 12.0,
+    progress_rewind_tolerance_m: 30.0,
+    maneuver_passed_eps_m: 8.0,
+    arrive_radius_m: 25.0,
+    projection_back_m: 80.0,
+    projection_fwd_m: 400.0,
+    heading_min_displacement_m: 8.0,
+    heading_max_sample_age_s: 3.0,
+    heading_min_speed_ms: 1.5,
+    stationary_speed_ms: 0.7,
+    early_guidance_s: 25.0,
+    near_turn_s: 2.5,
+    speed_floor_ms: 3.0,
+    speed_nominal_ms: 11.0
+  };
+
+  var GPS_OK = 'GPS_OK', GPS_DEGRADED = 'GPS_DEGRADED', GPS_STALE = 'GPS_STALE';
+  var ON_ROUTE = 'ON_ROUTE', OFF_ROUTE_CANDIDATE = 'OFF_ROUTE_CANDIDATE',
+      OFF_ROUTE_CONFIRMED = 'OFF_ROUTE_CONFIRMED';
+  var UPCOMING = 'UPCOMING', APPROACHING = 'APPROACHING', IMMINENT = 'IMMINENT',
+      EXECUTING = 'EXECUTING', PASSED = 'PASSED';
+  var MAN_RANK = { UPCOMING: 0, APPROACHING: 1, IMMINENT: 2, EXECUTING: 3, PASSED: 4 };
 
   function haversineM(aLat, aLng, bLat, bLng) {
     var p1 = aLat * RAD, p2 = bLat * RAD;
@@ -68,6 +87,13 @@
     var h = Math.sin(dp / 2) * Math.sin(dp / 2) +
             Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) * Math.sin(dl / 2);
     return 2 * 6371008.8 * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  function bearingDeg(aLat, aLng, bLat, bLng) {
+    var p1 = aLat * RAD, p2 = bLat * RAD, dl = (bLng - aLng) * RAD;
+    var y = Math.sin(dl) * Math.cos(p2);
+    var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return (Math.atan2(y, x) / RAD + 360) % 360;
   }
 
   function cumulative(points) {
@@ -79,85 +105,79 @@
     return cum;
   }
 
-  var TIER_ORDER = ['far', 'mid', 'near'];   // coarse -> fine; never runs back
-
   function create(route, options) {
-    var opt = {};
-    var k;
+    var opt = {}, k;
     for (k in DEFAULTS) opt[k] = DEFAULTS[k];
+    for (k in (route && route.timing) || {}) if (opt[k] !== undefined) opt[k] = route.timing[k];
     for (k in (options || {})) opt[k] = options[k];
-    if (route && route.tiers_s) {
-      opt.tiers = {
-        far: route.tiers_s.far, mid: route.tiers_s.mid, near: route.tiers_s.near,
-      };
-    }
 
-    var points = route.polyline || [];
+    var points = route.geometry || [];
     var cum = cumulative(points);
     var routeLen = cum.length ? cum[cum.length - 1] : 0;
 
-    // The maneuver's distance along the route is read off the polyline vertex
-    // the server pinned it to, not recomputed from its lat/lng: two junctions
-    // 20 m apart would otherwise be indistinguishable to a nearest-point search.
+    /* A maneuver's along-route position is read off the vertex the provider
+       pinned it to, never recomputed from its lat/lng: two junctions 20 m apart
+       would otherwise be indistinguishable to a nearest-point search, and the
+       tracker would announce the wrong one. */
     var mans = (route.maneuvers || []).map(function (m) {
-      var idx = Math.max(0, Math.min(points.length - 1, m.poly_index || 0));
+      var idx = Math.max(0, Math.min(points.length - 1, m.polyline_index || 0));
       return {
-        index: m.index, type: m.type, instruction: m.instruction,
-        lat: m.lat, lng: m.lng, poly_index: idx, along_m: cum[idx],
-        announce: m.announce || {},
-        firedRank: 0,          // 0 none, 1 far, 2 mid, 3 near
+        id: m.id, sequence: m.sequence, type: m.type, direction: m.direction,
+        road_name: m.road_name, instruction: m.instruction,
+        lat: m.lat, lng: m.lng, polyline_index: idx,
+        along_m: (typeof m.route_distance_position === 'number')
+                 ? m.route_distance_position : cum[idx],
+        anchors: m.anchors || [], speech: m.speech || {},
+        state: UPCOMING
       };
     });
 
     var listeners = [];
-    var vertex = 0;            // last projected vertex, the search anchor
-    var along = 0;             // distance travelled along the route, metres
-    var manIdx = 0;            // next maneuver
-    var lastFix = null;        // {lat, lng, t}
-    var offRouteRun = 0;
-    // Far in the past, not 0: the cooldown must not swallow the FIRST reroute
-    // of a drive whose clock starts near zero (every simulated drive, and any
-    // real one timed from page load).
-    var lastRerouteT = -1e9;
-    var arrived = false;
-    var stopped = false;
-    var firstFix = true;
-    var lastSpeed = null;
-    var lastSpeedSource = 'none';
-    var lastOffRouteM = 0;
+    var vertex = 0;              // last projected vertex — the search anchor
+    var along = 0;               // route progress, metres. Monotonic.
+    var manIdx = 0;
+    var lastFix = null;          // {lat,lng,t,accuracy}
+    var headingFix = null;       // last fix far enough back to derive a heading from
+    var gpsState = GPS_OK, gpsSince = 0, lastFixT = null;
+    var routeState = ON_ROUTE, offRun = 0, lastOffM = 0;
+    var arrived = false, stopped = false, firstFix = true;
+    var speed = null, speedSource = 'none';
+    var heading = null, headingSource = 'none';
+    var lastSelected = null;
+    var nowT = 0;
 
     function emit(type, payload) {
-      var ev = { t: (payload && payload.t) || 0, route_id: route.route_id };
-      for (var kk in payload) ev[kk] = payload[kk];
-      ev.type = type;   // last, so no payload key can ever shadow the event kind
+      var ev = { t: nowT, route_id: route.route_id, generation_id: route.generation_id };
+      for (var kk in (payload || {})) ev[kk] = payload[kk];
+      ev.type = type;      // last, so no payload key can shadow the event kind
       for (var i = 0; i < listeners.length; i++) {
         try { listeners[i](ev); } catch (e) { /* a listener must not stop the drive */ }
       }
     }
 
     function manPublic(m, extra) {
-      // maneuver_type, not type: the event's own `type` is the event kind, and
-      // a payload key that shadows it silently turns maneuver_approach into
-      // TURN_LEFT for every listener downstream.
       var out = {
-        maneuver: m.index, maneuver_type: m.type, instruction: m.instruction,
-        along_m: Math.round(m.along_m * 10) / 10,
+        maneuver_id: m.id, sequence: m.sequence, maneuver_type: m.type,
+        direction: m.direction, road_name: m.road_name, instruction: m.instruction,
+        maneuver_state: m.state, along_m: Math.round(m.along_m * 10) / 10,
+        n_anchor_candidates: (m.anchors || []).length
       };
       for (var kk in (extra || {})) out[kk] = extra[kk];
       return out;
     }
 
-    /* Nearest point on the route to (lat,lng), searched in a window around the
-       last known position. Local flat-earth metres: over a few hundred metres
-       the error is centimetres, and it keeps the inner loop to arithmetic. */
+    /* Nearest point on the route, searched in a window around where we already
+       are. Local flat-earth metres: over a few hundred metres the error is
+       centimetres and the inner loop stays arithmetic. The window is what stops
+       a route that crosses itself from snapping the car onto a later leg. */
     function project(lat, lng, full) {
       var kLng = M_PER_DEG * Math.cos(lat * RAD);
       var lo = 0, hi = points.length - 2;
       if (!full) {
         lo = vertex;
-        while (lo > 0 && cum[vertex] - cum[lo] < opt.searchBackM) lo--;
+        while (lo > 0 && cum[vertex] - cum[lo] < opt.projection_back_m) lo--;
         hi = vertex;
-        var fwd = Math.max(opt.searchFwdM, (lastSpeed || 0) * 30);
+        var fwd = Math.max(opt.projection_fwd_m, (speed || 0) * 30);
         while (hi < points.length - 2 && cum[hi] - cum[vertex] < fwd) hi++;
       }
       var best = null;
@@ -171,20 +191,40 @@
         var px = ax + t * dx, py = ay + t * dy;
         var d2 = px * px + py * py;
         if (!best || d2 < best.d2) {
-          best = { d2: d2, i: i, t: t, along: cum[i] + t * Math.sqrt(len2) };
+          best = { d2: d2, i: i, along: cum[i] + t * Math.sqrt(len2) };
         }
       }
       if (!best) return { vertex: 0, along: 0, offM: 0 };
       return { vertex: best.i, along: best.along, offM: Math.sqrt(best.d2) };
     }
 
-    function tierFor(ttaS) {
-      if (ttaS <= opt.tiers.near) return 'near';
-      if (ttaS <= opt.tiers.mid) return 'mid';
-      if (ttaS <= opt.tiers.far) return 'far';
-      return null;
+    /* --- GPS health ------------------------------------------------------
+       Three states, and none of them is an opinion about the route. */
+    function setGps(next, why) {
+      if (next === gpsState) return;
+      gpsState = next;
+      gpsSince = nowT;
+      emit(next === GPS_OK ? E.GPS_OK : (next === GPS_STALE ? E.GPS_STALE : E.GPS_DEGRADED),
+           { gps_state: next, reason: why || null,
+             accuracy_m: lastFix ? lastFix.accuracy : null });
     }
 
+    function gpsFromFix(fix) {
+      var acc = (typeof fix.accuracy === 'number' && isFinite(fix.accuracy))
+                ? fix.accuracy : null;
+      if (acc !== null && acc > opt.gps_accuracy_limit_m) {
+        setGps(GPS_DEGRADED, 'accuracy_' + Math.round(acc) + 'm');
+      } else {
+        setGps(GPS_OK, null);
+      }
+    }
+
+    /* --- speed and heading ------------------------------------------------
+       Browser Geolocation on iOS routinely reports speed: null and heading:
+       null, so both are derived when they are missing — and only when the
+       derivation actually means something. A heading computed from two fixes
+       3 m apart while parked is not a heading, it is noise with a compass
+       rose drawn on it. */
     function speedFrom(fix) {
       if (typeof fix.speed === 'number' && isFinite(fix.speed) && fix.speed >= 0) {
         return { v: fix.speed, src: fix.speedSource || 'fix' };
@@ -192,168 +232,288 @@
       if (lastFix && typeof fix.t === 'number' && typeof lastFix.t === 'number') {
         var dt = fix.t - lastFix.t;
         if (dt > 0.2 && dt < 10) {
-          var d = haversineM(lastFix.lat, lastFix.lng, fix.lat, fix.lng);
-          return { v: d / dt, src: 'derived' };
+          return { v: haversineM(lastFix.lat, lastFix.lng, fix.lat, fix.lng) / dt,
+                   src: 'derived' };
         }
       }
-      return { v: opt.vNominalMs, src: 'nominal' };
+      return { v: opt.speed_nominal_ms, src: 'nominal' };
     }
 
-    return {
-      route: route,
-      onEvent: function (fn) { if (typeof fn === 'function') listeners.push(fn); },
+    function headingFrom(fix, v) {
+      if (typeof fix.heading === 'number' && isFinite(fix.heading) && fix.heading >= 0) {
+        headingFix = { lat: fix.lat, lng: fix.lng, t: fix.t };
+        return { h: fix.heading, src: 'fix' };
+      }
+      if (!headingFix) {
+        headingFix = { lat: fix.lat, lng: fix.lng, t: fix.t };
+        return { h: heading, src: heading === null ? 'none' : headingSource };
+      }
+      var dt = fix.t - headingFix.t;
+      var d = haversineM(headingFix.lat, headingFix.lng, fix.lat, fix.lng);
+      var accOk = !(typeof fix.accuracy === 'number' && isFinite(fix.accuracy)) ||
+                  fix.accuracy <= opt.gps_accuracy_limit_m;
+      if (dt > 0 && dt <= opt.heading_max_sample_age_s &&
+          d >= opt.heading_min_displacement_m &&
+          v >= opt.heading_min_speed_ms && v > opt.stationary_speed_ms && accOk) {
+        var h = bearingDeg(headingFix.lat, headingFix.lng, fix.lat, fix.lng);
+        headingFix = { lat: fix.lat, lng: fix.lng, t: fix.t };
+        return { h: h, src: 'derived' };
+      }
+      if (dt > opt.heading_max_sample_age_s) {
+        // The reference sample went stale without producing a heading; start
+        // again from here rather than deriving from an old position.
+        headingFix = { lat: fix.lat, lng: fix.lng, t: fix.t };
+      }
+      return { h: heading, src: heading === null ? 'none' : headingSource };
+    }
 
-      /* One position fix. {lat, lng, speed?, t (seconds), accuracy?} */
-      position: function (fix) {
-        if (stopped || arrived || !points.length || !fix) return null;
+    /* --- maneuver state --------------------------------------------------
+       Time to the maneuver decides the state, with a distance floor so a
+       crawling car still reaches IMMINENT at the junction. States never run
+       backwards for a maneuver: a tracker that can un-imminent a turn is a
+       tracker that can announce it twice. */
+    function stateFor(remaining, tta) {
+      if (remaining <= opt.maneuver_passed_eps_m) return EXECUTING;
+      var nearS = opt.near_turn_s + (gpsState === GPS_DEGRADED ? opt.gps_degraded_bias_s : 0);
+      var earlyS = opt.early_guidance_s + (gpsState === GPS_DEGRADED ? opt.gps_degraded_bias_s : 0);
+      if (tta <= nearS) return IMMINENT;
+      if (tta <= earlyS) return APPROACHING;
+      return UPCOMING;
+    }
 
-        var sp = speedFrom(fix);
-        lastSpeed = sp.v;
-        lastSpeedSource = sp.src;
+    function selectManeuver() {
+      var m = manIdx < mans.length ? mans[manIdx] : null;
+      if (m && lastSelected !== m.id) {
+        lastSelected = m.id;
+        emit(E.MANEUVER_SELECTED, manPublic(m, {
+          remaining_maneuvers: mans.length - manIdx,
+          anchor_candidates: (m.anchors || []).map(function (a) {
+            return { anchor_id: a.anchor_id, label: a.label, relation: a.relation,
+                     relation_confidence: a.relation_confidence };
+          })
+        }));
+      }
+      return m;
+    }
 
-        var pr = project(fix.lat, fix.lng, firstFix);
-        // Never run backwards on noise: a fix that projects behind where we have
-        // already been is jitter unless it is far enough back to be a real
-        // reversal (a missed turn shows up as off-route, not as rewind).
-        if (!firstFix && pr.along < along - 30) {
-          pr.along = along;
-          pr.vertex = vertex;
-        }
-        firstFix = false;
-        vertex = pr.vertex;
-        along = pr.along;
-        lastOffRouteM = pr.offM;
-        lastFix = { lat: fix.lat, lng: fix.lng, t: fix.t };
+    function api() {
+      return {
+        route: route,
+        events: E,
 
-        // --- off route -----------------------------------------------------
-        if (pr.offM > opt.offRouteM) {
-          offRouteRun++;
-          if (offRouteRun >= opt.offRouteFixes &&
-              (fix.t - lastRerouteT) > opt.rerouteCooldownS) {
-            lastRerouteT = fix.t;
-            offRouteRun = 0;
-            // We do not repair the route. Google owns routing; this event asks
-            // for a new one and the engine stops announcing until it arrives.
-            stopped = true;
-            emit('reroute', {
-              t: fix.t, reason: 'off_route',
-              off_route_m: Math.round(pr.offM * 10) / 10,
-              lat: fix.lat, lng: fix.lng,
-              from_maneuver: manIdx < mans.length ? manIdx : null,
+        onEvent: function (fn) { if (typeof fn === 'function') listeners.push(fn); },
+
+        /* Clock-only update. GPS staleness is the absence of fixes, so it can
+           only be noticed by something that runs when nothing arrives. The
+           dashboard ticks this at 1 Hz. */
+        tick: function (t) {
+          if (typeof t === 'number') nowT = t;
+          if (stopped || arrived) return gpsState;
+          if (lastFixT !== null && (nowT - lastFixT) > opt.gps_stale_timeout_s) {
+            setGps(GPS_STALE, 'no_fix_' + Math.round(nowT - lastFixT) + 's');
+          }
+          return gpsState;
+        },
+
+        /* One position fix: {lat, lng, t (seconds), speed?, heading?, accuracy?} */
+        position: function (fix) {
+          if (stopped || arrived || !points.length || !fix) return null;
+          nowT = (typeof fix.t === 'number') ? fix.t : nowT;
+          lastFixT = nowT;
+
+          gpsFromFix(fix);
+          var sp = speedFrom(fix);
+          speed = sp.v; speedSource = sp.src;
+          var hd = headingFrom(fix, sp.v);
+          heading = hd.h; headingSource = hd.src;
+
+          var pr = project(fix.lat, fix.lng, firstFix);
+
+          /* Progress is monotonic under noise. A fix that projects behind
+             where we have already been is jitter unless it is far enough back
+             to be a real reversal — and a real wrong turn shows up as
+             off-route, not as rewind. Only a confirmed reroute resets
+             progress, and it does so by replacing the whole tracker. */
+          var rewound = false;
+          if (!firstFix && pr.along < along - opt.progress_rewind_tolerance_m) {
+            pr.along = along; pr.vertex = vertex; rewound = true;
+          } else if (!firstFix && pr.along < along) {
+            pr.along = along; pr.vertex = vertex;
+          }
+          firstFix = false;
+          vertex = pr.vertex;
+          along = pr.along;
+          lastOffM = pr.offM;
+          lastFix = { lat: fix.lat, lng: fix.lng, t: nowT,
+                      accuracy: (typeof fix.accuracy === 'number') ? fix.accuracy : null };
+
+          /* --- off route ---------------------------------------------------
+             Distance from the polyline plus persistence, and nothing else. A
+             deviation smaller than the fix's own stated uncertainty is not
+             evidence of anything, so it does not count towards the run. */
+          var acc = lastFix.accuracy;
+          var credible = pr.offM > opt.off_route_distance_m &&
+                         (acc === null || pr.offM > acc);
+          if (credible) {
+            offRun++;
+            if (offRun >= opt.off_route_persistence) {
+              if (routeState !== OFF_ROUTE_CONFIRMED) {
+                routeState = OFF_ROUTE_CONFIRMED;
+                stopped = true;   // stop announcing a route we know is wrong
+                emit(E.OFF_ROUTE_CONFIRMED, {
+                  off_route_m: Math.round(pr.offM * 10) / 10,
+                  fixes: offRun, lat: fix.lat, lng: fix.lng,
+                  from_maneuver_id: manIdx < mans.length ? mans[manIdx].id : null
+                });
+              }
+              return { off_route: true, route_state: routeState };
+            }
+            if (routeState === ON_ROUTE) {
+              routeState = OFF_ROUTE_CANDIDATE;
+              emit(E.OFF_ROUTE_CANDIDATE, {
+                off_route_m: Math.round(pr.offM * 10) / 10, fixes: offRun,
+                accuracy_m: acc
+              });
+            }
+          } else {
+            offRun = 0;
+            routeState = ON_ROUTE;
+          }
+
+          /* --- maneuvers now behind us ------------------------------------ */
+          while (manIdx < mans.length &&
+                 along > mans[manIdx].along_m + opt.maneuver_passed_eps_m) {
+            var done = mans[manIdx];
+            done.state = PASSED;
+            manIdx++;
+            lastSelected = null;
+            if (done.type !== 'ARRIVE') {
+              emit(E.MANEUVER_PASSED, manPublic(done, {
+                remaining_maneuvers: mans.length - manIdx
+              }));
+            }
+          }
+
+          /* --- arrival ----------------------------------------------------- */
+          var toEnd = routeLen - along;
+          var destGap = haversineM(fix.lat, fix.lng,
+                                   route.destination.lat, route.destination.lng);
+          if (manIdx >= mans.length ||
+              (toEnd <= opt.arrive_radius_m && destGap <= opt.arrive_radius_m * 4)) {
+            arrived = true;
+            emit(E.ARRIVED, {
+              destination: route.destination,
+              arrival_side: (route.arrival && route.arrival.side) || 'UNKNOWN',
+              gap_m: Math.round(destGap * 10) / 10
             });
-            return { offRoute: true };
+            return { arrived: true };
           }
-        } else {
-          offRouteRun = 0;
-        }
 
-        // --- maneuvers now behind us ---------------------------------------
-        while (manIdx < mans.length && along > mans[manIdx].along_m + opt.completeEpsM) {
-          var done = mans[manIdx];
-          manIdx++;
-          if (done.type === 'ARRIVE') break;   // arrival is announced below
-          emit('maneuver_complete', manPublic(done, {
-            t: fix.t, announced_tier: TIER_ORDER[done.firedRank - 1] || null,
-            remaining_maneuvers: mans.length - manIdx,
-          }));
-        }
+          var man = selectManeuver();
+          var remaining = man.along_m - along;
+          var vEff = Math.max(opt.speed_floor_ms, sp.v);
+          var tta = remaining / vEff;
+          var next = stateFor(remaining, tta);
+          if (MAN_RANK[next] > MAN_RANK[man.state]) man.state = next;
 
-        // --- arrival -------------------------------------------------------
-        var toEnd = routeLen - along;
-        var destGap = haversineM(fix.lat, fix.lng,
-                                 route.destination.lat, route.destination.lng);
-        if (manIdx >= mans.length || (toEnd <= opt.arriveM && destGap <= opt.arriveM * 4)) {
-          arrived = true;
-          var last = mans.length ? mans[mans.length - 1] : null;
-          emit('arrived', {
-            t: fix.t, lat: fix.lat, lng: fix.lng,
-            destination: route.destination,
-            gap_m: Math.round(destGap * 10) / 10,
-            announced_tier: last ? (TIER_ORDER[last.firedRank - 1] || null) : null,
+          emit(E.PROGRESS, {
+            along_m: Math.round(along * 10) / 10,
+            remaining_m: Math.round((routeLen - along) * 10) / 10,
+            off_route_m: Math.round(pr.offM * 10) / 10,
+            route_state: routeState, gps_state: gpsState,
+            maneuver_id: man.id, maneuver_type: man.type, direction: man.direction,
+            instruction: man.instruction, road_name: man.road_name,
+            maneuver_state: man.state,
+            to_maneuver_m: Math.round(remaining * 10) / 10,
+            tta_s: Math.round(tta * 10) / 10,
+            speed_ms: Math.round(sp.v * 100) / 100, speed_source: sp.src,
+            heading_deg: heading === null ? null : Math.round(heading * 10) / 10,
+            heading_source: headingSource,
+            rewound: rewound,
+            eta_epoch: route.eta_epoch
           });
-          return { arrived: true };
-        }
 
-        // --- approach tiers --------------------------------------------------
-        var man = mans[manIdx];
-        var remaining = man.along_m - along;
-        var vEff = Math.max(opt.vFloorMs, sp.v);
-        var tta = remaining / vEff;
-        var tier = tierFor(tta);
-        if (tier) {
-          var rank = TIER_ORDER.indexOf(tier) + 1;
-          if (rank > man.firedRank) {
-            man.firedRank = rank;
-            emit('maneuver_approach', manPublic(man, {
-              t: fix.t, tier: tier,
-              remaining_m: Math.round(remaining * 10) / 10,
-              tta_s: Math.round(tta * 10) / 10,
-              speed_ms: Math.round(sp.v * 100) / 100,
-              speed_source: sp.src,
-              // The precomputed line, so the log records what RIO meant to say
-              // even if the voice path failed.
-              text: (man.announce[tier] || {}).text || man.instruction,
-            }));
+          return { along_m: along, maneuver: man, to_maneuver_m: remaining,
+                   tta_s: tta, maneuver_state: man.state, gps_state: gpsState,
+                   route_state: routeState };
+        },
+
+        /* Position on the geometry at a given distance along it — the
+           simulator's only geometry, kept here so a simulated drive and a real
+           one project through exactly the same points. */
+        pointAt: function (m) {
+          if (!points.length) return null;
+          if (m <= 0) return { lat: points[0][0], lng: points[0][1], done: false };
+          if (m >= routeLen) {
+            var e = points[points.length - 1];
+            return { lat: e[0], lng: e[1], done: true };
           }
-        }
+          var lo = 0, hi = cum.length - 1;
+          while (lo < hi - 1) {
+            var mid = (lo + hi) >> 1;
+            if (cum[mid] <= m) lo = mid; else hi = mid;
+          }
+          var seg = cum[hi] - cum[lo];
+          var f = seg > 0 ? (m - cum[lo]) / seg : 0;
+          return {
+            lat: points[lo][0] + (points[hi][0] - points[lo][0]) * f,
+            lng: points[lo][1] + (points[hi][1] - points[lo][1]) * f,
+            done: false
+          };
+        },
 
-        emit('progress', {
-          t: fix.t, along_m: Math.round(along * 10) / 10,
-          remaining_m: Math.round((routeLen - along) * 10) / 10,
-          off_route_m: Math.round(pr.offM * 10) / 10,
-          maneuver: man.index, maneuver_type: man.type, instruction: man.instruction,
-          to_maneuver_m: Math.round(remaining * 10) / 10,
-          tta_s: Math.round(tta * 10) / 10,
-          speed_ms: Math.round(sp.v * 100) / 100,
-          speed_source: sp.src,
-          eta_epoch: route.eta_epoch,
-        });
-        return { along: along, maneuver: man.index, tta: tta };
-      },
+        maneuver: function () { return manIdx < mans.length ? mans[manIdx] : null; },
+        maneuverById: function (id) {
+          for (var i = 0; i < mans.length; i++) if (mans[i].id === id) return mans[i];
+          return null;
+        },
+        /* Speech validity asks this, at dequeue, about a maneuver that may
+           have been passed while the line sat in the queue (§25). */
+        isPassed: function (id) {
+          var m = this.maneuverById(id);
+          return !m || m.state === PASSED;
+        },
 
-      /* Position on the polyline at a given distance along it — the simulator's
-         only geometry, kept here so simulated and real drives project through
-         exactly the same points. */
-      pointAt: function (m) {
-        if (!points.length) return null;
-        if (m <= 0) return { lat: points[0][0], lng: points[0][1], done: false };
-        if (m >= routeLen) {
-          var e = points[points.length - 1];
-          return { lat: e[0], lng: e[1], done: true };
-        }
-        var lo = 0, hi = cum.length - 1;
-        while (lo < hi - 1) {
-          var mid = (lo + hi) >> 1;
-          if (cum[mid] <= m) lo = mid; else hi = mid;
-        }
-        var seg = cum[hi] - cum[lo];
-        var f = seg > 0 ? (m - cum[lo]) / seg : 0;
-        return {
-          lat: points[lo][0] + (points[hi][0] - points[lo][0]) * f,
-          lng: points[lo][1] + (points[hi][1] - points[lo][1]) * f,
-          done: false,
-        };
-      },
+        state: function () {
+          var man = manIdx < mans.length ? mans[manIdx] : null;
+          var remaining = man ? man.along_m - along : 0;
+          var vEff = Math.max(opt.speed_floor_ms, speed || 0);
+          return {
+            route_id: route.route_id, generation_id: route.generation_id,
+            destination: route.destination, eta_epoch: route.eta_epoch,
+            along_m: along, route_length_m: routeLen,
+            remaining_m: Math.max(0, routeLen - along),
+            maneuver: man ? manPublic(man) : null,
+            to_maneuver_m: man ? remaining : null,
+            tta_s: man ? remaining / vEff : null,
+            maneuvers_left: Math.max(0, mans.length - manIdx),
+            maneuver_state: man ? man.state : null,
+            gps_state: gpsState, gps_state_since: gpsSince,
+            route_state: routeState, off_route_m: lastOffM,
+            speed_ms: speed, speed_source: speedSource,
+            heading_deg: heading, heading_source: headingSource,
+            arrived: arrived, stopped: stopped
+          };
+        },
 
-      state: function () {
-        return {
-          route_id: route.route_id, along_m: along, route_length_m: routeLen,
-          maneuver: manIdx < mans.length ? manPublic(mans[manIdx]) : null,
-          maneuvers_left: Math.max(0, mans.length - manIdx),
-          off_route_m: lastOffRouteM, speed_ms: lastSpeed,
-          speed_source: lastSpeedSource, arrived: arrived, stopped: stopped,
-        };
-      },
+        routeLength: function () { return routeLen; },
+        stop: function () { stopped = true; }
+      };
+    }
 
-      routeLength: function () { return routeLen; },
-      stop: function () { stopped = true; },
-    };
+    return api();
   }
 
   root.RIO = root.RIO || {};
-  root.RIO.navcore = { create: create, haversineM: haversineM, DEFAULTS: DEFAULTS };
+  root.RIO.navcore = {
+    create: create, haversineM: haversineM, bearingDeg: bearingDeg,
+    DEFAULTS: DEFAULTS, EVENTS: E,
+    STATES: {
+      gps: [GPS_OK, GPS_DEGRADED, GPS_STALE],
+      route: [ON_ROUTE, OFF_ROUTE_CANDIDATE, OFF_ROUTE_CONFIRMED],
+      maneuver: [UPCOMING, APPROACHING, IMMINENT, EXECUTING, PASSED]
+    }
+  };
 
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { create: create, haversineM: haversineM, DEFAULTS: DEFAULTS };
-  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = root.RIO.navcore;
 })(typeof window !== 'undefined' ? window : globalThis);

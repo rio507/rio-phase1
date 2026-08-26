@@ -25,7 +25,10 @@ import voice
 import llm_interface
 import vision
 import perceive
-import nav
+from navigation import events as navevents
+from navigation import service as navservice
+from navigation import speech as navspeech
+from navigation import verify as navverify
 import tires
 import telemetry
 import insights
@@ -645,80 +648,152 @@ def headway_voice_endpoint(line: str = Query(...)):
                              headers={"Cache-Control": "no-store"})
 
 
-# --- Navigation (WebNavProvider, step 1) ---
+# --- Navigation (docs/navigation_v1.md) ---
 #
-# Three endpoints and no more: ask Google for a route, look an announcement up,
-# record what the progression engine did. The engine itself is client-side (see
-# static/rio_navcore.js) — nothing here is in the timing path between a driver
-# and a turn.
+# Six endpoints, none of them in the timing path between a driver and a turn.
+# The tracker is client-side (static/rio_navcore.js) and the speech planner
+# with it (static/rio_navplan.js); the server resolves destinations, computes
+# routes, holds the one table of sentences RIO may say about them, verifies a
+# landmark when asked, and writes the log.
+#
+# The authority firewall (§2) is visible in the shapes here: nothing a client
+# POSTs can change a route's maneuvers, and /nav/voice will not synthesize a
+# sentence that is not already in the route's own table.
 
 
 @app.get("/nav/suggest")
 def nav_suggest_endpoint(q: str = Query(...), lat: float = Query(default=None),
                          lng: float = Query(default=None)):
-    """Places autocomplete for the destination box. Never fatal — an empty list
-    just means the driver types the address in full and it geocodes."""
-    return {"suggestions": nav.suggest(q, lat, lng)}
+    """Destination autocomplete. Never fatal — an empty list just means the
+    driver types the address in full and it geocodes."""
+    return {"suggestions": [c.to_dict()
+                            for c in navservice.get_provider().suggest(q, lat, lng)]}
 
 
 @app.get("/nav/geocode")
 def nav_geocode_endpoint(q: str = Query(...)):
-    """Address -> lat/lng. Used for the desk-testing start-point override, and
-    as the fallback when a destination is typed rather than picked."""
-    g = nav.geocode(q)
+    """Address -> lat/lng, for the desk-testing start-point override."""
+    provider = navservice.get_provider()
+    g = provider.geocode_point(q) if hasattr(provider, "geocode_point") else None
     return g or {"error": "could not find that place", "q": q}
+
+
+@app.post("/nav/destination")
+def nav_destination_endpoint(body: dict = Body(...),
+                             session_id: str = Query(default=None)):
+    """Resolve what the driver asked for — or ask them which one they meant.
+
+    "Take me to LAX", "Navigate to Griffith Observatory", "Directions to 123
+    Main Street", "Let's go to the Getty" all arrive here as free text. The
+    last of those is two museums eight miles apart, and the honest answer to it
+    is a question. RIO never silently picks one (§4).
+    """
+    res = navservice.resolve_destination(str(body.get("q") or ""),
+                                         body.get("lat"), body.get("lng"))
+    if res["status"] == "ambiguous":
+        sessions.log_nav(session_id, navevents.DESTINATION_AMBIGUOUS,
+                         {"query": res["query"],
+                          "candidates": [c["display_name"] for c in res["candidates"]]})
+        return {"status": "ambiguous", "query": res["query"],
+                "candidates": res["candidates"]}
+    if res["status"] != "resolved":
+        return {"status": "not_found", "query": res.get("query", "")}
+    return {"status": "resolved", "reason": res.get("reason"),
+            "destination": res["destination"].to_dict()}
 
 
 @app.post("/nav/route")
 def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
-    """Compute a route and make it the active one.
+    """Compute a route and make it the active generation.
 
-    Google decides the route. The only judgement in this handler is refusing to
-    pretend: a routing failure comes back as an error the panel shows, never as
-    a stale or invented route.
+    The provider decides the route. The only judgement in this handler is
+    refusing to pretend: a routing failure comes back as an error the panel
+    shows, never as a stale or invented route.
+
+    `reroute_of` carries the previous route id, which is what makes the new
+    route the NEXT GENERATION of the same journey rather than an unrelated
+    drive — and what lets every announcement queued against the old one be
+    invalidated the moment it would otherwise be spoken.
     """
     try:
         lat = float(body.get("lat"))
         lng = float(body.get("lng"))
     except (TypeError, ValueError):
         return {"error": "need a current position (lat, lng) to route from"}
+
+    previous = None
+    reroute_of = body.get("reroute_of")
+    if reroute_of:
+        previous = navservice.get_route(str(reroute_of))
+        if previous is not None and not navservice.reroute_allowed(previous.journey_id):
+            # Anti-flap. A journey rerouting this often is not being rerouted,
+            # it is oscillating, and each attempt costs a routing call.
+            sessions.log_nav(session_id, navevents.REROUTE_FAILED, {
+                "route_id": previous.route_id, "journey_id": previous.journey_id,
+                "reason": "reroute_limit"})
+            return {"error": "too many reroutes on this journey"}
+
+    place_id = str(body.get("place_id") or "")
+    label = str(body.get("label") or "")
+    query = str(body.get("destination") or "")
+    provider = navservice.get_provider()
+    if previous is not None:
+        # A reroute goes back to the SAME destination object, never to a
+        # re-resolution of its label: re-geocoding "Starbucks" from a different
+        # part of town lands on a different Starbucks.
+        destination = previous.destination
+    elif place_id:
+        destination = provider.destination(place_id=place_id, label=label)
+    else:
+        destination = provider.destination(query=query, label=label)
+    if destination is None:
+        sessions.log_nav(session_id, navevents.ROUTE_FAILED,
+                         {"destination": query or label, "error": "unresolved destination"})
+        return {"error": "could not find that place"}
+
+    if previous is not None:
+        sessions.log_nav(session_id, navevents.REROUTE_STARTED, {
+            "route_id": previous.route_id, "journey_id": previous.journey_id,
+            "generation_id": previous.generation_id,
+            "reason": str(body.get("reason") or "off_route")})
     try:
-        route = nav.compute_route(
-            lat, lng,
-            destination=str(body.get("destination") or ""),
-            place_id=str(body.get("place_id") or ""),
-            label=str(body.get("label") or ""),
-            reroute_of=body.get("reroute_of"),
-        )
-    except nav.NavError as e:
-        sessions.log_nav(session_id, "route_failed", {
-            "destination": body.get("destination"), "error": str(e)})
+        route = navservice.build_route(lat, lng, destination, previous=previous)
+    except navservice.NavError as e:
+        sessions.log_nav(session_id, navevents.ROUTE_FAILED,
+                         {"destination": destination.display_name, "error": str(e)})
         return {"error": str(e)}
-    # route_set is logged here rather than from the browser: the server is the
-    # only place that holds the whole route, and the summary it writes is the
-    # record a review reads to see what RIO *intended* to say on this drive.
-    sessions.log_nav(session_id, "route_set", nav.summary(route))
-    return route
+
+    # Logged here rather than from the browser: the server is the only place
+    # that holds the whole route, and this summary is the record a review reads
+    # to see what RIO *intended* to be able to say on this drive.
+    sessions.log_nav(session_id,
+                     navevents.REROUTE_COMPLETE if previous is not None
+                     else navevents.ROUTE_STARTED,
+                     navservice.summary(route))
+    return navservice.wire(route)
 
 
 @app.get("/nav/voice")
-def nav_voice_endpoint(route_id: str = Query(...), m: int = Query(...),
-                       tier: str = Query(...), dist_m: float = Query(default=None)):
-    """TTS for one precomputed announcement, addressed by (route, maneuver, tier).
+def nav_voice_endpoint(route_id: str = Query(...), m: str = Query(...),
+                       call: str = Query(...), anchor: str = Query(default=None)):
+    """TTS for one precomputed line, addressed by (route, maneuver, call, anchor).
 
     Deliberately not a text-to-speech endpoint, for the same reason
     /headway_voice is not: the browser sends coordinates into a table, never a
-    sentence. Anything that does not resolve to a maneuver on a live route is
+    sentence. Anything that does not resolve to a line on a live route is
     refused, so the set of things RIO's voice can ever say about navigation is
-    bounded by what Google returned and this process precomputed.
+    bounded by what the provider returned and this process precomputed — an
+    anchor id included, which is why a landmark cannot be spoken about unless
+    the map put it on the route in the first place.
 
-    The exact sentence rides back on X-Nav-Text so the panel displays the words
-    that are being spoken rather than its own reconstruction of them.
+    The exact sentence rides back on X-Nav-Text so the panel shows the words
+    being spoken rather than its own reconstruction of them.
     """
-    text = nav.announcement_text(route_id, m, tier, dist_m)
+    route = navservice.get_route(route_id)
+    text = navspeech.text_for(route, m, call, anchor) if route else None
     if not text:
-        return {"error": "unknown route, maneuver or tier",
-                "route_id": route_id, "m": m, "tier": tier}
+        return {"error": "unknown route, maneuver, call or anchor",
+                "route_id": route_id, "m": m, "call": call}
     return StreamingResponse(
         voice.synthesize_stream(text), media_type="audio/mpeg",
         headers={
@@ -728,9 +803,50 @@ def nav_voice_endpoint(route_id: str = Query(...), m: int = Query(...),
         })
 
 
+@app.post("/nav/anchor/verify")
+def nav_anchor_verify_endpoint(body: dict = Body(...),
+                               session_id: str = Query(default=None)):
+    """Is one of this maneuver's expected landmarks visible right now?
+
+    The camera's entire role in navigation. The candidate list is taken from
+    the ROUTE, not from the request body — a client cannot introduce a landmark
+    RIO never looked up, and cannot alter the relation the map computed for it.
+
+    Returns `{"anchor": null, "reason": ...}` freely and without apology: no
+    camera, no recent frames, nothing visible, an uncertain identity, a
+    duplicate in view, an unstable track, a stale look or an implausible depth
+    all end here, and all of them mean RIO speaks the canonical instruction.
+    """
+    route = navservice.get_route(str(body.get("route_id") or ""))
+    if route is None:
+        return {"anchor": None, "reason": "unknown_route"}
+    if int(body.get("generation_id") or route.generation_id) != route.generation_id:
+        return {"anchor": None, "reason": "stale_generation"}
+    man = route.maneuver(str(body.get("maneuver_id") or ""))
+    if man is None:
+        return {"anchor": None, "reason": "unknown_maneuver"}
+    if not man.anchors:
+        return {"anchor": None, "reason": "no_candidates"}
+
+    result = navverify.verify(_visual_key(session_id), man.anchors)
+    if result.get("anchor"):
+        sessions.log_nav(session_id, navevents.ANCHOR_VERIFIED,
+                         {"route_id": route.route_id,
+                          "generation_id": route.generation_id,
+                          "maneuver_id": man.id, "anchor": result["anchor"],
+                          "observation": result.get("observation")})
+    else:
+        sessions.log_nav(session_id, navevents.ANCHOR_REJECTED,
+                         {"route_id": route.route_id,
+                          "generation_id": route.generation_id,
+                          "maneuver_id": man.id, "reason": result.get("reason"),
+                          "rejections": result.get("rejections")})
+    return result
+
+
 @app.post("/nav/event")
 def nav_event_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
-    """Record one progression event (kind "nav") in the session JSONL."""
+    """Record one navigation event (kind "nav") in the session JSONL."""
     event = str(body.get("event") or "unknown")
     payload = body.get("payload")
     sessions.log_nav(session_id, event, payload if isinstance(payload, dict) else None)

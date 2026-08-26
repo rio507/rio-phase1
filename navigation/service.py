@@ -100,6 +100,10 @@ def clean_destination_phrase(spoken: str) -> str:
                r"(?:take me to|navigate to|directions to|drive to|"
                r"let'?s go to|let'?s head to|head to|go to|route to|"
                r"take us to|navigate|set a route to)\s+", "", t, flags=re.I)
+    # Trailing politeness. "the Ferry Building please" geocodes differently
+    # from "the Ferry Building", and a driver who says please means the same
+    # place.
+    t = re.sub(r"[\s,]*(?:please|thanks|thank you)\s*$", "", t, flags=re.I)
     return t.strip().rstrip("?.!").strip()
 
 
