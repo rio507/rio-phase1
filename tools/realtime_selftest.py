@@ -77,14 +77,19 @@ def run_session():
        "session log, /last_talk and the router all read what it produced")
 
     tools = [t["name"] for t in s["tools"]]
-    ok(tools == [realtime.TOOL_NAME],
-       f"exactly one tool, and it is the escalation ({tools})")
+    ok(tools == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME],
+       f"two tools: thinking harder, and looking ({tools})")
     schema = s["tools"][0]
     ok("question" in schema["parameters"]["properties"],
-       "which takes a question")
+       "the escalation takes a question")
     ok("route" in schema["description"] or "car" in schema["description"],
        "and is told what NOT to use it for — the car and the route are answered "
        "elsewhere")
+    look = s["tools"][1]
+    ok("camera" in look["description"].lower(),
+       "the visual tool says plainly that it is the camera")
+    ok("cannot see" in look["description"].lower(),
+       "and that she cannot see anything without it")
 
     instr = s["instructions"]
     ok(config.SYSTEM_PROMPT.strip()[:200] in instr,
@@ -95,6 +100,8 @@ def run_session():
        "and is told never to give navigation instructions")
     ok("ok: false" in instr,
        "and what to do when the tool fails, which is: carry on")
+    ok("you cannot see" in instr.lower(),
+       "she is told outright that she has no eyes without the tool")
     ok(len(instr) > len(config.SYSTEM_PROMPT),
        "the addendum adds to the prompt rather than replacing it")
 
@@ -149,6 +156,11 @@ def run_dispatch():
     r = realtime.run_tool("some_other_tool", {"question": "x"})
     ok(r.get("ok") is False and r.get("note") == "unknown tool",
        "a tool name that is not in its own list is answered, not raised")
+
+    for args, why in (("not json", "unreadable arguments"),
+                      ({}, "no question")):
+        r = realtime.run_tool(realtime.LOOK_TOOL_NAME, args)
+        ok(r.get("ok") is False, f"look with {why} -> ok:false, not an exception")
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +295,15 @@ def run_firewall():
     ok(not hits,
        "realtime.py cannot reach navigation, headway, vehicle health or the TTS "
        "path" + (f" (found {hits})" if hits else ""))
+    # visual_qa and router ARE allowed, and the distinction is the whole point
+    # of the firewall rather than an exception to it: they are conversation.
+    # The visual path is already model-driven, already speaks at the same
+    # conversation tier, and already yields to every warning. What must stay
+    # unreachable is the DETERMINISTIC half — the code that decides a gap is
+    # closing or that a turn is four seconds away.
     ok(live_imports <= {"json", "os", "threading", "time", "typing", "openai",
-                        "config"},
-       f"and imports only what a session needs ({sorted(live_imports)})")
+                        "config", "visual_qa", "router"},
+       f"and imports only conversation-side code ({sorted(live_imports)})")
 
     # The instructions are the other half of it: the model is told in words,
     # because a model that CAN say a sentence has to be told not to.
@@ -334,6 +352,117 @@ def run_endpoints():
     ok(st["model"] == config.OPENAI_REALTIME_MODEL and
        st["reasoning_model"] == config.OPENAI_REASONING_MODEL,
        "status() reports both model ids without calling anything")
+
+
+# ---------------------------------------------------------------------------
+# G. Looking
+# ---------------------------------------------------------------------------
+class _FakeSession:
+    def __init__(self, referent=None, clarification=None):
+        self._ref, self._clar = referent, clarification
+
+    def active_referent(self):
+        return self._ref
+
+    def pending_clarification(self):
+        return self._clar
+
+
+class _FakeAnswer:
+    def __init__(self, text, meta=None):
+        self._text = text
+        self.meta = meta or {"question": "x"}
+
+    def text(self):
+        if isinstance(self._text, Exception):
+            raise self._text
+        return self._text
+
+
+class _FakeVisualQA:
+    """Stands in for the camera pipeline: it records what it was asked."""
+
+    def __init__(self, text="A white Lexus, two cars ahead.", meta=None,
+                 session=None):
+        self.text = text
+        self.meta = meta
+        self.session = session or _FakeSession()
+        self.calls = []
+
+    def get_session(self, key):
+        self.calls.append(("get_session", key))
+        return self.session
+
+    def answer(self, session_key, question, route=None):
+        self.calls.append(("answer", session_key, question, route))
+        return _FakeAnswer(self.text, self.meta)
+
+
+def _with_visual(fake):
+    sys.modules["visual_qa"] = fake
+    return fake
+
+
+def run_look():
+    section("G. looking — the camera pipeline, reached from a live session")
+    real = sys.modules.get("visual_qa")
+    try:
+        fake = _with_visual(_FakeVisualQA(meta={"route": {"request_type": "scene_description"}}))
+        r = realtime.run_tool(realtime.LOOK_TOOL_NAME,
+                              {"question": "what's that car ahead"},
+                              session_key="drive_1")
+        ok(r.get("ok") and "Lexus" in r["answer"],
+           "a visual question comes back as text for RIO to speak")
+        answered = [c for c in fake.calls if c[0] == "answer"][0]
+        ok(answered[1] == "drive_1",
+           "asked against the SESSION's frame ring, not a global one — a live "
+           "question and a recorded one look at the same few seconds of road")
+        ok(answered[2] == "what's that car ahead",
+           "with the driver's own words, so 'the black one' still resolves")
+        ok(r.get("meta") is not None,
+           "and the turn's decision chain rides back for the drive log")
+
+        # The route override. The model called `look`, so the question IS
+        # visual; a classifier that disagrees must not produce an answer with
+        # no picture behind it.
+        fake = _with_visual(_FakeVisualQA())
+        realtime.run_tool(realtime.LOOK_TOOL_NAME,
+                          {"question": "how are you doing today"})
+        route = [c for c in fake.calls if c[0] == "answer"][0][3]
+        ok(route["request_type"] == "scene_description",
+           f"a question the router reads as non-visual is forced to a look "
+           f"({route['request_type']})")
+        ok(route.get("method") == "forced_by_look_tool",
+           "and the override is recorded rather than disguised as a routing decision")
+
+        fake = _with_visual(_FakeVisualQA())
+        realtime.run_tool(realtime.LOOK_TOOL_NAME, {"question": "what is that"})
+        route = [c for c in fake.calls if c[0] == "answer"][0][3]
+        ok(route.get("method") != "forced_by_look_tool",
+           "...but a question that already reads as visual is left alone")
+
+        # Failure. All of it ends as ok:false, which RIO knows how to handle.
+        _with_visual(_FakeVisualQA(text=""))
+        r = realtime.run_tool(realtime.LOOK_TOOL_NAME, {"question": "what do you see"})
+        ok(r.get("ok") is False and r.get("note") == "nothing to see",
+           "no frames in the ring -> she says she cannot see, rather than "
+           "describing a road she has not been shown")
+
+        _with_visual(_FakeVisualQA(text=RuntimeError("no detector")))
+        r = realtime.run_tool(realtime.LOOK_TOOL_NAME, {"question": "what do you see"})
+        ok(r.get("ok") is False and "RuntimeError" in r.get("note", ""),
+           "the visual stack falling over -> ok:false, and the turn survives")
+
+        broken = _FakeVisualQA()
+        broken.get_session = lambda key: (_ for _ in ()).throw(KeyError("no session"))
+        _with_visual(broken)
+        r = realtime.run_tool(realtime.LOOK_TOOL_NAME, {"question": "what do you see"})
+        ok(r.get("ok") is False, "no session at all -> ok:false")
+    finally:
+        if real is not None:
+            sys.modules["visual_qa"] = real
+        else:
+            sys.modules.pop("visual_qa", None)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +515,7 @@ def main():
     run_failure()
     run_firewall()
     run_endpoints()
+    run_look()
     if args.live:
         run_live()
 

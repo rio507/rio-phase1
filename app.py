@@ -564,7 +564,10 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
     """
     name = str(body.get("name") or "")
     args = body.get("arguments")
-    result = realtime.run_tool(name, args)
+    # The visual tool needs the session's own frame ring — the same key the
+    # hold-to-talk path uses, so a live question and a recorded one look at the
+    # same few seconds of road.
+    result = realtime.run_tool(name, args, session_key=_visual_key(session_id))
     logged = {"tool": name, "ok": bool(result.get("ok")),
               "took_ms": result.get("took_ms")}
     if isinstance(args, dict):
@@ -572,6 +575,12 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
     if not result.get("ok"):
         logged["note"] = result.get("note")
     sessions.log_live(session_id, "tool_call", logged)
+    # A visual turn records its whole decision chain in the same kind the
+    # hold-to-talk path uses: which frame, which track, what went to the model.
+    # Without this a live drive's visual answers would be unarguable.
+    meta = result.pop("meta", None)
+    if meta:
+        sessions.log_visual_qa(session_id, meta)
     return result
 
 

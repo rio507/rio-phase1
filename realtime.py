@@ -46,6 +46,15 @@ _client_lock = threading.Lock()
 # make a second model visible.
 TOOL_NAME = "deep_dive"
 
+# The second tool: RIO's eyes. The camera pipeline already exists and already
+# answers questions about what is out of the window (docs/visual_qa.md) — it
+# picks the clearest recent frame, resolves "the black one" to a tracked
+# object, crops it and asks a multimodal model. None of that is reachable from
+# a live audio session unless the session can ask for it, and a RIO who answers
+# "what's that car?" from a conversational prior instead of from the camera is
+# worse than one who says she cannot see it.
+LOOK_TOOL_NAME = "look"
+
 TOOL_SCHEMA = {
     "type": "function",
     "name": TOOL_NAME,
@@ -79,6 +88,35 @@ TOOL_SCHEMA = {
     },
 }
 
+LOOK_SCHEMA = {
+    "type": "function",
+    "name": LOOK_TOOL_NAME,
+    "description": (
+        "Look through the car's forward camera and answer a question about what "
+        "is actually out there right now. Use this for ANY question about the "
+        "road, other vehicles, signs, buildings or surroundings — 'what's that "
+        "car', 'what does that sign say', 'what colour is the one on the left', "
+        "'what do you see'. You cannot see anything without calling this: if a "
+        "question is about the world outside the car, call it rather than "
+        "guessing. It takes a couple of seconds."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": (
+                    "The driver's question about what is visible, in their own "
+                    "words as far as possible — the camera pipeline resolves "
+                    "phrases like 'the black one on the left' itself."
+                ),
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
 # Appended to RIO's own personality prompt. Only the things that are true of a
 # LIVE session and not of the text path: how to be interrupted, how long to
 # talk for, and when to reach for the tool.
@@ -101,10 +139,20 @@ true when you are being heard rather than read:
   maneuver, or how far away it is; the navigation system does and it will say
   so itself. If the driver asks where to turn, tell them the navigation will
   call it.
-- Never invent anything about the car's sensors, tires, engine, or what the
-  camera can see. If you have not been told it in this conversation, you do not
-  know it.
+- Never invent anything about the car's sensors, tires, or engine. If you have
+  not been told it in this conversation, you do not know it.
+- You cannot see. The camera is a tool — `look` — and it is the only way you
+  know what is out of the window. Anything about the road, another vehicle, a
+  sign, a building or the surroundings goes through it, every time, even when
+  you think you can guess from what was said a moment ago. A confident answer
+  about a car you did not look at is the worst thing you can do here.
 - Numbers are spoken, not written: "twenty-nine P S I", not "29 PSI".
+
+WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
+
+Use the look tool, and say something first — "let me look" — because it takes a
+couple of seconds. Answer with what comes back and nothing more; if it says it
+cannot see, or asks which one the driver meant, say that, in your own words.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
@@ -162,7 +210,7 @@ def session_config() -> dict:
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
-        "tools": [TOOL_SCHEMA],
+        "tools": [TOOL_SCHEMA, LOOK_SCHEMA],
         "tool_choice": "auto",
     }
 
@@ -241,14 +289,69 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
             "model": config.OPENAI_REASONING_MODEL}
 
 
-def run_tool(name: str, arguments) -> dict:
+def look(question: str, session_key: str = "default") -> dict:
+    """RIO's eyes: the existing visual pipeline, called from a live session.
+
+    Nothing new is built here. `visual_qa.answer()` is the same path the
+    hold-to-talk turn uses — the frame ring, the frame selector, reference
+    resolution against tracked objects, the crop, the multimodal turn — and it
+    already knows how to say "which one do you mean?" and how to refuse when
+    the crop cannot carry the claim being asked for. This wires a tool call to
+    it and hands the text back for RIO to speak.
+
+    Imported lazily on purpose: the visual stack pulls in the frame ring, the
+    scene tracker and the enrichment cache, and a drive where nobody asks about
+    the road should not pay for any of it.
+
+    THE ROUTE OVERRIDE. The visual path classifies the question itself, which
+    is what keeps "the black one" working across turns. But the model has
+    already decided this question is about what is out there — that is what
+    calling `look` MEANS — so a classifier reading it as non-visual is
+    overruled here rather than producing an answer with no picture behind it.
+    """
+    q = (question or "").strip()
+    if not q:
+        return {"ok": False, "note": "no question"}
+    t0 = time.time()
+    try:
+        import router as request_router
+        import visual_qa
+
+        session = visual_qa.get_session(session_key)
+        route = request_router.classify(
+            q,
+            has_referent=session.active_referent() is not None,
+            pending_clarification=session.pending_clarification() is not None)
+        if not request_router.is_visual(route["request_type"]):
+            route = dict(route, request_type=request_router.SCENE,
+                         requires_full_frame=True, requires_object_crop=False,
+                         method="forced_by_look_tool")
+        va = visual_qa.answer(session_key, q, route)
+        text = (va.text() or "").strip()
+    except Exception as e:
+        took = round((time.time() - t0) * 1000, 1)
+        print(f"[realtime] look failed after {took} ms: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "note": f"{type(e).__name__}", "took_ms": took}
+
+    took = round((time.time() - t0) * 1000, 1)
+    if not text:
+        # No frames in the ring is the ordinary version of this: the drive has
+        # not started, or the camera is not running. RIO says she cannot see
+        # rather than describing a road she has not been shown.
+        return {"ok": False, "note": "nothing to see", "took_ms": took}
+    return {"ok": True, "answer": text, "took_ms": took,
+            "meta": getattr(va, "meta", None)}
+
+
+def run_tool(name: str, arguments, session_key: str = "default") -> dict:
     """Dispatch one tool call from the live session.
 
     An unknown tool name is answered, not raised: the session is a model and a
     model can produce a name that is not in its own tool list. `ok: false` is a
     thing RIO already knows how to handle, and a 500 is not.
     """
-    if name != TOOL_NAME:
+    if name not in (TOOL_NAME, LOOK_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
         try:
@@ -257,6 +360,8 @@ def run_tool(name: str, arguments) -> dict:
             return {"ok": False, "note": "unreadable arguments"}
     if not isinstance(arguments, dict):
         return {"ok": False, "note": "unreadable arguments"}
+    if name == LOOK_TOOL_NAME:
+        return look(str(arguments.get("question") or ""), session_key)
     return escalate(str(arguments.get("question") or ""),
                     str(arguments.get("context") or ""))
 
@@ -268,6 +373,7 @@ def status() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "reasoning_model": config.OPENAI_REASONING_MODEL,
+        "tools": [TOOL_NAME, LOOK_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),

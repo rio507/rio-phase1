@@ -47,6 +47,30 @@ endpoints), `static/rio_realtime.js` (WebRTC + arbitration + tool bridge),
 
 ---
 
+## Two tools: her eyes, and her patience
+
+`look(question)` is the camera. It calls the existing visual pipeline —
+`visual_qa.answer()`, the same path a hold-to-talk question takes: the frame
+ring, the frame selector, reference resolution against tracked objects, the
+crop, the multimodal turn. Nothing new was built for it. It already knows how
+to ask "which one do you mean?" and how to refuse when the crop cannot carry
+the claim.
+
+She is told, in the instructions, that she **cannot see** without it: anything
+about the road, another vehicle, a sign or a building goes through the tool
+every time, because a confident answer about a car she did not look at is the
+worst thing she can do here. When the tool comes back empty — no frames in the
+ring, camera not running — she says she cannot see rather than describing a
+road she was never shown.
+
+The route override is worth knowing about: the visual path classifies the
+question itself, which is what keeps "the black one" resolving across turns.
+But calling `look` IS the decision that the question is visual, so a classifier
+reading it as chat is overruled — recorded as `method: forced_by_look_tool`
+rather than disguised as a routing decision.
+
+`deep_dive(question, context)` is the second tool, below.
+
 ## The escalation, and why the driver never hears about it
 
 Some questions want more than a fast conversational model should attempt:
@@ -144,9 +168,5 @@ injected transport, driven in the tests against the *real* arbiter.
   malformed offer comes back "no audio media section", which proves URL, auth
   and content type). Echo cancellation, barge-in feel and voice quality in a
   moving car are a road test.
-- **Visual questions.** "What's that car?" reaches the camera on the
-  hold-to-talk path and does **not** in a live session — the visual pipeline is
-  not exposed to the model as a tool. One more tool definition would close it;
-  it is deliberately not in this change.
 - **Conversation transcripts are not logged** from the live path. The session
   log records that a session opened and what RIO escalated, not what was said.
