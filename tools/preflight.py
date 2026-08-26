@@ -210,6 +210,42 @@ def check_persistent():
           "missing something, there is no record of where provisioning stopped.",
           "bash /workspace/boot.sh")
 
+    # /workspace/boot.sh is a COPY of the repo's, and it is the one everything
+    # points at, because only /workspace survives a pod restart. On 2026-08-26
+    # it turned out to be three weeks stale: no RF-DETR step, no detector
+    # weights, no boot log, no preflight — i.e. the exact version whose missing
+    # step 5c caused the 2026-08-02 incident this file's header describes.
+    #
+    # Comparing them is the only check here that protects a FUTURE pod rather
+    # than this one: everything else asks what is missing now, and this asks
+    # whether the thing that puts it back is the current one. A comment saying
+    # "remember to copy it" was what existed before, and it is what failed.
+    repo_boot = REPO / "boot.sh"
+    live_boot = Path("/workspace/boot.sh")
+    if not repo_boot.exists():
+        check(False, "boot.sh in the repo",
+              "there is no source copy to compare against or to provision from.",
+              "git -C /workspace/rio-phase1 checkout boot.sh")
+    elif not live_boot.exists():
+        check(False, "/workspace/boot.sh present",
+              "the documented provisioning command points at a file that does "
+              "not exist, so a rebuilt pod has nothing to run.",
+              "cp /workspace/rio-phase1/boot.sh /workspace/boot.sh")
+    else:
+        same = repo_boot.read_bytes() == live_boot.read_bytes()
+        detail = ""
+        if not same:
+            repo_n = len(repo_boot.read_text().splitlines())
+            live_n = len(live_boot.read_text().splitlines())
+            detail = f" (repo {repo_n} lines, /workspace {live_n})"
+        check(same, "/workspace/boot.sh matches the repo" + detail,
+              "the documented provisioning command runs a DIFFERENT script from "
+              "the one in git. The last time these drifted, the copy predated "
+              "RF-DETR: re-provisioning would have brought the pod up with no "
+              "detector, no boot log and no preflight, and the only symptom "
+              "would have been an empty scene graph.",
+              "cp /workspace/rio-phase1/boot.sh /workspace/boot.sh")
+
 
 def check_server():
     head("server")
