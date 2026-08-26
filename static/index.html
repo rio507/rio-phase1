@@ -2024,12 +2024,68 @@ function stopRec() {
    microphone is safe to have in a car. */
 let live = null, liveMode = true, liveBusy = false;
 
+/* ---- frames for a live session ------------------------------------------
+   THE MISSING LINK, and it was not the tool.
+
+   RIO's camera pipeline is fed by ONE thing: the drive loop, which posts
+   /headway_frame at 4 fps and whose every tick begins `if (!RIO.driving)
+   return`. The frame ring on the server is filled from those posts and from
+   nothing else. So a live conversation opened without a drive running had a
+   look tool wired to a pipeline with an empty buffer — the tool worked, the
+   perception worked, and there was simply no picture in the building.
+
+   With a drive running there is nothing to do here: frames already flow, four
+   times a second, and a second feed would double the upload and the GPU work
+   for no benefit. Without one, this opens the camera and feeds the SAME
+   endpoint at a slower cadence for as long as the conversation lasts. Nothing
+   server-side knows the difference, which is the point. */
+const LIVE_FRAME_MS = 500;                     // 2 fps: plenty to answer from
+let liveFrames = { timer: null, stream: null };
+
+async function startLiveFrames() {
+  if (RIO.driving || liveFrames.timer || !RIO.mediaAvailable()) return false;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment' }, audio: false });
+  } catch (e) {
+    // No camera, or refused. The conversation still works; RIO simply cannot
+    // see, and the look tool says so rather than inventing a road.
+    console.warn('[live] no camera for this session:', e);
+    return false;
+  }
+  liveFrames.stream = stream;
+  video.srcObject = stream;
+  try { await video.play(); } catch (e) {}
+  const tick = async () => {
+    if (!liveFrames.timer) return;
+    // A drive starting mid-conversation takes over: it feeds the same ring
+    // faster, and two feeds would be two uploads of the same road.
+    if (!RIO.driving) {
+      try { await RIO.headway.captureFromVideo(video); } catch (e) {}
+    }
+    if (liveFrames.timer) liveFrames.timer = setTimeout(tick, LIVE_FRAME_MS);
+  };
+  liveFrames.timer = setTimeout(tick, 0);
+  return true;
+}
+
+function stopLiveFrames() {
+  if (liveFrames.timer) { clearTimeout(liveFrames.timer); liveFrames.timer = null; }
+  if (liveFrames.stream) {
+    liveFrames.stream.getTracks().forEach(t => t.stop());
+    liveFrames.stream = null;
+    if (!RIO.driving) video.srcObject = null;
+  }
+}
+
 async function toggleLive() {
   if (liveBusy) return;
   RIO.unlockAudio(player);
   if (live) {
     live.stop();
     live = null;
+    stopLiveFrames();
     micBtn.textContent = 'Talk to RIO';
     micBtn.classList.remove('recording');
     RIO.ui.voice('idle');
@@ -2053,12 +2109,17 @@ async function toggleLive() {
     micBtn.textContent = 'End conversation';
     micBtn.classList.add('recording');
     RIO.ui.voice('listening');
-    obs.textContent = 'Live — just talk. She will stop when you do.';
+    // Give her something to see. A drive already does; this covers the case
+    // where the driver just wants to talk.
+    const eyes = await startLiveFrames();
+    obs.textContent = 'Live — just talk. She will stop when you do.'
+      + (eyes || RIO.driving ? '' : ' (no camera — she cannot see)');
   } catch (e) {
     // One failure is enough: fall back for the rest of the drive rather than
     // making the driver discover it again at the next junction.
     liveMode = false;
     live = null;
+    stopLiveFrames();
     micBtn.textContent = 'Hold to talk';
     micBtn.classList.remove('recording');
     obs.textContent = 'Live conversation unavailable (' +

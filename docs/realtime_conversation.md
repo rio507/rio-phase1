@@ -47,6 +47,60 @@ endpoints), `static/rio_realtime.js` (WebRTC + arbitration + tool bridge),
 
 ---
 
+## What she can find out, and what she must not say
+
+A live session starts knowing nothing about this drive. Four tools give her the
+three things a driver actually asks about, each reusing the pipeline that
+already answers it:
+
+| tool | answers | source | runs |
+|---|---|---|---|
+| `look` | what is out of the window | `visual_qa.answer()` — frame ring, selector, crop, multimodal turn | server |
+| `nav_status` | destination, ETA, next maneuver, off-route, GPS | `RIO.nav.state()` — the dashboard card's own state | **browser** |
+| `vehicle_status` | live signals, DTCs, findings | `vehicle_health.context(full=True)` — the conversation-layer builder | server |
+| `deep_dive` | research and hard questions | `gpt-5.6-sol` via Responses | server |
+
+`nav_status` is answered in the panel because that is where the truth is: the
+route comes from the server but PROGRESS along it does not — the tracker runs
+in the page at 1 Hz with no network, which was a deliberate choice about
+announcement timing. A second source on the server would be a second answer,
+and the wrong one would be the one that sounded authoritative.
+
+`vehicle_status` calls the same builder an ordinary conversation turn gets, so
+a live answer and a hold-to-talk answer cannot disagree about the same tire. It
+passes the structure through untouched — every issue keeps who reported it (the
+vehicle's own computer, or RIO), its own observation window, and its lifecycle,
+because a model handed "26 PSI" with no source and no history will supply both.
+
+### Informed when asked. Never proactive.
+
+**She answers. She does not announce.** Turn calls, health warnings and hazard
+alerts come from the deterministic paths, in her voice, and are already
+handled. A `nav_status` result showing a turn four seconds out is CONTEXT for
+answering — not a cue, because navigation is about to say exactly that and she
+would be talking over it.
+
+That boundary is held three ways, not one: the instructions say it in those
+words, every `nav_status` result repeats it, and the ladder enforces it anyway
+— anything the model says is conversation priority, so a turn call pre-empts
+her mid-word regardless of what she thought she was doing.
+
+### The frame supply — what was actually missing
+
+Not the tool, and not the perception. RIO's camera pipeline is fed by exactly
+one thing: the drive loop, which posts `/headway_frame` at 4 fps and whose
+every tick begins `if (!RIO.driving) return`. The server's frame ring fills
+from those posts and from nothing else.
+
+So a live conversation opened *without a drive running* had a working tool
+wired to a working pipeline over an empty buffer. There was no picture in the
+building.
+
+A live session now starts its own feed when no drive is running — the same
+`captureFromVideo` → `/headway_frame` path, at 2 fps, stopped when the
+conversation ends — and does nothing at all when a drive is already feeding the
+ring faster. Nothing server-side can tell the difference, which is the point.
+
 ## Two tools: her eyes, and her patience
 
 `look(question)` is the camera. It calls the existing visual pipeline —

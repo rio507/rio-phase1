@@ -78,8 +78,8 @@ def run_session():
        "session log, /last_talk and the router all read what it produced")
 
     tools = [t["name"] for t in s["tools"]]
-    ok(tools == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME],
-       f"two tools: thinking harder, and looking ({tools})")
+    ok(tools[:2] == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME],
+       f"the session carries her tools ({tools})")
     schema = s["tools"][0]
     ok("question" in schema["parameters"]["properties"],
        "the escalation takes a question")
@@ -97,8 +97,8 @@ def run_session():
        "RIO's own personality prompt carries over verbatim")
     ok("interrupted" in instr.lower(),
        "with the live-only part added: she expects to be interrupted")
-    ok("navigation" in instr.lower() and "never" in instr.lower(),
-       "and is told never to give navigation instructions")
+    ok("never announce a turn" in instr.lower(),
+       "and is told never to announce a turn on her own initiative")
     ok("ok: false" in instr,
        "and what to do when the tool fails, which is: carry on")
     ok("you cannot see" in instr.lower(),
@@ -290,12 +290,23 @@ def run_firewall():
     # have no way to REACH a warning or an instruction. It cannot generate one
     # if it cannot import the thing that makes them.
     live_imports = _imports_of(os.path.join(REPO, "realtime.py"))
-    unreachable = {"navigation", "headway", "vehicle_health", "vehicle_health_policy",
+    # The line is between READING state and DECIDING to announce.
+    #
+    # vehicle_health.py builds the context an ordinary conversation turn
+    # already gets (llm_interface._health_block calls the same function), so
+    # reading it from a live session is the same read by a different mouth.
+    # vehicle_health_policy.py is the thing that decides whether a driver gets
+    # interrupted, and THAT must stay unreachable — along with the navigation
+    # speech planner, the headway policy and the TTS path.
+    unreachable = {"navigation", "headway", "vehicle_health_policy",
                    "tires", "telemetry", "voice"}
     hits = sorted(live_imports & unreachable)
     ok(not hits,
-       "realtime.py cannot reach navigation, headway, vehicle health or the TTS "
-       "path" + (f" (found {hits})" if hits else ""))
+       "realtime.py cannot reach anything that DECIDES to speak — the headway "
+       "policy, the health announcement policy, navigation or the TTS path"
+       + (f" (found {hits})" if hits else ""))
+    ok("vehicle_health_policy" not in live_imports,
+       "in particular it cannot reach the policy that interrupts a driver")
     # visual_qa and router ARE allowed, and the distinction is the whole point
     # of the firewall rather than an exception to it: they are conversation.
     # The visual path is already model-driven, already speaks at the same
@@ -305,17 +316,18 @@ def run_firewall():
     # base64/io/wave arrived with clip rendering: turning PCM deltas into a WAV
     # so the pre-rendered warnings can be produced in the same voice.
     ok(live_imports <= {"json", "os", "threading", "time", "typing", "openai",
-                        "config", "visual_qa", "router", "base64", "io", "wave"},
-       f"and imports only conversation-side code and stdlib "
-       f"({sorted(live_imports)})")
+                        "config", "visual_qa", "router", "vehicle_health",
+                        "base64", "io", "wave"},
+       f"and imports only read-side code and stdlib ({sorted(live_imports)})")
 
     # The instructions are the other half of it: the model is told in words,
     # because a model that CAN say a sentence has to be told not to.
     addendum = realtime.LIVE_ADDENDUM.lower()
-    ok("never give navigation instructions" in addendum,
-       "RIO is told never to give navigation instructions herself")
-    ok("sensors" in addendum and "invent" in addendum,
-       "and never to invent anything about the car's sensors")
+    ok("never announce a turn" in addendum,
+       "RIO is told never to announce a turn herself — the navigation system "
+       "calls it, and two voices calling one turn is the failure this prevents")
+    ok("never invent anything about the car, the route, or the road" in addendum,
+       "and never to invent anything about the car, the route or the road")
     ok("interrupt" in addendum,
        "and that other voices cutting her off is correct, not a fault to "
        "apologise for")
@@ -524,6 +536,104 @@ def run_dictation():
 
 
 # ---------------------------------------------------------------------------
+# I. Awareness
+# ---------------------------------------------------------------------------
+PENDING_CONTEXT = {
+    "vehicle_health": {
+        "overall_status": "attention",
+        "data_available": True,
+        "subsystems_reporting": ["engine", "tires"],
+        "moving": True,
+        "history_depth": "Live data from the current drive only.",
+        "issue_count": 2,
+        "issues": [
+            {"type": "engine.new_dtc", "domain": "diagnostics",
+             "reported_by": "the vehicle's own computer",
+             "severity": "attention", "where": "engine",
+             "code": "P0171", "lifecycle": "pending_first_seen",
+             "confirmed": False,
+             "message": "The car has picked up a pending engine code and has "
+                        "not confirmed that it is persistent.",
+             "observation_window": "seen once, in this drive"},
+            {"type": "tire.pressure_low", "domain": "tires",
+             "reported_by": "RIO", "severity": "informational",
+             "where": "rear left", "confirmed": True,
+             "message": "The rear left is a little below the others.",
+             "observation_window": "the last 40 minutes"},
+        ],
+        "summary": "One pending engine code, not yet confirmed, and a soft rear left.",
+    }
+}
+
+
+def run_awareness():
+    section("I. awareness — what she can find out when asked")
+    s = realtime.session_config()
+    names = [t["name"] for t in s["tools"]]
+    ok(names == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
+                 realtime.NAV_TOOL_NAME, realtime.VEHICLE_TOOL_NAME],
+       f"four tools: think, look, route, car ({names})")
+
+    nav_desc = s["tools"][2]["description"]
+    veh_desc = s["tools"][3]["description"]
+    ok("ETA" in nav_desc and "next turn" in nav_desc,
+       "the route tool says what it answers")
+    ok("not yet confirmed" in veh_desc or "not confirmed" in veh_desc,
+       "and the car tool names pending codes as part of its job")
+    for desc, what in ((nav_desc, "route"), (veh_desc, "car")):
+        ok("not" in desc.lower() and ("announce" in desc.lower()
+                                      or "itself" in desc.lower()),
+           f"the {what} tool's own description says it is for answering, not announcing")
+
+    instr = s["instructions"]
+    ok("YOU ANSWER. YOU DO NOT ANNOUNCE." in instr,
+       "the boundary is stated in the instructions, in those words")
+    for phrase in ("never announce a turn", "not a cue", "Unasked, you say nothing"):
+        ok(phrase.lower() in instr.lower(), f"and spelled out: {phrase!r}")
+    for phrase in ("Say only what the data supports", "Keep the provenance",
+                   "detected but NOT CONFIRMED"):
+        ok(phrase in instr, f"truthfulness rule carried over: {phrase!r}")
+
+    # vehicle_status must PASS THROUGH the existing builder, not summarise it.
+    import vehicle_health
+    real_context = vehicle_health.context
+    try:
+        vehicle_health.context = lambda full=True: PENDING_CONTEXT
+        r = realtime.vehicle_status()
+        ok(r["ok"], "vehicle_status answers from the conversation-layer context")
+        issues = r["vehicle"]["issues"]
+        ok(len(issues) == 2, "every issue survives — nothing is summarised away")
+        pending = issues[0]
+        ok(pending["lifecycle"] == "pending_first_seen" and pending["confirmed"] is False,
+           "a pending code arrives as PENDING, with its lifecycle intact")
+        ok("not confirmed" in pending["message"],
+           "and its own words say it has not been confirmed")
+        ok(pending["reported_by"] == "the vehicle's own computer"
+           and issues[1]["reported_by"] == "RIO",
+           "provenance is preserved per issue — the ECU and RIO are different "
+           "claims and stay that way")
+        ok(all("observation_window" in i for i in issues),
+           "as is how far back each observation actually goes")
+        ok("not confirmed" in (r.get("rules") or "").lower(),
+           "and the result restates the rules to the model")
+    finally:
+        vehicle_health.context = real_context
+
+    # ...and it does not build a parallel source.
+    src = inspect.getsource(realtime.vehicle_status)
+    ok("vehicle_health.context" in src,
+       "it calls the existing builder rather than assembling its own view")
+    ok("issues" not in src.replace('body.get("issues")', ""),
+       "and does not reshape what comes back")
+
+    # nav_status is deliberately NOT answered here.
+    r = realtime.run_tool(realtime.NAV_TOOL_NAME, {})
+    ok(r["ok"] is False and "panel" in r["note"],
+       "nav_status is refused server-side: progress lives in the browser, and "
+       "a second source would be a second answer")
+
+
+# ---------------------------------------------------------------------------
 # Live
 # ---------------------------------------------------------------------------
 SPOKEN_NUMBERS = {
@@ -681,10 +791,153 @@ def run_latency():
        "most time-critical lines are pre-rendered rather than either")
 
 
+# ---------------------------------------------------------------------------
+# The full chain, against the running server
+# ---------------------------------------------------------------------------
+def _ask_live(conn, question, tool_handler, timeout_s=120.0):
+    """Ask a real session a question, answer whatever it reaches for, and
+    return (everything it said, which tools it called).
+
+    This plays the part of the browser: the panel answers nav_status locally
+    and forwards the rest to the server, so `tool_handler` does both.
+
+    The one subtlety is turn-taking. A tool call arrives INSIDE a response that
+    is still active, so the result is queued as an item immediately but the
+    follow-up response is only asked for once that response is done —
+    otherwise the API refuses it, which is what a first cut of this function
+    did to itself.
+    """
+    conn.conversation.item.create(item={
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": question}]})
+    conn.response.create()
+
+    said, called, need_followup = [], [], False
+    t0 = time.time()
+    for event in conn:
+        if time.time() - t0 > timeout_s:
+            break
+        if event.type == "response.function_call_arguments.done":
+            called.append(event.name)
+            result = tool_handler(event.name, event.arguments)
+            conn.conversation.item.create(item={
+                "type": "function_call_output",
+                "call_id": event.call_id,
+                "output": json.dumps(result)})
+            need_followup = True
+        elif event.type == "response.output_audio_transcript.done":
+            if event.transcript:
+                said.append(event.transcript.strip())
+        elif event.type == "response.done":
+            if need_followup:
+                need_followup = False
+                conn.response.create()      # safe now: nothing is active
+                continue
+            break
+        elif event.type == "error":
+            said.append(f"[error: {getattr(event, 'error', '')}]")
+            break
+    return " ".join(said).strip(), called
+
+
+def run_chain(base: str = "http://127.0.0.1:8888"):
+    section("CHAIN — a real session, against the running server, over HTTP")
+    import httpx
+
+    # The panel's half of the tool bridge, and the scripted state it would be
+    # reading. nav_status is answered here because that is where the tracker
+    # lives; everything else goes to the server exactly as the browser sends it.
+    nav_state = {
+        "ok": True, "routing": True, "destination": "Griffith Observatory",
+        "distance_remaining_m": 4200, "minutes_remaining": 9,
+        "next_maneuver": {"instruction": "Turn left onto Vermont Avenue",
+                          "direction": "LEFT", "road_name": "Vermont Avenue",
+                          "distance_m": 60, "seconds_away": 4,
+                          "state": "IMMINENT"},
+        "maneuvers_left": 5, "route_state": "ON_ROUTE", "gps_state": "GPS_OK",
+        "arrived": False,
+        "rules": "Answer the question. Do NOT announce this maneuver — the "
+                 "navigation system calls it out loud itself.",
+    }
+    pending_vehicle = {"ok": True, "vehicle": PENDING_CONTEXT["vehicle_health"],
+                       "rules": ("Only claims this data supports. Keep who "
+                                 "reported what. A code detected but not "
+                                 "confirmed stays not confirmed.")}
+    use_pending = {"on": False}
+    calls = []
+
+    def tool_handler(name, arguments):
+        calls.append(name)
+        if name == realtime.NAV_TOOL_NAME:
+            return nav_state
+        if name == realtime.VEHICLE_TOOL_NAME and use_pending["on"]:
+            return pending_vehicle
+        r = httpx.post(f"{base}/realtime/tool", timeout=90,
+                       json={"name": name, "arguments":
+                             json.loads(arguments or "{}")})
+        return r.json()
+
+    # 5. FRAME SUPPLY, over HTTP, exactly as the browser posts it.
+    with open("/tmp/road.jpg", "rb") as fh:
+        frame = fh.read()
+    for i in range(3):
+        httpx.post(f"{base}/headway_frame", timeout=60,
+                   files={"image": ("frame.jpg", frame, "image/jpeg")},
+                   data={"v_host": "14.0", "v_host_age_s": "0.2",
+                         "frame_t": str(i)})
+    scene = httpx.get(f"{base}/scene", timeout=30).json()
+    ok(len(scene.get("objects") or []) > 0,
+       f"the frame ring fills from posted frames — {len(scene.get('objects') or [])} "
+       "objects in the scene graph")
+
+    with realtime.client().realtime.connect(
+            model=config.OPENAI_REALTIME_MODEL) as conn:
+        conn.session.update(session=dict(realtime.session_config(),
+                                         output_modalities=["audio"]))
+
+        # 1. A visual question must reach the camera.
+        said, used = _ask_live(conn, "What's ahead of us right now?", tool_handler)
+        print(f"    Q: what's ahead of us right now?\n    A: {said[:220]}")
+        ok(realtime.LOOK_TOOL_NAME in used, f"she looks ({used})")
+        ok(any(w in said.lower() for w in
+               ("car", "sedan", "suv", "street", "road", "traffic", "ahead",
+                "lane", "building")),
+           "and answers from what the camera actually returned")
+
+        # 2. A route question must reach the tracker.
+        calls.clear()
+        said, used = _ask_live(conn, "How far is it and where are we headed?",
+                               tool_handler)
+        print(f"    Q: how far is it and where are we headed?\n    A: {said[:220]}")
+        ok(realtime.NAV_TOOL_NAME in used, f"she checks the route ({used})")
+        ok("griffith" in said.lower(),
+           "and names the real destination rather than a plausible one")
+
+        # 4. ANTI-DOUBLE-SPEAK: the same state, with a turn four seconds away.
+        ok(not re.search(r"\b(turn left|turn right|take the next)\b", said.lower()),
+           "and does NOT call the turn, which the navigation system is about "
+           "to call itself")
+
+        # 3. A vehicle question with a pending code must keep the provenance.
+        use_pending["on"] = True
+        said, used = _ask_live(conn, "Is anything wrong with the car?", tool_handler)
+        print(f"    Q: is anything wrong with the car?\n    A: {said[:260]}")
+        ok(realtime.VEHICLE_TOOL_NAME in used, f"she checks the car ({used})")
+        low = said.lower()
+        ok(any(p in low for p in ("not confirm", "hasn't confirmed", "has not confirmed",
+                                  "pending", "not yet confirmed")),
+           "and preserves detected-but-not-confirmed rather than upgrading it "
+           "to a fault")
+        ok(not re.search(r"\b\d+\s*(psi|pounds)\b", low),
+           "and invents no numbers the data did not contain")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
                     help="also call both real models once")
+    ap.add_argument("--chain", action="store_true",
+                    help="drive a real session against the running server")
     args = ap.parse_args()
 
     run_session()
@@ -695,10 +948,13 @@ def main():
     run_endpoints()
     run_look()
     run_dictation()
+    run_awareness()
     if args.live:
         run_live()
         run_verbatim()
         run_latency()
+    if args.chain:
+        run_chain()
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)

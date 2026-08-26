@@ -55,6 +55,12 @@ TOOL_NAME = "deep_dive"
 # worse than one who says she cannot see it.
 LOOK_TOOL_NAME = "look"
 
+# The other two things a driver asks about that RIO cannot answer from a
+# conversation prior: where we are going, and how the car is. Both already have
+# a source of truth in this system and neither of them is the model.
+NAV_TOOL_NAME = "nav_status"
+VEHICLE_TOOL_NAME = "vehicle_status"
+
 TOOL_SCHEMA = {
     "type": "function",
     "name": TOOL_NAME,
@@ -117,6 +123,38 @@ LOOK_SCHEMA = {
     },
 }
 
+NAV_SCHEMA = {
+    "type": "function",
+    "name": NAV_TOOL_NAME,
+    "description": (
+        "Where the drive currently stands: destination, ETA, the next maneuver "
+        "and how far away it is, whether we are on route, and whether GPS is "
+        "healthy. Call this for ANY question about the route — where are we "
+        "going, how long left, what's the next turn, are we lost, did we miss "
+        "it. You do not otherwise know any of this. It returns instantly.\n"
+        "This is for ANSWERING questions. It is not a cue to announce the turn: "
+        "the navigation system calls turns itself, out loud, and you must not."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+VEHICLE_SCHEMA = {
+    "type": "function",
+    "name": VEHICLE_TOOL_NAME,
+    "description": (
+        "How the car itself is: live sensor summary, anything the vehicle's "
+        "computer has reported, anything RIO has observed, and any fault codes "
+        "including ones detected but not yet confirmed. Call this for ANY "
+        "question about the car — the tires, the engine, oil, coolant, the "
+        "battery, warning lights, 'is everything okay', 'is anything wrong'. "
+        "You do not otherwise know any of it, and you must never guess at a "
+        "number. It returns instantly.\n"
+        "This is for ANSWERING questions. Health announcements are made by the "
+        "car itself; you do not make them."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
 # Appended to RIO's own personality prompt. Only the things that are true of a
 # LIVE session and not of the text path: how to be interrupted, how long to
 # talk for, and when to reach for the tool.
@@ -135,12 +173,25 @@ true when you are being heard rather than read:
   turn instruction. That is correct and it is not your business. Do not
   apologise for it, do not fight it, do not repeat yourself afterwards unless
   the driver asks.
-- Never give navigation instructions. You do not know the route, the next
-  maneuver, or how far away it is; the navigation system does and it will say
-  so itself. If the driver asks where to turn, tell them the navigation will
-  call it.
-- Never invent anything about the car's sensors, tires, or engine. If you have
-  not been told it in this conversation, you do not know it.
+YOU ANSWER. YOU DO NOT ANNOUNCE.
+
+This is the line that matters most, and it is not about tone — it is about two
+voices saying the same thing at once. The car announces things on its own:
+turn instructions, health warnings, hazard alerts. Those come from the car's own
+systems, in your voice, and they are already handled.
+
+So: never announce a turn, a fault, or a hazard on your own initiative. Not
+when a tool result shows one. Not when you think it would be helpful. If
+nav_status tells you a turn is coming in four seconds, that is CONTEXT for
+answering the driver — it is not a cue to say "turn left here", because the
+navigation system is about to say exactly that and you would be talking over
+it.
+
+Asked, you answer freely: "where are we going", "how far", "what's the next
+turn", "is everything okay with the car". Unasked, you say nothing about any of
+it.
+- Never invent anything about the car, the route, or the road. You have tools
+  for all three and they are the only way you know any of it.
 - You cannot see. The camera is a tool — `look` — and it is the only way you
   know what is out of the window. Anything about the road, another vehicle, a
   sign, a building or the surroundings goes through it, every time, even when
@@ -151,8 +202,26 @@ true when you are being heard rather than read:
 WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
 
 Use the look tool, and say something first — "let me look" — because it takes a
-couple of seconds. Answer with what comes back and nothing more; if it says it
-cannot see, or asks which one the driver meant, say that, in your own words.
+couple of seconds. What comes back is short factual background: describe it in
+your own words, as you would anything else. Answer with what it gives you and
+nothing more; if it says it cannot see, or asks which one the driver meant, say
+that, in your own words.
+
+WHEN THE DRIVER ASKS ABOUT THE ROUTE, OR ABOUT THE CAR
+
+Use nav_status or vehicle_status. Both are instant, so just call them — no
+holding line needed. Never answer either kind of question from memory or from
+what you were told earlier in the drive: the whole point of them is that the
+answer changes while you are talking.
+
+Answering about the car, three rules that are not negotiable:
+  * Say only what the data supports. If a field is not there, you do not know
+    it. No estimated pressures, no invented mileage, no "probably fine".
+  * Keep the provenance. Something the vehicle's own computer reported and
+    something RIO noticed are different claims and must sound different.
+  * A code that is detected but NOT CONFIRMED is exactly that. Say it that way —
+    "the car has picked something up but hasn't confirmed it yet" — and never
+    upgrade it to a fault.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
@@ -310,7 +379,7 @@ def session_config() -> dict:
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
-        "tools": [TOOL_SCHEMA, LOOK_SCHEMA],
+        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, VEHICLE_SCHEMA],
         "tool_choice": "auto",
     }
 
@@ -451,6 +520,41 @@ def look(question: str, session_key: str = "default") -> dict:
             "meta": getattr(va, "meta", None)}
 
 
+def vehicle_status() -> dict:
+    """How the car is — from the builder the conversation path already uses.
+
+    `vehicle_health.context(full=True)` is not a summary written for this tool.
+    It is the SAME normalised structure that goes into an ordinary
+    conversation turn when the router decides a question is about the car
+    (llm_interface._health_block), which is what keeps a live answer and a
+    hold-to-talk answer from disagreeing about the same tire.
+
+    It carries its own provenance — every issue says who reported it, the
+    vehicle's own computer or RIO — and its own limits, including how far back
+    the data actually goes. Both survive into the tool result untouched,
+    because a model that is handed "26 PSI" with no history and no source will
+    happily supply both.
+    """
+    t0 = time.time()
+    try:
+        import vehicle_health
+
+        ctx = vehicle_health.context(full=True)
+    except Exception as e:
+        print(f"[realtime] vehicle_status failed: {type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "note": f"{type(e).__name__}"}
+    body = ctx.get("vehicle_health", ctx)
+    if not body.get("data_available", True) and not body.get("issues"):
+        # Nothing is reporting. That is an answer, and a specific one: RIO says
+        # she is not getting data rather than that the car is fine.
+        return {"ok": True, "vehicle": body, "took_ms": round((time.time() - t0) * 1000, 1),
+                "note": "no subsystem is reporting — say that, do not say the car is fine"}
+    return {"ok": True, "vehicle": body,
+            "took_ms": round((time.time() - t0) * 1000, 1),
+            "rules": ("Only claims this data supports. Keep who reported what. "
+                      "A code detected but not confirmed stays not confirmed.")}
+
+
 def run_tool(name: str, arguments, session_key: str = "default") -> dict:
     """Dispatch one tool call from the live session.
 
@@ -458,6 +562,14 @@ def run_tool(name: str, arguments, session_key: str = "default") -> dict:
     model can produce a name that is not in its own tool list. `ok: false` is a
     thing RIO already knows how to handle, and a 500 is not.
     """
+    if name == VEHICLE_TOOL_NAME:
+        return vehicle_status()
+    if name == NAV_TOOL_NAME:
+        # Answered in the BROWSER, where the route tracker lives — the server
+        # holds the route but not the progress along it, and inventing a second
+        # source for "how far to the next turn" is how two answers to one
+        # question happen. See rio_realtime.js: local tools.
+        return {"ok": False, "note": "nav_status is answered by the panel"}
     if name not in (TOOL_NAME, LOOK_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
@@ -480,7 +592,7 @@ def status() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "reasoning_model": config.OPENAI_REASONING_MODEL,
-        "tools": [TOOL_NAME, LOOK_TOOL_NAME],
+        "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME, VEHICLE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),

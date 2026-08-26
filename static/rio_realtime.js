@@ -35,6 +35,61 @@
   var CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
 
   /* ---------------------------------------------------------------------
+     Tools answered HERE, in the panel, rather than on the server.
+
+     nav_status is one of them, and it has to be: the route comes from the
+     server but PROGRESS along it does not. The tracker runs in this page, at
+     1 Hz, with no network — that was a deliberate choice about announcement
+     timing and it has the side effect that the server does not know how far
+     the next turn is. Answering from a second source on the server would
+     produce two answers to one question, and the wrong one would be the one
+     that sounded authoritative.
+
+     So this reads exactly what the dashboard's own nav card reads.
+     --------------------------------------------------------------------- */
+  function navStatus() {
+    var nav = root.RIO && root.RIO.nav;
+    var st = (nav && nav.state) ? nav.state() : null;
+    if (!st) {
+      return { ok: true, routing: false,
+               note: 'no route is set — say that, do not guess a destination' };
+    }
+    var man = st.maneuver || null;
+    var out = {
+      ok: true,
+      routing: true,
+      destination: (st.destination && (st.destination.display_name ||
+                                       st.destination.formatted_address)) || null,
+      distance_remaining_m: Math.round(st.remaining_m || 0),
+      eta_epoch: st.eta_epoch || null,
+      minutes_remaining: (st.remaining_m && st.speed_ms)
+        ? Math.round((st.remaining_m / Math.max(3, st.speed_ms)) / 60) : null,
+      next_maneuver: man ? {
+        instruction: man.instruction,
+        direction: man.direction,
+        road_name: man.road_name,
+        distance_m: st.to_maneuver_m === null ? null : Math.round(st.to_maneuver_m),
+        seconds_away: st.tta_s === null ? null : Math.round(st.tta_s),
+        state: st.maneuver_state,
+      } : null,
+      maneuvers_left: st.maneuvers_left,
+      route_state: st.route_state,        // ON_ROUTE / OFF_ROUTE_* — a real answer
+      gps_state: st.gps_state,            // ...and whether we can trust any of it
+      arrived: !!st.arrived,
+      // The boundary, restated where it is about to be tempting: a tool result
+      // showing a turn four seconds out is context for answering, never a cue.
+      rules: 'Answer the question. Do NOT announce this maneuver — the ' +
+             'navigation system calls it out loud itself.',
+    };
+    if (st.context && st.context.anchor) {
+      out.next_maneuver_landmark = st.context.anchor.label;
+    }
+    return out;
+  }
+
+  var LOCAL_TOOLS = { nav_status: navStatus };
+
+  /* ---------------------------------------------------------------------
      The controller: events in, decisions out.
      cfg = {
        arbiter,                      RIO.speech
@@ -391,6 +446,13 @@
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));
           },
           tool: function (name, args) {
+            // Answered in the page when the page is the source of truth;
+            // everything else goes to the server, which holds the camera, the
+            // vehicle context and the reasoning model.
+            if (LOCAL_TOOLS[name]) {
+              try { return Promise.resolve(LOCAL_TOOLS[name](args)); }
+              catch (e) { return Promise.resolve({ ok: false, note: 'panel error' }); }
+            }
             return fetch(url('/realtime/tool'), {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ name: name, arguments: args }),
@@ -469,12 +531,15 @@
   root.RIO.realtime = {
     createController: createController,
     connect: connect,
+    navStatus: navStatus,
+    localTools: LOCAL_TOOLS,
     active: function () { return active; },
     /* Tests and the panel: pretend a session is open, or that none is. */
     _setActive: function (h) { active = h; },
   };
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { createController: createController };
+    module.exports = { createController: createController, navStatus: navStatus,
+                       localTools: LOCAL_TOOLS };
   }
 })(typeof window !== 'undefined' ? window : globalThis);

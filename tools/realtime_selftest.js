@@ -486,6 +486,110 @@ section('the clip bypass is untouched');
      + 'wait on one');
 }
 
+// ---------------------------------------------------------------------------
+section('awareness — the three tools a live session needs');
+// ---------------------------------------------------------------------------
+{
+  // 1. A visual question reaches the camera, and the observation comes back
+  //    into the session for RIO to phrase.
+  const OBSERVATION = 'A white sedan two car lengths ahead in the same lane.';
+  const h = harness({
+    tool: (name, args) => {
+      if (name !== 'look') return Promise.resolve({ ok: false, note: 'wrong tool' });
+      return Promise.resolve({ ok: true, answer: OBSERVATION, took_ms: 1400 });
+    },
+  });
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'look', call_id: 'v1',
+    arguments: JSON.stringify({ question: "what's that car ahead" }),
+  });
+  await tick(); await tick();
+  const out = h.sent.find(e => e.type === 'conversation.item.create');
+  ok(out && JSON.parse(out.item.output).answer === OBSERVATION,
+     'a visual question puts the camera observation back into the session');
+  ok(h.types().indexOf('response.create') >= 0,
+     'and asks her to answer from it — she phrases it, the pipeline does not');
+}
+
+{
+  // 2. A route question is answered by the PANEL, from the same state the nav
+  //    card paints, because progress lives in the browser and nowhere else.
+  const rt = require(path.join(__dirname, '..', 'static', 'rio_realtime.js'));
+  global.RIO = global.RIO || {};
+  global.RIO.nav = { state: () => ({
+    destination: { display_name: 'Griffith Observatory' },
+    remaining_m: 4200, eta_epoch: 1787790000, speed_ms: 14,
+    maneuver: { instruction: 'Turn left onto Lincoln Boulevard',
+                direction: 'LEFT', road_name: 'Lincoln Boulevard' },
+    to_maneuver_m: 180, tta_s: 12.4, maneuver_state: 'APPROACHING',
+    maneuvers_left: 6, route_state: 'ON_ROUTE', gps_state: 'GPS_OK',
+    arrived: false, context: { anchor: { label: 'Shell' } },
+  }) };
+  const st = rt.navStatus();
+  ok(st.ok && st.destination === 'Griffith Observatory',
+     'nav_status answers with the real destination');
+  ok(st.next_maneuver.distance_m === 180 && st.next_maneuver.seconds_away === 12,
+     'the real distance and time to the next maneuver (' +
+     st.next_maneuver.distance_m + ' m, ' + st.next_maneuver.seconds_away + ' s)');
+  ok(st.route_state === 'ON_ROUTE' && st.gps_state === 'GPS_OK',
+     'off-route state and GPS health, which are answers in their own right');
+  ok(/do not announce/i.test(st.rules || ''),
+     'and the result itself carries the boundary: answer, do not announce');
+
+  global.RIO.nav = { state: () => null };
+  const none = rt.navStatus();
+  ok(none.ok && none.routing === false && /no route/.test(none.note),
+     'with no route set she is told to say so rather than guess a destination');
+  delete global.RIO.nav;
+}
+
+{
+  // 4. ANTI-DOUBLE-SPEAK. The turn the arbiter is about to call must not also
+  //    be announced by the model. The tool tells her about it; the instruction
+  //    tells her not to say it; and the deterministic call is a separate,
+  //    higher-priority item she cannot pre-empt.
+  const fs = require('fs');
+  const rtSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'rio_realtime.js'), 'utf8');
+  ok(/do not announce this maneuver/i.test(rtSrc),
+     'every nav_status result repeats the boundary to the model');
+
+  const h2 = harness();
+  h2.controller.handle({ type: 'response.created', response: { id: 'chat' } });
+  await tick();
+  ok(h2.arbiter.state().speaking.priority === speech.P.CONVO,
+     'anything the model says is conversation priority, whatever it is about');
+  const turn = item({ priority: speech.P.TURN_NEAR, group: 'nav:m3', id: 'nav:imminent' });
+  h2.arbiter.say(turn);
+  await tick();
+  ok(h2.arbiter.state().speaking.id === 'nav:imminent',
+     'so if she did start talking over a turn call, the turn wins — the '
+     + 'boundary is enforced by the ladder as well as by the instructions');
+  ok(h2.types().indexOf('response.cancel') >= 0,
+     'and she is cancelled at the model, not merely muted');
+}
+
+{
+  // 5. FRAME SUPPLY. The link that was actually missing: the ring is fed by
+  //    the drive loop, and a live session did not start one.
+  const fs = require('fs');
+  const html = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  ok(/if \(!RIO\.driving\) return;/.test(html),
+     'the drive frame loop still stops itself when no drive is running');
+  ok(/async function startLiveFrames/.test(html),
+     'and a live session now starts its own feed');
+  ok(/RIO\.headway\.captureFromVideo\(video\)/.test(
+       (html.match(/async function startLiveFrames[\s\S]*?\n}/) || [''])[0]),
+     'through the SAME capture path the drive uses — no second pipeline');
+  ok(/if \(RIO\.driving \|\| liveFrames\.timer/.test(html),
+     'and not at all when a drive is already feeding the ring faster');
+  ok(/stopLiveFrames\(\)/.test(html) &&
+     (html.match(/stopLiveFrames\(\)/g) || []).length >= 3,
+     'stopped when the conversation ends, and when it fails to start');
+}
+
 console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ') + checks + ' checks');
 process.exit(failures ? 1 : 0);
 }
