@@ -985,3 +985,156 @@ POWERTRAIN_HEAL_STABLE_S = {
     "engine.signal_integrity": 300.0,
     "engine.connection": 120.0,
 }
+
+
+# ---------------------------------------------------------------------------
+# Contextual navigation (docs/navigation_v1.md)
+# ---------------------------------------------------------------------------
+# Every threshold navigation has is here. None of them is a magic number buried
+# in the tracker, because every one of them is a claim about driving that will
+# be wrong somewhere and has to be tunable when it is.
+#
+# The whole of navigation's timing is expressed in SECONDS TO THE MANEUVER, not
+# metres. 200 m of downtown and 200 m of arterial are the same distance and
+# completely different warnings; seconds are what a driver needs to act. The
+# distance clamps below exist only to stop the seconds producing something
+# absurd at the extremes.
+
+NAV_ENABLED = True
+
+# --- GPS health -------------------------------------------------------------
+# GPS health and off-route are SEPARATE questions (§6). A stale fix means we do
+# not know where the car is; it does not mean the car left the route, and it
+# must never cause a reroute.
+NAV_GPS_STALE_TIMEOUT_S = 5.0       # no fix for this long -> GPS_STALE
+NAV_GPS_ACCURACY_LIMIT_M = 30.0     # worse than this -> GPS_DEGRADED
+NAV_GPS_DEGRADED_BIAS_S = 2.0       # degraded near a maneuver: speak this much
+                                    # EARLIER, never later (§6)
+
+# --- off route --------------------------------------------------------------
+# Distance from the polyline plus persistence, and nothing else (§7). No road
+# network matching, no lane inference, no probabilistic road inference: those
+# are the things that make an off-route detector confidently wrong.
+NAV_OFF_ROUTE_DISTANCE_M = 45.0
+NAV_OFF_ROUTE_PERSISTENCE = 3       # consecutive fixes beyond the distance
+NAV_REROUTE_DEBOUNCE_S = 12.0       # floor between reroutes — anti-flap
+NAV_REROUTE_MAX_PER_JOURNEY = 12    # hard stop on a reroute loop
+
+# --- route progress ---------------------------------------------------------
+# Progress is monotonic under noise: a fix that projects behind where we have
+# already been is jitter, not a reversal, unless it is this far back. A genuine
+# wrong turn shows up as off-route, not as rewind.
+NAV_PROGRESS_REWIND_TOLERANCE_M = 30.0
+NAV_MANEUVER_PASSED_EPS_M = 8.0     # this far past the point and it is behind you
+NAV_ARRIVE_RADIUS_M = 25.0
+NAV_PROJECTION_BACK_M = 80.0        # projection search window, behind
+NAV_PROJECTION_FWD_M = 400.0        # ...and ahead
+
+# --- heading fallback (§8) --------------------------------------------------
+# Browser Geolocation on iOS frequently reports heading: null and speed: null.
+# Heading is then derived from consecutive fixes — but only when the derivation
+# means anything: fresh samples, real displacement, usable accuracy, actually
+# moving.
+NAV_HEADING_MIN_DISPLACEMENT_M = 8.0
+NAV_HEADING_MAX_SAMPLE_AGE_S = 3.0
+NAV_HEADING_MIN_SPEED_MS = 1.5
+NAV_STATIONARY_SPEED_MS = 0.7
+
+# --- speech windows (§12) ---------------------------------------------------
+# Three OPPORTUNITIES, not three mandatory calls. RIO is a passenger who tells
+# you about the turn, not a GPS that counts down to it.
+NAV_EARLY_GUIDANCE_S = 25.0         # "Right turn coming up."      (optional)
+NAV_ANCHOR_ACQUISITION_S = 11.0     # start looking for the landmark
+NAV_CONTEXT_CALL_S = 6.0            # "Turn right by the Shell station."
+NAV_NEAR_TURN_S = 2.5               # "Right here."                (only if needed)
+# Clamps, so that a crawl does not announce a turn 4 m ahead and a fast road
+# does not announce one from a kilometre out.
+NAV_MIN_CALL_DISTANCE_M = 20.0
+NAV_MAX_CALL_DISTANCE_M = 400.0
+NAV_EARLY_MAX_DISTANCE_M = 900.0
+# Below this, time-to-maneuver stops meaning anything: at 0.2 m/s every
+# maneuver is hours away and nothing is ever said, including the turn being
+# crept towards in traffic. A floor for the arithmetic, not a claimed speed.
+NAV_SPEED_FLOOR_MS = 3.0
+NAV_SPEED_NOMINAL_MS = 11.0         # only when there is no speed at all
+NAV_DUPLICATE_INSTRUCTION_COOLDOWN_S = 8.0
+# A speech candidate is true only inside a window. These are the windows.
+NAV_SPEECH_TTL_S = {"early": 8.0, "primary": 5.0, "imminent": 2.5, "arrival": 8.0}
+
+# --- landmark candidates (V1.1) ---------------------------------------------
+# Fetched ONCE per route generation, one pass over the maneuvers at route load,
+# cached for that generation's lifetime, refreshed only on reroute. Never
+# per-frame, never on an interval — that is the difference between a place
+# lookup and a place subscription, and only one of them is affordable.
+NAV_LANDMARKS_ENABLED = True
+NAV_LANDMARK_SEARCH_RADIUS_M = 90.0
+NAV_LANDMARK_MAX_LOOKUPS_PER_ROUTE = 12     # hard budget cap (addendum)
+NAV_LANDMARK_MAX_CANDIDATES_PER_MANEUVER = 4
+NAV_LANDMARK_MAX_DISTANCE_M = 80.0          # further than this from the maneuver
+                                            # and it is not "by" the turn
+# Allowed anchor classes (§21). Branded fuel and major chain signage only:
+# things with a large, standardised, permanently-lit sign that a driver reads
+# without looking for it. Everything else is out of scope until this is
+# reliable.
+NAV_ANCHOR_TYPES = ("gas_station", "coffee_shop", "fast_food_restaurant",
+                    "pharmacy", "convenience_store")
+NAV_ANCHOR_BRANDS = {
+    # brand key -> (spoken form, anchor class, salience 0-1)
+    "shell":        ("the Shell station", "gas_station", 1.0),
+    "chevron":      ("the Chevron station", "gas_station", 1.0),
+    "mobil":        ("the Mobil station", "gas_station", 0.95),
+    "exxon":        ("the Exxon station", "gas_station", 0.95),
+    "76":           ("the 76 station", "gas_station", 0.9),
+    "arco":         ("the Arco station", "gas_station", 0.9),
+    "valero":       ("the Valero station", "gas_station", 0.85),
+    "bp":           ("the BP station", "gas_station", 0.85),
+    "starbucks":    ("the Starbucks", "coffee_shop", 0.9),
+    "mcdonald's":   ("the McDonald's", "fast_food_restaurant", 0.95),
+    "mcdonalds":    ("the McDonald's", "fast_food_restaurant", 0.95),
+    "burger king":  ("the Burger King", "fast_food_restaurant", 0.85),
+    "taco bell":    ("the Taco Bell", "fast_food_restaurant", 0.85),
+    "cvs":          ("the CVS", "pharmacy", 0.85),
+    "walgreens":    ("the Walgreens", "pharmacy", 0.85),
+    "7-eleven":     ("the 7-Eleven", "convenience_store", 0.8),
+}
+
+# --- landmark relation, from MAP DATA (§16 + addendum) ----------------------
+# turn_relation_to_anchor describes where the TURN is relative to the LANDMARK,
+# and it is computed from coordinates — never estimated by the camera.
+#   |along delta| <= NEAR band          -> NEAR        "turn left by the Shell"
+#   landmark before the turn            -> JUST_AFTER  "turn right just after..."
+#   landmark past the turn              -> JUST_BEFORE "turn left just before..."
+# NEAR is the default because it needs the least spatial certainty. The other
+# two are claims about ORDER, and a wrong one sends a driver through the
+# junction, so they demand a much wider margin before they are allowed.
+NAV_RELATION_NEAR_BAND_M = 22.0
+NAV_RELATION_ORDERED_MIN_M = 30.0     # below this margin, degrade to NEAR
+NAV_RELATION_ORDERED_MAX_M = 75.0     # beyond this the landmark is not "just" anything
+NAV_RELATION_MAX_LATERAL_M = 45.0     # off-route offset that still counts as roadside
+
+# --- anchor validation gates (§18) ------------------------------------------
+# Hard gates, all of them, before anything is ranked. Frequent rejection is the
+# design working: the fallback is ordinary navigation, which is fine, and a
+# confidently wrong landmark is worse than no landmark.
+NAV_ANCHOR_MIN_IDENTITY_CONFIDENCE = 0.75
+NAV_ANCHOR_MIN_VISIBILITY_CONFIDENCE = 0.6
+NAV_ANCHOR_MIN_RELATION_CONFIDENCE = 0.6
+NAV_ANCHOR_ORDERED_MIN_RELATION_CONFIDENCE = 0.8   # JUST_BEFORE / JUST_AFTER
+NAV_ANCHOR_MIN_TRACKING_DURATION_S = 1.2
+NAV_ANCHOR_MIN_OBSERVATIONS = 2
+NAV_ANCHOR_MAX_AGE_S = 3.0            # an observation older than this is history
+NAV_ANCHOR_VALID_FOR_S = 6.0          # a VerifiedAnchor's own shelf life
+NAV_ANCHOR_MAX_PER_MANEUVER = 1       # one anchor, ever (§19)
+
+# --- visual verification (V1.1) ---------------------------------------------
+# The camera answers ONE question: is this expected landmark clearly visible?
+# It does not locate the turn, it does not compute intersection coordinates and
+# it does not get a vote on the route.
+NAV_VISION_ENABLED = True
+NAV_VERIFY_MAX_FRAMES = 3             # observations per verification pass
+NAV_VERIFY_FRAME_MAX_AGE_S = 4.0
+NAV_VERIFY_MIN_SPACING_S = 0.4        # two reads of the same instant are one observation
+NAV_VERIFY_DEPTH_ENABLED = True
+NAV_VERIFY_DEPTH_MAX_M = 90.0         # a "landmark" reported 200 m out is not
+                                      # the one 40 m from the maneuver
+NAV_VERIFY_DEPTH_MIN_M = 3.0
