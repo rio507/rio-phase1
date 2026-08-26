@@ -1151,3 +1151,8 @@ NAV_VERIFY_DEPTH_ENABLED = True
 NAV_VERIFY_DEPTH_MAX_M = 90.0         # a "landmark" reported 200 m out is not
                                       # the one 40 m from the maneuver
 NAV_VERIFY_DEPTH_MIN_M = 3.0
+# Depth Anything reports its own confidence per ROI (spread, valid pixels,
+# range). Below this the reading is a number without a meaning — a box
+# straddling a sign and the sky behind it — and the consistency check abstains
+# rather than acting on it.
+NAV_VERIFY_DEPTH_MIN_CONF = 0.35

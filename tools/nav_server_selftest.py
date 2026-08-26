@@ -648,14 +648,23 @@ def _ring_with(n_frames, spacing_s=1.0):
     the observer's frame thinning is a claim about elapsed time and cannot be
     tested with frames that all arrived in the same millisecond.
     """
+    import io
+
     import framebuf
+    from PIL import Image
+
+    # Real JPEG bytes, because the depth path decodes them. A ring full of
+    # b"jpeg" would silently skip every check below it.
+    buf = io.BytesIO()
+    Image.new("RGB", (640, 360), (40, 44, 52)).save(buf, format="JPEG")
+    jpeg = buf.getvalue()
 
     ring = framebuf.FrameRing(seconds=30.0, max_frames=16)
     now = time.time()
     for i in range(n_frames):
-        rf = ring.push(b"jpegbytes", {"ok": True, "t": float(i),
-                                      "image": {"w": 1280, "h": 720},
-                                      "scene_objects": []})
+        rf = ring.push(jpeg, {"ok": True, "t": float(i),
+                              "image": {"w": 640, "h": 360},
+                              "scene_objects": []})
         rf.wall_t = now - (n_frames - 1 - i) * spacing_s
     return ring
 
@@ -731,6 +740,48 @@ def run_observer():
         framebuf.peek_ring = lambda key: None
         ok(verify_mod.verify("session", cands)["reason"] == "camera_unavailable",
            "and no ring at all is the camera being absent, which is fine")
+
+        # -- depth, against a stand-in for the real module ------------------
+        # roi_depth returns (metres, confidence, stats). Reading that tuple as
+        # anything else is a bug that hides perfectly: the check would simply
+        # abstain on every frame for the life of the product, and nothing would
+        # ever look wrong.
+        framebuf.peek_ring = lambda key: ring
+        import numpy as np
+        import types
+
+        calls = {}
+
+        def fake_depth(conf, metres):
+            mod = types.ModuleType("headway.depth")
+            mod.depth_map = lambda img: np.zeros(img.shape[:2], dtype="float32")
+
+            def roi_depth(dmap, box, shrink=0.6):
+                calls["box"] = box
+                return metres, conf, {"valid_frac": 0.9}
+            mod.roi_depth = roi_depth
+            return mod
+
+        seen_box = dict(seen, box=[600, 300, 700, 380])
+        for conf, metres, want, why in (
+                (0.9, 42.0, 42.0, "a confident reading is used"),
+                (0.1, 42.0, None, "a reading the depth model does not trust is not"),
+                (0.9, float("nan"), None, "and NaN — too few valid pixels — abstains")):
+            sys.modules["headway.depth"] = fake_depth(conf, metres)
+            verify_mod.set_adapter(ScriptedAdapter([{"Shell": seen_box}] * 3))
+            res = verify_mod.verify("session", cands)
+            got = (res.get("observation") or {}).get("depth_m")
+            ok(got == want or (want is None and got is None), why)
+
+        # A normalised box must not be read as pixels: that samples the top-left
+        # corner of the frame, which is the sky, and reports it confidently.
+        sys.modules["headway.depth"] = fake_depth(0.9, 42.0)
+        verify_mod.set_adapter(ScriptedAdapter(
+            [{"Shell": dict(seen, box=[0.47, 0.42, 0.55, 0.53])}] * 3))
+        verify_mod.verify("session", cands)
+        ok(calls.get("box") and calls["box"][0] > 100 and calls["box"][1] > 100,
+           f"a 0-1 box is scaled to the frame before it is sampled ({calls.get('box')})")
+        sys.modules.pop("headway.depth", None)
     finally:
         framebuf.peek_ring = original_peek
         verify_mod.set_adapter(None)

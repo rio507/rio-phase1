@@ -168,12 +168,40 @@ def _number(value) -> Optional[float]:
         return None
 
 
+def _pixel_box(box, w: int, h: int):
+    """A box in pixels, whatever units the model answered in.
+
+    Some models report 0-1 normalised coordinates and some report pixels, and
+    a normalised box read as pixels samples an 8x8 patch in the top-left
+    corner — which produces a confident depth reading of the sky. If every
+    value is <= 1 and the frame is bigger than that, it is normalised.
+    """
+    try:
+        vals = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != 4 or w <= 1 or h <= 1:
+        return None
+    if max(vals) <= 1.0:
+        vals = [vals[0] * w, vals[1] * h, vals[2] * w, vals[3] * h]
+    x1, y1, x2, y2 = vals
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
 def _depth_for(acc_entry: dict) -> Optional[float]:
     """Median depth inside the reported box, when there is one.
 
-    Abstains freely. No box, no depth model, a failed sample: all return None,
-    and None is not a rejection — it only means this particular consistency
-    check had nothing to say.
+    Abstains freely, and abstaining is not a rejection — it only means this
+    particular consistency check had nothing to say. No box, no depth model, a
+    patch with too few valid pixels, or a reading the depth model itself does
+    not trust (`depth_conf`) all come back None.
+
+    `roi_depth` returns (metres, confidence, stats). Taking the confidence
+    seriously is the whole reason to use it here rather than a bare median: a
+    box straddling a sign and the sky behind it produces a number, and the
+    number is meaningless.
     """
     if not config.NAV_VERIFY_DEPTH_ENABLED:
         return None
@@ -186,14 +214,17 @@ def _depth_for(acc_entry: dict) -> Optional[float]:
         img = frame.frame_bgr()
         if img is None:
             return None
-        dmap = depth_mod.depth_map(img)
-        stats = depth_mod.roi_depth(dmap, box)
-        if isinstance(stats, dict):
-            for k in ("median_m", "median", "depth_m", "range_m"):
-                if stats.get(k) is not None:
-                    return float(stats[k])
+        h, w = img.shape[:2]
+        px = _pixel_box(box, w, h)
+        if px is None:
             return None
-        return float(stats) if stats is not None else None
+        d, conf, _stats = depth_mod.roi_depth(depth_mod.depth_map(img), px)
+        d = float(d)
+        if d != d or d <= 0:                      # NaN: too few valid pixels
+            return None
+        if float(conf) < config.NAV_VERIFY_DEPTH_MIN_CONF:
+            return None
+        return d
     except Exception as e:
         print(f"[nav] depth check unavailable: {type(e).__name__}: {e}", flush=True)
         return None
