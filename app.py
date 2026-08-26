@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 import os
 import sys
 import time
@@ -184,10 +185,41 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 INDEX_PATH = Path("static/index.html")
 MAPS_KEY_TOKEN = "__GOOGLE_MAPS_API_KEY__"
 
+# Every local asset the page pulls in, so its URL can be stamped with the
+# file's own mtime on the way out.
+_ASSET_REF = re.compile(r'(src|href)="(/static/[^"?#]+)"')
+
+
+def _stamp_assets(html: str) -> str:
+    """/static/rio_nav.js -> /static/rio_nav.js?v=<mtime>
+
+    A browser holding yesterday's JavaScript against today's endpoints is not a
+    stale cache, it is two different programs talking to each other, and it
+    fails in ways that look like the server is broken: this repo has already
+    spent an afternoon on a dropdown that rendered blank rows because the panel
+    and the endpoint disagreed about field names across exactly that gap.
+
+    Stamping the URL with the file's modification time means a changed file is
+    a changed URL and there is nothing for the browser to serve from cache. An
+    unchanged file keeps its URL and stays cached, which is the whole point of
+    doing this rather than disabling caching.
+
+    A file that cannot be stat'd is left alone: a missing asset should 404
+    visibly, not be hidden behind a rewrite that failed quietly.
+    """
+    def stamp(m):
+        attr, path = m.group(1), m.group(2)
+        try:
+            mtime = int(Path(path.lstrip("/")).stat().st_mtime)
+        except OSError:
+            return m.group(0)
+        return f'{attr}="{path}?v={mtime}"'
+    return _ASSET_REF.sub(stamp, html)
+
 
 @app.get("/")
 def index():
-    """index.html with the Maps browser key injected at serve time.
+    """index.html with the Maps browser key injected and the assets stamped.
 
     The Maps JavaScript API needs a key the browser can see, so "keep it out of
     the browser" is not available — but "keep it out of the repository" is, and
@@ -196,12 +228,17 @@ def index():
 
     Consequence worth knowing: the page must be loaded from "/" and not from
     /static/index.html, which the StaticFiles mount will happily serve with the
-    placeholder still in it — the map would be the only thing that fails, and it
-    fails visibly.
+    placeholder still in it AND with unstamped script tags — the map would fail
+    visibly, and the JavaScript would go stale invisibly, which is worse.
+
+    The page itself is served no-cache so the stamps are always read fresh; it
+    is a few tens of kilobytes and it is the one document that decides which
+    version of everything else the browser runs.
     """
-    html = INDEX_PATH.read_text()
+    html = _stamp_assets(INDEX_PATH.read_text())
     return HTMLResponse(html.replace(MAPS_KEY_TOKEN,
-                                     os.getenv("GOOGLE_MAPS_API_KEY", "")))
+                                     os.getenv("GOOGLE_MAPS_API_KEY", "")),
+                        headers={"Cache-Control": "no-cache"})
 
 @app.get("/health")
 def health():

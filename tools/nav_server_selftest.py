@@ -899,6 +899,22 @@ def run_autocomplete():
     ok("routeToQuery(elDest.value.trim())" in nav_js,
        "and Enter still submits whatever is in the box, suggestions or not")
 
+    # -- and the browser cannot run a stale copy of it ----------------------
+    # This is the other half of the same failure. A panel from before a change,
+    # talking to endpoints from after it, is two different programs — and it
+    # presents as the server being broken. The page stamps every local asset
+    # with the file's own mtime, so a changed file is a changed URL.
+    page = app_mod._stamp_assets(open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "static", "index.html")).read())
+    stamped = re.findall(r'src="(/static/[^"]+)"', page)
+    ok(stamped and all("?v=" in u for u in stamped),
+       f"every script the page loads is stamped with its version ({len(stamped)} of them)")
+    ok(any("rio_nav.js?v=" in u for u in stamped),
+       "the navigation panel included — the file this whole section is about")
+    unchanged = app_mod._stamp_assets('<script src="/static/does_not_exist.js"></script>')
+    ok("?v=" not in unchanged,
+       "a missing asset is left alone, so it 404s visibly instead of being hidden")
+
 
 # ---------------------------------------------------------------------------
 # Optional: one real provider route
