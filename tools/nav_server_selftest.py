@@ -41,6 +41,7 @@ Seven parts, separated by what each one can prove:
 import argparse
 import inspect
 import os
+import re
 import sys
 import time
 
@@ -134,10 +135,10 @@ def run_provider():
         """A provider with no place data at all — the minimum contract."""
         name = "bare"
 
-        def suggest(self, query, lat=None, lng=None, limit=5):
+        def suggest(self, query, lat=None, lng=None, limit=5, session=None):
             return [DestinationCandidate("Somewhere", "Somewhere, CA", "p1")]
 
-        def destination(self, query="", place_id="", label=""):
+        def destination(self, query="", place_id="", label="", session=None):
             return fixtures.city_route().destination
 
         def route(self, origin_lat, origin_lng, destination):
@@ -161,14 +162,25 @@ def run_provider():
 class ScriptedProvider(fixtures.FixtureProvider):
     """Suggestions on demand, so ambiguity can be posed exactly."""
 
-    def __init__(self, suggestions):
+    def __init__(self, suggestions, fail_suggest=False):
         super().__init__()
         self._suggestions = suggestions
+        self.fail_suggest = fail_suggest
+        self.resolved = []
 
-    def suggest(self, query, lat=None, lng=None, limit=5):
+    def suggest(self, query, lat=None, lng=None, limit=5, session=None):
+        if session:
+            self.sessions_seen.append(("suggest", session))
+        if self.fail_suggest:
+            # What a provider outage looks like from here: an empty list, never
+            # an exception. The driver types the address in full instead.
+            return []
         return [DestinationCandidate(*s) for s in self._suggestions][:limit]
 
-    def destination(self, query="", place_id="", label=""):
+    def destination(self, query="", place_id="", label="", session=None):
+        if session:
+            self.sessions_seen.append(("destination", session))
+        self.resolved.append({"query": query, "place_id": place_id})
         return M.CanonicalDestination(
             display_name=label or query or "Resolved",
             formatted_address=label or query, latitude=34.0, longitude=-118.0,
@@ -789,6 +801,106 @@ def run_observer():
 
 
 # ---------------------------------------------------------------------------
+# J. Destination autocomplete
+# ---------------------------------------------------------------------------
+def run_autocomplete():
+    section("J. autocomplete — predictions while typing, and the fallback under them")
+    import app as app_mod
+    from navigation.providers import google as google_mod
+
+    picks = [("Griffith Observatory", "2800 E Observatory Rd, Los Angeles, CA", "p_obs"),
+             ("Griffith Park", "4730 Crystal Springs Dr, Los Angeles, CA", "p_park")]
+    provider = ScriptedProvider(picks)
+    service.set_provider(provider)
+
+    # -- the endpoint the box actually calls --------------------------------
+    res = app_mod.nav_suggest_endpoint(q="griff", lat=34.05, lng=-118.24, session="ac_1")
+    got = res["suggestions"]
+    ok(len(got) == 2, f"typing three characters returns predictions ({len(got)})")
+    ok(got[0]["display_name"] == "Griffith Observatory" and got[0]["provider_place_id"],
+       "each one carries a name to show and a place id to resolve")
+
+    # -- THE regression guard ------------------------------------------------
+    # The panel and this endpoint have to agree on field names, and when they
+    # silently disagreed the dropdown filled with blank rows that routed to
+    # `undefined`. So the fields the panel reads are read OUT OF THE PANEL and
+    # checked against what the endpoint emits, rather than being restated here
+    # where they could drift in step.
+    nav_js = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "static", "rio_nav.js")).read()
+    mapper = re.search(r"function toSuggestion\(c\) \{(.*?)\n    \}", nav_js, re.S)
+    ok(bool(mapper), "the panel maps suggestions in one place, toSuggestion()")
+    if mapper:
+        read = set(re.findall(r"c\.(\w+)", mapper.group(1)))
+        emitted = set(got[0].keys())
+        missing = read - emitted
+        ok(not missing,
+           f"every field the panel reads is emitted by /nav/suggest "
+           f"({sorted(read)})" if not missing else f"panel reads {sorted(missing)}, "
+           f"endpoint emits {sorted(emitted)}")
+    ok("if (!id || !(main || secondary)) return null;" in nav_js,
+       "a suggestion with no id or nothing to read is dropped, not rendered blank")
+
+    # -- selection resolves through place_id --------------------------------
+    provider.resolved = []
+    dest = service.get_provider().destination(place_id="p_obs",
+                                              label="Griffith Observatory",
+                                              session="ac_1")
+    ok(isinstance(dest, M.CanonicalDestination) and dest.provider_place_id == "p_obs",
+       "picking a prediction resolves by place id into a canonical Destination")
+    ok(provider.resolved and provider.resolved[-1]["place_id"] == "p_obs"
+       and not provider.resolved[-1]["query"],
+       "by id, never by re-searching the text — the same name can be two places")
+
+    # -- the session id reaches both halves ---------------------------------
+    provider.sessions_seen = []
+    service.resolve_destination("Griffith Observatory", 34.05, -118.24, session="ac_2")
+    kinds = [k for k, sid in provider.sessions_seen if sid == "ac_2"]
+    ok("suggest" in kinds and "destination" in kinds,
+       f"one typing session id spans the predictions and the resolution ({kinds})")
+
+    # -- and Google turns it into a token with a lifecycle -------------------
+    before = google_mod.sessions_open()
+    t1 = google_mod._session_token("typing_1")
+    t2 = google_mod._session_token("typing_1")
+    ok(t1 and t1 == t2, "every keystroke of one session shares a provider token")
+    ok(google_mod.sessions_open() == before + 1, "and only one token is held for it")
+    ok(google_mod._consume_session("typing_1") == t1,
+       "the details lookup consumes it — that is the call the session is billed as")
+    ok(google_mod.sessions_open() == before,
+       "after which nothing is held: the session is over")
+    ok(google_mod._session_token("typing_1") != t1,
+       "and the next thing typed gets a new token, never the spent one")
+    google_mod._consume_session("typing_1")
+    ok(google_mod._session_token(None) is None,
+       "a resolution with no typing behind it — a spoken destination, a reroute — "
+       "opens no session at all")
+
+    # -- autocomplete down: submitting what you typed still works -----------
+    broken = ScriptedProvider(picks, fail_suggest=True)
+    service.set_provider(broken)
+    ok(app_mod.nav_suggest_endpoint(q="griff", session="ac_3")["suggestions"] == [],
+       "a provider outage returns no predictions, and no error")
+    res = service.resolve_destination("Griffith Observatory", session="ac_3")
+    ok(res["status"] == "resolved" and res["reason"] == "geocoded",
+       "and the typed destination still resolves, by the path that does not need them")
+    ok(broken.resolved and broken.resolved[-1]["query"] == "Griffith Observatory",
+       "through the provider's own lookup, on the text the driver actually typed")
+
+    # -- the panel's own wiring, read out of the panel -----------------------
+    ok("setTimeout(" in nav_js and "clearTimeout(suggestTimer)" in nav_js,
+       "the panel debounces rather than asking on every keystroke")
+    ok("'&session=' + encodeURIComponent(session)" in nav_js,
+       "the session id rides on every suggest request")
+    ok("endSuggestSession();" in nav_js and "session: session" in nav_js,
+       "picking a suggestion sends the session id and then ends the session")
+    ok("if (typedAt !== suggestSeq) return;" in nav_js,
+       "a slow reply for an older prefix is discarded rather than repainting the list")
+    ok("routeToQuery(elDest.value.trim())" in nav_js,
+       "and Enter still submits whatever is in the box, suggestions or not")
+
+
+# ---------------------------------------------------------------------------
 # Optional: one real provider route
 # ---------------------------------------------------------------------------
 def run_live():
@@ -830,6 +942,7 @@ def main():
     run_speech()
     run_spoken()
     run_observer()
+    run_autocomplete()
     if args.live:
         run_live()
 

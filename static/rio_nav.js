@@ -81,12 +81,58 @@
     var sim = { timer: null, s: 0, ms: 0 };
     var map = null, mapLine = null, mapDest = null, mapHost = null, mapsFailed = false;
     var routing = false, lastRerouteAt = -1e9, clockS = 0;
+    /* One typing session: everything between starting to type a destination
+       and picking one. RIO mints an opaque id for it; the server hands that to
+       whichever provider is configured and Google turns it into an
+       autocomplete session token. The browser never holds a provider token —
+       same rule as the API key, applied to the thing the key is spent on.
+
+       The id is minted on the first keystroke and dropped the moment a
+       destination is resolved, because a session held past that point would be
+       attached to the NEXT thing the driver types. */
+    var suggestSession = null;
     // What the driver actually asked for, kept verbatim so a reroute asks for
     // the same PLACE. Re-resolving the label of a place picked from a list can
     // land on a different one of the same name.
     var lastRequest = null;
 
     function status(text) { if (elStatus) elStatus.textContent = text; }
+
+    function openSuggestSession() {
+      if (!suggestSession) {
+        suggestSession = 'ac_' + Math.random().toString(36).slice(2, 10) +
+                         Date.now().toString(36);
+      }
+      return suggestSession;
+    }
+    function endSuggestSession() { suggestSession = null; }
+
+    /* One server suggestion -> one row, or nothing.
+     *
+     * The `or nothing` is the point. This mapping is the seam where the panel
+     * and the endpoint have to agree on field names, and when they silently
+     * disagreed the dropdown filled with blank rows that routed to `undefined`
+     * — visibly broken, but only once you clicked. An entry without an id or
+     * without something to read is dropped here instead, so a future drift
+     * shows as "no suggestions" and the driver simply submits what they typed.
+     */
+    function toSuggestion(c) {
+      if (!c) return null;
+      var id = c.provider_place_id || '';
+      var main = c.display_name || '';
+      var secondary = c.formatted_address || '';
+      if (!id || !(main || secondary)) return null;
+      return { place_id: id, main: main || secondary, secondary: secondary,
+               text: secondary || main };
+    }
+    function toSuggestions(list) {
+      var out = [];
+      (list || []).forEach(function (c) {
+        var s = toSuggestion(c);
+        if (s) out.push(s);
+      });
+      return out;
+    }
     function nowS() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000; }
 
     /* ---------------------------------------------------------------------
@@ -493,7 +539,7 @@
             lat: origin.lat, lng: origin.lng,
             destination: opts.destination || '', place_id: opts.place_id || '',
             label: opts.label || '', reroute_of: opts.reroute_of || null,
-            reason: opts.reason || null,
+            reason: opts.reason || null, session: opts.session || null,
           }),
         });
       }).then(function (r) { return r.json(); })
@@ -513,13 +559,23 @@
        pick between two plausible readings of "the Getty". */
     function routeToQuery(text) {
       status('Finding …');
+      // The fallback path, and the one that has to keep working when
+      // autocomplete does not: whatever is in the box is resolved through the
+      // same provider, and an ambiguous answer still asks rather than guesses.
+      var session = suggestSession;
+      endSuggestSession();
       return fetch(RIO.url('/nav/destination'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ q: text, lat: lastFix ? lastFix.lat : null,
-                               lng: lastFix ? lastFix.lng : null }),
+                               lng: lastFix ? lastFix.lng : null,
+                               session: session }),
       }).then(function (r) { return r.json(); })
         .then(function (j) {
           if (j.status === 'ambiguous') {
+            // RIO is asking which one; the answer is a selection, and a
+            // selection is the end of a typing session that no longer has an
+            // id. The candidates carry place ids, which is all the resolution
+            // needs.
             offerDestinations(j.candidates);
             return;
           }
@@ -536,6 +592,7 @@
     }
 
     function clearRoute(reason) {
+      endSuggestSession();
       stopSim();
       if (planner) planner.stop();
       if (tracker) tracker.stop();
@@ -606,7 +663,7 @@
     /* ---------------------------------------------------------------------
        Destination input + autocomplete
        --------------------------------------------------------------------- */
-    var suggestTimer = null, suggestions = [];
+    var suggestTimer = null, suggestions = [], suggestSeq = 0;
 
     function paintSuggestions(list) {
       suggestions = list || [];
@@ -623,7 +680,12 @@
           elDest.value = s.text;
           paintSuggestions([]);
           unlock();
-          setRoute({ place_id: s.place_id, label: s.main || s.text });
+          // The selection closes the typing session, and carries its id so the
+          // provider can close it too.
+          var session = suggestSession;
+          endSuggestSession();
+          setRoute({ place_id: s.place_id, label: s.main || s.text,
+                     session: session });
         });
         elSuggest.appendChild(d);
       });
@@ -636,18 +698,26 @@
         var q = elDest.value.trim();
         if (suggestTimer) clearTimeout(suggestTimer);
         if (q.length < 3) { paintSuggestions([]); return; }
-        // Debounced: autocomplete is billed per keystroke otherwise.
+        var session = openSuggestSession();
+        var typedAt = ++suggestSeq;
+        // Debounced. Autocomplete is billed per request otherwise, and a
+        // driver types faster than a round trip.
         suggestTimer = setTimeout(function () {
-          var u = '/nav/suggest?q=' + encodeURIComponent(q);
+          var u = '/nav/suggest?q=' + encodeURIComponent(q)
+                + '&session=' + encodeURIComponent(session);
           if (lastFix) u += '&lat=' + lastFix.lat + '&lng=' + lastFix.lng;
           fetch(u).then(function (r) { return r.json(); })
                   .then(function (j) {
-                    paintSuggestions((j.suggestions || []).map(function (c) {
-                      return { place_id: c.provider_place_id, text: c.formatted_address,
-                               main: c.display_name, secondary: c.formatted_address };
-                    }));
+                    // A slow reply for a prefix the driver has already typed
+                    // past would repopulate the list with older matches.
+                    if (typedAt !== suggestSeq) return;
+                    paintSuggestions(toSuggestions(j.suggestions));
                   })
-                  .catch(function () { paintSuggestions([]); });
+                  .catch(function () {
+                    // Autocomplete is down. Not an error the driver should see:
+                    // the box still works, it just does not predict.
+                    paintSuggestions([]);
+                  });
         }, 250);
       });
       elDest.addEventListener('keydown', function (e) {
@@ -725,10 +795,7 @@
        the question has no answer the driver can give. */
     function offerDestinations(candidates) {
       status('Which one?');
-      paintSuggestions((candidates || []).map(function (c) {
-        return { place_id: c.provider_place_id, text: c.formatted_address,
-                 main: c.display_name, secondary: c.formatted_address };
-      }));
+      paintSuggestions(toSuggestions(candidates));
     }
 
     RIO.nav = {

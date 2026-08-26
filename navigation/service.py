@@ -108,7 +108,8 @@ def clean_destination_phrase(spoken: str) -> str:
 
 
 def resolve_destination(query: str, lat: Optional[float] = None,
-                        lng: Optional[float] = None) -> dict:
+                        lng: Optional[float] = None,
+                        session: Optional[str] = None) -> dict:
     """One destination, or a question. Never a silent guess (§4).
 
     The rule is narrow on purpose:
@@ -128,15 +129,19 @@ def resolve_destination(query: str, lat: Optional[float] = None,
         return {"status": "not_found", "query": query}
     provider = get_provider()
     if _STREET_NUMBER.match(phrase):
-        dest = provider.destination(query=phrase)
+        dest = provider.destination(query=phrase, session=session)
         if dest:
             return {"status": "resolved", "destination": dest, "query": phrase,
                     "reason": "street_address"}
         return {"status": "not_found", "query": phrase}
 
-    cands: List[DestinationCandidate] = provider.suggest(phrase, lat, lng, limit=5)
+    cands: List[DestinationCandidate] = provider.suggest(phrase, lat, lng, limit=5,
+                                                        session=session)
     if not cands:
-        dest = provider.destination(query=phrase)
+        # Autocomplete had nothing, or is down. Typing the destination in full
+        # and submitting it still has to work — that is the fallback the whole
+        # box is designed around, not an error path (§4).
+        dest = provider.destination(query=phrase, session=session)
         if dest:
             return {"status": "resolved", "destination": dest, "query": phrase,
                     "reason": "geocoded"}
@@ -146,7 +151,8 @@ def resolve_destination(query: str, lat: Optional[float] = None,
     exact = [c for c in cands if _normalise(c.display_name) == _normalise(phrase)]
     if len(exact) == 1:
         dest = provider.destination(place_id=exact[0].provider_place_id,
-                                    label=exact[0].formatted_address)
+                                    label=exact[0].formatted_address,
+                                    session=session)
         if dest:
             return {"status": "resolved", "destination": dest, "query": phrase,
                     "reason": "exact_name"}
@@ -162,7 +168,7 @@ def resolve_destination(query: str, lat: Optional[float] = None,
         return {"status": "ambiguous", "query": phrase,
                 "candidates": [c.to_dict() for c in cands[:3]]}
     dest = provider.destination(place_id=pick.provider_place_id,
-                               label=pick.formatted_address)
+                                label=pick.formatted_address, session=session)
     if not dest:
         return {"status": "not_found", "query": phrase}
     return {"status": "resolved", "destination": dest, "query": phrase,

@@ -72,14 +72,29 @@ class NavigationProvider(abc.ABC):
 
     @abc.abstractmethod
     def suggest(self, query: str, lat: Optional[float] = None,
-                lng: Optional[float] = None, limit: int = 5) -> List[DestinationCandidate]:
+                lng: Optional[float] = None, limit: int = 5,
+                session: Optional[str] = None) -> List[DestinationCandidate]:
         """Readings of a free-text destination, best first. Never raises:
-        an empty list is a valid answer and the caller asks the driver."""
+        an empty list is a valid answer and the caller asks the driver.
+
+        `session` is RIO's own opaque id for ONE typing session — everything
+        the driver types between starting to type and picking something. What a
+        provider does with it is the provider's business: Google groups the
+        keystrokes and the final lookup into a single billed autocomplete
+        session, a provider with no such concept ignores it. The browser never
+        sees a provider's token, only RIO's id for the session (§3).
+        """
 
     @abc.abstractmethod
     def destination(self, query: str = "", place_id: str = "",
-                    label: str = "") -> Optional[CanonicalDestination]:
-        """Pin one candidate to coordinates. None if it cannot be resolved."""
+                    label: str = "", session: Optional[str] = None
+                    ) -> Optional[CanonicalDestination]:
+        """Pin one candidate to coordinates. None if it cannot be resolved.
+
+        Passing the `session` the suggestions came from is what CLOSES that
+        typing session — for Google, it is the call the whole session is billed
+        as. A provider must treat the session as spent afterwards.
+        """
 
     @abc.abstractmethod
     def route(self, origin_lat: float, origin_lng: float,

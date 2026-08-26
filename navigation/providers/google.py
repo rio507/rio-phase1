@@ -19,7 +19,10 @@ phone's connection on every reroute.
 import math
 import os
 import re
+import threading
 import time
+import uuid
+from collections import OrderedDict
 from typing import List, Optional
 
 import httpx
@@ -92,6 +95,66 @@ _MANEUVER_MAP = {
 _ONTO = re.compile(r"\b(?:onto|on to)\s+(.+)$", re.IGNORECASE)
 
 
+# --- autocomplete session tokens --------------------------------------------
+# Google bills autocomplete two ways: per keystroke-request, or once per
+# SESSION when the requests carry a shared session token and end in a Place
+# Details call carrying the same one. A destination typed at 12 characters is
+# roughly a dozen requests, so the difference is not rounding.
+#
+# The token is a Google concept and therefore lives here, behind the provider
+# boundary, keyed by RIO's own opaque session id. The browser sends "this is
+# still the same typing session" and never sees a provider token — which is
+# the same rule that keeps the API key server-side, applied to the thing the
+# key is spent on.
+#
+# A session ends when it is consumed by a Place Details lookup, or when it goes
+# stale. Google's own window is about three minutes; a token held longer than
+# that is not saving anything and is quietly replaced.
+_SESSION_TTL_S = 170.0
+_SESSION_MAX = 32
+_sessions: "OrderedDict[str, tuple]" = OrderedDict()
+_session_lock = threading.Lock()
+
+
+def _session_token(session_id: Optional[str]) -> Optional[str]:
+    """The provider token for one RIO typing session, minted on first use."""
+    if not session_id:
+        return None
+    now = time.time()
+    with _session_lock:
+        for key, (_tok, born) in list(_sessions.items()):
+            if now - born > _SESSION_TTL_S:
+                _sessions.pop(key, None)
+        hit = _sessions.get(session_id)
+        if hit:
+            return hit[0]
+        token = uuid.uuid4().hex
+        _sessions[session_id] = (token, now)
+        while len(_sessions) > _SESSION_MAX:
+            _sessions.popitem(last=False)
+        return token
+
+
+def _consume_session(session_id: Optional[str]) -> Optional[str]:
+    """The token, and the session is over. Called by the details lookup.
+
+    Returns None for a session that was never opened, which is the ordinary
+    case for a destination resolved without any typing at all — a spoken
+    request, or a reroute.
+    """
+    if not session_id:
+        return None
+    with _session_lock:
+        hit = _sessions.pop(session_id, None)
+    return hit[0] if hit else None
+
+
+def sessions_open() -> int:
+    """How many typing sessions are currently held. For tests and the log."""
+    with _session_lock:
+        return len(_sessions)
+
+
 def _api_key() -> str:
     key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
     if not key:
@@ -152,11 +215,15 @@ class GoogleProvider(NavigationProvider):
 
     # -- destination resolution ---------------------------------------------
     def suggest(self, query: str, lat: Optional[float] = None,
-                lng: Optional[float] = None, limit: int = 5) -> List[DestinationCandidate]:
+                lng: Optional[float] = None, limit: int = 5,
+                session: Optional[str] = None) -> List[DestinationCandidate]:
         query = (query or "").strip()
         if len(query) < 3:
             return []
         body = {"input": query}
+        token = _session_token(session)
+        if token:
+            body["sessionToken"] = token
         if lat is not None and lng is not None:
             body["locationBias"] = {"circle": {
                 "center": {"latitude": lat, "longitude": lng}, "radius": 50000.0}}
@@ -188,9 +255,14 @@ class GoogleProvider(NavigationProvider):
         return out
 
     def destination(self, query: str = "", place_id: str = "",
-                    label: str = "") -> Optional[M.CanonicalDestination]:
+                    label: str = "", session: Optional[str] = None
+                    ) -> Optional[M.CanonicalDestination]:
+        # Whatever happens below, the typing session is over: it ends when the
+        # driver picks something, and a token held past that point would be
+        # attached to the NEXT destination they type.
+        token = _consume_session(session)
         if place_id:
-            d = self._place_details(place_id)
+            d = self._place_details(place_id, token)
             if d:
                 return d
             # Details unavailable: the Routes API accepts the place id directly,
@@ -211,10 +283,17 @@ class GoogleProvider(NavigationProvider):
             formatted_address=g["label"],
             latitude=g["lat"], longitude=g["lng"], provider_place_id=g.get("place_id"))
 
-    def _place_details(self, place_id: str) -> Optional[M.CanonicalDestination]:
+    def _place_details(self, place_id: str,
+                       session_token: Optional[str] = None
+                       ) -> Optional[M.CanonicalDestination]:
         try:
             r = httpx.get(PLACE_DETAILS_URL.format(place_id=place_id),
-                          timeout=HTTP_TIMEOUT_S, headers={
+                          timeout=HTTP_TIMEOUT_S,
+                          # The call that closes the autocomplete session. Sent
+                          # as a query parameter here, not a body field: this is
+                          # a GET.
+                          params={"sessionToken": session_token} if session_token else None,
+                          headers={
                               "X-Goog-Api-Key": _api_key(),
                               "X-Goog-FieldMask": "id,displayName,formattedAddress,location",
                           })

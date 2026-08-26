@@ -70,6 +70,12 @@ route and place names held in memory for the duration of a drive.
   business name obtained from Places may be spoken as navigational context —
   and whether a brand's own trademark position matters here independently of
   the API terms — is the single most product-specific question in this file.
+- **Autocomplete sessions.** Destination typing is grouped into billed
+  autocomplete sessions with a session token, minted server-side and consumed
+  by the Place Details lookup that resolves the selection. Confirm the token
+  lifetime and the requirement that a session end in a details call are being
+  honoured as the terms describe them, and that RIO's opaque session id (which
+  is what the browser sees) raises nothing of its own.
 - **Places data caching and retention.** Landmark candidates are fetched once
   per route generation and cached for that generation's lifetime (minutes),
   never written to disk. Confirm that is inside the permitted caching window,

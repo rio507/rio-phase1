@@ -724,11 +724,22 @@ def headway_voice_endpoint(line: str = Query(...)):
 
 @app.get("/nav/suggest")
 def nav_suggest_endpoint(q: str = Query(...), lat: float = Query(default=None),
-                         lng: float = Query(default=None)):
-    """Destination autocomplete. Never fatal — an empty list just means the
-    driver types the address in full and it geocodes."""
-    return {"suggestions": [c.to_dict()
-                            for c in navservice.get_provider().suggest(q, lat, lng)]}
+                         lng: float = Query(default=None),
+                         session: str = Query(default=None)):
+    """Destination autocomplete, proxied so the key stays on this side.
+
+    Never fatal: an empty list just means the driver types the address in full
+    and submits it, which resolves through the same provider. Autocomplete is a
+    convenience on top of that path, never a gate in front of it.
+
+    `session` is RIO's opaque id for one typing session, minted by the panel and
+    sent on every keystroke and again on the selection. What a provider makes of
+    it stops at the provider boundary — Google bills the whole session once; a
+    provider with no such concept ignores it.
+    """
+    return {"suggestions": [c.to_dict() for c in
+                            navservice.get_provider().suggest(q, lat, lng,
+                                                              session=session)]}
 
 
 @app.get("/nav/geocode")
@@ -750,7 +761,8 @@ def nav_destination_endpoint(body: dict = Body(...),
     is a question. RIO never silently picks one (§4).
     """
     res = navservice.resolve_destination(str(body.get("q") or ""),
-                                         body.get("lat"), body.get("lng"))
+                                         body.get("lat"), body.get("lng"),
+                                         session=str(body.get("session") or "") or None)
     if res["status"] == "ambiguous":
         sessions.log_nav(session_id, navevents.DESTINATION_AMBIGUOUS,
                          {"query": res["query"],
@@ -797,6 +809,7 @@ def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=N
     place_id = str(body.get("place_id") or "")
     label = str(body.get("label") or "")
     query = str(body.get("destination") or "")
+    session = str(body.get("session") or "") or None
     provider = navservice.get_provider()
     if previous is not None:
         # A reroute goes back to the SAME destination object, never to a
@@ -804,9 +817,14 @@ def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=N
         # part of town lands on a different Starbucks.
         destination = previous.destination
     elif place_id:
-        destination = provider.destination(place_id=place_id, label=label)
+        # Picking a suggestion is what ends the typing session, so the session
+        # id rides along with the selection — this lookup is the call the whole
+        # autocomplete session is billed as.
+        destination = provider.destination(place_id=place_id, label=label,
+                                           session=session)
     else:
-        destination = provider.destination(query=query, label=label)
+        destination = provider.destination(query=query, label=label,
+                                           session=session)
     if destination is None:
         sessions.log_nav(session_id, navevents.ROUTE_FAILED,
                          {"destination": query or label, "error": "unresolved destination"})

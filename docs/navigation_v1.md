@@ -350,6 +350,43 @@ the drive RIO would have made with no vision configured at all.
 
 ---
 
+## Destination entry
+
+Typing predicts. The box debounces (~250 ms), asks `/nav/suggest`, and renders
+what comes back; picking a prediction resolves **by place id**, never by
+re-searching the text, because the same name is frequently two places.
+
+Autocomplete is proxied through the server for two reasons: the key stays on
+one surface, and a provider-rendered dropdown cannot be made to look like the
+rest of this dashboard.
+
+**Typing sessions.** RIO mints an opaque id for one typing session — everything
+between the first keystroke and the selection — and sends it with every suggest
+request and again with the selection. Providers may do what they like with it
+behind the boundary: Google turns it into an autocomplete session token, which
+groups a dozen keystroke requests and the final lookup into one billed session.
+The browser never holds a provider token, which is the API-key rule applied to
+the thing the key is spent on. The session is consumed by the resolution and a
+new one is minted the next time the driver types; a resolution with no typing
+behind it (a spoken destination, a reroute) opens none at all.
+
+**Submitting is the path underneath.** Suggestions are a convenience on top of
+it, never a gate in front of it: Enter or **Route** resolves whatever is in the
+box through the same provider, so an autocomplete outage costs prediction and
+nothing else. An ambiguous submission still asks which one was meant, and the
+choice renders through the same list.
+
+One thing worth knowing about the seam: the panel maps a suggestion to a row in
+exactly one function (`toSuggestion`), which drops any entry without an id or
+without something to read. When the panel and the endpoint once disagreed about
+field names, the dropdown filled with blank rows that routed to `undefined` —
+visible only after a click. A future drift now shows as "no suggestions" and
+the driver simply submits what they typed. `tools/nav_server_selftest.py` reads
+the field names out of that function and checks them against what
+`/nav/suggest` actually emits.
+
+---
+
 ## Dashboard
 
 Destination, ETA, next maneuver, distance to it, and four states shown

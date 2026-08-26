@@ -129,13 +129,21 @@ class FixtureProvider(NavigationProvider):
         self._fail_with = fail_with
         self.route_calls = 0
         self.landmark_calls = 0
+        self.sessions_seen = []
 
-    def suggest(self, query, lat=None, lng=None, limit=5):
+    def suggest(self, query, lat=None, lng=None, limit=5, session=None):
+        # Sessions are recorded rather than used: a provider with no session
+        # concept still has to accept one, and a test wants to see that the
+        # same id arrived on every keystroke and again on the selection.
+        if session:
+            self.sessions_seen.append(("suggest", session))
         d = self._route.destination
         return [DestinationCandidate(d.display_name, d.formatted_address,
                                      d.provider_place_id, d.latitude, d.longitude)]
 
-    def destination(self, query="", place_id="", label=""):
+    def destination(self, query="", place_id="", label="", session=None):
+        if session:
+            self.sessions_seen.append(("destination", session))
         return self._route.destination
 
     def route(self, origin_lat, origin_lng, destination):
