@@ -515,11 +515,7 @@
       }).then(function (r) { return r.json(); })
         .then(function (j) {
           if (j.status === 'ambiguous') {
-            status('Which one?');
-            paintSuggestions((j.candidates || []).map(function (c) {
-              return { place_id: c.provider_place_id, text: c.formatted_address,
-                       main: c.display_name, secondary: c.formatted_address };
-            }));
+            offerDestinations(j.candidates);
             return;
           }
           if (j.status !== 'resolved') {
@@ -720,9 +716,20 @@
        a server-side change; nothing on this page needs to know which one
        answered.
        --------------------------------------------------------------------- */
+    /* RIO asked "which Getty?" out loud; the panel has to show which ones, or
+       the question has no answer the driver can give. */
+    function offerDestinations(candidates) {
+      status('Which one?');
+      paintSuggestions((candidates || []).map(function (c) {
+        return { place_id: c.provider_place_id, text: c.formatted_address,
+                 main: c.display_name, secondary: c.formatted_address };
+      }));
+    }
+
     RIO.nav = {
       setRoute: setRoute,
       routeToQuery: routeToQuery,
+      offerDestinations: offerDestinations,
       clearRoute: clearRoute,
       simulate: startSim,
       stopSimulation: stopSim,

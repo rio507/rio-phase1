@@ -104,13 +104,21 @@ class VisionObserver(LandmarkObserver):
                 continue
             for c, rep in zip(candidates, reports or []):
                 a = acc[c["anchor_id"]]
-                if not rep.get("visible"):
+                if not isinstance(rep, dict) or not rep.get("visible"):
+                    continue
+                # A reply that does not parse is read as "not visible", never
+                # as "probably". An adapter is a third party — a stray string
+                # where a number belongs must cost this landmark and nothing
+                # else.
+                ident = _number(rep.get("identity"))
+                clarity = _number(rep.get("clarity"))
+                if ident is None or clarity is None:
                     continue
                 a["visible"] = True
                 a["hits"] += 1
-                a["identity"].append(float(rep.get("identity") or 0.0))
-                a["clarity"].append(float(rep.get("clarity") or 0.0))
-                a["instances"] = max(a["instances"], int(rep.get("count") or 1))
+                a["identity"].append(ident)
+                a["clarity"].append(clarity)
+                a["instances"] = max(a["instances"], int(_number(rep.get("count")) or 1))
                 a["last_seen_t"] = max(a["last_seen_t"] or 0.0, frame.wall_t)
                 a["first_seen_t"] = min(a["first_seen_t"] or frame.wall_t, frame.wall_t)
                 side = rep.get("side")
@@ -150,6 +158,14 @@ class VisionObserver(LandmarkObserver):
                 "frames_examined": len(picked),
             }
         return out
+
+
+def _number(value) -> Optional[float]:
+    """A float, or None. Never an exception: see the caller."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _depth_for(acc_entry: dict) -> Optional[float]:

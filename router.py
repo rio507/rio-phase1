@@ -67,6 +67,18 @@ VEHICLE_HEALTH = "vehicle_health_question"
 # question the driver did not ask.
 DIAGNOSTIC_REPORT = "diagnostic_report_request"
 
+# "Take me to LAX." A destination, not a question about one — and routed here
+# for the same reason vehicle health is: a driver does not know or care which
+# subsystem answers them, and a second classifier living inside navigation
+# would eventually disagree with this one about what a sentence is.
+#
+# It never reaches the camera and never reaches a model. The destination phrase
+# is resolved through the navigation provider, which either finds one place or
+# asks which one was meant; RIO's reply is a deterministic line either way,
+# because a model composing "Routing to LAX" is a model that can compose
+# "Routing to LAS".
+NAVIGATION = "navigation_request"
+
 # Not in the spec's list, and needed: the spec names the type for "RIO must ask
 # which one", but a clarification is a two-turn exchange and the second turn --
 # the driver answering -- is a different thing to route. It never comes from the
@@ -77,7 +89,7 @@ PHASE_A_TYPES = {SCENE, OBJECT, FOLLOW_UP, NON_VISUAL}
 PHASE_B_TYPES = {COMPARISON, LANDMARK, READ_TEXT, CLARIFY, CLARIFY_RESPONSE}
 # Neither phase: a different axis entirely. Grouped so `classify` can be asked
 # "is this one of the non-visual specialisations" without listing them.
-NON_VISUAL_TYPES = {NON_VISUAL, VEHICLE_HEALTH, DIAGNOSTIC_REPORT}
+NON_VISUAL_TYPES = {NON_VISUAL, VEHICLE_HEALTH, DIAGNOSTIC_REPORT, NAVIGATION}
 
 # Below this the rules do not trust themselves and the model is asked.
 RULE_CONFIDENCE_MIN = 0.6
@@ -204,6 +216,33 @@ _DIAGNOSTIC_REPORT_PATTERNS = [
     r"\bare there any (error |fault |trouble )?codes?\b",
     r"\bany (error|fault|trouble) codes?\b",
     r"\bcheck (the |my )?(car|engine) for (codes?|faults?|problems?)\b",
+]
+
+# Setting a destination. Every one of these has to be followed by SOMETHING —
+# the trailing capture is not decoration, it is what separates "take me to the
+# airport" from "take me back", and an empty destination is not a navigation
+# request at all.
+#
+# Deliberately narrow. "Where are we" and "what's that building" are landmark
+# questions about the world outside and are matched earlier; the cost of a
+# false positive here is RIO announcing a route the driver did not ask for,
+# which is worse than the cost of typing the destination.
+_NAVIGATION_PATTERNS = [
+    r"\b(take|drive|get) (me|us) (to|back to)\s+\S+",
+    r"\bnavigate (to|me to)\s+\S+",
+    r"\b(directions|route) to\s+\S+",
+    r"\blet'?s (go|head) to\s+\S+",
+    r"\bset (a |the )?(route|destination) (to|for)\s+\S+",
+    r"\bhead (to|for)\s+\S+",
+    r"^\s*go to\s+\S+",
+]
+
+# ...and the phrasings that are ABOUT a route rather than a request for one.
+# "How far is it" is a question RIO answers from the route it already has, and
+# routing it as a destination request would restart the drive.
+_NAVIGATION_NEGATIVE = [
+    r"\bhow (far|long)\b", r"\bwhat'?s the eta\b", r"\bare we (there|close)\b",
+    r"\bcancel (the )?(route|navigation)\b", r"\bstop navigating\b",
 ]
 
 _LANDMARK_PATTERNS = [
@@ -342,6 +381,12 @@ def classify(question: str, has_referent: bool = False,
     if _any(_HEALTH_PATTERNS, text):
         return _result(VEHICLE_HEALTH, None, 0.85, "rules", t0)
 
+    # A destination, before any reading of the words as a question about the
+    # world. "Take me to the Shell station on Lincoln" names a place and asks
+    # to be driven there; the camera has nothing to add to it.
+    if _any(_NAVIGATION_PATTERNS, text) and not _any(_NAVIGATION_NEGATIVE, text):
+        return _result(NAVIGATION, extract_destination(question), 0.85, "rules", t0)
+
     # Phase B types first: they are more specific than the Phase A ones and
     # would otherwise be swallowed by them ("what does that sign say" contains
     # "what does that").
@@ -381,6 +426,22 @@ def classify(question: str, has_referent: bool = False,
             got["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
             return got
     return _result(NON_VISUAL, None, 0.4, "rules_default", t0)
+
+
+def extract_destination(text: str) -> str:
+    """The destination out of "Take me to LAX" -> "LAX".
+
+    One implementation, in navigation, used from both the panel and the voice
+    path — the two must not be able to disagree about what the driver named.
+    """
+    from navigation import service as navservice
+
+    return navservice.clean_destination_phrase(text)
+
+
+def is_navigation(request_type: str) -> bool:
+    """Is the driver asking to be taken somewhere?"""
+    return request_type == NAVIGATION
 
 
 def _result(request_type, reference, confidence, method, t0) -> dict:

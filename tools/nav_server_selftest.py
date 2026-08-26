@@ -581,6 +581,163 @@ def run_speech():
 
 
 # ---------------------------------------------------------------------------
+# H. Spoken destinations
+# ---------------------------------------------------------------------------
+def run_spoken():
+    section("H. spoken destinations — one classifier, one resolver, no model")
+    import router as request_router
+
+    for phrase in ("Take me to LAX", "Navigate to Griffith Observatory",
+                   "Directions to 123 Main Street", "Let's go to the Getty",
+                   "Set a route to the Ferry Building"):
+        r = request_router.classify(phrase, use_model=False)
+        ok(r["request_type"] == request_router.NAVIGATION,
+           f'"{phrase}" is a navigation request')
+
+    # ...and the near misses that must NOT be. A driver asking how far it is,
+    # or what that building is, has not asked to be taken anywhere, and routing
+    # them as a destination would restart the drive.
+    for phrase, why in (("how far is it", "a question about the route we are on"),
+                        ("where are we", "a landmark question"),
+                        ("what's that building", "a question about the world"),
+                        ("how are my tires", "a question about the car"),
+                        ("take me back", "names no destination at all")):
+        r = request_router.classify(phrase, use_model=False)
+        ok(r["request_type"] != request_router.NAVIGATION, f'"{phrase}" is not — {why}')
+
+    ok(request_router.classify("Take me to LAX", use_model=False)["object_reference"]
+       == "LAX",
+       "the destination phrase is extracted by navigation's own cleaner, not a second one")
+    ok(not request_router.is_visual(request_router.NAVIGATION),
+       "a destination request never reaches the camera")
+
+    ok(speech_mod.destination_reply("resolved", name="Griffith Observatory")
+       == "Routing to Griffith Observatory.",
+       "a resolved destination is confirmed with the provider's own name")
+    two = [{"display_name": "Getty Center"}, {"display_name": "Getty Villa"}]
+    ok(speech_mod.destination_reply("ambiguous", candidates=two)
+       == "I found two — Getty Center or Getty Villa. Which one?",
+       "an ambiguous one is a question naming both readings")
+    ok(speech_mod.destination_reply("not_found", query="Xyzzy")
+       == "I couldn't find Xyzzy.",
+       "and one that cannot be found is said plainly, not improvised around")
+
+
+# ---------------------------------------------------------------------------
+# I. The visual observer's own arithmetic
+# ---------------------------------------------------------------------------
+class ScriptedAdapter:
+    """Stands in for the resident VLM: a scripted answer per frame."""
+
+    def __init__(self, per_frame):
+        self.per_frame = list(per_frame)
+        self.calls = 0
+
+    def landmark(self, frame_jpeg, labels):
+        reports = self.per_frame[min(self.calls, len(self.per_frame) - 1)]
+        self.calls += 1
+        return [dict(reports.get(l, {"visible": False, "identity": 0.0,
+                                     "clarity": 0.0, "count": 0, "side": None,
+                                     "box": None})) for l in labels]
+
+
+def _ring_with(n_frames, spacing_s=1.0):
+    """A frame ring holding n frames, spaced in wall time.
+
+    push() stamps wall_t with the clock, so the spacing is applied afterwards —
+    the observer's frame thinning is a claim about elapsed time and cannot be
+    tested with frames that all arrived in the same millisecond.
+    """
+    import framebuf
+
+    ring = framebuf.FrameRing(seconds=30.0, max_frames=16)
+    now = time.time()
+    for i in range(n_frames):
+        rf = ring.push(b"jpegbytes", {"ok": True, "t": float(i),
+                                      "image": {"w": 1280, "h": 720},
+                                      "scene_objects": []})
+        rf.wall_t = now - (n_frames - 1 - i) * spacing_s
+    return ring
+
+
+def run_observer():
+    section("I. the visual observer — persistence, uniqueness, and abstention")
+    import framebuf
+
+    route = fixtures.city_route()
+    turn = route.maneuvers[0].route_distance_position
+    service.set_provider(fixtures.FixtureProvider(
+        route, [shell_near_turn(route, turn - 14, 12, "Shell")]))
+    service.reset()
+    r = service.build_route(route.geometry[0][0], route.geometry[0][1], route.destination)
+    cands = r.maneuvers[0].anchors
+
+    seen = {"visible": True, "identity": 0.9, "clarity": 0.8, "count": 1, "side": "right"}
+    unseen = {"visible": False, "identity": 0.0, "clarity": 0.0, "count": 0}
+
+    original_peek = framebuf.peek_ring
+    try:
+        ring = _ring_with(3)
+        framebuf.peek_ring = lambda key: ring
+        verify_mod.set_observer(verify_mod.VisionObserver())
+
+        verify_mod.set_adapter(ScriptedAdapter([{"Shell": seen}] * 3))
+        res = verify_mod.verify("session", cands)
+        ok(res["anchor"] is not None,
+           "a landmark held across three frames verifies")
+        ok(res["observation"]["observations"] == 3 and
+           res["observation"]["frames_examined"] == 3,
+           "and the count of observations is the count of frames it was in")
+        ok(res["observation"]["tracking_duration_s"] >= 1.9,
+           f"tracking duration is elapsed wall time, not a frame count "
+           f"({res['observation']['tracking_duration_s']:.1f} s)")
+        ok(res["observation"]["depth_m"] is None,
+           "no box means no depth, and no depth is not a rejection")
+
+        # Seen once out of three: a sign flickering in and out of view is not
+        # one a driver can be told to turn at.
+        verify_mod.set_adapter(ScriptedAdapter([{"Shell": seen},
+                                                {"Shell": unseen},
+                                                {"Shell": unseen}]))
+        ok(verify_mod.verify("session", cands)["anchor"] is None,
+           "a landmark seen in one frame of three does not")
+
+        # Two of them, in only one of the frames, still rejects.
+        verify_mod.set_adapter(ScriptedAdapter([
+            dict(Shell=dict(seen, count=2)), {"Shell": seen}, {"Shell": seen}]))
+        res = verify_mod.verify("session", cands)
+        ok(res["anchor"] is None and
+           "scene_uniqueness" in (res["rejections"].get("m0a0") or []),
+           "two Shells in a single frame is enough to reject the whole thing")
+
+        # A model that answers with nonsense answers "no".
+        class Nonsense:
+            def landmark(self, jpeg, labels):
+                return [{"visible": True, "identity": "very sure"}]
+        verify_mod.set_adapter(Nonsense())
+        res = verify_mod.verify("session", cands)
+        ok(res["anchor"] is None and res["reason"] != "observer_error",
+           "a malformed model reply is read as 'not visible' — not as 'probably', "
+           "and not as a crash")
+
+        # One frame in the window is not enough to persist anything.
+        ring2 = _ring_with(1)
+        framebuf.peek_ring = lambda key: ring2
+        verify_mod.set_adapter(ScriptedAdapter([{"Shell": seen}]))
+        res = verify_mod.verify("session", cands)
+        ok(res["anchor"] is None and res["reason"] == "not_enough_frames",
+           "a single frame in the window is not an observation")
+
+        framebuf.peek_ring = lambda key: None
+        ok(verify_mod.verify("session", cands)["reason"] == "camera_unavailable",
+           "and no ring at all is the camera being absent, which is fine")
+    finally:
+        framebuf.peek_ring = original_peek
+        verify_mod.set_adapter(None)
+        verify_mod.set_observer(None)
+
+
+# ---------------------------------------------------------------------------
 # Optional: one real provider route
 # ---------------------------------------------------------------------------
 def run_live():
@@ -620,6 +777,8 @@ def main():
     run_gates()
     run_verification()
     run_speech()
+    run_spoken()
+    run_observer()
     if args.live:
         run_live()
 

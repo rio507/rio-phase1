@@ -191,6 +191,31 @@ def text_for(route: "M.CanonicalRoute", maneuver_id: str, call_type: str,
     return man.speech.get(call_type)
 
 
+def destination_reply(status: str, name: str = "", candidates=None,
+                      query: str = "") -> str:
+    """What RIO says when the driver asks to be taken somewhere.
+
+    Deterministic, like everything else on this path, and for a sharper reason
+    than usual: a model composing "Routing to LAX" is a model that can compose
+    "Routing to LAS". The destination in this sentence is the one the provider
+    resolved, spelled the way the provider spelled it, or it is a question.
+    """
+    if status == "resolved":
+        return f"Routing to {name}." if name else "Routing there now."
+    if status == "ambiguous":
+        names = [c.get("display_name") or c.get("formatted_address", "")
+                 for c in (candidates or []) if c]
+        names = [n for n in names if n][:3]
+        if len(names) >= 3:
+            return (f"I found a few — {names[0]}, {names[1]}, or {names[2]}. "
+                    "Which one?")
+        if len(names) == 2:
+            return f"I found two — {names[0]} or {names[1]}. Which one?"
+        return "I found more than one place by that name. Which one did you mean?"
+    return (f"I couldn't find {query}." if query
+            else "I couldn't find that place.")
+
+
 def ttl_ms(call_type: str) -> int:
     """How long this call stays true, in milliseconds.
 

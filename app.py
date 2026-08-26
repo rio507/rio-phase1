@@ -1,5 +1,6 @@
 
 
+import json
 import math
 import os
 import sys
@@ -305,6 +306,13 @@ def _route_and_prepare(transcript: str, session_id: str):
             # is the only place that knows a question was asked, and the policy
             # is deliberately incapable of finding out on its own.
             _health_policy.note_status_request(time.time())
+        if request_router.is_navigation(route["request_type"]):
+            # The driver named a destination. Resolved HERE, on the server,
+            # through the same provider the panel uses, so a spoken request and
+            # a typed one cannot land on different places. Nothing is routed
+            # yet: the tracker is client-side and the browser decides when to
+            # attach a route, exactly as it does when the destination is typed.
+            route["navigation"] = _resolve_spoken_destination(transcript, session_id)
         if request_router.is_diagnostic_report(route["request_type"]):
             # ...and this one asked RIO to go and interrogate the car, which is
             # a different thing and is why it is a different intent. Run here,
@@ -325,6 +333,39 @@ def _route_and_prepare(transcript: str, session_id: str):
     except Exception as e:
         print(f"[talk] visual routing failed: {type(e).__name__}: {e}", flush=True)
         return None, None
+
+
+def _resolve_spoken_destination(transcript: str, session_id: str = None) -> dict:
+    """"Take me to LAX" -> a destination, or a question about which one.
+
+    Returns what the browser needs to act on plus the exact line RIO says. The
+    line is a template (navigation/speech.py): a model composing "Routing to
+    LAX" is a model that can compose "Routing to LAS", and the destination is
+    the one part of this sentence that has to be the provider's own word.
+    """
+    try:
+        res = navservice.resolve_destination(transcript)
+    except Exception as e:
+        print(f"[talk] destination resolution failed: {type(e).__name__}: {e}",
+              flush=True)
+        return {"status": "not_found", "query": transcript,
+                "spoken": navspeech.destination_reply("not_found")}
+    status = res["status"]
+    query = res.get("query", "")
+    if status == "resolved":
+        dest = res["destination"].to_dict()
+        return {"status": status, "query": query, "destination": dest,
+                "spoken": navspeech.destination_reply(status,
+                                                      name=dest["display_name"])}
+    if status == "ambiguous":
+        sessions.log_nav(session_id, navevents.DESTINATION_AMBIGUOUS,
+                         {"query": query, "spoken": True,
+                          "candidates": [c["display_name"] for c in res["candidates"]]})
+        return {"status": status, "query": query, "candidates": res["candidates"],
+                "spoken": navspeech.destination_reply(status,
+                                                      candidates=res["candidates"])}
+    return {"status": "not_found", "query": query,
+            "spoken": navspeech.destination_reply("not_found", query=query)}
 
 
 @app.post("/talk")
@@ -365,8 +406,15 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
         reply_parts = []
         audio_len = 0
 
-        tokens = va.stream() if va is not None \
-            else llm_interface.generate_stream(transcript, route)
+        nav_action = (route or {}).get("navigation")
+        if nav_action:
+            # A destination request is answered from a template, not a model.
+            # One "token", so the sentence reaches TTS in one piece.
+            tokens = iter([nav_action["spoken"]])
+        elif va is not None:
+            tokens = va.stream()
+        else:
+            tokens = llm_interface.generate_stream(transcript, route)
 
         for token in tokens:
             buffer += token
@@ -413,6 +461,13 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
         "X-Request-Type": request_type,
         "Access-Control-Expose-Headers": "X-Transcript, X-Talk-Id, X-Request-Type",
     }
+    # A resolved (or ambiguous) destination rides back on a header so the panel
+    # can set the route — or offer the choice — while RIO is still saying so.
+    # The browser gets a place id and a label, never a sentence to speak.
+    nav_action = (route or {}).get("navigation")
+    if nav_action:
+        headers["X-Nav-Action"] = quote(json.dumps(nav_action), safe="")
+        headers["Access-Control-Expose-Headers"] += ", X-Nav-Action"
     return StreamingResponse(streamer(), media_type="audio/mpeg", headers=headers)
 
 
@@ -443,6 +498,12 @@ async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=N
         return {"error": "no question"}
 
     route, va = await run_in_threadpool(_route_and_prepare, question, session_id)
+    nav_action = (route or {}).get("navigation")
+    if nav_action:
+        # Same answer /talk speaks, in text: the destination path is fully
+        # testable without a microphone or a speaker.
+        return {"reply": nav_action["spoken"], "request_type": route["request_type"],
+                "visual": False, "navigation": nav_action}
     if va is None:
         # Not a visual question (or the visual path is unavailable): answer it
         # the ordinary way rather than refusing, so /ask is a complete

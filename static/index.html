@@ -1958,6 +1958,27 @@ async function startRec() {
       // alone. Shown on the HUD; it is the fastest way to see a misroute.
       const requestType = r.headers.get('X-Request-Type') || '';
       if (transcript) RIO.ui.driver(transcript);
+      // "Take me to LAX." The server resolved the destination through the same
+      // provider the panel uses and is already saying so; this sets the route
+      // while RIO speaks. An ambiguous answer offers the choice instead — RIO
+      // asked which one, so the panel has to show which ones.
+      const rawNav = r.headers.get('X-Nav-Action');
+      if (rawNav && RIO.nav) {
+        try {
+          const act = JSON.parse(decodeURIComponent(rawNav));
+          if (act.status === 'resolved' && act.destination) {
+            RIO.nav.unlock();
+            RIO.nav.setRoute({
+              place_id: act.destination.provider_place_id || '',
+              destination: act.destination.provider_place_id ? ''
+                           : act.destination.formatted_address,
+              label: act.destination.display_name || act.destination.formatted_address,
+            });
+          } else if (act.status === 'ambiguous') {
+            RIO.nav.offerDestinations(act.candidates || []);
+          }
+        } catch (e) { console.warn('[nav] bad X-Nav-Action', e); }
+      }
       RIO.sayReply(player, await r.blob(), { talkId: talkId, type: requestType });
       RIO.ui.requestType(requestType);
       // Reply text only exists once the stream finished; pick it up from /last_talk.
