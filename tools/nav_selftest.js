@@ -429,8 +429,13 @@ section('speech validity — a reroute invalidates the generation it replaced');
   const route1 = synthRoute({ route_id: 'r1', generation_id: 1 });
   const tracker = navcore.create(route1);
   const spoken = [];
+  // The production wiring: the planner asks what generation is live NOW, and a
+  // reroute REPLACES the route object rather than editing it — so a planner
+  // that read its own captured route would believe generation 1 forever.
+  let live = route1;
   const planner = navplan.create({
     tracker: tracker, arbiter: arbiter, route: route1,
+    activeGeneration: () => live.generation_id,
     audio: (c) => ({ play: () => { spoken.push(c.text + ' @gen' + c.route_generation); },
                      stop: () => {} }),
   });
@@ -451,8 +456,12 @@ section('speech validity — a reroute invalidates the generation it replaced');
   ok(arbiter.state().queued.length > 0, 'a nav line is queued behind the warning');
   ok(spoken.length === 0, 'and nothing has been spoken — the warning has the mouth');
 
-  // ...then the driver leaves the route, and generation 2 replaces it.
-  route1.generation_id = 2;
+  // ...then the driver leaves the route, and a NEW route object — generation
+  // 2 of the same journey — replaces it. The old one is untouched, exactly as
+  // it is in the browser.
+  live = synthRoute({ route_id: 'r2', generation_id: 2 });
+  ok(route1.generation_id === 1,
+     'the replaced route object is not edited — it is simply no longer current');
   hold();
   await tick();
   ok(spoken.length === 0,

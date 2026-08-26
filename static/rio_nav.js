@@ -423,6 +423,11 @@
       planner = RIO.navplan.create({
         tracker: tracker, arbiter: RIO.speech, route: r,
         audio: audioFor, verify: verifyAnchor,
+        // The live generation, read from whatever route is active NOW. After a
+        // reroute this planner is no longer the current one, and anything it
+        // left in the arbiter's queue must fail validity on its own rather
+        // than relying on the queue having been cleared.
+        activeGeneration: function () { return route ? route.generation_id : -1; },
       });
       tracker.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
       planner.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });

@@ -99,6 +99,16 @@
     // expiry in here is expressed in the same units the tracker reports.
     var verify = cfg.verify || null;      // fn(request) -> Promise<anchor|null>
     var audio = cfg.audio || null;        // fn(candidate) -> {play, stop}
+    /* Which route generation is CURRENTLY live, asked freshly each time.
+     *
+     * Not `route.generation_id`: a reroute does not mutate the route object
+     * this planner was built with, it replaces it — so a planner holding
+     * generation 1 would go on believing generation 1 is current forever, and
+     * a line queued against it would still look valid at dequeue. The glue
+     * passes a function reading the active route; the fallback is only right
+     * for a planner that outlives nothing. */
+    var activeGeneration = cfg.activeGeneration ||
+        function () { return route.generation_id; };
 
     var opt = {}, k;
     for (k in DEFAULTS) opt[k] = DEFAULTS[k];
@@ -193,7 +203,7 @@
         b.acquiring = false;
         // A verification that lands after the route was replaced, or after the
         // maneuver was passed, describes a world that no longer exists.
-        if (stopped || gen !== route.generation_id) return;
+        if (stopped || gen !== activeGeneration()) return;
         if (tracker && tracker.isPassed && tracker.isPassed(man.id)) return;
         if (anchor && anchor.label) {
           anchor.valid_until = clock + (anchor.valid_for_s || opt.anchor_valid_for_s);
@@ -284,7 +294,7 @@
          expired. */
       function valid() {
         if (stopped) return false;
-        if (candidate.route_generation !== route.generation_id) return false;
+        if (candidate.route_generation !== activeGeneration()) return false;
         if (clock > candidate.expires_at) return false;
         if (!tracker) return true;
         var active = tracker.maneuver ? tracker.maneuver() : null;
