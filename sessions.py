@@ -313,6 +313,27 @@ def log_talk(session_id: Optional[str], transcript: str, reply: str, audio_bytes
     })
 
 
+def log_live(session_id: Optional[str], event: str, payload: Optional[dict] = None) -> None:
+    """One event from the live speech-to-speech conversation.
+
+    Its own kind, and a thin one on purpose. The live session's audio never
+    reaches this process — the browser talks to the model directly — so what
+    can be recorded here is the shape of the conversation rather than its
+    content: when a session opened, when RIO reached for the reasoning model,
+    what she asked it, how long it took and whether it worked.
+
+    That is exactly the part worth reviewing. "RIO went quiet for eight seconds
+    somewhere near the exit" is a question about escalation timing, and it is
+    unanswerable from a transcript.
+    """
+    if not session_id:
+        return
+    body = {"event": event}
+    if payload:
+        body.update(payload)
+    _write(session_id, "live", body)
+
+
 def log_visual_qa(session_id: Optional[str], meta: dict) -> None:
     """One visual conversation turn, every stage of it.
 

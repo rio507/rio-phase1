@@ -2008,12 +2008,78 @@ function stopRec() {
     RIO.ui.voice('idle');
   }
 }
-micBtn.addEventListener('mousedown', startRec);
-micBtn.addEventListener('mouseup', stopRec);
-micBtn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
-micBtn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
+/* ---- RIO live ------------------------------------------------------------
+   The mic button opens a speech-to-speech session and leaves it open: the
+   driver talks, RIO talks back, and either can interrupt the other. Press
+   again to end it.
+
+   Hold-to-talk is still here, underneath. If a live session cannot be started
+   — the model unavailable, no key, the feature switched off — the button
+   reverts to the recorder for the rest of the drive, which is exactly the path
+   that existed before and still answers through Whisper.
+
+   RIO's live audio comes out of the same element as everything else and claims
+   the mouth through the same arbiter, so a gap warning still cuts her off
+   mid-word. That is not incidental: it is the only reason a continuously open
+   microphone is safe to have in a car. */
+let live = null, liveMode = true, liveBusy = false;
+
+async function toggleLive() {
+  if (liveBusy) return;
+  RIO.unlockAudio(player);
+  if (live) {
+    live.stop();
+    live = null;
+    micBtn.textContent = 'Talk to RIO';
+    micBtn.classList.remove('recording');
+    RIO.ui.voice('idle');
+    return;
+  }
+  liveBusy = true;
+  micBtn.textContent = 'Connecting…';
+  try {
+    live = await RIO.realtime.connect({
+      arbiter: RIO.speech,
+      url: RIO.url,
+      element: player,
+      onEvent: (ev) => {
+        if (ev.type === 'LIVE_TRANSCRIPT' && ev.transcript) RIO.ui.driver(ev.transcript);
+        else if (ev.type === 'LIVE_RESPONSE_START') RIO.ui.voice('speaking');
+        else if (ev.type === 'LIVE_RESPONSE_END') RIO.ui.voice('listening');
+        else if (ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
+        else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
+      },
+    });
+    micBtn.textContent = 'End conversation';
+    micBtn.classList.add('recording');
+    RIO.ui.voice('listening');
+    obs.textContent = 'Live — just talk. She will stop when you do.';
+  } catch (e) {
+    // One failure is enough: fall back for the rest of the drive rather than
+    // making the driver discover it again at the next junction.
+    liveMode = false;
+    live = null;
+    micBtn.textContent = 'Hold to talk';
+    micBtn.classList.remove('recording');
+    obs.textContent = 'Live conversation unavailable (' +
+      (e && e.message ? e.message : e) + ') — hold to talk instead.';
+    console.warn('[live] falling back to hold-to-talk:', e);
+  } finally {
+    liveBusy = false;
+  }
+}
+
+if (micBtn) micBtn.textContent = 'Talk to RIO';
+
+micBtn.addEventListener('mousedown', () => { if (liveMode) toggleLive(); else startRec(); });
+micBtn.addEventListener('mouseup', () => { if (!liveMode) stopRec(); });
+micBtn.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (liveMode) toggleLive(); else startRec();
+});
+micBtn.addEventListener('touchend', e => { e.preventDefault(); if (!liveMode) stopRec(); });
 // Without this a dragged-off or interrupted touch leaves the recorder running.
-micBtn.addEventListener('touchcancel', e => { e.preventDefault(); stopRec(); });
+micBtn.addEventListener('touchcancel', e => { e.preventDefault(); if (!liveMode) stopRec(); });
 micBtn.addEventListener('contextmenu', e => e.preventDefault());
 
 frameBtn.addEventListener('click', async () => {
@@ -3247,6 +3313,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 <!-- ---- Navigation. Loaded last, and in this order:
        rio_speech.js    the arbiter — must exist before anything asks to speak
+       rio_realtime.js  RIO's live speech-to-speech session — no DOM in the
+                        half that decides anything, so node can test it
        rio_navcore.js   the route tracker — no DOM, node-testable
        rio_navplan.js   the speech planner and the context lifecycle — likewise
        rio_nav.js       the panel, the map, the simulator, the logging
@@ -3260,6 +3328,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.RIO_MAPS_KEY = "__GOOGLE_MAPS_API_KEY__";
 </script>
 <script src="/static/rio_speech.js"></script>
+<script src="/static/rio_realtime.js"></script>
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>

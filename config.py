@@ -3,8 +3,52 @@ import os
 # RIO prompts now sourced from rio_prompts.py (compiled from behavior bible v1)
 from rio_prompts import RIO_SYSTEM_PROMPT
 
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+# Every model id RIO uses is named here and overridable from the environment,
+# so swapping one is a config change and not a search through the codebase.
+#
+#   REALTIME    RIO herself, live: her ears, her brain and her voice in one
+#               speech-to-speech session. The driver talks, she talks back, and
+#               either can interrupt the other.
+#   REASONING   the deeper, slower one, reached only as a TOOL the realtime
+#               model calls when a question needs research or careful work.
+#               Never a second voice — RIO speaks its result in her own.
+#   CHAT        the text conversation path (/talk, /ask), which is what answers
+#               when the live session is not running, and what the visual
+#               question path is built on.
+#   STT         Whisper. Kept deliberately: every transcript consumer outside
+#               the live loop — the session log, /last_talk, the router, the
+#               visual pipeline — reads what Whisper produced, and the live
+#               session is configured to transcribe with the same model so a
+#               drive's transcripts come from one place.
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
+OPENAI_REASONING_MODEL = os.getenv("OPENAI_REASONING_MODEL", "gpt-5.6-sol")
 OPENAI_CHAT_MODEL = "gpt-5.5"
 OPENAI_STT_MODEL = "whisper-1"
+
+# cedar or marin. Config, not code: it is the single most noticeable thing
+# about RIO and the one most likely to be argued about.
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "cedar")
+
+# The live session is the conversation path when it is available. Turning this
+# off returns RIO to hold-to-talk through Whisper and ElevenLabs, which is not
+# a degraded mode so much as the previous one — every other voice on the page
+# (headway, health, navigation) is unaffected either way, because none of them
+# has ever gone near a conversation model.
+REALTIME_ENABLED = True
+
+# How long RIO waits for the reasoning model before carrying on without it.
+# Sol answers a plain question in ~4 s and a web-search one in ~6 s; past this
+# the driver has been listening to silence for too long, and an answer she
+# gives from what she already knows is better than a better answer that arrives
+# after the exit.
+REALTIME_TOOL_TIMEOUT_S = 25.0
+# Let the reasoning model search when the question needs current information.
+REALTIME_WEB_SEARCH = True
+# A spoken answer is not a document. This bounds how long RIO can talk for.
+REALTIME_TOOL_MAX_OUTPUT_TOKENS = 3000
 
 OPENAI_TEMPERATURE = 1
 # gpt-5.5 is a reasoning model: max_completion_tokens covers reasoning AND output.
@@ -18,6 +62,17 @@ OPENAI_MAX_TOKENS = 300
 # spoken reply and the empty-reply failure cannot recur. "low" if RIO needs more.
 OPENAI_REASONING_EFFORT = "none"
 
+# ElevenLabs, and what it still does now that RIO speaks for herself.
+#
+# The live session generates RIO's own voice, so conversation no longer passes
+# through here. Everything DETERMINISTIC still does, and must: the headway
+# warnings, the vehicle-health announcements, the navigation instructions and
+# the pre-rendered alert clips are all spoken from fixed tables through
+# voice.synthesize_stream, and they are the lines that cannot be allowed to
+# depend on a conversational model being reachable.
+#
+# So this is not dormant code, it is a narrower job than it had. Turning the
+# live session off (REALTIME_ENABLED) puts conversation back through it too.
 VOICE_BACKEND = "elevenlabs"
 ELEVENLABS_MODEL = "eleven_flash_v2_5"
 
