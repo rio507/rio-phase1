@@ -32,6 +32,37 @@ OPENAI_STT_MODEL = "whisper-1"
 # about RIO and the one most likely to be argued about.
 OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "cedar")
 
+# --- deterministic speech through the live voice ---------------------------
+# Warnings, health announcements and turn instructions dictated to the live
+# session instead of synthesised separately. Off returns every one of them to
+# ElevenLabs, which is a supported configuration and not a degraded one.
+REALTIME_SPEECH_ENABLED = True
+
+# How long a dictated line may take to START before RIO gives up on the live
+# session and says it the other way.
+#
+# MEASURED on this stack, across two sessions: dictation reaches first audio in
+# 390-585 ms, ElevenLabs in 145-172 ms, a pre-rendered clip in 0. So the budget
+# sits above the observed worst case with room, and below a second: a false bail
+# costs a line in the fallback voice, while a budget that is too generous costs
+# the driver the delay AND the fallback on top of it.
+#
+# The lines where this would actually matter are not dictated at all — the red
+# tier and the tire fast path play local clips.
+REALTIME_SPEAK_TIMEOUT_MS = 900
+
+# Channels dictated to the live voice. Per-channel because they are not the
+# same kind of speech: a turn instruction six seconds out and a gap warning
+# that is already late have completely different tolerance for a few hundred
+# milliseconds.
+#
+# The most time-critical lines are not in here at all and never will be: the
+# red-tier headway warnings and the two tire fast-path lines play PRE-RENDERED
+# CLIPS from static/audio/, with no network in the path (docs/warning_logic_v2).
+# Those clips are rendered in the live voice, which is what makes "one voice
+# everywhere" true rather than approximately true.
+REALTIME_SPEECH_CHANNELS = {"nav": True, "health": True, "headway": True}
+
 # The live session is the conversation path when it is available. Turning this
 # off returns RIO to hold-to-talk through Whisper and ElevenLabs, which is not
 # a degraded mode so much as the previous one — every other voice on the page
@@ -62,18 +93,27 @@ OPENAI_MAX_TOKENS = 300
 # spoken reply and the empty-reply failure cannot recur. "low" if RIO needs more.
 OPENAI_REASONING_EFFORT = "none"
 
-# ElevenLabs, and what it still does now that RIO speaks for herself.
+# ElevenLabs: RIO's fallback voice, and nothing else now.
 #
-# The live session generates RIO's own voice, so conversation no longer passes
-# through here. Everything DETERMINISTIC still does, and must: the headway
-# warnings, the vehicle-health announcements, the navigation instructions and
-# the pre-rendered alert clips are all spoken from fixed tables through
-# voice.synthesize_stream, and they are the lines that cannot be allowed to
-# depend on a conversational model being reachable.
+# One voice everywhere was the goal, and two voices is what you get if the
+# warnings keep their own synthesiser: conversation in one, alerts in another,
+# with the alerts — the lines that matter most — sounding like a different
+# system. So deterministic speech is DICTATED to the live session, word for
+# word, and the pre-rendered clips are rendered in the same voice.
 #
-# So this is not dormant code, it is a narrower job than it had. Turning the
-# live session off (REALTIME_ENABLED) puts conversation back through it too.
-VOICE_BACKEND = "elevenlabs"
+# ElevenLabs stays wired up, complete, and off the active path. It is what
+# speaks when the live session is not there: no session open and one cannot be
+# started, the dictation timing out, the model refusing. That is not a
+# hypothetical — a car drives through tunnels — and it is the reason this is a
+# fallback rather than a deletion.
+# RIO's ACTIVE voice: the live session. Deterministic lines are dictated to it
+# and the pre-rendered clips are rendered in it.
+VOICE_BACKEND = "realtime"
+# ...and the voice that speaks when the live one cannot. Every server-side TTS
+# endpoint (/nav/voice, /headway_voice, /vehicle/health/voice) is now, by
+# definition, the fallback path: the browser only reaches for it when dictation
+# was not possible or did not start in time.
+VOICE_FALLBACK_BACKEND = "elevenlabs"
 ELEVENLABS_MODEL = "eleven_flash_v2_5"
 
 SYSTEM_PROMPT = RIO_SYSTEM_PROMPT

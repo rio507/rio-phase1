@@ -77,81 +77,38 @@
     if (ann.id === lastId) return;
     lastId = ann.id;
 
-    var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    var stopped = false;
-    var cleanup = null;      // set once the audio blob exists; see stop()
+    /* One voice for everything RIO says.
+
+       The urgent fast path still plays a PRE-RENDERED CLIP with no network in
+       its path — that bypass is the whole reason the fast path exists and it is
+       untouched. The clips are simply rendered in the same voice now.
+
+       Everything else is dictated to the live session, word for word, falling
+       back to the synthesiser when there is no session or dictation does not
+       start in time. The arbiter item around it is unchanged: still P2, still
+       group "health", still pre-empted by a gap warning. */
+    var clip = (ann.audio && ann.audio !== 'tts')
+      ? '/static/audio/' + ann.audio + '.mp3' : null;
+    var source = RIO.speak.provider({
+      text: ann.text || '',
+      channel: 'health',
+      // A clip line gets no TTS url: its whole point is never waiting on the
+      // network.
+      ttsUrl: clip ? null : '/vehicle/health/voice?id=' + encodeURIComponent(ann.id),
+      clipUrl: clip,
+      element: audio,
+    });
 
     RIO.speech.say({
       priority: RIO.speech.P.VEHICLE_HEALTH,
       group: 'health',
       id: 'health:' + ann.id,
-      text: ann.text || '',        // the policy's own words, until the audio confirms them
+      text: ann.text || '',        // the policy's own words, spoken verbatim
       ttlMs: TTL_MS,
       meta: { key: ann.key, type: ann.type, severity: ann.severity,
               reason: ann.reason },
-      play: function () {
-        /* The urgent fast path plays a pre-rendered clip instead of waiting on
-           a TTS round trip — the same mechanism, and the same argument, as the
-           headway red tier: 300-800 ms to first audio is exactly the delay a
-           fast path exists to avoid. Everything else is live TTS, addressed by
-           the id the server's policy issued. */
-        if (ann.audio && ann.audio !== 'tts') {
-          return new Promise(function (resolve, reject) {
-            var settled = false;
-            var done = function (fn) {
-              if (settled) return;
-              settled = true;
-              audio.onended = audio.onerror = null;
-              fn();
-            };
-            cleanup = function () { done(resolve); };
-            audio.onended = function () { done(resolve); };
-            audio.onerror = function () { done(reject); };
-            audio.src = '/static/audio/' + ann.audio + '.mp3';
-            var p = audio.play();
-            if (p && p.catch) p.catch(function (e) { done(function () { reject(e); }); });
-          });
-        }
-        return fetch('/vehicle/health/voice?id=' + encodeURIComponent(ann.id),
-                     ctl ? { signal: ctl.signal } : undefined)
-          .then(function (r) {
-            if (!r.ok) throw new Error('health voice ' + r.status);
-            var said = r.headers.get('X-Health-Text');
-            if (said) {
-              try { RIO.bus.emit('speaking', { text: decodeURIComponent(said) }); }
-              catch (e) {}
-            }
-            return r.blob();
-          })
-          .then(function (blob) {
-            if (stopped) return;
-            return new Promise(function (resolve, reject) {
-              var url = URL.createObjectURL(blob);
-              var settled = false;
-              var done = function (fn) {
-                if (settled) return;
-                settled = true;
-                audio.onended = audio.onerror = null;
-                URL.revokeObjectURL(url);
-                fn();
-              };
-              // A pre-empted line never reaches 'ended', so stop() has to be
-              // the one that releases the blob.
-              cleanup = function () { done(resolve); };
-              audio.onended = function () { done(resolve); };
-              audio.onerror = function () { done(reject); };
-              audio.src = url;
-              var p = audio.play();
-              if (p && p.catch) p.catch(function (e) { done(function () { reject(e); }); });
-            });
-          });
-      },
-      stop: function () {
-        stopped = true;
-        if (ctl) { try { ctl.abort(); } catch (e) {} }
-        try { audio.pause(); } catch (e) {}
-        if (cleanup) { cleanup(); cleanup = null; }
-      },
+      play: source.play,
+      stop: source.stop,
     });
   }
 

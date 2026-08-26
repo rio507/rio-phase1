@@ -56,8 +56,18 @@
     var speaking = null;      // { responseId, resolve, cancelled }
     var stopped = false;
     var counters = { responses: 0, interrupted: 0, barge_ins: 0,
-                     tool_calls: 0, tool_failures: 0 };
+                     tool_calls: 0, tool_failures: 0,
+                     dictated: 0, dictation_failures: 0 };
     var lastTranscript = '';
+    /* A dictated line — a warning, a turn, a health announcement — in flight.
+       It is NOT a conversation response and must never be treated as one: it
+       does not claim the mouth (its caller already holds it, at its own
+       priority) and it does not enter the conversation history. */
+    var dictation = null;
+    var verbatimInstruction = cfg.verbatimInstruction ||
+      'Read the text below out loud, exactly as written, word for word. ' +
+      'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
+    var speakTimeoutMs = cfg.speakTimeoutMs || 700;
 
     function emit(type, payload) {
       var ev = payload || {};
@@ -73,7 +83,16 @@
      * and an item that lasts a drive would either block every warning or be
      * pre-empted once and never recover. */
     function beginResponse(responseId) {
-      if (stopped || speaking) return;
+      if (stopped) return;
+      /* The first response after a dictation was sent IS that dictation. It
+         gets bound here rather than claiming the mouth: a warning arriving as
+         a conversation-priority item would be a warning that yields to
+         navigation, which is upside down. */
+      if (dictation && !dictation.responseId) {
+        dictation.responseId = responseId;
+        return;
+      }
+      if (speaking) return;
       var entry = { responseId: responseId, resolve: null, cancelled: false };
       speaking = entry;
       counters.responses++;
@@ -137,6 +156,33 @@
       }
     }
 
+    function dictationStarted() {
+      if (!dictation || dictation.started) return;
+      dictation.started = true;
+      if (dictation.timer) { clearTimeout(dictation.timer); dictation.timer = null; }
+      audio.unmute();
+      emit('LIVE_DICTATION_START', { text: dictation.text });
+      if (typeof dictation.onStart === 'function') {
+        try { dictation.onStart(); } catch (e) {}
+      }
+    }
+
+    function finishDictation(err) {
+      if (!dictation) return;
+      var d = dictation;
+      dictation = null;
+      if (d.timer) { clearTimeout(d.timer); d.timer = null; }
+      if (err) {
+        counters.dictation_failures++;
+        emit('LIVE_DICTATION_FAILED', { text: d.text, reason: err });
+        d.reject(new Error(err));
+      } else {
+        counters.dictated++;
+        emit('LIVE_DICTATION_END', { text: d.text, transcript: d.transcript || '' });
+        d.resolve({ transcript: d.transcript || '' });
+      }
+    }
+
     function toolCall(name, callId, argsJson) {
       counters.tool_calls++;
       emit('LIVE_TOOL_CALL', { tool: name, call_id: callId });
@@ -183,13 +229,31 @@
             beginResponse((ev.response && ev.response.id) || ev.response_id);
             break;
           case 'output_audio_buffer.started':
+            if (dictation && dictation.responseId === ev.response_id) {
+              // The line is being spoken. Whatever fallback was armed against
+              // this taking too long can stand down.
+              dictationStarted();
+              break;
+            }
             // Belt and braces: on some paths audio starts without a
             // response.created having been seen by this client.
             beginResponse(ev.response_id);
             break;
           case 'response.done':
           case 'output_audio_buffer.stopped':
+            if (dictation && dictation.responseId ===
+                ((ev.response && ev.response.id) || ev.response_id)) {
+              finishDictation(null);
+              break;
+            }
             endResponse((ev.response && ev.response.id) || ev.response_id);
+            break;
+          case 'response.output_audio_transcript.done':
+            // What the model says it said. The tests compare it with what it
+            // was asked to say; in the car it is what the log records.
+            if (dictation && dictation.responseId === ev.response_id) {
+              dictation.transcript = ev.transcript || '';
+            }
             break;
           case 'input_audio_buffer.speech_started':
             bargeIn();
@@ -211,17 +275,66 @@
 
       onEvent: function (fn) { if (typeof fn === 'function') listeners.push(fn); },
 
+      /* Dictate one deterministic line — a warning, a turn, a health
+         announcement — in RIO's voice, word for word.
+       *
+       * Out of band (`conversation: "none"`), so the line never enters the
+       * conversation history: a warning is a fact about the car, not something
+       * RIO said and can later be asked about.
+       *
+       * The caller already holds the mouth at its OWN priority, which is the
+       * whole point — a gap warning dictated here is still a gap warning, and
+       * it pre-empted the conversation before it got this far. That is also
+       * why this does not go anywhere near the arbiter itself.
+       *
+       * Rejects if audio has not STARTED within the timeout, so the caller can
+       * fall back to a synthesiser that is 200 ms away rather than wait on a
+       * session that has gone quiet. */
+      speak: function (text, opts) {
+        opts = opts || {};
+        var line = (text || '').trim();
+        if (stopped || !line) return Promise.reject(new Error('no session'));
+        if (dictation) return Promise.reject(new Error('busy'));
+        return new Promise(function (resolve, reject) {
+          dictation = {
+            text: line, resolve: resolve, reject: reject, started: false,
+            responseId: null, transcript: '', onStart: opts.onStart, timer: null,
+          };
+          dictation.timer = setTimeout(function () {
+            // Never heard it start. Give up on the live voice for this line;
+            // a warning that arrives late has stopped being a warning.
+            try { send({ type: 'response.cancel' }); } catch (e) {}
+            finishDictation('timeout');
+          }, opts.timeoutMs || speakTimeoutMs);
+          try {
+            audio.unmute();
+            send({
+              type: 'response.create',
+              response: {
+                conversation: 'none',
+                output_modalities: ['audio'],
+                instructions: verbatimInstruction + line,
+              },
+            });
+          } catch (e) {
+            finishDictation('send_failed');
+          }
+        });
+      },
+
       /* Ending the session releases the mouth: an item left claimed would
          block every conversational reply for the rest of the drive. */
       stop: function () {
         stopped = true;
         audio.mute();
+        if (dictation) finishDictation('session_stopped');
         if (speaking) endResponse(speaking.responseId);
       },
 
       state: function () {
         return {
           speaking: !!speaking,
+          dictating: !!dictation,
           response_id: speaking ? speaking.responseId : null,
           stopped: stopped,
           last_transcript: lastTranscript,
@@ -269,6 +382,11 @@
 
         var controller = createController({
           arbiter: arbiter,
+          // Dictation policy comes from the server with the session, so the
+          // browser holds no second copy of the verbatim instruction to drift
+          // from the one the tests check.
+          verbatimInstruction: session.verbatim_instruction,
+          speakTimeoutMs: session.speak_timeout_ms,
           send: function (obj) {
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));
           },
@@ -315,23 +433,46 @@
             return pc.setRemoteDescription({ type: 'answer', sdp: answer });
           })
           .then(function () {
-            return {
+            var handle = {
               session: session,
               controller: controller,
+              /* Dictate a deterministic line in RIO's voice. Warnings,
+                 turns and health announcements come through here; each of
+                 them already holds the mouth at its own priority. */
+              speak: function (text, o) { return controller.speak(text, o); },
+              speechEnabled: function (channel) {
+                if (session.speech_enabled === false) return false;
+                var chans = session.speech_channels || {};
+                return chans[channel] !== false;
+              },
               stop: function () {
                 controller.stop();
                 try { channel.close(); } catch (e) {}
                 try { pc.close(); } catch (e) {}
                 mic.getTracks().forEach(function (t) { t.stop(); });
                 element.srcObject = null;
+                if (active === handle) active = null;
               },
             };
+            active = handle;
+            return handle;
           });
       });
   }
 
+  /* The one live session, if there is one. Deterministic speech asks for it
+     by name rather than being handed it: a warning fires from a code path that
+     has never heard of the conversation panel and must not have to. */
+  var active = null;
+
   root.RIO = root.RIO || {};
-  root.RIO.realtime = { createController: createController, connect: connect };
+  root.RIO.realtime = {
+    createController: createController,
+    connect: connect,
+    active: function () { return active; },
+    /* Tests and the panel: pretend a session is open, or that none is. */
+    _setActive: function (h) { active = h; },
+  };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController };

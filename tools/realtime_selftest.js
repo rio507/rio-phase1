@@ -285,6 +285,207 @@ section('transcripts');
   ok(h.events.some(e => e.type === 'LIVE_TRANSCRIPT'), 'and emitted as an event');
 }
 
+// ---------------------------------------------------------------------------
+section('dictation — a deterministic line, in RIO\'s voice, word for word');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  const p = h.controller.speak('Back off — now.');
+  await tick();
+  const req = h.sent.find(e => e.type === 'response.create');
+  ok(!!req, 'a dictated line goes out as a response.create');
+  ok(req && req.response.conversation === 'none',
+     'OUT OF BAND — a warning is a fact about the car, not something RIO said '
+     + 'and can be asked about later');
+  ok(req && req.response.output_modalities.join() === 'audio',
+     'audio only: nothing is written back into the transcript');
+  ok(req && req.response.instructions.indexOf('Back off — now.') >= 0,
+     'carrying the exact words the policy wrote');
+  ok(req && /word for word/i.test(req.response.instructions),
+     'under an instruction to read them verbatim');
+
+  ok(h.arbiter.state().speaking === null,
+     'and it does NOT claim the mouth as conversation — the caller already '
+     + 'holds it, at the priority the line deserves');
+
+  h.controller.handle({ type: 'response.created', response: { id: 'd1' } });
+  h.controller.handle({ type: 'output_audio_buffer.started', response_id: 'd1' });
+  await tick();
+  ok(h.audio.muted === false, 'the audio is audible while it speaks');
+  ok(h.arbiter.state().speaking === null,
+     'still no conversation item — a dictated response is not a reply');
+
+  h.controller.handle({ type: 'response.output_audio_transcript.done',
+                        response_id: 'd1', transcript: 'Back off — now.' });
+  h.controller.handle({ type: 'response.done', response: { id: 'd1' } });
+  const done = await p;
+  ok(done.transcript === 'Back off — now.',
+     'and it reports back what the model says it said, for the verbatim check');
+  ok(h.controller.state().counters.dictated === 1, 'counted as one dictated line');
+}
+
+{
+  const h = harness();
+  let failed = null;
+  h.controller.speak('Watch your distance.', { timeoutMs: 20 })
+    .catch(e => { failed = e.message; });
+  await new Promise(r => setTimeout(r, 40));
+  ok(failed === 'timeout',
+     'a dictation that never starts is abandoned, not waited on');
+  ok(h.types().indexOf('response.cancel') >= 0,
+     'and the model is told to drop it, so it cannot speak over the fallback');
+  ok(h.controller.state().counters.dictation_failures === 1, 'counted as a failure');
+}
+
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  await tick();
+  ok(h.arbiter.state().speaking !== null, 'RIO is mid-sentence in conversation');
+  const warning = item({ priority: speech.P.SAFETY, group: 'headway', id: 'warn' });
+  h.arbiter.say(warning);
+  await tick();
+  const cancelAt = h.types().indexOf('response.cancel');
+  h.controller.speak('You\'re too close.');
+  await tick();
+  const speakAt = h.types().lastIndexOf('response.create');
+  ok(cancelAt >= 0 && cancelAt < speakAt,
+     'a warning cancels the conversation BEFORE it dictates over it — the two '
+     + 'cannot overlap in one audio stream');
+}
+
+// ---------------------------------------------------------------------------
+section('the fallback chain — a warning never waits on a cloud call');
+// ---------------------------------------------------------------------------
+{
+  // rio_speak.js is the piece that chooses: dictate, else synthesise, else
+  // play a clip. It runs in the browser, so the browser's three moving parts
+  // are stubbed and nothing else is.
+  const speak = require(path.join(__dirname, '..', 'static', 'rio_speak.js'));
+
+  function stubBrowser(opts) {
+    opts = opts || {};
+    const played = [];
+    global.URL = { createObjectURL: () => 'blob:x', revokeObjectURL: () => {} };
+    global.fetch = (url) => {
+      played.push('fetch:' + url);
+      if (opts.ttsFails) return Promise.reject(new Error('offline'));
+      return Promise.resolve({
+        ok: true, headers: { get: () => null },
+        blob: () => Promise.resolve({}),
+      });
+    };
+    const element = {
+      play: function () {
+        played.push('element:' + (this.src || 'preloaded'));
+        setTimeout(() => { if (this.onended) this.onended(); }, 0);
+        return Promise.resolve();
+      },
+      pause: () => {},
+    };
+    global.RIO.realtime = { active: () => opts.session || null };
+    speak.reset();
+    return { played, element };
+  }
+
+  {
+    const b = stubBrowser({
+      session: { speak: () => Promise.resolve({ transcript: 'x' }),
+                 speechEnabled: () => true },
+    });
+    const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
+                                 ttsUrl: '/headway_voice?line=too_close',
+                                 element: b.element });
+    await src.play();
+    ok(speak.stats().last === 'dictated',
+       'with a session open, the line is dictated in RIO\'s voice');
+    ok(b.played.length === 0, 'and nothing is fetched or synthesised');
+  }
+
+  {
+    const b = stubBrowser({ session: null });
+    const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
+                                 ttsUrl: '/headway_voice?line=too_close',
+                                 element: b.element });
+    await src.play();
+    ok(speak.stats().last === 'tts',
+       'with NO session, it falls straight through to the synthesiser — a '
+       + 'warning does not depend on a conversation being open');
+    ok(b.played.some(p => p.indexOf('/headway_voice') >= 0),
+       'through the endpoint that already existed');
+  }
+
+  {
+    const b = stubBrowser({
+      session: { speak: () => Promise.resolve(), speechEnabled: () => false },
+    });
+    const src = speak.provider({ text: 'Turn left by the Shell station.',
+                                 channel: 'nav', ttsUrl: '/nav/voice?x=1',
+                                 element: b.element });
+    await src.play();
+    ok(speak.stats().last === 'tts',
+       'a channel switched off falls back too, session or no session');
+  }
+
+  {
+    const b = stubBrowser({
+      session: { speak: () => Promise.reject(new Error('timeout')),
+                 speechEnabled: () => true },
+    });
+    const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
+                                 ttsUrl: '/headway_voice?line=too_close',
+                                 element: b.element });
+    await src.play();
+    ok(speak.stats().last === 'tts',
+       'dictation that times out falls back rather than going silent');
+  }
+
+  {
+    const b = stubBrowser({
+      ttsFails: true,
+      session: { speak: () => Promise.reject(new Error('timeout')),
+                 speechEnabled: () => true },
+    });
+    const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
+                                 ttsUrl: '/headway_voice?line=too_close',
+                                 clipUrl: '/static/audio/too_close.mp3',
+                                 element: b.element });
+    await src.play();
+    ok(speak.stats().last === 'clip',
+       'and when the synthesiser is unreachable too, the pre-rendered clip '
+       + 'plays — no network left in the path');
+    ok(b.played.some(p => p.indexOf('too_close.mp3') >= 0), 'from the local file');
+  }
+
+  {
+    const b = stubBrowser({ session: null, ttsFails: true });
+    const src = speak.provider({ text: 'x', channel: 'nav',
+                                 ttsUrl: '/nav/voice?x=1', element: b.element });
+    let threw = false;
+    await src.play().catch(() => { threw = true; });
+    ok(threw && speak.stats().last === 'silent',
+       'with nothing left to try it reports silence rather than pretending');
+  }
+
+  delete global.fetch;
+  delete global.URL;
+}
+
+// ---------------------------------------------------------------------------
+section('the clip bypass is untouched');
+// ---------------------------------------------------------------------------
+{
+  const fs = require('fs');
+  const html = fs.readFileSync(path.join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  ok(html.indexOf("playElement(el, null)") >= 0,
+     'the red tier still plays its preloaded element directly, with no provider '
+     + 'and no network in the path');
+  const health = fs.readFileSync(path.join(__dirname, '..', 'static', 'rio_health.js'), 'utf8');
+  ok(health.indexOf("ttsUrl: clip ? null :") >= 0,
+     'and a health clip line is given no synthesiser url at all, so it cannot '
+     + 'wait on one');
+}
+
 console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ') + checks + ' checks');
 process.exit(failures ? 1 : 0);
 }

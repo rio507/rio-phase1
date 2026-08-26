@@ -163,54 +163,27 @@
     }
 
     function audioFor(candidate) {
-      var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-      var stopped = false;
-      var cleanup = null;
-      return {
-        play: function () {
-          var url = '/nav/voice?route_id=' + encodeURIComponent(candidate.route_id)
-                  + '&m=' + encodeURIComponent(candidate.maneuver_id)
-                  + '&call=' + encodeURIComponent(candidate.call_type)
-                  + (candidate.anchor_id ? '&anchor=' + encodeURIComponent(candidate.anchor_id) : '');
-          return fetch(url, ctl ? { signal: ctl.signal } : undefined)
-            .then(function (r) {
-              if (!r.ok) throw new Error('nav voice ' + r.status);
-              var said = r.headers.get('X-Nav-Text');
-              if (said) {
-                try { RIO.bus.emit('speaking', { text: decodeURIComponent(said) }); } catch (e) {}
-              }
-              return r.blob();
-            })
-            .then(function (blob) {
-              if (stopped) return;
-              return new Promise(function (resolve, reject) {
-                var url2 = URL.createObjectURL(blob);
-                var settled = false;
-                var done = function (fn) {
-                  if (settled) return;
-                  settled = true;
-                  navAudio.onended = navAudio.onerror = null;
-                  URL.revokeObjectURL(url2);
-                  fn();
-                };
-                // A pre-empted line never reaches 'ended', so stop() has to be
-                // the one that releases the blob.
-                cleanup = function () { done(resolve); };
-                navAudio.onended = function () { done(resolve); };
-                navAudio.onerror = function () { done(reject); };
-                navAudio.src = url2;
-                var p = navAudio.play();
-                if (p && p.catch) p.catch(function (e) { done(function () { reject(e); }); });
-              });
-            });
-        },
-        stop: function () {
-          stopped = true;
-          if (ctl) { try { ctl.abort(); } catch (e) {} }
-          try { navAudio.pause(); } catch (e) {}
-          if (cleanup) { cleanup(); cleanup = null; }
-        },
-      };
+      /* One voice for every line RIO says.
+
+         The sentence itself still comes from the ROUTE'S OWN TABLE — the
+         browser holds the text only because the server put it there — and it
+         is now dictated to the live session word for word rather than
+         synthesised separately. The fallback is the same /nav/voice endpoint
+         as before, addressed by (route, maneuver, call, anchor), which still
+         refuses anything that does not resolve to a line on a live route.
+
+         The arbiter item around this is untouched: same priority, same group,
+         same TTL, same pre-emption by anything that matters more. */
+      var url = '/nav/voice?route_id=' + encodeURIComponent(candidate.route_id)
+              + '&m=' + encodeURIComponent(candidate.maneuver_id)
+              + '&call=' + encodeURIComponent(candidate.call_type)
+              + (candidate.anchor_id ? '&anchor=' + encodeURIComponent(candidate.anchor_id) : '');
+      return RIO.speak.provider({
+        text: candidate.text || '',
+        channel: 'nav',
+        ttsUrl: url,
+        element: navAudio,
+      });
     }
 
     /* Landmark verification. The candidate list is NOT sent — the server takes

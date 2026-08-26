@@ -29,6 +29,7 @@ import argparse
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -301,9 +302,12 @@ def run_firewall():
     # conversation tier, and already yields to every warning. What must stay
     # unreachable is the DETERMINISTIC half — the code that decides a gap is
     # closing or that a turn is four seconds away.
+    # base64/io/wave arrived with clip rendering: turning PCM deltas into a WAV
+    # so the pre-rendered warnings can be produced in the same voice.
     ok(live_imports <= {"json", "os", "threading", "time", "typing", "openai",
-                        "config", "visual_qa", "router"},
-       f"and imports only conversation-side code ({sorted(live_imports)})")
+                        "config", "visual_qa", "router", "base64", "io", "wave"},
+       f"and imports only conversation-side code and stdlib "
+       f"({sorted(live_imports)})")
 
     # The instructions are the other half of it: the model is told in words,
     # because a model that CAN say a sentence has to be told not to.
@@ -466,8 +470,89 @@ def run_look():
 
 
 # ---------------------------------------------------------------------------
+# H. Dictation
+# ---------------------------------------------------------------------------
+def run_dictation():
+    section("H. dictation — deterministic lines in RIO's own voice")
+    r = realtime.verbatim_response("Back off — now.")
+    ok(r["conversation"] == "none",
+       "a dictated line is OUT OF BAND — it never enters the conversation, "
+       "because a warning is a fact about the car and not something RIO said")
+    ok(r["output_modalities"] == ["audio"], "audio only")
+    ok(r["instructions"].endswith("Back off — now."),
+       "with the policy's exact words at the end of the instruction")
+    for phrase in ("word for word", "Add nothing", "Do not rephrase",
+                   "not addressed to you"):
+        ok(phrase in r["instructions"],
+           f"and an instruction that says {phrase!r}")
+
+    ok(config.VOICE_BACKEND == "realtime",
+       f"RIO's active voice is the live session ({config.VOICE_BACKEND})")
+    ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
+       "with ElevenLabs kept as the fallback, complete and off the active path")
+
+    import voice
+    gen = voice.synthesize_stream("anything", backend="realtime")
+    try:
+        next(gen)
+        ok(False, "this process must not pretend it can produce the live voice")
+    except voice.VoiceUnavailable:
+        ok(True, "and this process refuses to fake the live voice rather than "
+                 "silently substituting the other one")
+    except Exception as e:
+        ok(False, f"unexpected error: {type(e).__name__}")
+
+    ok(config.REALTIME_SPEAK_TIMEOUT_MS <= 1000,
+       f"the dictation budget is short ({config.REALTIME_SPEAK_TIMEOUT_MS} ms) — "
+       "a warning that arrives late has stopped being a warning")
+    ok(set(config.REALTIME_SPEECH_CHANNELS) == {"nav", "health", "headway"},
+       "every deterministic channel has a switch")
+
+    # The browser must not hold its own copy of the verbatim instruction.
+    nav_js = open(os.path.join(REPO, "static", "rio_realtime.js")).read()
+    ok("session.verbatim_instruction" in nav_js,
+       "the panel takes the verbatim instruction from the session payload, so "
+       "there is one copy of it and it is this one")
+
+    # ...and the clip renderer must render in the same voice by default.
+    renderer = open(os.path.join(REPO, "tools", "render_alerts.py")).read()
+    ok("config.VOICE_BACKEND" in renderer,
+       "the pre-rendered clips are rendered in whatever RIO's active voice is")
+    ok("CLIP_RENDER_ATTEMPTS" in renderer and "_transcribe" in renderer,
+       "and are transcribed after transcoding, because a clip is written once "
+       "and played for months")
+
+
+# ---------------------------------------------------------------------------
 # Live
 # ---------------------------------------------------------------------------
+SPOKEN_NUMBERS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12", "twenty": "20", "thirty": "30",
+    "twentysix": "26", "twenty six": "26",
+}
+
+
+def spoken_norm(text: str) -> str:
+    """Compare what was SAID, not how a transcriber chose to spell it.
+
+    Whisper writes "twenty-six P S I" as "26 psi". That is a rendering
+    difference, not a paraphrase, and a verbatim check that fails on it would
+    be a check nobody keeps. Numbers are folded to digits and single letters
+    are joined, and NOTHING else is forgiven: a changed, added or dropped word
+    still fails.
+    """
+    t = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    for word, digit in sorted(SPOKEN_NUMBERS.items(), key=lambda kv: -len(kv[0])):
+        t = re.sub(r"\b" + word.replace(" ", r"\s+") + r"\b", digit, t)
+    # "p s i" -> "psi": a spelled-out acronym is the same sound either way.
+    t = re.sub(r"\b(?:([a-z]) )+([a-z])\b",
+               lambda m: m.group(0).replace(" ", ""), t)
+    return " ".join(t.split())
+
+
 def run_live():
     section("LIVE — both models, once each, against the real account")
     from openai import OpenAI
@@ -503,6 +588,99 @@ def run_live():
            "in prose meant to be spoken — no markdown reaching a voice")
 
 
+def run_verbatim():
+    section("VERBATIM — what it was asked to say, and what it actually said")
+    import io
+
+    from openai import OpenAI
+
+    from headway import live_policy
+
+    client = OpenAI()
+    lines = [
+        live_policy.LINE_TEXT[live_policy.LINE_TOO_CLOSE],
+        "Turn left by the Shell station.",
+        "The rear left tire is down to twenty-six P S I.",
+        "Right here.",
+    ]
+    for line in lines:
+        got = realtime.render_speech(line)
+        if not got.get("ok"):
+            ok(False, f"could not render {line!r}: {got.get('note')}")
+            continue
+        # Two different claims, checked separately:
+        #   what the model SAYS it said — catches a paraphrase outright;
+        #   what a different model HEARS in the audio — catches the first
+        #   claim being wrong, which is the only reason to do both.
+        ok(spoken_norm(got["transcript"]) == spoken_norm(line),
+           f"its own transcript matches: {line!r}")
+        buf = io.BytesIO(got["wav"])
+        buf.name = "line.wav"
+        heard = client.audio.transcriptions.create(
+            model=config.OPENAI_STT_MODEL, file=buf).text
+        same = spoken_norm(heard) == spoken_norm(line)
+        ok(same, f"and Whisper hears the same words back"
+                 + ("" if same else f" — heard {heard.strip()!r}"))
+
+
+def run_latency():
+    section("LATENCY — text to first audio, the old way and the new")
+    import statistics
+
+    import voice
+
+    line = "You're too close."
+    runs = 3
+
+    el = []
+    for _ in range(runs):
+        t0 = time.time()
+        stream = voice.synthesize_stream(line, backend="elevenlabs")
+        next(iter(stream))
+        el.append((time.time() - t0) * 1000)
+
+    warm = []
+    t_conn = time.time()
+    with realtime.client().realtime.connect(
+            model=config.OPENAI_REALTIME_MODEL) as conn:
+        conn.session.update(session={
+            "type": "realtime", "output_modalities": ["audio"],
+            "audio": {"output": {"voice": config.OPENAI_REALTIME_VOICE}}})
+        connect_ms = (time.time() - t_conn) * 1000
+        for _ in range(runs):
+            t0 = time.time()
+            conn.response.create(response=realtime.verbatim_response(line))
+            for event in conn:
+                if event.type == "response.output_audio.delta":
+                    warm.append((time.time() - t0) * 1000)
+                    break
+                if event.type == "error":
+                    break
+            for event in conn:
+                if event.type == "response.done":
+                    break
+
+    el_med = statistics.median(el)
+    rt_med = statistics.median(warm) if warm else float("inf")
+    print(f"    elevenlabs (fallback) : {el_med:6.0f} ms   {[round(x) for x in el]}")
+    print(f"    dictated (warm)       : {rt_med:6.0f} ms   {[round(x) for x in warm]}")
+    print(f"    opening a session     : {connect_ms:6.0f} ms  (only when none is open)")
+    print(f"    pre-rendered clip     :      0 ms  (local file, no network)")
+
+    ok(bool(warm), "the live voice speaks a dictated warning")
+    ok(rt_med < config.REALTIME_SPEAK_TIMEOUT_MS,
+       f"and starts inside the dictation budget ({rt_med:.0f} ms of "
+       f"{config.REALTIME_SPEAK_TIMEOUT_MS} ms), so the fallback does not fire "
+       "on a healthy session")
+    # Not a pass/fail: the number itself is the deliverable. What must hold is
+    # that the fallback is quicker, which is why it is the fallback.
+    print(f"    -> dictation costs {rt_med - el_med:+.0f} ms against the "
+          f"synthesiser on a warm session")
+    ok(el_med < rt_med,
+       f"the fallback is the faster path ({el_med:.0f} ms), which is why the "
+       "most time-critical lines are pre-rendered rather than either")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -516,8 +694,11 @@ def main():
     run_firewall()
     run_endpoints()
     run_look()
+    run_dictation()
     if args.live:
         run_live()
+        run_verbatim()
+        run_latency()
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)

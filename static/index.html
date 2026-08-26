@@ -2667,9 +2667,25 @@ document.addEventListener('DOMContentLoaded', () => {
       // this only bites if the device itself is stalled.
       ttlMs: 2500,
       meta: { line: sp.line, audio: sp.audio },
-      play: () => playElement(el, isTts
-        ? '/headway_voice?line=' + encodeURIComponent(sp.line) : null),
-      stop: () => { try { el.pause(); } catch (e) {} },
+      /* One voice. The three red-tier lines still play their PRE-RENDERED
+         clips straight off the preloaded element with no network in the path —
+         that bypass is the reason the tier exists and it is untouched; the
+         clips are simply rendered in RIO's voice now. The amber coaching lines
+         are dictated to the live session, word for word, and fall back to the
+         synthesiser if there is no session or dictation does not start inside
+         its budget. A warning never waits on a cloud call it is not getting. */
+      ...(isTts ? (() => {
+        const source = RIO.speak.provider({
+          text: sp.text || '',
+          channel: 'headway',
+          ttsUrl: '/headway_voice?line=' + encodeURIComponent(sp.line),
+          element: el,
+        });
+        return { play: source.play, stop: source.stop };
+      })() : {
+        play: () => playElement(el, null),
+        stop: () => { try { el.pause(); } catch (e) {} },
+      }),
     });
   }
 
@@ -3315,6 +3331,8 @@ document.addEventListener('DOMContentLoaded', () => {
        rio_speech.js    the arbiter — must exist before anything asks to speak
        rio_realtime.js  RIO's live speech-to-speech session — no DOM in the
                         half that decides anything, so node can test it
+       rio_speak.js     one voice for deterministic lines: dictate, else
+                        synthesise, else play the clip
        rio_navcore.js   the route tracker — no DOM, node-testable
        rio_navplan.js   the speech planner and the context lifecycle — likewise
        rio_nav.js       the panel, the map, the simulator, the logging
@@ -3329,6 +3347,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 <script src="/static/rio_speech.js"></script>
 <script src="/static/rio_realtime.js"></script>
+<script src="/static/rio_speak.js"></script>
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>

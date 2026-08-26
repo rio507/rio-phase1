@@ -116,6 +116,63 @@ after you have started is the most irritating thing an assistant can do.
 
 ---
 
+## One voice everywhere
+
+Deterministic lines — headway warnings, vehicle-health announcements,
+navigation instructions — are **dictated** to the live session rather than
+synthesised separately, so a warning and a conversation sound like the same
+person. They are written by policy code and must be spoken word for word, so
+they are not asked for, they are dictated:
+
+```json
+{"type": "response.create",
+ "response": {"conversation": "none",
+              "output_modalities": ["audio"],
+              "instructions": "<read this verbatim…>\n\nTEXT:\nYou're too close."}}
+```
+
+`conversation: "none"` matters more than it looks. A warning that landed in the
+transcript would become something RIO could refer back to, agree with, or be
+asked about — and it is a fact about the car, not a thing she said.
+
+**Verbatim is requested and then verified.** A model can always paraphrase, so
+what stops that shipping is the check, not the sentence: the tests transcribe
+the audio that came back and compare it with what was asked for, twice over —
+the model's own transcript (catches a paraphrase) and Whisper on the audio
+(catches the first claim being wrong). Comparison folds spoken numbers to
+digits, because "twenty-six P S I" transcribed as "26 psi" is a rendering
+difference; nothing else is forgiven.
+
+### The chain, and what never waits on it
+
+| | path | first audio |
+|---|---|---|
+| red-tier warnings, tire fast path | **pre-rendered clip**, local file | 0 ms |
+| everything else deterministic | dictated to the live session | 390–585 ms |
+| no session / dictation stalls | ElevenLabs, through the existing endpoints | 145–172 ms |
+| synthesiser unreachable too | the clip, if the line has one | 0 ms |
+
+A warning **never waits on a cloud call it is not getting**: dictation gets
+900 ms to *start* and is then abandoned, cancelled at the model so it cannot
+speak over the fallback. The lines where those milliseconds would genuinely
+matter are not dictated at all — they are local files, preloaded, with no
+network in the path. That bypass is unchanged; the clips are simply rendered in
+the same voice now (`python -m tools.render_alerts --force`), verified by
+transcribing the finished MP3 and re-rendering if it does not match.
+
+**The arbiter is untouched.** Every caller keeps the item it already had —
+same priority, same group, same TTL. Only the audio behind it changed. A gap
+warning is still P1 and still cuts RIO off mid-sentence; it now does so in her
+own voice, and the conversation is cancelled *before* the dictation starts,
+because both share one audio stream.
+
+**ElevenLabs is dormant, complete, and reachable.** `VOICE_BACKEND` is now
+`realtime`; `VOICE_FALLBACK_BACKEND` is `elevenlabs`. The server's TTS
+endpoints are the fallback path by definition — the browser only calls them
+when the live voice could not say the line — and `voice.synthesize_stream`
+refuses to pretend it can produce the live voice rather than silently
+substituting the other one.
+
 ## Whisper, still
 
 The live session is configured to transcribe its input with `whisper-1` — the

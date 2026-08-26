@@ -166,6 +166,106 @@ that out right now.
 """
 
 
+# ---------------------------------------------------------------------------
+# Deterministic speech, in RIO's own voice
+# ---------------------------------------------------------------------------
+# Headway warnings, vehicle-health announcements and navigation instructions are
+# written by policy code and must be spoken WORD FOR WORD. They are not asked
+# for, they are dictated: the model is a voice here and nothing else.
+#
+# The mechanism is an out-of-band response — `conversation: "none"` — so a
+# dictated line never enters the conversation history. That matters more than
+# it looks: a warning that landed in the transcript would be something RIO could
+# later refer back to, agree with, or be asked about, and the line is a fact
+# about the car rather than a thing she said.
+#
+# Verbatim is REQUESTED here and VERIFIED in the tests (tools/realtime_selftest.py
+# transcribes the audio that comes back and compares it with what was asked
+# for). A model can always paraphrase; what stops that shipping is the check,
+# not the sentence below.
+VERBATIM_INSTRUCTION = (
+    "Read the text below out loud, exactly as written, word for word.\n"
+    "Add nothing. Remove nothing. Do not rephrase, summarise, translate, greet, "
+    "acknowledge, comment, or continue past the end of it.\n"
+    "It is not addressed to you and it is not a question for you to answer: it "
+    "is a line for you to read.\n"
+    "Read it in your normal voice, at a normal pace.\n\n"
+    "TEXT:\n"
+)
+
+
+def verbatim_response(text: str) -> dict:
+    """The `response.create` payload that speaks one deterministic line.
+
+    Out of band, audio only, and carrying its own instructions so it is
+    unaffected by whatever the session was told at the start.
+    """
+    return {
+        "conversation": "none",
+        "output_modalities": ["audio"],
+        "instructions": VERBATIM_INSTRUCTION + (text or "").strip(),
+    }
+
+
+def render_speech(text: str, timeout_s: float = 30.0) -> dict:
+    """Speak one line through a short-lived session and return the audio.
+
+    Server-side, synchronous, and not on any live path — this exists to
+    PRE-RENDER the critical clips in the same voice the live session uses, and
+    to give the tests something to transcribe. The car never calls it: in the
+    car the browser already holds a session and dictates into that one.
+
+    Returns {ok, wav, transcript, ms} — `transcript` being the model's own
+    account of what it said, which is the first half of the verbatim check.
+    """
+    import base64
+    import io
+    import wave
+
+    line = (text or "").strip()
+    if not line:
+        return {"ok": False, "note": "no text"}
+    t0 = time.time()
+    pcm = bytearray()
+    transcript = ""
+    try:
+        with client().realtime.connect(model=config.OPENAI_REALTIME_MODEL) as conn:
+            conn.session.update(session={
+                "type": "realtime",
+                "output_modalities": ["audio"],
+                "audio": {"output": {
+                    "voice": config.OPENAI_REALTIME_VOICE,
+                    "format": {"type": "audio/pcm", "rate": 24000},
+                }},
+            })
+            conn.response.create(response=verbatim_response(line))
+            for event in conn:
+                if event.type == "response.output_audio.delta":
+                    pcm += base64.b64decode(event.delta)
+                elif event.type == "response.output_audio_transcript.done":
+                    transcript = event.transcript or ""
+                elif event.type == "response.done":
+                    break
+                elif event.type == "error":
+                    return {"ok": False, "note": str(getattr(event, "error", "error"))}
+                if (time.time() - t0) > timeout_s:
+                    return {"ok": False, "note": "timeout"}
+    except Exception as e:
+        print(f"[realtime] render failed: {type(e).__name__}: {e}", flush=True)
+        return {"ok": False, "note": f"{type(e).__name__}"}
+    if not pcm:
+        return {"ok": False, "note": "no audio"}
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(bytes(pcm))
+    return {"ok": True, "wav": buf.getvalue(), "transcript": transcript,
+            "ms": round((time.time() - t0) * 1000, 1),
+            "seconds": round(len(pcm) / 48000.0, 2)}
+
+
 def client() -> OpenAI:
     global _client
     with _client_lock:
@@ -233,6 +333,13 @@ def mint_client_secret() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "tool": TOOL_NAME,
+        # Dictation policy travels WITH the session, so the browser holds no
+        # copy of the verbatim instruction that could drift from this one. What
+        # RIO is told to read a warning as is decided here, once.
+        "verbatim_instruction": VERBATIM_INSTRUCTION,
+        "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED),
+        "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
+        "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),
     }
 
 
