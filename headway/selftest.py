@@ -1436,6 +1436,275 @@ def test_lane_advisory_only():
                                         ("speak", "voice", "line", "clip")),
           str(fired))
 
+
+def test_gap_is_never_negative():
+    """C: a coasted gap may be stale, absent or zero -- never negative.
+
+    The failure this pins down was on the screen: GAP -66.8 M, on a clip whose
+    lead drove off the end of the road. A constant-velocity model with a closing
+    ḋ and nothing to correct it walks d through zero and keeps going, and
+    `distance_m` reported whatever the state held.
+    """
+    from .filter import GAP_FLOOR_M
+    from .live import report_gap
+
+    # A lead closing hard, then gone: 30 m at -8 m/s, measured until it
+    # vanishes, then coasted for 20 s at the live loop's 4 fps.
+    f = HeadwayFilter()
+    d_true, dt = 30.0, 0.25
+    for _ in range(10):                      # 30 m -> 10 m, still a real gap
+        d_true -= 8.0 * dt
+        f.step(d_true, 0.9, dt)
+    check("filter has a closing rate before the lead is lost", f.d_dot < -3.0,
+          f"d_dot {f.d_dot:.2f} m/s")
+
+    ds = []
+    for _ in range(80):                      # 20 s of coasting
+        snap = f.step(None, 0.0, dt)
+        ds.append(snap["d"])
+    check("20 s of coasting never drives the gap below zero",
+          all(x >= GAP_FLOOR_M for x in ds),
+          f"min {min(ds):.2f} m (unclamped, 20 s at this closing rate "
+          f"reaches about {10.0 - 8.0 * 20.0:.0f} m)")
+    check("the gap floor actually engaged", f.n_clamped > 0,
+          f"clamped on {f.n_clamped} steps")
+    check("a gap pinned at the floor stops claiming to close", f.d_dot >= 0.0,
+          f"d_dot {f.d_dot:.2f} m/s")
+
+    # ...and the reported gap goes ABSENT long before any of that, because a
+    # measurement older than MAX_COAST_S is not a gap.
+    check("a fresh gap is reported", report_gap(12.0, 0.0) == (12.0, None))
+    check("a briefly coasted gap is still reported",
+          report_gap(12.0, S.MAX_COAST_S / 2) == (12.0, None),
+          "coasting under MAX_COAST_S is the filter doing its job")
+    check("a gap coasted past MAX_COAST_S is reported as absent",
+          report_gap(12.0, S.MAX_COAST_S + 0.01) == (None, "coasted_out"),
+          "the HUD draws '--', not a number nobody has measured for a second")
+    check("no filter state means no gap",
+          report_gap(None, 0.0) == (None, "no_estimate"))
+    check("a NaN gap is absent, not printed",
+          report_gap(float("nan"), 0.0) == (None, "not_finite"))
+
+    # The assertion is the backstop, and it must be live: if the floor is ever
+    # removed, this is what says so.
+    raised = False
+    try:
+        report_gap(-5.0, 0.0)
+    except AssertionError:
+        raised = True
+    check("a negative gap trips the assertion rather than being reported", raised,
+          "the floor is in filter.py; this is the tripwire under it")
+
+
+def test_box_size_vs_depth_plausibility():
+    """B: a range must be consistent with the size of the box carrying it."""
+    from . import plausibility as P
+
+    W, H = 1280, 720
+    f_px = P.focal_px(W)
+    check("focal length from the corridor's own FOV", 1050 < f_px < 1150,
+          f"f_px {f_px:.0f} at {W} px wide, 60 deg HFOV")
+
+    # The frame that prompted this: small boxes at the vanishing point carrying
+    # 2 m, 6 m and 9 m labels. A 14 px-tall car is ~120 m away, and there is no
+    # tolerance that makes it 6.
+    tiny = (600.0, 350.0, 618.0, 364.0)          # 14 px tall
+    for claimed in (2.0, 6.0, 9.0):
+        v = P.check("car", tiny, claimed, f_px, image_h=H)
+        check(f"a 14 px car at {claimed:.0f} m is refused", not v["ok"],
+              f"{v['reason']}, implied {v['implied_m']} m")
+    check("...and below the size floor it is refused as unmeasurable, not as wrong",
+          P.check("car", tiny, 2.0, f_px, image_h=H)["reason"] == "below_size_floor",
+          "a 14 px box is past the range where any depth means anything")
+
+    # Big enough to measure, still impossible.
+    small = (600.0, 340.0, 626.0, 365.0)         # 25 px tall -> ~70 m
+    v = P.check("car", small, 6.0, f_px, image_h=H)
+    check("a 25 px car cannot be 6 m away",
+          not v["ok"] and v["reason"] == "depth_too_near_for_box", f"implied {v['implied_m']} m")
+    v = P.check("car", small, 62.0, f_px, image_h=H)
+    check("...and the same box at 62 m is accepted", v["ok"],
+          f"window {v['window']} m")
+
+    # A real lead at a real distance is untouched. This is the check that keeps
+    # the gate from eating the thing it exists to protect.
+    lead = (560.0, 300.0, 720.0, 383.0)          # 83 px tall -> ~20 m
+    for claimed in (14.0, 20.0, 28.0):
+        v = P.check("car", lead, claimed, f_px, image_h=H)
+        check(f"a lead-sized box at {claimed:.0f} m is accepted", v["ok"],
+              f"window {v['window']} m")
+
+    # Truncation: a vehicle clipped by the frame bottom looks SHORTER than it
+    # is, so its implied range is an over-estimate and the near bound must not
+    # fire. The far bound still holds.
+    truncated = (400.0, 400.0, 900.0, float(H))
+    v = P.check("car", truncated, 4.0, f_px, image_h=H)
+    check("a vehicle clipped by the frame bottom keeps its near reading",
+          v["ok"] and v["truncated"],
+          "visible height understates a close vehicle — rejecting it would "
+          "throw away the one that matters most")
+    v = P.check("car", truncated, 90.0, f_px, image_h=H)
+    check("...but a clipped box still cannot be 90 m away", not v["ok"],
+          "true height >= visible height, so the far bound survives truncation")
+
+    # Classes carry their own sizes, and the check is only as sharp as the
+    # difference between them. A car and a pedestrian are within 30 cm of each
+    # other in HEIGHT, so this gate cannot tell them apart and does not try --
+    # it is a check on the RANGE attached to a box, not a second opinion on the
+    # class. Where the real sizes do differ it bites: the same box that is a
+    # car at 20 m cannot be a truck at 20 m, because a truck that close is far
+    # bigger than 55 px.
+    box55 = (600.0, 300.0, 620.0, 355.0)         # 55 px tall
+    v_car = P.check("car", box55, 20.0, f_px, image_h=H)
+    v_truck = P.check("truck", box55, 20.0, f_px, image_h=H)
+    check("the same box is plausible for a car at 20 m and not for a truck",
+          v_car["ok"] and not v_truck["ok"],
+          f"car window {v_car['window']} m, truck window {v_truck['window']} m")
+    check("a car and a pedestrian are NOT separated by height alone",
+          P.check("car", box55, 30.0, f_px, image_h=H)["ok"]
+          and P.check("pedestrian", box55, 30.0, f_px, image_h=H)["ok"],
+          "1.3-2.1 m against 1.2-2.05 m — this gate checks ranges, not classes")
+
+    # An unknown class gets no veto: geometry has no size on record for it.
+    check("a class with no size on record is not vetoed",
+          P.check("train", lead, 5.0, f_px, image_h=H)["ok"],
+          "the gate only speaks where it has evidence")
+
+    # No depth is not a plausibility failure, but it is still not a range.
+    v = P.check("car", lead, None, f_px, image_h=H)
+    check("a missing depth is reported as missing",
+          not v["ok"] and v["reason"] == "no_depth")
+
+
+def test_implausible_range_cannot_be_the_lead():
+    """B + C: a refused range keeps a phantom out of lead selection.
+
+    The wiring, not the geometry: live.py's depth_fn returns None for an
+    implausible reading, and this is what that None buys.
+    """
+    from . import anchor as A
+    from .membership import CandidateSet
+    from . import plausibility as P
+
+    corridor = A.EgoCorridor(1280, 720)
+    f_px = P.focal_px(1280)
+    cs = CandidateSet()
+
+    # Both boxes are placed where this camera model says they belong, because
+    # membership gates on the corridor's lane bounds at the box's bottom row and
+    # a box floating at the wrong row is not a test of anything.
+    #
+    # A real lead 20 m ahead: bottom row cy + f*h_cam/20 = 432, height
+    # f*1.5/20 = 83 px, width f*1.8/20 = 100 px. Squarely in lane.
+    lead_box = (590.0, 349.0, 690.0, 432.0)
+    # A phantom at the vanishing point: 26x25 px on the road-end texture, whose
+    # bottom row puts it ~144 m out, and which the depth model reads as 6 m.
+    # Nearer than the lead, so ungated it wins the lock outright.
+    phantom = (630.0, 345.0, 656.0, 370.0)
+    depths = {lead_box: 20.0, phantom: 6.0}
+
+    def depth_fn(box, label=None):
+        raw = depths.get(tuple(box))
+        v = P.check(label, box, raw, f_px, image_h=720)
+        return (raw if v["ok"] else None), (None if v["ok"] else v["reason"])
+
+    t = 0.0
+    for _ in range(12):
+        cs.observe([("car", lead_box, 0.9, {"confirmed": True}),
+                    ("car", phantom, 0.6, {"confirmed": True})], t)
+        cs.evaluate(corridor, t, depth_fn=depth_fn, allow_merge=False)
+        t += 0.25
+
+    lead, info = cs.select_lead(t)
+    check("the real lead is selected, not the nearer phantom",
+          lead is not None and tuple(lead.box) == lead_box,
+          f"lead range {None if lead is None else lead.range_m} m")
+    phantom_cand = [c for c in cs.candidates.values() if tuple(c.box) == phantom]
+    check("the phantom carries no range at all",
+          phantom_cand and phantom_cand[0].range_m is None,
+          f"reject reason {phantom_cand[0].range_reject if phantom_cand else '?'}")
+    check("...and the log says why",
+          phantom_cand and phantom_cand[0].range_reject == "depth_too_near_for_box")
+
+    # Without the gate the phantom wins, which is the point.
+    cs2 = CandidateSet()
+    t = 0.0
+    for _ in range(12):
+        cs2.observe([("car", lead_box, 0.9), ("car", phantom, 0.6)], t)
+        cs2.evaluate(corridor, t,
+                     depth_fn=lambda box, label=None: depths.get(tuple(box)),
+                     allow_merge=False)
+        t += 0.25
+    lead2, _ = cs2.select_lead(t)
+    check("ungated, the 6 m phantom takes the lead lock",
+          lead2 is not None and tuple(lead2.box) == phantom,
+          "this is the behaviour the plausibility veto removes")
+
+
+def test_vulnerable_road_users_are_seen_but_never_led():
+    """D: pedestrians and cyclists are tracked, and can never be a lead."""
+    from . import anchor as A
+    from .membership import CandidateSet, LEAD_LABELS
+    from . import detect as D
+
+    check("the detector emits pedestrians and cyclists",
+          "pedestrian" in D.COCO_TO_LABEL.values()
+          and "cyclist" in D.COCO_TO_LABEL.values(),
+          "there is no vehicle-only class filter in detect.py")
+    check("...and neither can ever be a following target",
+          "pedestrian" not in LEAD_LABELS and "cyclist" not in LEAD_LABELS,
+          f"LEAD_LABELS = {sorted(LEAD_LABELS)}")
+
+    corridor = A.EgoCorridor(1280, 720)
+    cs = CandidateSet()
+    ped = (600.0, 300.0, 640.0, 420.0)
+    t = 0.0
+    for _ in range(12):
+        cs.observe([("pedestrian", ped, 0.6, {"confirmed": True})], t)
+        cs.evaluate(corridor, t, depth_fn=lambda box, label=None: 18.0,
+                    allow_merge=False)
+        t += 0.25
+
+    lead, info = cs.select_lead(t)
+    check("a pedestrian dead ahead is not made the lead", lead is None,
+          f"reason {info.get('reason')}")
+    check("...but the system knows it is there",
+          info.get("n_vulnerable") == 1,
+          "n_vulnerable is reported on every frame")
+    cand = list(cs.candidates.values())[0]
+    check("...with a range and corridor membership of its own",
+          cand.range_m == 18.0 and cand.member,
+          "everything a warning needs, withheld only from lead selection")
+
+
+def test_unconfirmed_boxes_claim_no_range():
+    """A: below the size floor a detection is drawn, not measured."""
+    from . import anchor as A
+    from .membership import CandidateSet
+    from . import plausibility as P
+
+    corridor = A.EgoCorridor(1280, 720)
+    f_px = P.focal_px(1280)
+    cs = CandidateSet()
+    tiny = (620.0, 350.0, 636.0, 364.0)          # 14 px: under CONFIRM_MIN_PX
+
+    def depth_fn(box, label=None):
+        v = P.check(label, box, 40.0, f_px, image_h=720)
+        return (40.0 if v["ok"] else None), (None if v["ok"] else v["reason"])
+
+    t = 0.0
+    for _ in range(8):
+        cs.observe([("car", tiny, 0.7, {"confirmed": False})], t)
+        cs.evaluate(corridor, t, depth_fn=depth_fn, allow_merge=False)
+        t += 0.25
+    cand = list(cs.candidates.values())[0]
+    check("a sub-floor detection is marked unconfirmed", not cand.confirmed)
+    check("...and carries no range",
+          cand.range_m is None and cand.range_reject == "below_size_floor", "drawn, but never measured")
+    lead, _ = cs.select_lead(t)
+    check("...so it cannot become the lead", lead is None)
+
+
 def main():
     print("=" * 70)
     print("headway warning-logic v2 self-test (docs/warning_logic_v2.md)")
@@ -1466,6 +1735,11 @@ def main():
     test_lane_drift()
     test_lane_confidence_contribution()
     test_lane_advisory_only()
+    test_gap_is_never_negative()
+    test_box_size_vs_depth_plausibility()
+    test_implausible_range_cannot_be_the_lead()
+    test_vulnerable_road_users_are_seen_but_never_led()
+    test_unconfirmed_boxes_claim_no_range()
 
     passed = sum(1 for ok, _, _ in _results if ok)
     total = len(_results)

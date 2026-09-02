@@ -29,6 +29,7 @@ import vision
 from headway import anchor as anchor_mod
 from headway import depth as depth_mod
 from headway import lanes as lanes_mod
+from headway import plausibility as plaus_mod
 
 # Lend the app's Qwen to headway. Import-time so any entry point into this
 # module (endpoint, warm, self-test) is covered before the first anchor call.
@@ -297,11 +298,21 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         print(f"[perceive] lane detection unavailable: {e}", flush=True)
     corridor, lane_info = anchor_mod.build_corridor(base_corridor, lane_result)
 
+    # The same size-vs-depth veto the live loop applies (headway/plausibility.py),
+    # for the same reason and on the same geometry. This path draws boxes with
+    # distances on them too, and a distance nobody checked is a distance that
+    # can be 6 m on a 10 px box -- which is precisely what the overlay was
+    # showing. Qwen proposes the pixels here rather than RF-DETR, which if
+    # anything makes the check more necessary: a language model will happily
+    # invent a box on road-end texture.
+    f_px = getattr(corridor, "f_px", None) or plaus_mod.focal_px(width)
+
     boxes = []
     for label, box in parsed:
         x1, y1, x2, y2 = box
         distance_m = None
         conf = 0.0
+        reject = None
         if depth_map is not None:
             d, conf, _ = depth_mod.roi_depth(depth_map, box)
             if np.isfinite(d) and conf > 0.2:
@@ -316,6 +327,11 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             # so the box still carries a distance the driver can read.
             distance_m = round(float(geo["forward_m"]), 1)
 
+        verdict = plaus_mod.check(label, box, distance_m, f_px, image_h=height)
+        if distance_m is not None and not verdict["ok"]:
+            reject = verdict["reason"]
+            distance_m = None
+
         boxes.append({
             "label": label,
             "box": [round(float(x1), 1), round(float(y1), 1),
@@ -324,6 +340,10 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "lead": False,
             "in_corridor": bool(inside),
             "depth_conf": round(float(conf), 3),
+            # Parity with headway's scene_objects, so the overlay draws both
+            # layers by one rule: a box that cannot be measured shows "--".
+            "confirmed": bool(verdict["confirmed"]),
+            "range_reject": reject,
         })
 
     # Lead = nearest in-corridor vehicle, chosen by geometry exactly as

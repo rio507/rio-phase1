@@ -2639,7 +2639,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const runBtn = document.getElementById('runheadway');
   const preview = document.getElementById('preview');
 
-  const CADENCE_MS = 250;                 // ~4 fps
+  const CADENCE_MS = 250;                 // ~4 fps -- the LIVE camera's budget
+
+  /* Replay is a different problem from a live drive, and it was being paced
+     like one. On the road the 250 ms floor exists because a phone streaming
+     frames over a mobile link cannot do better and the warning has to be
+     current; on an uploaded clip there is no radio, no battery and no deadline,
+     and the only thing the fixed wait bought was boxes that visibly trailed
+     the cars they were on. So replay sends the next frame the moment the last
+     result lands and runs at whatever the server can do (~25-30 fps here
+     against a ~35 ms frame). The floor stays non-zero only to yield to the
+     event loop between frames. */
+  const REPLAY_CADENCE_MS = 10;
   const MPH_TO_MS = 0.44704;
   const CLIP_IDS = ['too_close', 'watch_distance', 'back_off'];
 
@@ -2845,8 +2856,12 @@ document.addEventListener('DOMContentLoaded', () => {
     elBand.textContent = BAND_LABEL[band] || band;
     elTau.textContent = (j && typeof j.tau_s === 'number') ? j.tau_s.toFixed(1) + 's' : '--';
     elTrend.textContent = (j && j.trend) || '--';
-    elGap.textContent = (j && typeof j.distance_m === 'number')
-      ? j.distance_m.toFixed(1) + ' m' : '--';
+    // The server sends null for a gap it will not stand behind -- no lead yet,
+    // or one coasted past MAX_COAST_S (headway/live.py report_gap). The >= 0
+    // guard is belt and braces under the filter's own floor: a negative gap is
+    // not a small gap, and this HUD showed -66.8 m once.
+    const gap = (j && typeof j.distance_m === 'number') ? j.distance_m : null;
+    elGap.textContent = (gap !== null && gap >= 0) ? gap.toFixed(1) + ' m' : '--';
     const s = speed();
     elSpeed.textContent = (s.v === null) ? '--' : s.v.toFixed(1) + ' m/s';
     if (elLanes) {
@@ -2891,6 +2906,27 @@ document.addEventListener('DOMContentLoaded', () => {
     return j;
   }
 
+  /* Resolve on the next frame the video element actually presents. Falls back
+     to a short timer where requestVideoFrameCallback is missing (Firefox), which
+     is the old behaviour and no worse than it was. */
+  function nextVideoFrame(el) {
+    if (typeof el.requestVideoFrameCallback !== 'function') {
+      return new Promise(r => setTimeout(r, 33));
+    }
+    return new Promise(r => {
+      let done = false;
+      const id = el.requestVideoFrameCallback(() => { done = true; r(); });
+      // A paused or stalled element never calls back, and the loop must not
+      // hang on it.
+      setTimeout(() => {
+        if (!done) {
+          try { el.cancelVideoFrameCallback(id); } catch (e) {}
+          r();
+        }
+      }, 250);
+    });
+  }
+
   function frameFrom(el, quality) {
     return new Promise((resolve, reject) => {
       if (!el.videoWidth || !el.videoHeight) return reject(new Error('video not ready'));
@@ -2933,17 +2969,29 @@ document.addEventListener('DOMContentLoaded', () => {
     runBtn.textContent = 'Stop Headway Run';
     if (preview.paused) { try { await preview.play(); } catch (e) {} }
 
+    let nFrames = 0, tStart = performance.now();
     while (videoRunning && !preview.ended) {
       if (preview.paused) { await new Promise(r => setTimeout(r, 200)); continue; }
       const t0 = performance.now();
       try {
+        // Wait for the next PRESENTED frame where the browser can tell us about
+        // one. Grabbing on a timer samples whatever happens to be in the video
+        // element, which at a high rate is often the same frame twice; rVFC
+        // grabs the frame the viewer is actually looking at, so a box drawn
+        // from it lands on the pixels that produced it.
+        await nextVideoFrame(preview);
+        if (!videoRunning || preview.paused || preview.ended) break;
         const blob = await frameFrom(preview);
         await sendFrame(blob, { el: preview, frameT: preview.currentTime });
+        nFrames++;
       } catch (e) { /* one bad frame must not end the run */ }
-      // Pace to the cadence rather than sleeping a flat 500 ms, so processing
-      // time does not silently halve the frame rate.
-      const wait = Math.max(0, CADENCE_MS - (performance.now() - t0));
+      const wait = Math.max(0, REPLAY_CADENCE_MS - (performance.now() - t0));
       await new Promise(r => setTimeout(r, wait));
+    }
+    const secs = (performance.now() - tStart) / 1000;
+    if (nFrames && secs > 0.5) {
+      console.log(`[headway] replay analysed ${nFrames} frames in ` +
+                  `${secs.toFixed(1)}s (${(nFrames / secs).toFixed(1)} fps)`);
     }
     videoRunning = false;
     runBtn.textContent = 'Run Headway On Video';
@@ -2995,6 +3043,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resetSession: resetSession,
     resetHud: resetHud,
     cadenceMs: CADENCE_MS,
+    replayCadenceMs: REPLAY_CADENCE_MS,
   };
 });
 </script>
@@ -3190,60 +3239,155 @@ document.addEventListener('DOMContentLoaded', () => {
 
     ctx.save();
     ctx.strokeStyle = color;
+    // `confirmed` is absent on older responses, which means "assume yes" —
+    // the field is additive and its absence must not dim every box.
+    const confirmed = (b.confirmed === undefined) ? true : !!b.confirmed;
+    ctx.globalAlpha = confirmed ? 1 : 0.55;
     ctx.lineWidth = b.lead ? 1.5 : 1;
     ctx.shadowColor = color;
     ctx.shadowBlur = b.lead ? 10 : 6;
+    if (!confirmed) ctx.setLineDash([3, 3]);
     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
     ctx.restore();
 
     if (b.lead) drawBrackets(x1, y1, x2, y2, LEAD);
 
     let text = label;
-    if (typeof b.distance_m === 'number') text += ' · ' + b.distance_m.toFixed(1) + 'm';
+    // Same rule as the headway layer: a range the server refused (implausible
+    // for the box size, or a box too small to measure) prints "--".
+    text += (typeof b.distance_m === 'number')
+      ? ' · ' + b.distance_m.toFixed(1) + 'm' : ' · --';
     if (b.lead) text = '▸ ' + text;
     // Above the box, unless that would clip off the top of the frame.
     const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
     drawLabel(text, Math.max(2, x1), ty, color);
   }
 
-  /* The live headway layer: one box, coloured by band, with the tau readout.
-     Drawn over the /perceive layer because it updates ~7x more often and it is
-     the one the driver is being warned about. */
-  function drawHeadway(m, r, drewCorridor) {
+  /* Extrapolate a box forward by the tracker's own velocity estimate.
+
+     Between results a box is drawn where the object WAS, and at 4 fps a car
+     crossing the frame is most of its own width past it by the time the next
+     one lands -- which is exactly the trailing the overlay was reported for.
+     scene_objects carry px/s per edge (membership.Candidate.vel_px), so the
+     gap can be filled by the same arithmetic the tracker already did.
+
+     Capped hard at MAX_EXTRAP_S. Extrapolation is a guess that gets worse the
+     longer it runs, and a box that keeps flying after its object stopped being
+     detected would be a worse lie than a box that lags. Past the cap the box
+     simply holds still until the next real detection. */
+  const MAX_EXTRAP_S = 0.35;
+
+  function advance(box, vel, ageS) {
+    if (!vel || !ageS) return box;
+    const k = Math.min(ageS, MAX_EXTRAP_S);
+    return [box[0] + (vel[0] || 0) * k, box[1] + (vel[1] || 0) * k,
+            box[2] + (vel[2] || 0) * k, box[3] + (vel[3] || 0) * k];
+  }
+
+  /* One detected road user. Colour says what it is and whether we can measure
+     it; the label never invents a number.
+
+     UNCONFIRMED (below the detector's size floor) is drawn dashed and dim with
+     no range, because "RIO can see something there but cannot tell you how far"
+     is a real state and hiding it would be worse than showing it. */
+  function drawSceneObject(m, o, ageS, bandColor) {
+    const box = advance(o.box, o.vel_px, ageS);
+    const x1 = m.x(box[0]), y1 = m.y(box[1]);
+    const x2 = m.x(box[2]), y2 = m.y(box[3]);
+    const color = o.is_lead ? (bandColor || LEAD)
+                            : (o.vulnerable ? AMBER : CYAN);
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = o.confirmed ? 1 : 0.55;
+    ctx.lineWidth = o.is_lead ? 2 : 1;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = o.is_lead ? 10 : 6;
+    if (!o.confirmed) ctx.setLineDash([3, 3]);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.restore();
+
+    let text = String(o.label || 'object');
+    // A range is printed only when the pipeline stands behind it: no depth, a
+    // box too small to measure, or a depth the box's own size rules out all
+    // arrive here as null and all print "--". See headway/plausibility.py.
+    text += (typeof o.range_m === 'number') ? ' · ' + o.range_m.toFixed(1) + 'm'
+                                            : ' · --';
+    const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
+    drawLabel(text, Math.max(2, x1), ty, color);
+    return { x1: x1, y1: y1, x2: x2, y2: y2 };
+  }
+
+  /* The live headway layer: EVERY road user the detector found, coloured by
+     what it is, with the lead called out in the band colour.
+
+     It used to draw one box -- the lead -- and nothing else, which is why two
+     pedestrians walking towards the camera on a coastal clip were detected,
+     tracked and logged while the screen showed nothing. Lead selection is
+     unchanged and still vehicle-only (membership.LEAD_LABELS): a pedestrian is
+     drawn, and can never be the thing a following distance is computed to. */
+  function drawHeadway(m, r, drewCorridor, ageS) {
     const color = BAND_COLOR[r.band] || BAND_COLOR.UNKNOWN;
     // /perceive only lands every ~15 s in headway mode, so if it has not drawn
     // a corridor this frame the headway result supplies one. Drawing both would
     // just double-stroke identical geometry.
     if (!drewCorridor) drawCorridor(m, r.corridor);
-    // Lanes under the box, over the corridor fill.
+    // Lanes under the boxes, over the corridor fill.
     drawLanes(m, r.lanes);
-    if (!r.lead_box) return;
 
-    const x1 = m.x(r.lead_box[0]), y1 = m.y(r.lead_box[1]);
-    const x2 = m.x(r.lead_box[2]), y2 = m.y(r.lead_box[3]);
+    const objs = (r.scene_objects || []).filter(o => o && o.box);
+    // Lead last, so its brackets sit on top of anything it overlaps.
+    objs.forEach(o => { if (!o.is_lead) drawSceneObject(m, o, ageS, color); });
+    const lead = objs.find(o => o.is_lead);
 
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = (r.band === 'UNSAFE') ? 2.5 : (r.band === 'GETTING_UNSAFE' ? 2 : 1.5);
-    ctx.shadowColor = color;
-    ctx.shadowBlur = (r.band === 'UNSAFE') ? 16 : 10;
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.restore();
-    drawBrackets(x1, y1, x2, y2, color);
+    if (!lead && !r.lead_box) return;
+    let px;
+    if (lead) {
+      px = drawSceneObject(m, lead, ageS, color);
+    } else {
+      // No scene_objects (an older server, or a lead held through a frame with
+      // no detection): fall back to the lead box alone, as before.
+      const b = r.lead_box;
+      px = { x1: m.x(b[0]), y1: m.y(b[1]), x2: m.x(b[2]), y2: m.y(b[3]) };
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = (r.band === 'UNSAFE') ? 2.5 : (r.band === 'GETTING_UNSAFE' ? 2 : 1.5);
+      ctx.shadowColor = color;
+      ctx.shadowBlur = (r.band === 'UNSAFE') ? 16 : 10;
+      ctx.strokeRect(px.x1, px.y1, px.x2 - px.x1, px.y2 - px.y1);
+      ctx.restore();
+    }
+    drawBrackets(px.x1, px.y1, px.x2, px.y2, color);
 
     const bits = [];
     if (typeof r.tau_s === 'number') bits.push('τ ' + r.tau_s.toFixed(1) + 's');
     else bits.push('τ --');
     if (r.trend) bits.push(r.trend);
-    if (typeof r.distance_m === 'number') bits.push(r.distance_m.toFixed(1) + 'm');
-    const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
-    drawLabel(bits.join(' · '), Math.max(2, x1), ty, color);
+    // Same rule as the HUD: a gap the server did not stand behind is "--".
+    if (typeof r.distance_m === 'number' && r.distance_m >= 0) {
+      bits.push(r.distance_m.toFixed(1) + 'm');
+    }
+    // Under the box, so it cannot collide with the object's own label above it.
+    const ty = Math.min(px.y2 + 14, wrap.clientHeight - 2);
+    drawLabel(bits.join(' · '), Math.max(2, px.x1), ty, color);
   }
+
+  /* How long a headway result stays the authority on what is in the scene.
+     While one is fresh, the /perceive box layer is not drawn at all: both
+     describe the same road users, /headway_frame does it every frame from a
+     detector while /perceive does it every ~15 s from a language model, and
+     drawing both put two boxes of different vintages on one car. The caption
+     and the corridor from /perceive are unaffected -- only its boxes. */
+  const HW_AUTHORITATIVE_MS = 1500;
 
   function redraw() {
     if (!resize()) return;
     wipe();
     if (!enabled) return;
+
+    const now = performance.now();
+    const hwAge = (lastHw && lastHw.t) ? (now - lastHw.t) / 1000 : null;
+    const hwFresh = hwAge !== null && hwAge * 1000 < HW_AUTHORITATIVE_MS;
 
     let drewCorridor = false;
     if (last && last.result) {
@@ -3257,10 +3401,12 @@ document.addEventListener('DOMContentLoaded', () => {
         // carries the same lane lines. Drawn here for the frames between
         // headway results.
         drawLanes(m, last.result.lanes);
-        const boxes = last.result.boxes || [];
-        // Lead last so its brackets sit on top of any box it overlaps.
-        boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
-        boxes.forEach(b => { if (b.lead) drawBox(m, b); });
+        if (!hwFresh) {
+          const boxes = last.result.boxes || [];
+          // Lead last so its brackets sit on top of any box it overlaps.
+          boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
+          boxes.forEach(b => { if (b.lead) drawBox(m, b); });
+        }
       }
     }
 
@@ -3268,8 +3414,27 @@ document.addEventListener('DOMContentLoaded', () => {
       const el = dims(lastHw.el) ? lastHw.el : mediaEl();
       const img = lastHw.result.image || {};
       const m = el ? mapper(el, img.w, img.h) : null;
-      if (m) drawHeadway(m, lastHw.result, drewCorridor);
+      if (m) drawHeadway(m, lastHw.result, drewCorridor, hwAge || 0);
     }
+  }
+
+  /* Redraw between results while the last one is still fresh, so extrapolated
+     boxes actually move instead of sitting still until the next response. One
+     rAF loop, started by a result and stopping itself when the result goes
+     stale -- an idle dashboard must not hold a repaint loop open. */
+  let extrapRaf = null;
+
+  function pumpExtrapolation() {
+    if (extrapRaf !== null) return;
+    const tick = () => {
+      extrapRaf = null;
+      if (!enabled || !lastHw || !lastHw.t) return;
+      const age = performance.now() - lastHw.t;
+      if (age > HW_AUTHORITATIVE_MS) { redraw(); return; }
+      redraw();
+      extrapRaf = requestAnimationFrame(tick);
+    };
+    extrapRaf = requestAnimationFrame(tick);
   }
 
   function render(result, el) {
@@ -3279,8 +3444,11 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function headway(result, el) {
-    lastHw = result ? { result: result, el: el || mediaEl() } : null;
+    lastHw = result
+      ? { result: result, el: el || mediaEl(), t: performance.now() }
+      : null;
     redraw();
+    if (lastHw) pumpExtrapolation();
   }
 
   function clear() { last = null; lastHw = null; redraw(); }

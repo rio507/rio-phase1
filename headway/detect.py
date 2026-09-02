@@ -54,6 +54,8 @@ import time
 import numpy as np
 import torch
 
+from . import plausibility
+
 # Where rfdetr's package directory is. NOT a constant: this used to be the
 # literal "/usr/local/lib/python3.12/dist-packages/rfdetr", which was true of
 # the pod it was written on and false the moment that pod was rebuilt on a
@@ -99,10 +101,55 @@ COCO_TO_LABEL = {
 # the candidate set.
 SCORE_MIN = 0.35
 
+# Per class, because the classes do not fail the same way. The vulnerable ones
+# sit LOWER than the vehicles on purpose: a pedestrian at 40 m is a few hundred
+# pixels of a person-shaped thing and scores worse than a car of the same
+# apparent size, and the cost of missing one is not symmetric with the cost of
+# drawing a spurious box. Nothing downstream can promote a pedestrian into a
+# following target (membership.LEAD_LABELS), so a generous floor here buys
+# recall without touching the warning path.
+SCORE_MIN_BY_LABEL = {
+    "car": 0.35,
+    "truck": 0.35,
+    "bus": 0.35,
+    "motorcycle": 0.30,
+    "pedestrian": 0.28,
+    "cyclist": 0.28,
+}
+
 # Detections below this many pixels tall are past the range where DA-V2 gives a
 # usable depth anyway (§7.2), and they dominate the candidate count on an open
 # motorway.
 MIN_BOX_PX = 12
+
+# Between MIN_BOX_PX and plausibility.CONFIRM_MIN_PX a detection is kept but
+# marked UNCONFIRMED: drawn, so the driver can see RIO has noticed something,
+# with no range claimed for it. A small box must also clear a HIGHER score to
+# be emitted at all, and that is the gate aimed squarely at the vanishing
+# point: road-end texture produces small boxes at low confidence, and real
+# distant vehicles produce small boxes at higher confidence. Size alone would
+# throw both away; score alone keeps both.
+SMALL_BOX_SCORE_MIN = 0.55
+
+# --- duplicate suppression --------------------------------------------------
+# RF-DETR is set-based and is not supposed to need NMS -- the Hungarian
+# matching in training is what removes duplicates, and on a well-separated
+# vehicle it does. It fails where the assignment is ambiguous, and the
+# vanishing point is the canonical ambiguous case: several queries land on the
+# same few pixels of road-end texture, each with its own slightly different box
+# and its own confidence, and none of them is suppressed. Observed as a cluster
+# of 4-5 overlapping "car" boxes at the horizon on a coastal clip.
+#
+# So the duplicates are removed here, greedily, highest score first.
+IOU_MERGE = 0.55        # two boxes of one class overlapping this much are one object
+CONTAIN_FRAC = 0.80     # ...or a small box mostly swallowed by a bigger one
+
+# Cross-class suppression applies only WITHIN this set. car/truck/bus/motorcycle
+# are competing readings of one object, so two of them on the same pixels means
+# one object and one wrong label. pedestrian and cyclist are deliberately NOT in
+# it: a cyclist IS a person on a bicycle, the two boxes genuinely coincide, and
+# suppressing one would delete a road user rather than a duplicate.
+EXCLUSIVE_LABELS = frozenset({"car", "truck", "bus", "motorcycle"})
 
 # --- the ego vehicle's own bonnet -------------------------------------------
 # A dashcam sees the host car's bonnet across the bottom of every frame, and
@@ -128,6 +175,152 @@ def _is_ego_bonnet(x1, y1, x2, y2, w, h) -> bool:
     return (y2 >= BONNET_BOTTOM_FRAC * h
             and bw >= BONNET_WIDTH_FRAC * w
             and (bw / bh) >= BONNET_MIN_ASPECT)
+
+
+def _iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0, 0.0
+    area_a = max(1e-6, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(1e-6, (b[2] - b[0]) * (b[3] - b[1]))
+    union = area_a + area_b - inter
+    # Second value is the CONTAINMENT fraction of the smaller box, which is the
+    # number that catches a nested duplicate: a 10 px box sitting entirely
+    # inside a 40 px box has an IoU of only 0.06 and a containment of 1.0.
+    return inter / union, inter / min(area_a, area_b)
+
+
+def _duplicates(dets):
+    """Greedy duplicate suppression. -> (kept, dropped)
+
+    `dets` is [(label, box, score), ...]; both lists returned hold the same
+    tuples, with the dropped ones carrying the id of the box that beat them so
+    a quality report can say WHICH cluster collapsed rather than only how many.
+
+    Highest score first, so the survivor of a cluster is the detection the model
+    was most sure of. Two boxes are the same object when they are the same class
+    and overlap past IOU_MERGE, when one is CONTAIN_FRAC swallowed by the other,
+    or when they are two different EXCLUSIVE_LABELS readings of the same pixels.
+    """
+    order = sorted(range(len(dets)), key=lambda i: -dets[i][2])
+    kept, dropped = [], []
+    for i in order:
+        label_i, box_i, score_i = dets[i][0], dets[i][1], dets[i][2]
+        beaten_by = None
+        for j in kept:
+            label_j, box_j = dets[j][0], dets[j][1]
+            same_class = label_i == label_j
+            exclusive = (label_i in EXCLUSIVE_LABELS and label_j in EXCLUSIVE_LABELS)
+            if not (same_class or exclusive):
+                continue
+            iou, contain = _iou(box_i, box_j)
+            if iou >= IOU_MERGE or contain >= CONTAIN_FRAC:
+                beaten_by = (j, round(iou, 3), round(contain, 3),
+                             "iou" if iou >= IOU_MERGE else "containment")
+                break
+        if beaten_by is None:
+            kept.append(i)
+        else:
+            dropped.append((i, beaten_by))
+    return kept, dropped
+
+
+def raw_boxes(scores, labels, boxes, w, h):
+    """Model output -> ([(label, box, score)], n_bonnet_rejected).
+
+    Road users only, no confidence gate.
+
+    Everything that is class-mappable, big enough to be a box at all, and not
+    our own bonnet. The confidence and duplicate gates are deliberately NOT
+    here: they are policy, they have changed once and will change again, and
+    keeping them separate is what lets one forward pass be re-gated two ways.
+    """
+    out, n_bonnet = [], 0
+    for s, c, b in zip(scores, labels, boxes):
+        name = COCO_TO_LABEL.get(int(c))
+        if name is None:
+            continue
+        x1, y1, x2, y2 = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        x1, x2 = max(0.0, min(x1, x2)), min(float(w), max(x1, x2))
+        y1, y2 = max(0.0, min(y1, y2)), min(float(h), max(y1, y2))
+        if (x2 - x1) < 4 or (y2 - y1) < MIN_BOX_PX:
+            continue
+        if _is_ego_bonnet(x1, y1, x2, y2, w, h):
+            n_bonnet += 1
+            continue
+        out.append((name, (x1, y1, x2, y2), float(s)))
+    return out, n_bonnet
+
+
+def gate(raw, dedupe: bool = True, score_min: float = None,
+         per_class: bool = True, size_floor: bool = True) -> dict:
+    """Apply the confidence and duplicate policy to raw boxes.
+
+    `per_class=False, size_floor=False, dedupe=False` reproduces the gating
+    this file shipped before any of it existed: one flat SCORE_MIN for every
+    class and every box size, and whatever duplicates the model emitted. That
+    combination is not used in production -- it is there so the quality harness
+    can measure what the gates actually removed rather than asserting it.
+    """
+    kept_pre, n_small = [], 0
+    for name, box, score in raw:
+        h_px = box[3] - box[1]
+        if per_class:
+            floor = SCORE_MIN_BY_LABEL.get(name, SCORE_MIN)
+        else:
+            floor = SCORE_MIN
+        if size_floor and h_px < plausibility.CONFIRM_MIN_PX:
+            floor = max(floor, SMALL_BOX_SCORE_MIN)
+        if score_min is not None:
+            floor = max(floor, float(score_min))
+        if score < floor:
+            # Counted separately when it is the SIZE that raised the bar: that
+            # is the gate the vanishing-point cluster dies on, and its rate is
+            # what the quality report leads with.
+            if score >= SCORE_MIN_BY_LABEL.get(name, SCORE_MIN):
+                n_small += 1
+            continue
+        kept_pre.append((name, box, score))
+
+    if dedupe:
+        keep_idx, dropped = _duplicates(kept_pre)
+        kept = [kept_pre[i] for i in keep_idx]
+    else:
+        kept, dropped = list(kept_pre), []
+
+    dets = [(name, box, score,
+             {"confirmed": (box[3] - box[1]) >= plausibility.CONFIRM_MIN_PX,
+              "h_px": round(box[3] - box[1], 1)})
+            for name, box, score in kept]
+
+    # Largest first, which on a forward-facing camera is nearest first. The
+    # membership layer re-ranks by measured depth; this only makes truncation
+    # or a debug dump show the vehicles that matter at the top.
+    dets.sort(key=lambda d: -((d[1][2] - d[1][0]) * (d[1][3] - d[1][1])))
+
+    return {
+        "detections": dets,
+        "n_duplicates_dropped": len(dropped),
+        "n_small_rejected": n_small,
+        "n_unconfirmed": sum(1 for d in dets if not d[3]["confirmed"]),
+        "duplicates": [{"label": kept_pre[i][0],
+                        "box": [round(v, 1) for v in kept_pre[i][1]],
+                        "score": round(kept_pre[i][2], 3),
+                        "beaten_by": [round(v, 1) for v in kept_pre[j][1]],
+                        "iou": iou, "containment": contain, "rule": rule}
+                       for i, (j, iou, contain, rule) in dropped],
+    }
+
+
+def _score_floor(label, h_px):
+    """The confidence this detection has to clear, given its class and size."""
+    floor = SCORE_MIN_BY_LABEL.get(label, SCORE_MIN)
+    if h_px < plausibility.CONFIRM_MIN_PX:
+        floor = max(floor, SMALL_BOX_SCORE_MIN)
+    return floor
 
 _model = None
 _postproc = None
@@ -327,12 +520,27 @@ def _preprocess(frame_bgr):
     return t.to(_dtype)
 
 
-def detect(frame, score_min: float = SCORE_MIN, variant: str = None) -> dict:
+def detect(frame, score_min: float = None, variant: str = None,
+           dedupe: bool = True) -> dict:
     """Detect road users in one BGR frame.
 
+    Args:
+        score_min  extra global confidence floor. None (the default) uses
+                   SCORE_MIN_BY_LABEL alone; a number is applied ON TOP of the
+                   per-class floors, never below them, so a caller can ask for
+                   less noise but never for a class gate looser than the table.
+        dedupe     False reproduces the pre-suppression behaviour verbatim.
+                   Only tools/detect_quality.py passes it, to measure the
+                   before/after on the same frames.
+
     Returns:
-        detections  [(label, (x1, y1, x2, y2), score), ...] in FRAME pixels,
-                    nearest-looking first (largest box first)
+        detections  [(label, (x1, y1, x2, y2), score, info), ...] in FRAME
+                    pixels, nearest-looking first (largest box first). `info`
+                    carries `confirmed` (the box clears the size floor, so a
+                    range may be claimed for it) and `h_px`. Consumers that
+                    predate it read the first three fields and are unaffected.
+        n_duplicates_dropped  how many boxes were suppressed as duplicates
+        n_small_rejected      how many failed the size/score floor
         timing_ms   forward / postprocess / total
     """
     t0 = time.perf_counter()
@@ -353,37 +561,23 @@ def detect(frame, score_min: float = SCORE_MIN, variant: str = None) -> dict:
         labels = res["labels"].detach().cpu().numpy()
         boxes = res["boxes"].detach().cpu().numpy()
 
-    dets = []
-    n_bonnet = 0
-    for s, c, b in zip(scores, labels, boxes):
-        if s < score_min:
-            continue
-        name = COCO_TO_LABEL.get(int(c))
-        if name is None:
-            continue
-        x1, y1, x2, y2 = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
-        x1, x2 = max(0.0, min(x1, x2)), min(float(w), max(x1, x2))
-        y1, y2 = max(0.0, min(y1, y2)), min(float(h), max(y1, y2))
-        if (x2 - x1) < 4 or (y2 - y1) < MIN_BOX_PX:
-            continue
-        if _is_ego_bonnet(x1, y1, x2, y2, w, h):
-            n_bonnet += 1
-            continue
-        dets.append((name, (x1, y1, x2, y2), float(s)))
-
-    # Largest first, which on a forward-facing camera is nearest first. The
-    # membership layer re-ranks by measured depth; this only makes truncation
-    # or a debug dump show the vehicles that matter at the top.
-    dets.sort(key=lambda d: -((d[1][2] - d[1][0]) * (d[1][3] - d[1][1])))
+    raw, n_bonnet = raw_boxes(scores, labels, boxes, w, h)
+    out = gate(raw, dedupe=dedupe, score_min=score_min)
+    out["n_bonnet_rejected"] = n_bonnet
     t_end = time.perf_counter()
 
-    return {
-        "detections": dets,
-        "n_bonnet_rejected": n_bonnet,
+    out.update({
+        # Everything the model proposed that is a road user and is not the
+        # bonnet, BEFORE any confidence or duplicate gate. Carried so a caller
+        # can re-gate the same frame differently without a second forward pass —
+        # which is exactly what tools/detect_quality.py does to produce a
+        # before/after on identical pixels.
+        "raw": raw,
         "image": {"w": w, "h": h},
         "timing_ms": {
             "forward": round((t_fwd - t0) * 1000, 2),
             "post": round((t_end - t_fwd) * 1000, 2),
             "total": round((t_end - t0) * 1000, 2),
         },
-    }
+    })
+    return out

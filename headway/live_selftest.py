@@ -981,9 +981,51 @@ def run_detector():
           f"p50 {p50:.2f} ms, p95 {p95:.2f} ms (Qwen enumeration was 600-1500 ms)")
 
     r = D.detect(frame)
-    check(all(lab in D.COCO_TO_LABEL.values() for lab, _, _ in r["detections"]),
+    # det is (label, box, score, info) -- indexed rather than unpacked so a
+    # future field cannot break this the way the `info` field broke it once.
+    check(all(det[0] in D.COCO_TO_LABEL.values() for det in r["detections"]),
           "only road-user classes are emitted",
-          str(sorted({lab for lab, _, _ in r["detections"]})))
+          str(sorted({det[0] for det in r["detections"]})))
+    check(all(len(det) == 4 and isinstance(det[3], dict) for det in r["detections"]),
+          "every detection carries its (confirmed, h_px) info dict",
+          "consumers read det[0..2]; det[3] is additive")
+
+    # --- duplicate suppression (the vanishing-point cluster) ----------------
+    # Four boxes on the same few pixels, as observed at a road-end horizon.
+    # _duplicates is pure geometry, so it is checked directly rather than by
+    # hunting for a frame that reproduces the failure.
+    cluster = [("car", (600.0, 350.0, 618.0, 364.0), 0.61),
+               ("car", (602.0, 351.0, 620.0, 366.0), 0.55),
+               ("car", (598.0, 349.0, 621.0, 365.0), 0.48),
+               ("truck", (601.0, 350.0, 619.0, 365.0), 0.44),
+               ("car", (200.0, 300.0, 320.0, 400.0), 0.90)]   # a real, separate car
+    keep, dropped = D._duplicates(cluster)
+    check(len(keep) == 2 and len(dropped) == 3,
+          "an overlapping cluster collapses to one box",
+          f"kept {len(keep)} of {len(cluster)} (the cluster + the separate car)")
+    check(cluster[keep[0]][2] == 0.61 or cluster[keep[1]][2] == 0.61,
+          "the survivor of a cluster is its highest-scoring member")
+    check(any(cluster[i][0] == "truck" for i, _ in dropped),
+          "a cross-class duplicate (car vs truck on one object) is suppressed",
+          "car/truck/bus/motorcycle are competing readings of one object")
+
+    person_on_bike = [("cyclist", (400.0, 300.0, 440.0, 380.0), 0.70),
+                      ("pedestrian", (405.0, 295.0, 435.0, 370.0), 0.65)]
+    keep2, dropped2 = D._duplicates(person_on_bike)
+    check(len(keep2) == 2 and not dropped2,
+          "a pedestrian overlapping a cyclist is NOT suppressed",
+          "a cyclist IS a person on a bicycle — both boxes are real")
+
+    # --- the size/score floor ----------------------------------------------
+    check(D._score_floor("car", 60.0) == D.SCORE_MIN_BY_LABEL["car"],
+          "a normal-sized box is gated on its class threshold alone")
+    check(D._score_floor("car", 14.0) == D.SMALL_BOX_SCORE_MIN,
+          "a sub-floor box must clear a higher confidence",
+          f"{D.SMALL_BOX_SCORE_MIN} vs {D.SCORE_MIN_BY_LABEL['car']} — road-end "
+          "texture scores low, distant vehicles score high")
+    check(D._score_floor("pedestrian", 60.0) < D._score_floor("car", 60.0),
+          "pedestrians are gated LOWER than vehicles",
+          "recall on vulnerable road users is worth more than a clean box count")
 
 
 def main():

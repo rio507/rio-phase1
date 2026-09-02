@@ -211,7 +211,8 @@ class Candidate:
     __slots__ = ("id", "label", "box", "first_seen", "last_seen", "last_detected",
                  "overlap", "history", "member", "member_since", "merge_promoted",
                  "merge_t", "merge_slope", "depths", "tracker", "lost",
-                 "overlap_reason", "score", "quality", "n_detections")
+                 "overlap_reason", "score", "quality", "n_detections",
+                 "confirmed", "vel_px", "range_reject")
 
     def __init__(self, cid, box, label, t):
         self.id = cid
@@ -233,6 +234,18 @@ class Candidate:
         self.lost = False
         self.score = 0.0            # detector confidence, last detection
         self.n_detections = 1
+        # Big enough for a range to be claimed for it (detect.py's size floor).
+        # An unconfirmed candidate is still watched and still drawn -- it is a
+        # road user we can see but cannot measure.
+        self.confirmed = True
+        # Per-edge box velocity in px/s, EMA-smoothed. The overlay extrapolates
+        # boxes with it between detections so they do not visibly trail a moving
+        # object; nothing in the warning path reads it.
+        self.vel_px = (0.0, 0.0, 0.0, 0.0)
+        # Why this candidate's last depth reading was refused, if it was. Set by
+        # the caller's depth_fn (live.py runs the plausibility check, which needs
+        # camera geometry this module deliberately does not carry).
+        self.range_reject = None
         # v2 sec8's track_quality term. With RF-DETR the box comes from a fresh
         # detection every frame rather than from a correlation filter, but the
         # question the term asks is unchanged: does this box move like one
@@ -351,6 +364,8 @@ class Candidate:
             "nr": self.n_valid_range,
             "s": round(self.score, 2),
             "w": self.overlap_reason if self.overlap_reason != "ok" else None,
+            "cf": int(self.confirmed),
+            "rr": self.range_reject,
         }
 
 
@@ -401,6 +416,10 @@ class CandidateSet:
         for det in detections:
             label, box = det[0], det[1]
             score = float(det[2]) if len(det) > 2 else 0.0
+            # detect.py's fourth field. Absent for the synthetic-clip stubs and
+            # for run_clip.py's Qwen anchor, where every box is confirmed by
+            # construction, so its absence means True rather than unknown.
+            info = det[3] if len(det) > 3 and isinstance(det[3], dict) else {}
             if keep_labels is not None and label is not None and label not in keep_labels:
                 continue
             best, best_cost = None, None
@@ -418,9 +437,18 @@ class CandidateSet:
                 from .tracker import motion_plausibility
                 q = motion_plausibility(cand.box, box, dt)
                 cand.quality = 0.7 * cand.quality + 0.3 * q
+                # Per-edge velocity BEFORE the box is replaced, from the two
+                # detections and the real time between them. EMA at 0.5: enough
+                # smoothing that one jittery box does not fling the overlay's
+                # extrapolation, little enough that it follows a genuine
+                # acceleration within a couple of frames.
+                v = tuple((b - a) / dt for a, b in zip(cand.box, box))
+                cand.vel_px = tuple(0.5 * old + 0.5 * new
+                                    for old, new in zip(cand.vel_px, v))
                 cand.box = box
                 cand.label = label or cand.label
                 cand.score = score
+                cand.confirmed = bool(info.get("confirmed", True))
                 cand.n_detections += 1
                 cand.last_detected = t
                 cand.last_seen = t
@@ -429,6 +457,7 @@ class CandidateSet:
             else:
                 cand = Candidate(self._next_id, box, label, t)
                 cand.score = score
+                cand.confirmed = bool(info.get("confirmed", True))
                 self._next_id += 1
                 self.candidates[cand.id] = cand
                 seen.append(cand)
@@ -477,8 +506,14 @@ class CandidateSet:
     def evaluate(self, corridor, t, depth_fn=None, allow_merge=True):
         """Recompute overlap, membership and merge promotion for every candidate.
 
-        `depth_fn(box) -> metres or None` keeps this module free of the depth
-        model; `allow_merge` is False when the corridor is the trapezoid, since
+        `depth_fn(box, label) -> metres or None` keeps this module free of the
+        depth model AND of the camera geometry: the caller is what knows the
+        focal length, so the caller is where a range is checked for plausibility
+        against the box's size (see headway/plausibility.py). A refused range
+        arrives here as None, which is a state this module already handles --
+        a candidate without a range cannot be the lead.
+
+        `allow_merge` is False when the corridor is the trapezoid, since
         promoting a merge off guessed geometry would be inventing the one event
         the driver is least able to check.
         """
@@ -490,7 +525,14 @@ class CandidateSet:
             frac, info = bottom_edge_overlap(cand.box, corridor)
             cand.update_overlap(frac, info["reason"], t)
             if depth_fn is not None:
-                cand.depths.append(depth_fn(cand.box))
+                out = depth_fn(cand.box, cand.label)
+                # (metres, reject_reason) from live.py; a bare number from any
+                # caller that does not run the plausibility check.
+                if isinstance(out, tuple):
+                    rng, cand.range_reject = out
+                else:
+                    rng, cand.range_reject = out, None
+                cand.depths.append(rng)
             ev = cand.check_merge(t, allow_merge)
             if ev is not None:
                 ev["corridor_source"] = getattr(corridor, "source", "static")

@@ -43,6 +43,7 @@ from . import anchor as anchor_mod
 from . import depth as depth_mod
 from . import detect as detect_mod
 from . import lanes as lanes_mod
+from . import plausibility as plaus_mod
 from . import live_policy as policy_mod
 from . import membership as member_mod
 from . import state as v2
@@ -134,6 +135,43 @@ def _round(v, nd=3):
     return round(v, nd)
 
 
+def report_gap(d, coast_age, max_coast_s=None):
+    """The filter's gap -> what may be REPORTED as the gap. -> (gap|None, reason)
+
+    Three ways a gap is not a gap:
+
+      no_estimate  the filter has nothing yet (no lead has ever been measured)
+      not_finite   NaN/inf got in, which is a bug, and reporting it is worse
+      coasted_out  the last real measurement is older than MAX_COAST_S
+
+    The last is the one this function was written for. The warning path already
+    refuses to act on a gap that old -- compute_confidence multiplies it to zero
+    at exactly MAX_COAST_S and the state machine declares LOST -- but the
+    reported `distance_m` ignored all of it and returned the Kalman's coasted
+    prediction. On a coastal clip whose lead drove off the end of the road, that
+    prediction kept extrapolating a closing rate into a lead nobody could see,
+    and the HUD showed GAP -66.8 M.
+
+    The negative sign is fixed at the source (filter.GAP_FLOOR_M). This is the
+    other half: a gap nobody has measured for over a second is not a small
+    number or a clamped one, it is absent, and "--" is the honest way to draw
+    absent.
+    """
+    if max_coast_s is None:
+        max_coast_s = v2.MAX_COAST_S
+    if d is None:
+        return None, "no_estimate"
+    d = float(d)
+    if not math.isfinite(d):
+        return None, "not_finite"
+    if float(coast_age) > float(max_coast_s):
+        return None, "coasted_out"
+    # A distance. If this fires, filter.py's floor has been bypassed and the
+    # HUD is one line away from showing a negative gap again.
+    assert d >= 0.0, f"negative gap reached the report: {d}"
+    return d, None
+
+
 def lead_corridor_check(corridor, box, prev_count):
     """Is the tracked lead still in our lane? -> (consecutive_misses, geo|None).
 
@@ -197,6 +235,8 @@ class LiveSession:
         self.n_detections = 0
         self.detect_error = None    # first detector failure, reported once
         self.n_glare_frames = 0     # frames whose depth was refused as flared
+        self.n_range_refused = 0    # depth readings vetoed as size-implausible
+        self.n_gap_clamped = 0      # frames the gap floor had to hold d up
 
         self.t = 0.0                # session clock, seconds
         self.last_wall = None
@@ -369,11 +409,34 @@ class LiveSession:
 
         self.candidates.observe(detections, t)
 
-        def _range_of(b):
+        f_px = getattr(self.corridor, "f_px", None) or plaus_mod.focal_px(w)
+
+        def _range_of(b, label=None):
+            """ROI depth for one candidate box -> (metres|None, reject_reason).
+
+            Two independent things can refuse a range here, and they refuse it
+            for opposite reasons. depth.roi_depth's own confidence asks whether
+            the depth model had enough to work with; plausibility asks whether
+            the answer it gave is geometrically possible for a box that size.
+            The second is the one that catches the vanishing-point cluster,
+            where the model is confident AND wrong: a 10 px box cannot be 6 m
+            away, whatever the median of its ROI says.
+
+            A refused range is None, not a guess. Downstream that means the
+            candidate carries no distance, cannot be selected as the lead, and
+            is drawn without a number -- all behaviour that already existed for
+            a candidate whose depth simply failed.
+            """
             if depth_full is None:
-                return None
+                return None, "no_depth_map"
             d, conf, _ = depth_mod.roi_depth(depth_full, b)
-            return float(d) if (np.isfinite(d) and conf > 0.2) else None
+            if not (np.isfinite(d) and conf > 0.2):
+                return None, "low_depth_conf"
+            verdict = plaus_mod.check(label, b, float(d), f_px, image_h=h)
+            if not verdict["ok"]:
+                self.n_range_refused += 1
+                return None, verdict["reason"]
+            return float(d), None
 
         # Merge promotion needs real lane paint. Declaring a merge off the
         # trapezoid would be inventing the one event a driver is least able to
@@ -453,9 +516,22 @@ class LiveSession:
             self.corridor, box, self.out_of_corridor)
 
         # --- measure -------------------------------------------------------
+        # The lead's own reading gets the same plausibility veto its candidate
+        # range did. It is the same box and the same depth map, so a verdict
+        # that refused one and accepted the other would be incoherent -- and
+        # this is the reading that reaches the Kalman, so it is the one that
+        # matters most. A refused measurement is no measurement: the filter
+        # coasts, which is exactly what it does for a lead behind a truck.
         z, depth_conf, dstats = float("nan"), 0.0, {}
+        lead_depth_reject = None
         if box is not None and depth_full is not None:
             z, depth_conf, dstats = depth_mod.roi_depth(depth_full, box)
+            if np.isfinite(z):
+                verdict = plaus_mod.check(lead_cand.label if lead_cand else None,
+                                          box, float(z), f_px, image_h=h)
+                if not verdict["ok"] and verdict["reason"] != "no_depth":
+                    lead_depth_reject = verdict["reason"]
+                    z, depth_conf = float("nan"), 0.0
 
         # --- filter --------------------------------------------------------
         snap = self.kf.step(None if (z is None or not np.isfinite(z)) else z,
@@ -464,6 +540,24 @@ class LiveSession:
             self.reset_t = t
 
         d, d_dot = snap["d"], snap["d_dot"]
+        if snap.get("n_clamped"):
+            self.n_gap_clamped = int(snap["n_clamped"])
+
+        # --- is this gap a thing we may show a driver? ----------------------
+        # The filter guarantees d >= 0 (filter.GAP_FLOOR_M). That is necessary
+        # and not sufficient: a gap coasted past MAX_COAST_S is a prediction
+        # about a vehicle nobody has seen for over a second, and the warning
+        # path already refuses to act on one -- compute_confidence multiplies it
+        # to zero and the state machine calls it LOST. `distance_m` was the one
+        # output that ignored all of that and reported the number anyway, which
+        # is how a coasted gap reached the HUD.
+        #
+        # So the same rule the warning path applies is applied to the reported
+        # gap: no measurement in over MAX_COAST_S means no gap, not a stale one.
+        # The client renders a missing gap as "--", which is true, rather than
+        # as a number, which is not.
+        gap_m, gap_invalid = report_gap(d, snap["coast_age"])
+
         v_for_tau = 0.0 if stale else float(v_host)
         tau = v2.compute_tau(d, v_for_tau) if not stale else float("inf")
         ttc = v2.compute_ttc(d, d_dot)
@@ -496,6 +590,11 @@ class LiveSession:
         # it ships to the session JSONL on every frame and is already the
         # largest thing in the file, so this rides in the response only and is
         # not logged. Nothing downstream of here can affect a warning.
+        # This is also what the OVERLAY draws. Before it did, the only box on
+        # the screen from this path was the lead, which is why two pedestrians
+        # walking towards the camera on a coastal clip were detected, tracked,
+        # logged -- and invisible. Nothing here can affect a warning; it is the
+        # same candidate set the geometry already ran on, reported.
         scene_objects = []
         for cand in self.candidates.candidates.values():
             if cand.lost:
@@ -516,6 +615,18 @@ class LiveSession:
                 "lane_bounds": (None if bounds is None
                                 else [round(float(bounds[0]), 1),
                                       round(float(bounds[1]), 1)]),
+                # Big enough to measure. False = drawn, but no range claimed.
+                "confirmed": bool(cand.confirmed),
+                # Why this object has no range, when it has none. The overlay
+                # shows "--" either way; this is for the log and the harness.
+                "range_reject": cand.range_reject,
+                # A road user that cannot be a following target. The overlay
+                # colours these differently, and LEAD_LABELS keeps them out of
+                # lead selection -- see membership.select_lead.
+                "vulnerable": cand.label not in member_mod.LEAD_LABELS,
+                # px/s per edge, for the overlay to extrapolate between frames.
+                # Presentation only: nothing in the warning path reads it.
+                "vel_px": [round(float(v), 1) for v in cand.vel_px],
             })
 
         self.frame_idx += 1
@@ -530,7 +641,12 @@ class LiveSession:
             "dt": round(dt, 4),
 
             "lead_box": ([round(float(v), 1) for v in box] if box else None),
-            "distance_m": _round(d, 2),
+            "distance_m": _round(gap_m, 2),
+            # Present whenever distance_m is None, so a reader can tell "no lead
+            # yet" from "the lead has been out of sight too long to report".
+            "gap_invalid_reason": gap_invalid,
+            "gap_clamped": int(snap.get("n_clamped") or 0),
+            "lead_depth_reject": lead_depth_reject,
             "d_dot_ms": _round(d_dot, 3),
             "tau_s": _round(tau, 3),
             "ttc_s": _round(ttc, 3),
@@ -588,6 +704,7 @@ class LiveSession:
             "image": {"w": w, "h": h},
             "depth_error": depth_err,
             "depth_trusted": bool(depth_trust),
+            "n_range_refused": self.n_range_refused,
             "glare_p01": trust_info.get("glare_p01"),
             "timing_ms": {
                 "decode": round((t_decode - t_start) * 1000, 1),

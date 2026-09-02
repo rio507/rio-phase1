@@ -103,6 +103,25 @@ MIN_CONSEC_REJECTS = 2
 
 MAX_COAST_S = 1.0        # §5: never warn from coasted data older than this
 
+# --- the gap is a distance, and distances are not negative -------------------
+# A constant-velocity model extrapolated far enough always walks through zero:
+# `predict` is x <- [d + ḋ·Δt, ḋ], and with a closing ḋ and no measurement to
+# correct it, d passes 0 and keeps going. Nothing in the maths objects, because
+# nothing in the maths knows d is a distance.
+#
+# It reached the HUD. Observed on a coastal clip: GAP -66.8 M, which is what
+# ~13 s of coasting at -5 m/s looks like after the lead drove out of frame at
+# the end of the road. The warning path was never fooled -- confidence decays to
+# zero at MAX_COAST_S and the state machine declares LOST -- but `distance_m`
+# was reported and painted regardless, so the driver was shown a number that
+# cannot exist.
+#
+# Clamped in the STATE rather than at the display, so the whole system agrees
+# about what the gap is: TTC, tau and the log all read the same clamped value.
+# The velocity is zeroed at the same time, because a gap held at the floor by a
+# closing rate would otherwise carry a phantom closing speed forever.
+GAP_FLOOR_M = 0.0
+
 
 class HeadwayFilter:
     """Kalman on [d, ḋ] with a 3σ gate and a cut-in escape hatch."""
@@ -125,6 +144,7 @@ class HeadwayFilter:
         self.new_lead = False        # latched for one step after a reset
         self.initialised = False
         self.n_updates = 0
+        self.n_clamped = 0           # times the gap floor had to hold the state up
 
     # -- properties ----------------------------------------------------------
     @property
@@ -166,6 +186,26 @@ class HeadwayFilter:
         F = np.array([[1.0, dt], [0.0, 1.0]], dtype=float)
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + self._Q(dt)
+        self._clamp()
+
+    def _clamp(self) -> bool:
+        """Hold the gap at or above GAP_FLOOR_M. -> did it have to?
+
+        The covariance is deliberately left alone. P describes how uncertain the
+        estimate is, and the clamp does not make it more certain -- if anything
+        a state that had to be corrected by a constraint is less trustworthy,
+        and letting P keep growing is the honest version of that.
+        """
+        if self.x is None or self.x[0] >= GAP_FLOOR_M:
+            return False
+        self.x[0] = GAP_FLOOR_M
+        # A closing rate that has already driven the gap into the floor has
+        # nowhere left to close to. Left in, it would re-violate the floor on
+        # every subsequent predict and report a gap that is pinned at zero while
+        # claiming to be shrinking.
+        self.x[1] = max(self.x[1], 0.0)
+        self.n_clamped += 1
+        return True
 
     def step(self, z, depth_conf: float, dt: float) -> dict:
         """One filter tick. `z=None` (or NaN) means no measurement -> coast.
@@ -224,6 +264,7 @@ class HeadwayFilter:
 
         K = (self.P @ H) / S
         self.x = self.x + K * innovation
+        self._clamp()
         I_KH = np.eye(2) - np.outer(K, H)
         # Joseph form: stays positive-definite under the repeated gating and
         # resets this filter does, where the short form can drift negative.
@@ -252,6 +293,7 @@ class HeadwayFilter:
             "consec_rejects": int(self.consec_rejects),
             "reject_span": round(float(self.reject_span), 4),
             "coast_age": round(float(self.coast_age), 4),
+            "n_clamped": int(self.n_clamped),
             "new_lead": bool(self.new_lead),
             "P_dd": None if self.P is None else round(float(self.P[0, 0]), 5),
             "P_vv": None if self.P is None else round(float(self.P[1, 1]), 5),
