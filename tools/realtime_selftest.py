@@ -1649,7 +1649,12 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
             places_fail["on"] = False
         print(f"    Q: find me a taco place near here (search failing)\n"
               f"    A: {said[:240]}")
-        low = said.lower()
+        # A transcriber writes "couldn't" with a typographic apostrophe. That is
+        # a rendering difference, not a different sentence, and a check that
+        # fails on it reports the model for saying exactly the right thing --
+        # which is what this one did on its first live run. The vehicle section
+        # above normalises the same character for the same reason.
+        low = said.lower().replace("\u2019", "'")
         ok(realtime.PLACES_TOOL_NAME in used, f"she still reaches for it ({used})")
         ok(any(p in low for p in ("couldn't", "could not", "can't", "cannot",
                                   "unable", "not able", "trouble", "failed")),
