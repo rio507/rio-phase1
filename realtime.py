@@ -357,7 +357,9 @@ in your character stays exactly as it is; these are the things that are only
 true when you are being heard rather than read:
 
 - Be brief by default. One or two sentences. The driver can always ask for
-  more, and while you are talking they cannot hear the road.
+  more, and while you are talking they cannot hear the road. A first answer is
+  ALWAYS short — depth is something they ask for, never something you decide
+  they wanted.
 - Expect to be interrupted, and stop cleanly when you are. Do not restate what
   you had already said — pick up from what they just asked.
 - Other voices will cut you off mid-sentence: a gap warning, a tire fault, a
@@ -407,9 +409,28 @@ still never do is call the turns along the way.
 
 WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
 
-Use the look tool. Never use the research tool for anything you can see: it has
-no picture, and a description of a road it cannot look at is invention with a
-delay in front of it.
+TWO TIERS, AND THE FIRST ONE IS ALWAYS SHORT.
+
+The first answer to anything you can see is the camera's, and it is one or two
+sentences. "What's that building?" — say what it is. "What car is that?" — say
+what it is. That is the whole answer. The driver is driving; they asked a
+question, not for a briefing, and several seconds of silence followed by a
+paragraph is the worst thing you can do to somebody at the wheel.
+
+So: use the look tool. Never use the research tool for anything you can see —
+it has no picture, and a description of a road it cannot look at is invention
+with a delay in front of it. It will refuse a first look anyway, and tell you
+to answer from what you already have.
+
+THEN OFFER, DON'T DELIVER. When the thing is worth more — a landmark, a named
+building, something unusual — add one short clause at the end: "want to know
+more about it?" One clause, not a paragraph, and not every time: an ordinary
+car in ordinary traffic has nothing to offer and asking about it is noise.
+
+ONLY WHEN THEY ASK. "Tell me more", "what's the history", or just "yes" after
+you offered — then use the research tool. Say a holding line first, because
+that one does take a few seconds. Keep the answer to three or four sentences
+and offer to go on rather than going on.
 
 Say something first — "let me look" — because it can take a couple of seconds.
 Often it will not: a plain "what do you see" comes back immediately, because
@@ -688,6 +709,13 @@ def session_config() -> dict:
         "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
                   PLACES_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA],
         "tool_choice": "auto",
+        # A ceiling on any single spoken answer, at the API rather than in the
+        # prompt. The instructions ask for brevity and mostly get it; this is
+        # what makes a five-paragraph answer impossible rather than unlikely.
+        # It is not a target — ordinary answers are a fraction of it — it is
+        # the point past which something has gone wrong and the driver should
+        # not have to sit through the rest of it.
+        "max_output_tokens": int(config.REALTIME_MAX_RESPONSE_TOKENS),
     }
 
 
@@ -721,6 +749,98 @@ def mint_client_secret() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# TWO TIERS OF ANSWER
+# ---------------------------------------------------------------------------
+# The first answer to anything the camera can see is the camera's, and it is
+# short. Depth is a second turn, and only if the driver asks for one.
+#
+# This exists because deep_dive was reachable from "what's that building?" --
+# a question look() answers in a sentence -- and the driver got several seconds
+# of silence followed by a paragraph. The instructions asked for the right
+# behaviour and mostly got it; "mostly" is not a policy, and a rule that is
+# only in a prompt is a rule the model may reconsider.
+#
+# So the tiers are enforced here, in the tool, where reconsidering is not
+# available.
+
+_visual_turns = {}                  # session_key -> {"last_look_t", "depth_until"}
+_turns_lock = threading.Lock()
+
+# The driver asking for more. Any of these unlocks the reasoning model for
+# DEPTH_WINDOW_S, because a follow-up chain about one building is one
+# conversation rather than a series of cold questions.
+_DEPTH_REQUEST = re.compile(
+    r"\b(tell me more|more about|more detail|say more|go on|go deeper|"
+    r"elaborate|expand on|what'?s the (?:history|story)|history of|"
+    r"who (?:built|designed|owns|made)|when was|how old|why (?:is|was|did)|"
+    r"background on|anything else about|what else)\b",
+    re.IGNORECASE)
+
+# A question the camera should answer. Not a classifier -- the router is that,
+# and it can cost a model call. This is the cheap test for "the driver is
+# asking about something out of the window", used only to decide whether a
+# deep_dive is jumping the queue.
+_LOOKS_VISUAL = re.compile(
+    r"\b(that|those|this)\s+(building|car|vehicle|truck|sign|shop|store|"
+    r"place|thing|one)\b"
+    r"|\bwhat(?:'?s| is| kind of| sort of)?\s+(?:that|this|the)\s+"
+    r"(building|car|vehicle|truck|sign|shop|store|place|thing)\b"
+    r"|\bwhat do you see\b|\bout (?:of )?the window\b"
+    r"|\b(?:on|to) (?:the|our) (?:left|right)\b"
+    r"|\bahead of us\b|\bin front of us\b",
+    re.IGNORECASE)
+
+
+def note_look(session_key: str, question: str) -> None:
+    """A visual question was just answered from the camera."""
+    with _turns_lock:
+        st = _visual_turns.setdefault(str(session_key or "default"), {})
+        st["last_look_t"] = time.time()
+        st["last_look_q"] = (question or "")[:200]
+
+
+def unlock_depth(session_key: str) -> None:
+    """The driver asked for more. Depth is open for a while."""
+    with _turns_lock:
+        st = _visual_turns.setdefault(str(session_key or "default"), {})
+        st["depth_until"] = time.time() + float(config.DEPTH_WINDOW_S)
+
+
+def depth_allowed(session_key: str, question: str, context: str = "") -> dict:
+    """May this deep_dive run? -> {"allowed", "reason"}
+
+    Refused in exactly one situation, and it is the one that made visual
+    questions slow: a question about something the camera can see, asked cold
+    -- either while a look for this session is still the current exchange, or
+    phrased as a question about what is out of the window -- with nothing in it
+    that asks for depth.
+
+    Everything else runs. "What's the speed limit in California", "how does
+    regenerative braking work", "what time does the game start" are all cold
+    questions and none of them is a first look; the reasoning model is exactly
+    right for them and this gate never sees them.
+    """
+    text = f"{question or ''} {context or ''}"
+    key = str(session_key or "default")
+    now = time.time()
+
+    if _DEPTH_REQUEST.search(text):
+        unlock_depth(key)
+        return {"allowed": True, "reason": "asked_for_depth"}
+
+    with _turns_lock:
+        st = dict(_visual_turns.get(key) or {})
+    if st.get("depth_until", 0) > now:
+        return {"allowed": True, "reason": "depth_window_open"}
+
+    looked_recently = (now - st.get("last_look_t", 0)) < float(config.DEPTH_COLD_S)
+    if looked_recently or _LOOKS_VISUAL.search(text):
+        return {"allowed": False,
+                "reason": "first_look" if looked_recently else "visual_question"}
+    return {"allowed": True, "reason": "not_a_visual_question"}
+
+
 def escalate(question: str, context: str = "", timeout_s: Optional[float] = None) -> dict:
     """The deep_dive tool: ask the reasoning model, hand back text.
 
@@ -748,17 +868,20 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
             model=config.OPENAI_REASONING_MODEL,
             instructions=(
                 "You are the research and reasoning step behind a car "
-                "assistant's spoken answer. Answer the question directly and "
-                "completely, in plain prose meant to be READ ALOUD: no "
-                "markdown, no bullet points, no headings, no URLs, no "
-                "citations. Two or three sentences unless the question genuinely "
-                "needs more. If the answer depends on something you cannot "
-                "verify, say so in the answer itself rather than hedging around "
-                "it."
+                "assistant's spoken answer. Answer the question directly, in "
+                "plain prose meant to be READ ALOUD: no markdown, no bullet "
+                "points, no headings, no URLs, no citations.\n"
+                "THREE OR FOUR SENTENCES. This is going to be spoken to "
+                "somebody driving, who cannot skim it and cannot politely "
+                "interrupt a paragraph. Say the most interesting true thing "
+                "first. If there is more worth telling, STOP and say there is "
+                "more — one short clause — rather than telling it now.\n"
+                "If the answer depends on something you cannot verify, say so "
+                "in the answer itself rather than hedging around it."
             ),
             input=prompt,
             tools=tools,
-            max_output_tokens=int(config.REALTIME_TOOL_MAX_OUTPUT_TOKENS),
+            max_output_tokens=int(config.DEEP_ANSWER_MAX_TOKENS),
         )
     except Exception as e:
         took = round((time.time() - t0) * 1000, 1)
@@ -770,8 +893,16 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
     took = round((time.time() - t0) * 1000, 1)
     if not text:
         return {"ok": False, "note": "empty answer", "took_ms": took}
-    return {"ok": True, "answer": text, "took_ms": took,
-            "model": config.OPENAI_REASONING_MODEL}
+    return {
+        "ok": True, "answer": text, "took_ms": took,
+        "model": config.OPENAI_REASONING_MODEL,
+        "rules": (
+            "Say this in your own voice, and keep it to three or four "
+            "sentences. If it ends by saying there is more, offer that in a "
+            "short clause rather than continuing into it — the driver can ask "
+            "again, and a monologue in a car is one nobody can interrupt."
+        ),
+    }
 
 
 # --- the fast path's gate ---------------------------------------------------
@@ -868,6 +999,9 @@ def look(question: str, session_key: str = "default") -> dict:
         # for the rest of a conversation once one object had been mentioned.
         observer.start(session_key)
         observer.touch(session_key)
+        # This turn is a look. deep_dive refuses a visual question asked within
+        # DEPTH_COLD_S of one -- see depth_allowed().
+        note_look(session_key, q)
         if (is_generic_scene_question(q)
                 and session.pending_clarification() is None):
             hit = observer.fresh(session_key)
@@ -890,11 +1024,12 @@ def look(question: str, session_key: str = "default") -> dict:
                     "rules": (
                         "This is what the camera is seeing right now — "
                         f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
-                        "words, briefly, as the road in front of you. Do not "
-                        "read it out as a caption and do not add anything it "
-                        "does not contain: if the driver wants detail about one "
-                        "particular thing, ask this tool again about that thing "
-                        "and it will look properly."
+                        "words, in ONE short sentence, as the road in front of "
+                        "you. Do not read it out as a caption and do not add "
+                        "anything it does not contain. If the driver wants "
+                        "detail about one particular thing, ask this tool again "
+                        "about that thing and it will look properly. This is a "
+                        "passing scene, so do not offer to say more about it."
                     ),
                 }
 
@@ -933,8 +1068,21 @@ def look(question: str, session_key: str = "default") -> dict:
         # not started, or the camera is not running. RIO says she cannot see
         # rather than describing a road she has not been shown.
         return {"ok": False, "note": "nothing to see", "took_ms": took}
-    return {"ok": True, "answer": text, "took_ms": took,
-            "meta": getattr(va, "meta", None)}
+    return {
+        "ok": True, "answer": text, "took_ms": took,
+        "meta": getattr(va, "meta", None),
+        "rules": (
+            "FIRST ANSWER, AND IT IS SHORT: one or two sentences, in your own "
+            "words, from what is here and nothing else. Do not research this "
+            "and do not go away and think about it — the driver asked what "
+            "something is, not for an essay, and they are driving.\n"
+            "If it is the kind of thing there is plausibly more to say about — "
+            "a landmark, a named building, an unusual vehicle — you may add ONE "
+            "short clause offering it: 'want to know more about it?'. Not every "
+            "time, and not for ordinary traffic or an empty road, where there "
+            "is nothing to offer and asking is noise."
+        ),
+    }
 
 
 def vehicle_status() -> dict:
@@ -1025,8 +1173,25 @@ def run_tool(name: str, arguments, session_key: str = "default",
             open_now=bool(arguments.get("open_now")),
             count=arguments.get("count"),
             where=where, session_key=session_key)
-    return escalate(str(arguments.get("question") or ""),
-                    str(arguments.get("context") or ""))
+    q = str(arguments.get("question") or "")
+    ctx = str(arguments.get("context") or "")
+    gate = depth_allowed(session_key, q, ctx)
+    if not gate["allowed"]:
+        # Refused, briefly, with what to do instead. The model gets an answer
+        # rather than an error, and the answer is "you already have one".
+        return {
+            "ok": False,
+            "note": "not for first-look questions",
+            "reason": gate["reason"],
+            "rules": (
+                "This is a first look, not research. Answer from what the "
+                "camera gave you — one or two short sentences, in your own "
+                "words — and if there is plausibly more to say, offer it in a "
+                "short clause: 'want to know more about it?'. If the driver "
+                "then asks, call this again and it will run."
+            ),
+        }
+    return escalate(q, ctx)
 
 
 def _observer_status() -> dict:

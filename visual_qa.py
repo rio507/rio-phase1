@@ -93,12 +93,138 @@ class OpenAIChatAdapter(ChatAdapter):
                 yield delta
 
 
+class QwenChatAdapter(ChatAdapter):
+    """Qwen3-VL, resident on this box, answering from the crop directly.
+
+    THE HOP THIS REMOVES. An object question already produces the thing that
+    answers it: a close crop of the object, chosen by the frame selector out of
+    the ring. The crop was then sent over the network to a reasoning model,
+    which looked at it and wrote a sentence — a remote round trip, measured at
+    ~2 s, to describe a picture that a resident 8B multimodal model can describe
+    in a few hundred milliseconds. And the realtime model rephrases whatever
+    comes back anyway, so the careful prose was being paraphrased before the
+    driver ever heard it.
+
+    WHAT IT IS AND IS NOT GIVEN. The question and the picture. NOT the
+    perception grounding packet: that is a page of JSON written for a large
+    model that can hold it and the question at once, and an 8B model handed both
+    starts answering the JSON. The detector's own label rides along in one short
+    line, because "the thing in this crop is a car" is worth stating and is
+    something the crop alone can be wrong about.
+
+    The honesty rules survive the swap, because they were never the model's
+    idea: a crop that cannot carry a claim is refused by the pipeline before
+    this, and what reaches here is a question that the picture can answer.
+    """
+
+    name = "qwen3-vl-8b"
+
+    SYSTEM = ("You are the eyes of a car assistant. Answer the driver's "
+              "question about the picture in ONE or TWO short sentences of "
+              "plain spoken English.\n"
+              "ANSWER THE QUESTION THAT WAS ASKED. If they ask what a car is, "
+              "name it as precisely as the picture allows — make and model if "
+              "the shape or the badge tells you, otherwise the type and "
+              "colour ('a white saloon'). 'A white car' is not an answer to "
+              "'what kind of car is that'.\n"
+              "Say only what you can actually see, and if the picture does not "
+              "settle it say that plainly and briefly. No lists, no markdown, "
+              "no preamble, no describing the image as an image.")
+
+    def _split(self, messages):
+        """The last user turn -> (question_text, [PIL images]).
+
+        Only the last turn: the history is text and this model is being asked
+        one visual question, not to hold a conversation. `visual_qa` keeps the
+        conversation's memory itself.
+        """
+        import base64
+        import io as _io
+
+        from PIL import Image
+
+        text_bits, images = [], []
+        last = None
+        for m in messages:
+            if m.get("role") == "user":
+                last = m
+        parts = (last or {}).get("content")
+        if isinstance(parts, str):
+            return parts, []
+        for part in (parts or []):
+            if part.get("type") == "text":
+                t = part.get("text", "")
+                # The grounding packet is deliberately dropped -- see the class
+                # docstring. Everything else in the turn is a short human line
+                # ("Close crop of the object being asked about:") worth keeping.
+                if t.startswith("PERCEPTION GROUNDING"):
+                    continue
+                text_bits.append(t)
+            elif part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                if "," in url:
+                    try:
+                        raw = base64.b64decode(url.split(",", 1)[1])
+                        images.append(Image.open(_io.BytesIO(raw)).convert("RGB"))
+                    except Exception:
+                        pass
+        return "\n".join(text_bits).strip(), images
+
+    def stream(self, system: str, messages: list):
+        import vision
+
+        question, images = self._split(messages)
+        if not images:
+            # Nothing to look at. The caller's honesty path handles an empty
+            # answer; inventing one here would be the whole failure this
+            # subsystem exists to prevent.
+            return
+        # The CROP is the last image attached and the one the question is about
+        # (_build_messages appends the full frame first, then the crop), so when
+        # both are present the crop goes last here too and Qwen sees it nearest
+        # the question.
+        images = images[-config.VISUAL_QWEN_MAX_IMAGES:]
+
+        processor, model, lock = vision.get_handles()
+        content = [{"type": "image", "image": im} for im in images]
+        content.append({"type": "text", "text": question})
+        msgs = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]},
+                {"role": "user", "content": content}]
+        with lock:
+            inputs = processor.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt").to(model.device)
+            out = model.generate(**inputs,
+                                 max_new_tokens=int(config.VISUAL_QWEN_MAX_TOKENS),
+                                 do_sample=False)
+            text = processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True)[0].strip()
+        if text:
+            # One delta. This model is not streamed: it is local and short, and
+            # a token-by-token trickle from it would only make the caller's
+            # first-token timing look better than the driver's wait actually is.
+            yield text
+
+
 _chat_adapter = None
+_qwen_adapter = None
 _chat_lock = threading.Lock()
 
 
-def get_chat_adapter() -> ChatAdapter:
-    global _chat_adapter
+def get_chat_adapter(prefer: str = None) -> ChatAdapter:
+    """The model that writes the answer.
+
+    `prefer="qwen"` asks for the local one. It is a REQUEST, not a switch: if
+    the local model cannot be had, this returns the remote one rather than
+    failing the turn, because a slower answer is better than none.
+    """
+    global _chat_adapter, _qwen_adapter
+    if prefer == "qwen" and config.VISION_ENABLED:
+        with _chat_lock:
+            if _qwen_adapter is None:
+                _qwen_adapter = QwenChatAdapter()
+            return _qwen_adapter
     with _chat_lock:
         if _chat_adapter is None:
             _chat_adapter = OpenAIChatAdapter()
@@ -1026,8 +1152,10 @@ class VisualAnswer:
         t0 = time.perf_counter()
         first = None
         parts = []
+        prefer = self._answer_model()
+        self.meta["answer_model"] = prefer
         try:
-            for delta in get_chat_adapter().stream(self._system, self._messages):
+            for delta in get_chat_adapter(prefer).stream(self._system, self._messages):
                 if first is None:
                     first = time.perf_counter()
                     self.timing["gpt_first_token"] = round((first - t0) * 1000, 1)
@@ -1039,6 +1167,27 @@ class VisualAnswer:
         self.timing["gpt"] = round((time.perf_counter() - t0) * 1000, 1)
         self.reply = "".join(parts).strip()
         self.finish()
+
+    def _answer_model(self) -> str:
+        """Local or remote, for THIS turn.
+
+        An object question has a crop, and a crop is the whole of the evidence:
+        a local 8B model looking at it answers in a few hundred milliseconds
+        what the remote one answered in about two seconds. A scene question has
+        no crop and needs the wide frame read carefully -- including the rule
+        about not naming a marque it cannot see -- so it keeps the bigger model.
+        """
+        setting = str(config.VISUAL_ANSWER_MODEL or "auto").lower()
+        if setting in ("qwen", "openai"):
+            return setting
+        if self._compare or self._crop is None:
+            return "openai"
+        if self.route and self.route.get("request_type") == router.READ_TEXT:
+            # Reading text off a sign is the one visual task where the bigger
+            # model is reliably better, and a misread sign is a wrong answer
+            # rather than a vague one.
+            return "openai"
+        return "qwen"
 
     def text(self) -> str:
         return "".join(self.stream())

@@ -1580,6 +1580,34 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
             ok(True, "(this route came back with no landmark candidates — "
                      "nothing to preview, and inventing one would be the bug)")
 
+        # 6b. TWO TIERS. The first answer to anything visual is short and
+        #     comes from the camera; depth is a second turn the driver asks
+        #     for. Both halves are checked here because both are behaviour:
+        #     the guard makes the wrong one impossible, and this says the
+        #     right one actually happens.
+        calls.clear()
+        said, used = ask("What do you see out there?")
+        print(f"    Q: what do you see out there?\n    A: {said[:240]}")
+        ok(realtime.LOOK_TOOL_NAME in used, f"she looks ({used})")
+        ok(realtime.TOOL_NAME not in used,
+           "and does NOT go away and think about it — a first look is the "
+           "camera's answer, not research")
+        sentences = [x for x in re.split(r"[.!?]+", said) if x.strip()]
+        ok(len(sentences) <= 3,
+           f"answered in {len(sentences)} sentence(s) — a first answer is short")
+
+        # ...and then the driver asks for more, which is the only thing that
+        # opens the reasoning model.
+        calls.clear()
+        said, used = ask("Tell me more about that.")
+        print(f"    Q: tell me more about that\n    A: {said[:300]}")
+        deep_sentences = [x for x in re.split(r"[.!?]+", said) if x.strip()]
+        ok(len(deep_sentences) <= 6,
+           f"the deeper answer is still capped for speech "
+           f"({len(deep_sentences)} sentences)")
+        ok(len(said.split()) < 120,
+           f"and is not a monologue ({len(said.split())} words)")
+
         # 7. PLACES. The question RIO used to answer from the model's own
         #    memory of restaurants, which is a description of the world as it
         #    was when the weights were made.
@@ -2043,6 +2071,112 @@ def run_fast_path():
        "and the instructions say it in the section about looking")
 
 
+
+# ---------------------------------------------------------------------------
+# TWO TIERS — a short first answer, and depth only when it is asked for
+# ---------------------------------------------------------------------------
+def run_two_tier():
+    section("K. two tiers — quick first, deep only on request")
+    key = "tier_test"
+    realtime._visual_turns.pop(key, None)
+
+    # 1. A COLD VISUAL QUESTION IS REFUSED. This is the guard: the driver asked
+    #    what a building is, and the answer to that is the camera's, now.
+    r = realtime.run_tool(realtime.TOOL_NAME,
+                          {"question": "what is that building on the right"},
+                          session_key=key)
+    ok(r["ok"] is False and r["note"] == "not for first-look questions",
+       "a cold visual question is refused by deep_dive itself, not merely "
+       "discouraged in a prompt")
+    ok("one or two short sentences" in (r.get("rules") or ""),
+       "and the refusal says what to do instead — answer from the camera")
+    ok("want to know more about it" in (r.get("rules") or ""),
+       "...including offering depth rather than delivering it")
+
+    # 2. A LOOK MAKES THE NEXT DEEP DIVE COLD TOO. The model looking and then
+    #    immediately escalating is the exact sequence that produced several
+    #    seconds of silence followed by a paragraph.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "what is that building")
+    r = realtime.run_tool(realtime.TOOL_NAME,
+                          {"question": "the architecture of the building"},
+                          session_key=key)
+    ok(r["ok"] is False and r["reason"] == "first_look",
+       "a deep_dive within seconds of a look is the same turn, and is refused")
+
+    # 3. ASKING FOR MORE OPENS IT.
+    r = realtime.run_tool(realtime.TOOL_NAME,
+                          {"question": "tell me more about that building",
+                           "context": "the driver asked to hear more"},
+                          session_key=key)
+    ok(r.get("note") != "not for first-look questions",
+       "'tell me more' is a request for depth and is allowed through")
+
+    # ...and STAYS open, because a chain of follow-ups is one conversation.
+    # Deliberately a question that is visual-shaped AND does not itself ask for
+    # depth: cold, it would be refused, and the only thing letting it through
+    # is that the driver already asked for more a moment ago.
+    g = realtime.depth_allowed(key, "what is that building made of")
+    ok(g["allowed"] and g["reason"] == "depth_window_open",
+       f"a follow-up inside the window is allowed, even phrased as a visual "
+       f"question ({g['reason']})")
+
+    # 4. A QUESTION THAT WAS NEVER VISUAL IS NEVER TOUCHED BY ANY OF THIS.
+    realtime._visual_turns.pop(key, None)
+    for q in ("how does regenerative braking work",
+              "what is the speed limit on a California freeway",
+              "who won the game last night"):
+        g = realtime.depth_allowed(key, q)
+        ok(g["allowed"] and g["reason"] == "not_a_visual_question",
+           f"research question runs as before: {q!r}")
+
+    # 5. THE PHRASES. Both lists, checked as behaviour rather than as regexes.
+    realtime._visual_turns.pop(key, None)
+    for q in ("what is that car", "what's that building on the left",
+              "what do you see", "what's that sign ahead of us"):
+        ok(not realtime.depth_allowed(key, q)["allowed"],
+           f"visual, so refused cold: {q!r}")
+    for q in ("tell me more", "what's the history of it", "who built it",
+              "say more about that", "when was it built"):
+        realtime._visual_turns.pop(key, None)
+        ok(realtime.depth_allowed(key, q)["allowed"],
+           f"asks for depth, so allowed: {q!r}")
+
+    # 6. THE ANSWER LENGTHS ARE CAPPED WHERE IT COUNTS: at the API, not in a
+    #    prompt that can be reconsidered.
+    cfg = realtime.session_config()
+    ok(cfg.get("max_output_tokens") == config.REALTIME_MAX_RESPONSE_TOKENS,
+       f"the live session has a hard ceiling on any one answer "
+       f"({config.REALTIME_MAX_RESPONSE_TOKENS} tokens)")
+    ok(config.REALTIME_MAX_RESPONSE_TOKENS <= 300,
+       "and it is short enough to be a limit rather than a formality")
+    ok(config.DEEP_ANSWER_MAX_TOKENS <= 400,
+       f"a deep answer is capped for speech too ({config.DEEP_ANSWER_MAX_TOKENS})")
+
+    # 7. THE INSTRUCTIONS SAY THE SAME THING THE CODE ENFORCES.
+    instr = re.sub(r"\s+", " ", cfg["instructions"])
+    ok("TWO TIERS, AND THE FIRST ONE IS ALWAYS SHORT." in instr,
+       "the two-tier policy is stated in the instructions")
+    ok("THEN OFFER, DON'T DELIVER." in instr,
+       "with the offer as its own rule")
+    ok("want to know more about it?" in instr,
+       "and the offer given as words rather than as a principle")
+    ok("ONLY WHEN THEY ASK." in instr and "three or four sentences" in instr,
+       "and depth gated on being asked, capped when it happens")
+
+    # 8. THE LOCAL ANSWER PATH EXISTS, and the measurement that chose against
+    #    it by default is recorded where the knob is.
+    import visual_qa
+    ok(hasattr(visual_qa, "QwenChatAdapter"),
+       "the local visual answer path is implemented")
+    ok(visual_qa.get_chat_adapter("qwen").name.startswith("qwen"),
+       "and reachable by asking for it")
+    ok(visual_qa.get_chat_adapter().name != "qwen3-vl-8b",
+       f"but not the default ({config.VISUAL_ANSWER_MODEL}) — measured at "
+       "p50 1483 ms and 3 words against 2800 ms and 32: faster, and materially "
+       "worse at the one thing an object question asks")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -2063,6 +2197,7 @@ def main():
     run_routing()
     run_places()
     run_fast_path()
+    run_two_tier()
     if args.live:
         run_live()
         run_verbatim()

@@ -81,6 +81,36 @@ REALTIME_WEB_SEARCH = True
 # A spoken answer is not a document. This bounds how long RIO can talk for.
 REALTIME_TOOL_MAX_OUTPUT_TOKENS = 3000
 
+# --- two tiers of answer ----------------------------------------------------
+# A driver asking "what's that building?" wants a sentence, now. They do not
+# want RIO to go away and think, and the thing that made her go away and think
+# was that deep_dive was reachable from a question the camera had already
+# answered. So the first answer to anything visual is the camera's, and the
+# reasoning model is unlocked only by being asked for.
+#
+# The window: a visual question inside this many seconds of a look is a FIRST
+# look, and deep_dive is refused for it. Sized as "the same exchange" rather
+# than "recently" -- a minute later, the driver asking about a building is
+# asking a fresh question, not still waiting on the last one.
+DEPTH_COLD_S = 60.0
+
+# Once the driver has asked for more, they can keep asking: a chain of
+# follow-ups about the same thing is one conversation, not a series of cold
+# questions to be refused one at a time.
+DEPTH_WINDOW_S = 120.0
+
+# What a spoken deep answer may run to. The reasoning model will happily write
+# an essay, and an essay read aloud in a car is a monologue nobody can
+# interrupt politely. Three or four sentences, then an offer to go on.
+DEEP_ANSWER_MAX_TOKENS = 320
+
+# --- brevity, out loud ------------------------------------------------------
+# The ceiling on any single spoken response, enforced at the API rather than
+# asked for in the prompt: instructions are guidance and this is a limit. ~200
+# tokens is roughly 25 seconds of speech, which is already long for a car and
+# is meant to be unreachable in ordinary conversation rather than typical.
+REALTIME_MAX_RESPONSE_TOKENS = 200
+
 OPENAI_TEMPERATURE = 1
 # gpt-5.5 is a reasoning model: max_completion_tokens covers reasoning AND output.
 # At 120 the reasoning pass could eat the whole budget and RIO returned an empty
@@ -309,6 +339,42 @@ OPENAI_VISUAL_MAX_TOKENS = 700
 # and saying honestly how sure you are is the one thing in this product that
 # actually benefits from a thinking pass.
 OPENAI_VISUAL_REASONING_EFFORT = "low"
+# --- which model writes a visual answer -------------------------------------
+# "openai" sends the crop to a reasoning model. "qwen" answers from the crop
+# locally, in a few hundred milliseconds. "auto" picks local for object
+# questions and remote for scene ones.
+#
+# MEASURED, on the same crops, same questions, same ring — five object
+# questions, each arm fed fresh frames so none of them was answering from an
+# aged-out buffer:
+#
+#     openai (effort low)   p50 2800 ms   median 32 words
+#     openai (effort none)  p50 2897 ms   median 25 words
+#     qwen                  p50 1483 ms   median  3 words
+#
+# Qwen is 1.3 s faster and materially worse, in the way that matters most:
+# asked "what kind of car is that" it says "A white sedan." — which is the
+# question restated, not answered — where the remote model says "a Toyota
+# Camry, likely early-2010s; can't pin the year from this angle". Identifying
+# a car IS the object question, so the hop that does it is not redundant.
+#
+# Turning the thinking pass off does not buy the latency back either (2897 vs
+# 2800 ms), so there is no cheap version of the remote answer to prefer.
+#
+# The local path stays implemented, tested and one env var away
+# (RIO_VISUAL_ANSWER_MODEL=qwen) for a deployment that would rather have "a
+# white sedan" in 1.5 s than the make in 2.8 s. This one would not.
+VISUAL_ANSWER_MODEL = os.getenv("RIO_VISUAL_ANSWER_MODEL", "openai")
+
+# One or two sentences from an 8B model. Long enough for "a white Lexus saloon,
+# a couple of cars ahead in the next lane over"; short enough that a rambling
+# answer is cut rather than spoken.
+VISUAL_QWEN_MAX_TOKENS = 96
+
+# The crop, and the frame it came out of. More than two images and an 8B model
+# starts answering about the wrong one.
+VISUAL_QWEN_MAX_IMAGES = 2
+
 # Full frame at "auto", crop at "high": the crop is the image the answer turns
 # on, and it is small.
 VISUAL_FRAME_DETAIL = "auto"
