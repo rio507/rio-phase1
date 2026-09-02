@@ -13,3 +13,8 @@ weights/
 
 # Local Claude Code settings — per-machine, not part of the project
 .claude/
+
+# Git credential store — lives at /workspace/.git-credentials, OUTSIDE this
+# repo, so it survives a container rebuild and git cannot stage it. This line
+# only guards against a stray copy ever landing inside the worktree.
+.git-credentials

@@ -198,11 +198,28 @@ def check_weights():
 
 def check_persistent():
     head("persistent volume")
+    # This is a property of the SHELL preflight is running in, not of the pod:
+    # it fails in any shell that has not sourced the environment, which means
+    # every non-interactive one and every one that predates the last boot.sh.
+    # The fix is one line, not a re-provision -- and boot.sh now keeps the value
+    # in /workspace/env.sh so there is a durable file to source. It used to
+    # append the export to ~/.bashrc, which lives in the container layer, so the
+    # persistence lasted exactly until the next rebuild and this check came up
+    # unset on every fresh pod.
     hf = os.environ.get("HF_HOME", "")
     check(hf.startswith("/workspace"), f"HF_HOME={hf or '<unset>'}",
-          "transformers caches into the container layer and re-downloads 16 GB "
-          "of Qwen3-VL on every pod start.",
-          "export HF_HOME=/workspace/.cache/huggingface  (boot.sh step 1)")
+          "anything started from THIS shell caches into the container layer and "
+          "re-downloads 16 GB of Qwen3-VL on every pod start. (The uvicorn "
+          "boot.sh launched is unaffected — step 7 passes HF_HOME explicitly.)",
+          ". /workspace/env.sh   # written by boot.sh step 1, and sourced from "
+          "~/.bashrc for new shells")
+
+    env_file = Path("/workspace/env.sh")
+    has_env = env_file.exists() and "HF_HOME" in env_file.read_text()
+    check(has_env, "/workspace/env.sh present",
+          "there is no durable copy of the pod's environment to source, so "
+          "HF_HOME exists only in whatever shell boot.sh happened to run in.",
+          "bash /workspace/boot.sh   # step 1 writes it")
 
     boot_log = Path("/workspace/boot.log")
     check(boot_log.exists(), "boot.log present",
@@ -258,8 +275,9 @@ def check_server():
     check(ok, "uvicorn answering on :8888",
           "RIO is not running. (Not a provisioning fault on its own — this "
           "check is here so one command answers 'is the pod up and complete'.)",
-          "cd /workspace/rio-phase1 && nohup uvicorn app:app --host 0.0.0.0 "
-          "--port 8888 > uvicorn.log 2>&1 &")
+          "cd /workspace/rio-phase1 && HF_HOME=/workspace/.cache/huggingface "
+          "nohup uvicorn app:app --host 0.0.0.0 --port 8888 "
+          "> uvicorn.log 2>&1 &")
 
 
 # ---------------------------------------------------------------------------
