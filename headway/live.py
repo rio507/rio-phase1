@@ -639,6 +639,15 @@ class LiveSession:
             "frame_idx": self.frame_idx - 1,
             "t": round(t, 4),
             "dt": round(dt, 4),
+            # The SOURCE frame's own timestamp, echoed back exactly as the
+            # client sent it. The overlay draws against the video clock, so it
+            # needs to know which moment of the video this result describes --
+            # and the client knowing what it sent is not the same as the result
+            # carrying it: a result that outlives its request (a log, a replay
+            # of the JSONL, the alignment harness) has no other way to place
+            # itself in the clip. None for the live camera, which has no media
+            # clock to be placed on.
+            "frame_t": _round(frame_t, 4),
 
             "lead_box": ([round(float(v), 1) for v in box] if box else None),
             "distance_m": _round(gap_m, 2),

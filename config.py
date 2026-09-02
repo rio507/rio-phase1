@@ -120,6 +120,36 @@ SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
 
 VISION_ENABLED = True
 
+# --- replay presentation buffer ---------------------------------------------
+# Seconds the ANALYSIS stream runs ahead of the picture during an uploaded-clip
+# headway run. It is the fix for a rendering fault, not a detection one: a box
+# is computed from the frame at time T and cannot exist until T + latency, so
+# drawn on arrival it lands on a frame the road has already moved past. On a
+# file there is no reason to accept that -- the future of the clip is sitting
+# on disk. The dashboard therefore analyses from a hidden video element held
+# this far AHEAD of the visible one, so by the time the viewer reaches frame T
+# its result is already in hand and the box lands on the pixels it was computed
+# from.
+#
+# Sized from the measured end-to-end latency, p95 rather than p50: the buffer
+# has to cover the slow frames, since the fast ones simply wait. Measured over
+# HTTP on this pod at 1280x720: p50 41 ms, p95 173 ms, worst 246 ms. 250 ms
+# covers that with headroom and is still under the ~300 ms at which a delayed
+# start becomes noticeable when the clip is scrubbed.
+#
+# The cost is start-up: nothing can be drawn over the first HEADWAY_REPLAY_LEAD_S
+# of the clip, because no frame that old has been analysed yet.
+#
+# Injected into the page at "/" (like the Maps key) so the browser, the harness
+# and this file cannot disagree about it. Live camera mode ignores it entirely
+# -- reality cannot be buffered, and extrapolation covers that case instead.
+HEADWAY_REPLAY_LEAD_S = 0.25
+
+# One frame at 24 fps. The alignment target: a box must be drawn on a frame
+# within this of the one it was computed from, which is the point at which the
+# error is smaller than the interval between frames and cannot be seen.
+HEADWAY_ALIGN_TOLERANCE_S = 1.0 / 24.0
+
 
 # ---------------------------------------------------------------------------
 # Visual conversation (docs/visual_qa.md)

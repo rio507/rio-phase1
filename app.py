@@ -185,6 +185,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 INDEX_PATH = Path("static/index.html")
 MAPS_KEY_TOKEN = "__GOOGLE_MAPS_API_KEY__"
+# The replay presentation buffer, injected the same way and for the same reason
+# the Maps key is: the value has to exist in one place. config.py is that place,
+# the browser is where it is acted on, and a constant copied into the JavaScript
+# would drift from the harness that asserts against it.
+REPLAY_LEAD_TOKEN = "__HEADWAY_REPLAY_LEAD_S__"
 
 # Every local asset the page pulls in, so its URL can be stamped with the
 # file's own mtime on the way out.
@@ -237,9 +242,9 @@ def index():
     version of everything else the browser runs.
     """
     html = _stamp_assets(INDEX_PATH.read_text())
-    return HTMLResponse(html.replace(MAPS_KEY_TOKEN,
-                                     os.getenv("GOOGLE_MAPS_API_KEY", "")),
-                        headers={"Cache-Control": "no-cache"})
+    html = html.replace(MAPS_KEY_TOKEN, os.getenv("GOOGLE_MAPS_API_KEY", ""))
+    html = html.replace(REPLAY_LEAD_TOKEN, f"{config.HEADWAY_REPLAY_LEAD_S:g}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 @app.get("/health")
 def health():

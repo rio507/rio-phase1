@@ -1351,6 +1351,21 @@
       <img id="campreview" alt="">
       <video id="preview" style="display:none;" controls playsinline muted autoplay
              controlsList="nofullscreen" disablePictureInPicture></video>
+      <!-- The analysis stream for an uploaded clip. Same file as #preview, held
+           HEADWAY_REPLAY_LEAD_S ahead of it, never shown and never audible: it
+           exists so a frame's boxes are computed before the viewer reaches that
+           frame. See the replay section of the headway script.
+
+           NOT display:none. requestVideoFrameCallback fires when a frame is
+           PRESENTED, and an element outside the render tree may never present
+           one -- the capture loop would fall back to its timeout and quietly
+           run at 4 fps. So it stays composited and is hidden the only way that
+           keeps frames coming: two pixels, almost transparent, behind the
+           canvas and out of the layout's way. -->
+      <video id="scout" muted playsinline preload="auto" aria-hidden="true"
+             disablePictureInPicture
+             style="position:absolute; left:0; top:0; width:2px; height:2px;
+                    opacity:0.01; pointer-events:none; z-index:0;"></video>
       <canvas id="overlay"></canvas>
       <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
       <div class="cam-badge">Live</div>
@@ -2651,6 +2666,19 @@ document.addEventListener('DOMContentLoaded', () => {
      against a ~35 ms frame). The floor stays non-zero only to yield to the
      event loop between frames. */
   const REPLAY_CADENCE_MS = 10;
+
+  /* How far AHEAD of the picture the analysis stream runs during a replay.
+     Injected from config.HEADWAY_REPLAY_LEAD_S by the "/" handler, exactly as
+     the Maps key is. The fallback is not decoration: served straight from
+     /static/index.html the token is never substituted, and a NaN here would
+     silently disable the buffer rather than fail. */
+  const REPLAY_LEAD_S = (function () {
+    const v = parseFloat('__HEADWAY_REPLAY_LEAD_S__');
+    return (isFinite(v) && v >= 0 && v <= 2) ? v : 0.25;
+  })();
+  // Drift past this and the scout is seeked rather than nudged. Two frames at
+  // 25 fps: below that, rate trimming corrects faster than a seek can.
+  const SCOUT_RESYNC_S = 0.08;
   const MPH_TO_MS = 0.44704;
   const CLIP_IDS = ['too_close', 'watch_distance', 'back_off'];
 
@@ -2901,7 +2929,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const j = await r.json();
     if (!j || j.ok === false) return j;
     paintHud(j);
-    if (RIO.overlay && RIO.overlay.headway) RIO.overlay.headway(j, opts.el || null);
+    // WHEN this result describes, handed to the overlay with it. frameT is the
+    // clip position the frame came from (replay); capturedAt is the wall clock
+    // at the grab (live, where there is no media clock). The overlay needs one
+    // or the other to draw a box at the right moment instead of at the moment
+    // the response happened to land.
+    if (RIO.overlay && RIO.overlay.headway) {
+      RIO.overlay.headway(j, opts.el || null, {
+        frameT: (opts.frameT === undefined) ? null : opts.frameT,
+        capturedAt: (opts.capturedAt === undefined) ? null : opts.capturedAt,
+      });
+    }
     if (j.speak) speak(j.speak);
     return j;
   }
@@ -2940,8 +2978,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function captureFromVideo(el) {
+    // The capture instant, not the send instant: the live path has no media
+    // clock, so this is what the overlay measures its lag and its
+    // extrapolation against, and it must cover the encode as well as the round
+    // trip.
+    const capturedAt = performance.now();
     const blob = await frameFrom(el);
-    return sendFrame(blob, { el: el });
+    return sendFrame(blob, { el: el, capturedAt: capturedAt });
   }
 
   async function resetSession() {
@@ -2951,11 +2994,79 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   /* ---------------- video test mode --------------------------------------
-     The same /headway_frame path the live camera uses, driven off a playing
-     uploaded clip at the same ~4 fps, with the manual speed standing in for
-     GPS. frame_t is the media element's own currentTime, so the Kalman gets
-     the true spacing between the frames actually analysed rather than wall
-     clock inflated by network latency. */
+     The same /headway_frame path the live camera uses, driven off an uploaded
+     clip, with the manual speed standing in for GPS.
+
+     THE ANALYSIS STREAM IS NOT THE ONE ON SCREEN.
+
+     A box for the frame at time T cannot exist before T + latency. Analysed
+     from the visible element, it is therefore always drawn onto a frame the
+     road has already moved past -- detection is on time and the OVERLAY is
+     late, which looks identical to a tracker that cannot keep up and is not.
+     Extrapolation hides it; it does not remove it.
+
+     On a file it can be removed, because the future of the clip is already on
+     disk. #scout is a second, hidden, muted element playing the same object
+     URL REPLAY_LEAD_S ahead of #preview. Frames are captured from IT, so by
+     the time the viewer reaches frame T, T's result is already in the
+     overlay's queue and the box lands on the pixels that produced it.
+
+     The visible element is untouched: its clock, its controls and its audio
+     stay exactly as they were, which is what keeps the drive experience
+     coherent -- the picture a viewer sees and any sound that goes with it come
+     from one element, and only the analysis runs early. (#preview is muted
+     today, so there is no sound to keep in step; the point is that the design
+     does not create a problem for the day it is not.) */
+  function ensureScout() {
+    const scout = document.getElementById('scout');
+    if (!scout) return null;
+    const src = preview.currentSrc || preview.src;
+    if (!src) return null;
+    if (scout.getAttribute('data-src') !== src) {
+      scout.src = src;
+      scout.setAttribute('data-src', src);
+    }
+    return scout;
+  }
+
+  function scoutReady(scout) {
+    if (scout.readyState >= 2 && scout.videoWidth) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const done = () => { cleanup(); resolve(!!scout.videoWidth); };
+      const fail = () => { cleanup(); resolve(false); };
+      function cleanup() {
+        scout.removeEventListener('loadeddata', done);
+        scout.removeEventListener('error', fail);
+      }
+      scout.addEventListener('loadeddata', done);
+      scout.addEventListener('error', fail);
+      setTimeout(fail, 4000);          // a scout that never loads must not hang the run
+    });
+  }
+
+  /* Hold the scout REPLAY_LEAD_S ahead of the picture.
+
+     Trimmed by playback rate, not by seeking: a seek on every frame would
+     stall decode and jitter the very timestamps this exists to keep straight.
+     A seek is the fallback for a drift no rate trim can close in reasonable
+     time -- the clip being scrubbed, or the tab having been backgrounded. */
+  function syncScout(scout) {
+    if (!scout || !isFinite(preview.currentTime)) return 0;
+    const target = preview.currentTime + REPLAY_LEAD_S;
+    const drift = target - scout.currentTime;
+    if (Math.abs(drift) > SCOUT_RESYNC_S) {
+      if (isFinite(scout.duration) && target < scout.duration) {
+        scout.currentTime = target;
+        scout.playbackRate = 1;
+      }
+    } else {
+      // 1 +/- 12.5%: enough authority to close 80 ms in well under a second,
+      // gentle enough that the decoder never notices.
+      scout.playbackRate = Math.max(0.875, Math.min(1.125, 1 + drift * 1.5));
+    }
+    return drift;
+  }
+
   async function runVideo() {
     if (videoRunning) { videoRunning = false; return; }
     if (!preview || !preview.videoWidth) return;
@@ -2965,33 +3076,76 @@ document.addEventListener('DOMContentLoaded', () => {
         'Set a speed override first — no speed means no classification';
     }
     await resetSession();
+    if (RIO.overlay && RIO.overlay.resetLag) RIO.overlay.resetLag();
     videoRunning = true;
     runBtn.textContent = 'Stop Headway Run';
+
+    // The analysis element, primed ahead of the picture BEFORE either plays,
+    // so the very first frames are already buffered rather than catching up.
+    const scout = ensureScout();
+    let haveScout = false;
+    if (scout) {
+      haveScout = await scoutReady(scout);
+      if (haveScout) {
+        try {
+          scout.currentTime = Math.min(preview.currentTime + REPLAY_LEAD_S,
+                                       Math.max(0, (scout.duration || 0) - 0.05));
+          await scout.play();
+        } catch (e) { haveScout = false; }
+      }
+    }
+    // No scout (a browser that refused the second element, a src we cannot
+    // read) means the old behaviour: analyse the visible element and let
+    // extrapolation cover the lag. Degraded, not broken, and it says so.
+    const src = haveScout ? scout : preview;
+    if (!haveScout) {
+      console.warn('[headway] replay buffer unavailable — analysing the ' +
+                   'visible element, boxes will lag by the round trip');
+    }
     if (preview.paused) { try { await preview.play(); } catch (e) {} }
 
     let nFrames = 0, tStart = performance.now();
-    while (videoRunning && !preview.ended) {
-      if (preview.paused) { await new Promise(r => setTimeout(r, 200)); continue; }
+    while (videoRunning && !preview.ended && !src.ended) {
+      if (preview.paused) {
+        if (haveScout && !scout.paused) { try { scout.pause(); } catch (e) {} }
+        await new Promise(r => setTimeout(r, 200));
+        continue;
+      }
+      if (haveScout && scout.paused && !scout.ended) {
+        try { await scout.play(); } catch (e) {}
+      }
+      if (haveScout) syncScout(scout);
       const t0 = performance.now();
       try {
         // Wait for the next PRESENTED frame where the browser can tell us about
         // one. Grabbing on a timer samples whatever happens to be in the video
         // element, which at a high rate is often the same frame twice; rVFC
-        // grabs the frame the viewer is actually looking at, so a box drawn
-        // from it lands on the pixels that produced it.
-        await nextVideoFrame(preview);
+        // grabs the frame that was actually decoded for display, so its
+        // currentTime is the true source timestamp of the pixels we send.
+        await nextVideoFrame(src);
         if (!videoRunning || preview.paused || preview.ended) break;
-        const blob = await frameFrom(preview);
-        await sendFrame(blob, { el: preview, frameT: preview.currentTime });
+        const frameT = src.currentTime;
+        const blob = await frameFrom(src);
+        await sendFrame(blob, { el: preview, frameT: frameT, capturedAt: t0 });
         nFrames++;
       } catch (e) { /* one bad frame must not end the run */ }
       const wait = Math.max(0, REPLAY_CADENCE_MS - (performance.now() - t0));
       await new Promise(r => setTimeout(r, wait));
     }
+    if (haveScout) { try { scout.pause(); } catch (e) {} }
     const secs = (performance.now() - tStart) / 1000;
     if (nFrames && secs > 0.5) {
+      const lag = (RIO.overlay && RIO.overlay.lagStats)
+        ? RIO.overlay.lagStats().replay : null;
+      const lagTxt = (lag && lag.n)
+        ? `, draw lag p50 ${(lag.p50 * 1000).toFixed(0)} ms / p95 ` +
+          `${(lag.p95 * 1000).toFixed(0)} ms over ${lag.n} results, ` +
+          `${lag.late} past the ${(lag.tolerance_s * 1000).toFixed(0)} ms ` +
+          `tolerance (raise HEADWAY_REPLAY_LEAD_S if that is many)`
+        : '';
       console.log(`[headway] replay analysed ${nFrames} frames in ` +
-                  `${secs.toFixed(1)}s (${(nFrames / secs).toFixed(1)} fps)`);
+                  `${secs.toFixed(1)}s (${(nFrames / secs).toFixed(1)} fps` +
+                  `, buffer ${(REPLAY_LEAD_S * 1000).toFixed(0)} ms)${lagTxt}`);
     }
     videoRunning = false;
     runBtn.textContent = 'Run Headway On Video';
@@ -3044,6 +3198,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resetHud: resetHud,
     cadenceMs: CADENCE_MS,
     replayCadenceMs: REPLAY_CADENCE_MS,
+    replayLeadS: REPLAY_LEAD_S,
   };
 });
 </script>
@@ -3064,7 +3219,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let enabled = true;
   let last = null;            // { result, el }  -- /perceive
-  let lastHw = null;          // { result, el }  -- /headway_frame
+
+  /* /headway_frame results, oldest first, each tagged with the moment it
+     describes. NOT a single "latest result": a result is drawn when the video
+     REACHES the frame it came from, which in replay is after it arrives, so
+     there has to be somewhere to keep it in the meantime.
+
+     In live mode there is no media clock to wait for and the queue holds
+     exactly one entry -- the newest -- which is the behaviour this replaced. */
+  let hwQueue = [];
+  const HW_QUEUE_MAX = 60;    // ~2.5 s at 24 fps; a bound, not a target
+
+  // A result counts as due when the picture has reached its frame, give or
+  // take half a frame at 24 fps: exact equality never happens between two
+  // clocks sampled independently.
+  const DUE_TOL_S = (1 / 24) / 2;
 
   // Band -> colour. This is the warning at a glance, so it is the one thing on
   // the canvas that must never be ambiguous.
@@ -3380,14 +3549,122 @@ document.addEventListener('DOMContentLoaded', () => {
      and the corridor from /perceive are unaffected -- only its boxes. */
   const HW_AUTHORITATIVE_MS = 1500;
 
+  /* --- when a result belongs on the screen -------------------------------
+
+     The whole alignment fix is these three functions.
+
+     A result describes ONE MOMENT of the road: the frame at `srcT` in replay,
+     or the instant `capturedAt` in live. Drawing it "when it arrives" throws
+     that away and pins it to a different moment -- the one the round trip
+     happened to end on -- which is why boxes trailed even when detection was
+     on time.
+
+     replay: the video clock is the truth. A result is due once the picture
+             reaches its frame, and its age is measured in video time, so a
+             paused, scrubbed or slowed clip stays correct for free.
+     live:   there is no media clock, so the wall clock since CAPTURE is used
+             -- which counts the encode and the round trip, unlike the time
+             since arrival that this replaced. */
+  function entryAge(entry) {
+    if (entry.srcT !== null && entry.srcT !== undefined) {
+      const el = entry.el;
+      if (el && isFinite(el.currentTime)) {
+        return Math.max(0, el.currentTime - entry.srcT);
+      }
+    }
+    if (entry.capturedAt !== null && entry.capturedAt !== undefined) {
+      return Math.max(0, (performance.now() - entry.capturedAt) / 1000);
+    }
+    return Math.max(0, (performance.now() - entry.t) / 1000);
+  }
+
+  function dueEntry() {
+    if (!hwQueue.length) return null;
+    const newest = hwQueue[hwQueue.length - 1];
+    // Live, or a replay result with no timestamp: nothing to wait for.
+    if (newest.srcT === null || newest.srcT === undefined) return newest;
+    const el = newest.el;
+    if (!el || !isFinite(el.currentTime)) return newest;
+    const t = el.currentTime + DUE_TOL_S;
+    let pick = null;
+    for (let i = 0; i < hwQueue.length; i++) {
+      if (hwQueue[i].srcT <= t) pick = hwQueue[i]; else break;
+    }
+    // Nothing due means the picture has not reached the first analysed frame
+    // yet -- the first REPLAY_LEAD_S of a run. Drawing the newest result there
+    // would be drawing the future onto the present, which is the same fault as
+    // drawing the past onto it. Draw nothing.
+    return pick;
+  }
+
+  function pruneQueue(kept) {
+    if (!kept || hwQueue.length < 2) return;
+    const i = hwQueue.indexOf(kept);
+    if (i > 0) hwQueue.splice(0, i);
+  }
+
+  /* --- display lag, measured ---------------------------------------------
+     Recorded once per result, the first time it is actually painted: source
+     frame timestamp against the video time on the screen at that moment. This
+     is the number the whole change is about, so it is measured rather than
+     assumed, and it is measured where the box is drawn rather than where the
+     response arrives. */
+  const lagSamples = { replay: [], live: [] };
+  const LAG_MAX_SAMPLES = 600;
+  // One frame at 24 fps -- the alignment target, and the same number
+  // config.HEADWAY_ALIGN_TOLERANCE_S holds for the harness. Below it the error
+  // is smaller than the interval between frames and cannot be seen.
+  const ALIGN_TOLERANCE_S = 1 / 24;
+  const lagLate = { replay: 0, live: 0 };
+
+  function recordLag(mode, seconds) {
+    const a = lagSamples[mode];
+    if (!a) return;
+    a.push(seconds);
+    if (a.length > LAG_MAX_SAMPLES) a.shift();
+    // A replay result that misses the tolerance is one the presentation buffer
+    // failed to cover -- the frame took longer than REPLAY_LEAD_S to come back.
+    // Counted rather than hidden: a run reporting many of these is a run whose
+    // buffer is too small for this link, which is a number the operator can act
+    // on and a guess nobody should have to make.
+    if (seconds > ALIGN_TOLERANCE_S) lagLate[mode]++;
+  }
+
+  function pct(arr, q) {
+    if (!arr.length) return null;
+    const v = arr.slice().sort((x, y) => x - y);
+    return v[Math.min(v.length - 1, Math.floor(q * (v.length - 1) + 0.5))];
+  }
+
+  function lagStats() {
+    const out = {};
+    Object.keys(lagSamples).forEach(k => {
+      const a = lagSamples[k];
+      out[k] = {
+        n: a.length,
+        p50: pct(a, 0.5), p95: pct(a, 0.95),
+        max: a.length ? Math.max.apply(null, a) : null,
+        late: lagLate[k],
+        tolerance_s: ALIGN_TOLERANCE_S,
+      };
+    });
+    return out;
+  }
+
+  function resetLag() {
+    lagSamples.replay = []; lagSamples.live = [];
+    lagLate.replay = 0; lagLate.live = 0;
+  }
+
   function redraw() {
     if (!resize()) return;
     wipe();
     if (!enabled) return;
 
     const now = performance.now();
-    const hwAge = (lastHw && lastHw.t) ? (now - lastHw.t) / 1000 : null;
-    const hwFresh = hwAge !== null && hwAge * 1000 < HW_AUTHORITATIVE_MS;
+    const hw = dueEntry();
+    const hwAge = hw ? entryAge(hw) : null;
+    const hwFresh = hw !== null && (now - hw.t) < HW_AUTHORITATIVE_MS;
 
     let drewCorridor = false;
     if (last && last.result) {
@@ -3410,11 +3687,19 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
 
-    if (lastHw && lastHw.result) {
-      const el = dims(lastHw.el) ? lastHw.el : mediaEl();
-      const img = lastHw.result.image || {};
+    if (hw && hw.result) {
+      const el = dims(hw.el) ? hw.el : mediaEl();
+      const img = hw.result.image || {};
       const m = el ? mapper(el, img.w, img.h) : null;
-      if (m) drawHeadway(m, lastHw.result, drewCorridor, hwAge || 0);
+      if (m) {
+        drawHeadway(m, hw.result, drewCorridor, hwAge || 0);
+        if (!hw.drawn) {
+          hw.drawn = true;
+          recordLag((hw.srcT === null || hw.srcT === undefined) ? 'live' : 'replay',
+                    hwAge || 0);
+        }
+        pruneQueue(hw);
+      }
     }
   }
 
@@ -3428,8 +3713,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (extrapRaf !== null) return;
     const tick = () => {
       extrapRaf = null;
-      if (!enabled || !lastHw || !lastHw.t) return;
-      const age = performance.now() - lastHw.t;
+      if (!enabled || !hwQueue.length) return;
+      const newest = hwQueue[hwQueue.length - 1];
+      const age = performance.now() - newest.t;
       if (age > HW_AUTHORITATIVE_MS) { redraw(); return; }
       redraw();
       extrapRaf = requestAnimationFrame(tick);
@@ -3443,15 +3729,40 @@ document.addEventListener('DOMContentLoaded', () => {
     redraw();
   }
 
-  function headway(result, el) {
-    lastHw = result
-      ? { result: result, el: el || mediaEl(), t: performance.now() }
-      : null;
+  function headway(result, el, meta) {
+    if (!result) { hwQueue = []; redraw(); return; }
+    meta = meta || {};
+    // The result's own frame_t is preferred over the caller's: it survives a
+    // log and a replay of one, where the caller's local variable does not.
+    let srcT = (result.frame_t === undefined || result.frame_t === null)
+      ? ((meta.frameT === undefined) ? null : meta.frameT)
+      : result.frame_t;
+    if (srcT !== null && !isFinite(srcT)) srcT = null;
+    const entry = {
+      result: result,
+      el: el || mediaEl(),
+      t: performance.now(),
+      srcT: srcT,
+      capturedAt: (meta.capturedAt === undefined) ? null : meta.capturedAt,
+      drawn: false,
+    };
+    if (entry.srcT === null) {
+      // Live: nothing to schedule against, so only the newest matters.
+      hwQueue = [entry];
+    } else {
+      hwQueue.push(entry);
+      // Out-of-order arrivals are possible the moment requests overlap, and a
+      // queue that is not sorted by source time would draw them backwards.
+      hwQueue.sort((a, b) => a.srcT - b.srcT);
+      if (hwQueue.length > HW_QUEUE_MAX) {
+        hwQueue.splice(0, hwQueue.length - HW_QUEUE_MAX);
+      }
+    }
     redraw();
-    if (lastHw) pumpExtrapolation();
+    pumpExtrapolation();
   }
 
-  function clear() { last = null; lastHw = null; redraw(); }
+  function clear() { last = null; hwQueue = []; redraw(); }
 
   if (toggle) {
     toggle.addEventListener('click', () => {
@@ -3552,7 +3863,16 @@ document.addEventListener('DOMContentLoaded', () => {
   }).observe(document.body, { attributes: true, attributeFilter: ['class'] });
 
   window.RIO = window.RIO || {};
-  RIO.overlay = { render: render, headway: headway, clear: clear, redraw: redraw };
+  RIO.overlay = {
+    render: render, headway: headway, clear: clear, redraw: redraw,
+    // Measured display lag: source frame timestamp vs the video time the box
+    // was actually painted at, p50/p95/max per mode. Read it from the console
+    // after a run -- RIO.overlay.lagStats() -- or let runVideo print it.
+    lagStats: lagStats, resetLag: resetLag,
+    // Exposed for the same reason the stats are: this is the queue depth an
+    // alignment problem shows up in.
+    get pending() { return hwQueue.length; },
+  };
 });
 </script>
 

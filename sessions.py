@@ -160,6 +160,11 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "frame_idx": result.get("frame_idx"),
         "t": result.get("t"),
         "dt": result.get("dt"),
+        # The source frame's position in the clip, for replay runs. Without it
+        # a logged frame cannot be put back against the video it came from,
+        # which is the only way to check afterwards that a box was drawn on the
+        # frame it was computed from.
+        "frame_t": result.get("frame_t"),
         "lead_box": result.get("lead_box"),
         "distance_m": result.get("distance_m"),
         "d_dot_ms": result.get("d_dot_ms"),
