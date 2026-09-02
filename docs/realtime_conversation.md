@@ -49,7 +49,7 @@ endpoints), `static/rio_realtime.js` (WebRTC + arbitration + tool bridge),
 
 ## What she can find out, and what she must not say
 
-A live session starts knowing nothing about this drive. Five tools give her the
+A live session starts knowing nothing about this drive. Six tools give her the
 things a driver actually asks about — and the one thing they ask her to *do* —
 each reusing the pipeline that already handles it:
 
@@ -57,6 +57,7 @@ each reusing the pipeline that already handles it:
 |---|---|---|---|
 | `look` | what is out of the window | `visual_qa.answer()` — frame ring, selector, crop, multimodal turn | server |
 | `nav_status` | destination, ETA, next maneuver, off-route, GPS | `RIO.nav.state()` — the dashboard card's own state | **browser** |
+| `nav_directions` | the upcoming turns, in order, with landmarks | `RIO.nav.directions()` → the tracker's `upcoming()` | **browser** |
 | `vehicle_status` | live signals, DTCs, findings | `vehicle_health.context(full=True)` — the conversation-layer builder | server |
 | `deep_dive` | research and hard questions | `gpt-5.6-sol` via Responses | server |
 | `start_navigation` | *takes the driver somewhere* | `RIO.nav.routeToQuery()` — the destination box's own entry point | **browser** |
@@ -72,6 +73,16 @@ is not a read. The server can resolve a destination — it does, at
 `/nav/destination` — but it cannot make the car navigate to one, because the
 route is loaded and the tracker started in the page. A server-side version
 could only resolve and hope.
+
+`nav_directions` is the same source one question further along. `nav_status`
+returns ONE maneuver, because one is what an announcement needs — and asked for
+the directions of a route she was actively driving, RIO said she could not read
+them. She was right about what she had. The list was in the tracker the whole
+time and nothing exposed it, so the fix was a method (`upcoming()`), a tool, and
+permission written into the instructions; the distances come from the tracker
+rather than the route because "how far to the turn after next" is a question
+about where the car is, and reading them off the route would answer it from the
+start of the drive.
 
 `vehicle_status` calls the same builder an ordinary conversation turn gets, so
 a live answer and a hold-to-talk answer cannot disagree about the same tire. It
@@ -91,6 +102,21 @@ That boundary is held three ways, not one: the instructions say it in those
 words, every `nav_status` result repeats it, and the ladder enforces it anyway
 — anything the model says is conversation priority, so a turn call pre-empts
 her mid-word regardless of what she thought she was doing.
+
+**Reading is not announcing.** The rule is about calling a turn AT the turn,
+over the driver, off a tool result that happened to mention it. A driver asking
+"what are the directions?" three miles earlier has asked a question, and the
+answer is the route. `nav_directions` exists to answer it, its result says so in
+the same breath as it says not to call the turns, and nothing about the timing
+changes: each maneuver is still announced by the planner at the moment it
+matters. Refusing to read a route she is driving was never the boundary — it
+was a gap in the tools, wearing the boundary's clothes.
+
+Landmarks read this way are EXPECTATIONS. A candidate in the route is a places
+lookup; what turns one into "there's the Shell" is the visual verifier at the
+junction, and it has not run yet when the directions are being read. So RIO
+says "there should be a Shell", and the tool result and the instructions both
+give her that sentence rather than the principle behind it.
 
 ### The one thing she initiates: going somewhere
 

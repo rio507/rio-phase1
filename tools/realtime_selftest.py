@@ -584,12 +584,29 @@ def run_awareness():
     s = realtime.session_config()
     names = [t["name"] for t in s["tools"]]
     ok(names == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
-                 realtime.NAV_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
-                 realtime.NAVIGATE_TOOL_NAME],
-       f"five tools: think, look, route, car — and go ({names})")
+                 realtime.NAV_TOOL_NAME, realtime.NAV_DIRECTIONS_TOOL_NAME,
+                 realtime.VEHICLE_TOOL_NAME, realtime.NAVIGATE_TOOL_NAME],
+       f"six tools: think, look, route, directions, car — and go ({names})")
 
-    nav_desc = s["tools"][2]["description"]
-    veh_desc = s["tools"][3]["description"]
+    # By name, not by index. The list has grown once and will again, and an
+    # index here means the next tool inserted silently re-points three
+    # assertions at the wrong description.
+    by_name = {t["name"]: t for t in s["tools"]}
+    nav_desc = by_name[realtime.NAV_TOOL_NAME]["description"]
+    dir_desc = by_name[realtime.NAV_DIRECTIONS_TOOL_NAME]["description"]
+    veh_desc = by_name[realtime.VEHICLE_TOOL_NAME]["description"]
+
+    # The directions tool: what it is for, and the two lines that keep it from
+    # becoming a second voice for the turns.
+    ok("turn-by-turn" in dir_desc and "in order" in dir_desc,
+       "the directions tool says it returns the whole upcoming list")
+    ok("ANSWERING" in dir_desc and "not a cue to call a turn" in dir_desc,
+       "and that reading them is answering, while calling them is not hers")
+    ok("expectation" in dir_desc and "never as something you can see" in dir_desc,
+       "and that a map landmark is an expectation, not a sighting")
+    ok(by_name[realtime.NAV_DIRECTIONS_TOOL_NAME]["parameters"]["properties"]
+       .get("count") is not None,
+       "it takes a count, so 'the next few' and 'all of them' are one tool")
     ok("ETA" in nav_desc and "next turn" in nav_desc,
        "the route tool says what it answers")
     ok("not yet confirmed" in veh_desc or "not confirmed" in veh_desc,
@@ -607,6 +624,29 @@ def run_awareness():
     for phrase in ("Say only what the data supports", "Keep the provenance",
                    "detected but NOT CONFIRMED"):
         ok(phrase in instr, f"truthfulness rule carried over: {phrase!r}")
+
+    # READING IS ANSWERING. The bug was RIO saying she could not read the
+    # directions of a route she was driving; the fix is a tool AND permission,
+    # and permission that is not written down is not permission.
+    ok("WHEN THE DRIVER ASKS FOR THE DIRECTIONS" in instr,
+       "the instructions have a section for being asked to read the route")
+    ok("Reading the directions when the driver asks for them is ANSWERING" in instr,
+       "which says, in the section about not announcing, that reading is not "
+       "announcing")
+    ok(realtime.NAV_DIRECTIONS_TOOL_NAME in instr,
+       "and names the tool that does it")
+    ok("there should be a Shell" in instr,
+       "the landmark phrasing is given as a sentence, not as a principle")
+    ok(all(p in instr for p in ("Round the distances", "not the way a screen "
+                                "lists them")),
+       "and it asks for directions spoken the way a person gives them")
+    # Line-wrap tolerant: the instructions are a paragraph, and asserting on a
+    # phrase that happens to sit either side of a newline is a test that fails
+    # for the wrong reason the next time someone reflows it.
+    flat = re.sub(r"\s+", " ", instr)
+    ok('no "turn left here"' in flat and "nothing that sounds like an "
+       "instruction for right now" in flat,
+       "while ruling out the phrasings that would sound like a turn call")
 
     # vehicle_status must PASS THROUGH the existing builder, not summarise it.
     import vehicle_health
@@ -1010,8 +1050,41 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
     # what she says afterwards — the panel's real code is exercised end to end
     # by `node tools/realtime_selftest.js --server`.
     ORIGIN = (34.0219, -118.4814)
+    live_route = {}
+
+    REL_PHRASE = {"NEAR": "by", "JUST_AFTER": "just after",
+                  "JUST_BEFORE": "just before"}
+
+    def _step(m, i, distance_key):
+        """One maneuver as the panel hands it to the model.
+
+        The landmark is the map's first candidate and carries its RELATION,
+        because "just after the Shell" and "just before the Shell" are
+        different turns. It is marked unverified: nothing has looked at it.
+        """
+        step = {"step": i + 1, "instruction": m.get("instruction", ""),
+                "road_name": m.get("road_name", ""),
+                "maneuver_type": m.get("type"), "direction": m.get("direction"),
+                distance_key: round(m.get("route_distance_position") or 0)}
+        anchors = m.get("anchors") or []
+        if anchors and anchors[0].get("label"):
+            a = anchors[0]
+            label = a.get("spoken_label") or a["label"]
+            step["landmark"] = {
+                "label": label, "relation": a.get("relation"),
+                "phrase": f"{REL_PHRASE.get(a.get('relation'), 'near')} {label}",
+                "confidence": a.get("relation_confidence"), "verified": False,
+            }
+        return step
 
     def route_by_voice(spoken):
+        # Kept because the ambiguity check below has to probe the query SHE
+        # sent, not the one the test imagined she would. Asked to "take me to
+        # LAX" she may reasonably say "Los Angeles International Airport",
+        # which the provider resolves outright — and a test that then probes
+        # the bare "LAX" reports her for not asking a question nobody put to
+        # her.
+        live_route["query"] = spoken
         d = httpx.post(f"{base}/nav/destination", timeout=60,
                        json={"q": spoken, "lat": ORIGIN[0],
                              "lng": ORIGIN[1]}).json()
@@ -1040,24 +1113,83 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
         if r.get("error"):
             return {"ok": False, "status": "failed", "note": r["error"],
                     "rules": "The route did not start. Say so plainly."}
-        # From here on the drive really is going there, so the tool that
-        # answers "where are we going" has to agree.
+        # From here on the drive really is going there, so the tools that
+        # answer "where are we going" and "what are the turns" have to agree.
         nav_state["destination"] = r["destination"]["display_name"]
+        live_route["route"] = r
+        mans = r.get("maneuvers") or []
         return {"ok": True, "routing": True, "status": "routed",
                 "destination": r["destination"]["display_name"],
                 "minutes": max(1, round(r["duration_s"] / 60)),
                 "distance_km": round(r["total_distance_m"] / 100) / 10,
+                "eta_epoch": r.get("eta_epoch"),
+                "total_maneuvers": len(mans),
+                "first_steps": [_step(m, i, "distance_from_start_m")
+                                for i, m in enumerate(mans[:3])],
                 "rules": "The route is live and the car is navigating already. "
                          "Confirm it once, briefly, in your own words, using "
                          "this destination name exactly as spelled here. Do "
                          "NOT tell the driver to set it themselves — it is "
-                         "set. Do NOT read out the turns: the navigation "
-                         "system calls those itself."}
+                         "set. Do not read the turns out now: confirming is "
+                         "one line. If they ASK for the directions, call "
+                         "nav_directions and read them — that is answering. "
+                         "What you never do is call a turn as it arrives; the "
+                         "navigation system does that itself, at the moment "
+                         "it matters."}
+
+    def read_directions(arguments):
+        """The panel's nav_directions, played from the REAL route.
+
+        Shaped exactly as rio_realtime.js shapes it, for the same reason
+        route_by_voice is: what is under test here is the MODEL — whether she
+        reaches for this tool when asked for the directions and what she does
+        with a landmark hint when she has one. The panel's own code is
+        exercised end to end by `node tools/realtime_selftest.js`.
+        """
+        r = live_route.get("route")
+        if not r:
+            return {"ok": True, "routing": False,
+                    "note": "no route is set — say that, do not invent turns"}
+        args = json.loads(arguments or "{}")
+        raw = args.get("count")
+        count = 5
+        if isinstance(raw, str) and raw.strip().lower() == "all":
+            count = None
+        elif raw not in (None, ""):
+            try:
+                count = max(1, int(raw))
+            except (TypeError, ValueError):
+                count = None
+        mans = r.get("maneuvers") or []
+        chosen = mans if count is None else mans[:count]
+        return {
+            "ok": True, "routing": True,
+            "destination": r["destination"]["display_name"],
+            "distance_remaining_m": round(r.get("total_distance_m") or 0),
+            "eta_epoch": r.get("eta_epoch"),
+            "total_maneuvers": len(mans),
+            "maneuvers_left": len(chosen),
+            "truncated": count is not None and len(mans) > len(chosen),
+            "route_state": "ON_ROUTE", "gps_state": "GPS_OK", "arrived": False,
+            "steps": [_step(m, i, "distance_m") for i, m in enumerate(chosen)],
+            "rules": "The driver asked for these, so read them — that is "
+                     "answering, not announcing. In your own voice and in one "
+                     "flowing sentence or two, not as a numbered list: name "
+                     "the roads, round the distances the way a person would, "
+                     "and stop after the first few unless they asked for all "
+                     "of it. A landmark here is what the MAP expects, not "
+                     "something anyone has seen: say \"there should be a "
+                     "Shell\", never \"there's a Shell\". Do NOT call any of "
+                     "these turns as instructions now — when each one arrives "
+                     "the navigation system calls it itself.",
+        }
 
     def tool_handler(name, arguments):
         calls.append(name)
         if name == realtime.NAV_TOOL_NAME:
             return nav_state
+        if name == realtime.NAV_DIRECTIONS_TOOL_NAME:
+            return read_directions(arguments)
         if name == realtime.NAVIGATE_TOOL_NAME:
             args = json.loads(arguments or "{}")
             return route_by_voice(str(args.get("destination") or ""))
@@ -1195,6 +1327,85 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
                          said.lower()),
            "and still does not call the turns on the route she just started")
 
+        # 5b. "WHAT ARE THE DIRECTIONS?" The bug: RIO could start a route and
+        #     then say she could not read it. She has a tool now, and the
+        #     things worth checking are that she reaches for it, that what she
+        #     says comes from the real route, and that reading is not the same
+        #     as calling.
+        calls.clear()
+        said, used = ask("What are the directions?")
+        print(f"    Q: what are the directions?\n    A: {said[:320]}")
+        ok(realtime.NAV_DIRECTIONS_TOOL_NAME in used,
+           f"she reads the route rather than refusing ({used})")
+
+        route_now = live_route.get("route") or {}
+        mans = route_now.get("maneuvers") or []
+        roads = [m.get("road_name", "") for m in mans if m.get("road_name")]
+        low = said.lower()
+        hit = [r for r in roads if r.lower() in low]
+        ok(bool(hit),
+           "and names roads that are actually on the route "
+           f"({hit[:3] if hit else 'none of ' + str(roads[:4])})")
+
+        # Reading a turn is fine — that is the whole point. CALLING one is not.
+        # The phrases that separate them are the ones that mean "now".
+        call_now = re.search(
+            r"\b(turn|go|bear|keep)\s+(left|right)\s+(here|now)\b"
+            r"|\bget ready to turn\b|\bturn (?:left|right) in a moment\b",
+            low)
+        ok(call_now is None,
+           "and reads them as directions rather than calling one "
+           f"({call_now.group(0) if call_now else 'no turn call'})")
+
+        # The landmark, if this route has one: named, and named as an
+        # EXPECTATION. Skipped honestly when the provider found none, because
+        # a route with no landmarks cannot test landmark phrasing.
+        anchored = [(m, (m.get("anchors") or [None])[0]) for m in mans
+                    if m.get("anchors")]
+        if anchored:
+            labels = [(a.get("spoken_label") or a.get("label") or "")
+                      for _m, a in anchored]
+            named = [l for l in labels if l and l.split()[-1].lower() in low]
+            if named:
+                ok(True, f"and previews the map's landmark ({named[0]!r})")
+                expectation = re.search(
+                    r"(should be|should see|there'?s? (?:meant|supposed) to be|"
+                    r"expect|look(?:ing)? for)", low)
+                ok(expectation is not None,
+                   "as an expectation rather than a sighting "
+                   f"({expectation.group(0) if expectation else 'stated as fact'})")
+            else:
+                # The landmarked turn is further down the route than the few
+                # she read, which is correct behaviour and no test of the
+                # landmark. So ask for the part that contains it.
+                print(f"    (landmarks are deeper in the route than she read: "
+                      f"{labels[:3]} — asking for all of them)")
+                said2, used2 = ask("Read me all of them.")
+                print(f"    Q: read me all of them\n    A: {said2[:400]}")
+                low2 = said2.lower()
+                ok(realtime.NAV_DIRECTIONS_TOOL_NAME in used2,
+                   f"she reads the rest of the route on request ({used2})")
+                named2 = [l for l in labels
+                          if l and l.split()[-1].lower() in low2]
+                if named2:
+                    ok(True, "and previews the map's landmark when she gets "
+                             f"to it ({named2[0]!r})")
+                    expectation = re.search(
+                        r"(should be|should see|should have|there'?s? "
+                        r"(?:meant|supposed) to be|expect|look(?:ing)? for)",
+                        low2)
+                    ok(expectation is not None,
+                       "as an expectation rather than a sighting "
+                       f"({expectation.group(0) if expectation else 'stated as fact'})")
+                else:
+                    ok(True, f"(she summarised rather than reading every turn, "
+                             f"so the landmarked ones {labels[:2]} did not come "
+                             "up — the hint is in the tool result either way, "
+                             "which the offline tests assert)")
+        else:
+            ok(True, "(this route came back with no landmark candidates — "
+                     "nothing to preview, and inventing one would be the bug)")
+
         # 6. ...and ambiguity still stops her, now that stopping costs her
         #    something: she is the one who would have to route.
         calls.clear()
@@ -1202,9 +1413,12 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
         print(f"    Q: take me to LAX instead\n    A: {said[:260]}")
         ok(realtime.NAVIGATE_TOOL_NAME in used,
            f"she reaches for the same tool ({used})")
+        asked_for = live_route.get("query") or "LAX"
         amb = httpx.post(f"{base}/nav/destination", timeout=60,
-                         json={"q": "LAX", "lat": 34.0219,
-                               "lng": -118.4814}).json()
+                         json={"q": asked_for, "lat": ORIGIN[0],
+                               "lng": ORIGIN[1]}).json()
+        print(f"    (she asked the provider for {asked_for!r} -> "
+              f"{amb.get('status')})")
         if amb.get("status") == "ambiguous":
             ok("?" in said,
                "the provider read that as more than one place, and she asks "
@@ -1213,8 +1427,9 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
                    for c in amb["candidates"]),
                "naming what she found, so the question can be answered")
         else:
-            ok(True, f"the provider resolved LAX outright ({amb.get('status')}) "
-                     "— no ambiguity to exercise today")
+            ok(True, f"the provider resolved {asked_for!r} outright "
+                     f"({amb.get('status')}) — she expanded the acronym "
+                     "herself, so there was no ambiguity left to stop her on")
     finally:
         close_session()
 

@@ -463,6 +463,47 @@
         },
 
         maneuver: function () { return manIdx < mans.length ? mans[manIdx] : null; },
+
+        /* Every maneuver still ahead of the car, in order.
+         *
+         * state() answers "what is the NEXT turn", which is what an
+         * announcement needs and all it needs. A driver asking "what are the
+         * directions" is asking a different question, and until this existed
+         * the only honest answer was that RIO could not read them: the list
+         * was in here the whole time and nothing exposed it.
+         *
+         * Distances are measured from where the car is NOW, not from the start
+         * of the route, because the question is always asked mid-drive. `leg_m`
+         * is the gap from the previous maneuver in this list, which is what
+         * turns a list of turns into a set of directions -- "then left on
+         * Sunset, then straight for six miles".
+         *
+         * `count` omitted or null gives the whole remaining route.
+         */
+        upcoming: function (count) {
+          var out = [];
+          var limit = (count === undefined || count === null)
+            ? mans.length : Math.max(0, count);
+          var prevAlong = along;
+          for (var i = manIdx; i < mans.length && out.length < limit; i++) {
+            var m = mans[i];
+            out.push(manPublic(m, {
+              // Ahead of the car. Clamped at zero: the current maneuver can be
+              // a metre behind the projection while still being the one we are
+              // driving into, and a negative distance in an answer is worse
+              // than a rounded-down one.
+              distance_m: Math.max(0, Math.round(m.along_m - along)),
+              leg_m: Math.max(0, Math.round(m.along_m - prevAlong)),
+              // The map's landmark candidates for this turn, unfiltered and
+              // unranked here -- whoever reads them decides what to say. Kept
+              // whole rather than reduced to a label, because the relation is
+              // what makes the sentence true.
+              anchors: m.anchors || []
+            }));
+            prevAlong = m.along_m;
+          }
+          return out;
+        },
         maneuverById: function (id) {
           for (var i = 0; i < mans.length; i++) if (mans[i].id === id) return mans[i];
           return null;

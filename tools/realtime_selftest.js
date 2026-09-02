@@ -23,6 +23,9 @@
 const path = require('path');
 const rt = require(path.join(__dirname, '..', 'static', 'rio_realtime.js'));
 const speech = require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
+// The real tracker, so the directions a test reads are computed the way the
+// car computes them rather than written out by the test.
+const navcore = require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
 
 let checks = 0, failures = 0;
 function ok(cond, what) {
@@ -606,6 +609,28 @@ section('routing — asked to go somewhere, she takes them there');
 /* A stand-in for the navigation panel, with the same surface rio_nav.js
    exposes: routeToQuery resolves an outcome, state() answers nav_status from
    whatever is actually routed. `behaviour` decides what the provider says. */
+/* A route fixture the real tracker will accept: a straight line long enough to
+   hold the fixture's maneuvers, with each one pinned to the vertex its distance
+   along the route puts it at. Ten-metre spacing, so a maneuver at 400 m is
+   vertex 40 and no nearest-point search is involved. */
+function trackable(route) {
+  const lat0 = 34.0, lng0 = -118.4;
+  const mLat = 111320, mLng = 111320 * Math.cos(lat0 * Math.PI / 180);
+  const pts = [];
+  const total = route.total_distance_m || 1000;
+  for (let d = 0; d <= total + 10; d += 10) pts.push([lat0, lng0 + d / mLng]);
+  return {
+    route_id: 'r1', journey_id: 'j1', generation_id: 1, provider: 'fixture',
+    geometry: pts, eta_epoch: route.eta_epoch || 0,
+    destination: { display_name: 'fixture', lat: lat0, lng: lng0 },
+    total_distance_m: total, arrival: { side: 'RIGHT' },
+    maneuvers: (route.maneuvers || []).map(m => Object.assign({}, m, {
+      lat: lat0, lng: lng0 + (m.route_distance_position || 0) / mLng,
+      polyline_index: Math.round((m.route_distance_position || 0) / 10),
+    })),
+  };
+}
+
 function fakePanel(behaviour) {
   const panel = { asked: [], unlocked: false, routed: null, logged: [] };
   panel.nav = {
@@ -624,6 +649,24 @@ function fakePanel(behaviour) {
       maneuver_state: 'NONE', maneuvers_left: 8,
       route_state: 'ON_ROUTE', gps_state: 'GPS_OK', arrived: false,
     } : null),
+    /* The same shape rio_nav.js's directions() returns, and the maneuver list
+       comes from the REAL tracker rather than from a hand-written array: what
+       is under test is the whole path from "a route is loaded" to "she can
+       read it", and a stubbed list would skip the half of it that computes
+       how far away each turn is. */
+    directions: (count) => {
+      if (!panel.routed) return null;
+      const r = panel.routed.route;
+      const tracker = navcore.create(trackable(r));
+      return {
+        destination: panel.routed.destination,
+        route_id: 'r1', generation_id: 1, landmarks_state: 'ready',
+        total_maneuvers: (r.maneuvers || []).length,
+        remaining_m: r.total_distance_m, eta_epoch: r.eta_epoch,
+        route_state: 'ON_ROUTE', gps_state: 'GPS_OK', arrived: false,
+        maneuvers: tracker.upcoming(count),
+      };
+    },
   };
   global.RIO = global.RIO || {};
   global.RIO.nav = panel.nav;
@@ -631,11 +674,34 @@ function fakePanel(behaviour) {
   return panel;
 }
 
+/* A landmark candidate as the map hands one over: a place the lookup found
+   near a turn, with the relation that makes a sentence about it true. NOT a
+   sighting — nothing has looked at it yet. */
+const SHELL = {
+  anchor_id: 'm0a0', place_id: 'p_shell', label: 'Shell',
+  spoken_label: 'the Shell station', type: 'gas_station', salience: 1.0,
+  relation: 'JUST_AFTER', relation_confidence: 0.81,
+  distance_to_maneuver_m: 24.0, speech: 'Turn right just after the Shell station.',
+};
+
+const LAX_MANEUVERS = [
+  { id: 'm0', sequence: 0, type: 'TURN', direction: 'RIGHT',
+    road_name: 'Lincoln Boulevard', instruction: 'Turn right onto Lincoln Boulevard',
+    route_distance_position: 400, polyline_index: 4, anchors: [SHELL], speech: {} },
+  { id: 'm1', sequence: 1, type: 'TURN', direction: 'LEFT',
+    road_name: 'Sunset Boulevard', instruction: 'Turn left onto Sunset Boulevard',
+    route_distance_position: 3200, polyline_index: 32, anchors: [], speech: {} },
+  { id: 'm2', sequence: 2, type: 'ARRIVE', direction: 'RIGHT',
+    road_name: '', instruction: 'Arrive at Los Angeles International Airport',
+    route_distance_position: 21400, polyline_index: 214, anchors: [], speech: {} },
+];
+
 const LAX = {
   status: 'routed',
   destination: { display_name: 'Los Angeles International Airport',
                  formatted_address: '1 World Way, Los Angeles, CA 90045' },
-  route: { total_distance_m: 21400, duration_s: 1080, eta_epoch: 1787790000 },
+  route: { total_distance_m: 21400, duration_s: 1080, eta_epoch: 1787790000,
+           maneuvers: LAX_MANEUVERS },
 };
 
 /* The tool bridge exactly as connect() wires it: names in LOCAL_TOOLS are
@@ -674,8 +740,21 @@ function panelTools() {
      + ' minutes)');
   ok(/do NOT tell the driver to set it themselves/i.test(out.rules || ''),
      'and the result itself closes the door on the old behaviour');
-  ok(/do NOT read out the turns/i.test(out.rules || ''),
-     'while leaving the turns exactly where they were: not hers');
+  ok(/If they ASK for the directions, call nav_directions/i.test(out.rules || ''),
+     'and points her at the tool for when they ask for the turns — reading '
+     + 'them is answering');
+  ok(/never do is call a turn as it arrives/i.test(out.rules || ''),
+     'while leaving the CALLS exactly where they were: not hers');
+  ok(out.total_maneuvers === 3 && out.first_steps.length === 3,
+     'the confirmation carries the route summary — ' + out.total_maneuvers
+     + ' maneuvers, first ' + out.first_steps.length
+     + ' spelled out, so she needs no second call to confirm from');
+  ok(out.first_steps[0].road_name === 'Lincoln Boulevard'
+     && out.first_steps[0].distance_from_start_m === 400,
+     'with real road names and real distances (' + out.first_steps[0].road_name
+     + ' at ' + out.first_steps[0].distance_from_start_m + ' m)');
+  ok(out.eta_epoch === 1787790000,
+     'and the ETA, which is the other half of a confirmation');
   ok(h.types().indexOf('response.create') >= 0,
      'she is then asked to say so out loud — the driver hears a confirmation, '
      + 'not silence');
@@ -689,6 +768,90 @@ function panelTools() {
   ok(panel.logged.some(e => e[0] === 'NAV_VOICE_DESTINATION' &&
                             e[1].status === 'routed'),
      'the drive log records that this one was set by voice');
+}
+
+{
+  // 1b. "WHAT ARE THE DIRECTIONS?" The bug this section exists for: RIO could
+  //     start a route and then say she could not read it. nav_status answers
+  //     "what is the next turn", which is a different question, and there was
+  //     nothing else to ask. The list was in the tracker the whole time.
+  const panel = fakePanel(() => LAX);
+  const h = harness({ tool: panelTools() });
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'd0',
+    arguments: JSON.stringify({ destination: 'take me to LAX' }),
+  });
+  await tick(); await tick(); await tick();
+
+  const dir = rt.navDirections({});
+  ok(dir.ok === true && dir.routing === true,
+     'with a route live, nav_directions answers from it');
+  ok(dir.destination === 'Los Angeles International Airport',
+     'naming the destination the route was actually built to');
+  ok(dir.steps.length === 3 && dir.steps[0].road_name === 'Lincoln Boulevard'
+     && dir.steps[1].road_name === 'Sunset Boulevard',
+     'with the REAL steps of that route, in order (' +
+     dir.steps.map(s2 => s2.road_name || s2.maneuver_type).join(' -> ') + ')');
+  ok(dir.steps[0].direction === 'RIGHT' && dir.steps[1].direction === 'LEFT',
+     'each carrying which way to turn');
+  ok(dir.steps[0].distance_m === 400 && dir.steps[1].distance_m === 3200,
+     'and how far to it (' + dir.steps[0].distance_m + ' m, ' +
+     dir.steps[1].distance_m + ' m)');
+  ok(dir.steps[1].leg_m === 2800,
+     'plus the gap from the previous turn, which is what makes it read as ' +
+     'directions rather than as a table (' + dir.steps[1].leg_m + ' m)');
+  ok(dir.total_maneuvers === 3 && dir.truncated === false,
+     'and says whether there are more than it listed');
+
+  // THE LANDMARK, AS AN EXPECTATION. The map found a Shell near the first
+  // turn; nothing has looked at it. That difference has to survive into what
+  // she is allowed to say.
+  const lm = dir.steps[0].landmark;
+  ok(lm && lm.label === 'the Shell station',
+     'a maneuver with a landmark candidate carries it (' +
+     (lm ? lm.label : 'none') + ')');
+  ok(lm && lm.phrase === 'just after the Shell station',
+     'phrased by its RELATION to the turn, not as "near" for everything (' +
+     (lm ? lm.phrase : 'none') + ')');
+  ok(lm && lm.verified === false,
+     'and marked unverified — this is a map lookup, not a sighting');
+  ok(dir.steps[1].landmark === undefined,
+     'a turn with no candidate gets no landmark rather than an invented one');
+  ok(/there should be a Shell/i.test(dir.rules || ''),
+     'the rules make her phrase it as an expectation, in those words');
+  ok(/that is answering, not announcing/i.test(dir.rules || ''),
+     'they say reading these IS answering...');
+  ok(/Do NOT call any of these turns as instructions now/i.test(dir.rules || ''),
+     '...and that calling them is still not hers');
+  ok(!/^\s*1[.)]/m.test(dir.rules || '') && /not as a numbered list/i.test(dir.rules || ''),
+     'and ask for a spoken answer rather than a list read aloud');
+
+  // COUNT. The default is a few; "all" is the whole route.
+  const five = rt.navDirections({ count: 2 });
+  ok(five.steps.length === 2 && five.truncated === true,
+     'a count truncates, and says so');
+  const all = rt.navDirections({ count: 'all' });
+  ok(all.steps.length === 3 && all.truncated === false,
+     '"all" reads the whole route');
+  const junk = rt.navDirections({ count: 'some' });
+  ok(junk.steps.length === 3,
+     'and anything unreadable as a number is treated as "all" rather than ' +
+     'as an error the driver has to hear about');
+
+  // The tool bridge answers it in the PANEL, like the other two.
+  ok(typeof rt.localTools.nav_directions === 'function',
+     'nav_directions is answered in the browser, where the route lives');
+}
+
+{
+  // 1c. NO ROUTE. The honest answer, not an invented one.
+  fakePanel(() => LAX);
+  global.RIO.nav.directions = () => null;
+  const none = rt.navDirections({});
+  ok(none.ok === true && none.routing === false && /no route/.test(none.note),
+     'with no route set she is told to say so, not to invent turns');
+  ok(!none.steps, 'and is handed no steps at all to be tempted by');
 }
 
 {

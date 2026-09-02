@@ -72,6 +72,17 @@ LOOK_TOOL_NAME = "look"
 # conversation prior: where we are going, and how the car is. Both already have
 # a source of truth in this system and neither of them is the model.
 NAV_TOOL_NAME = "nav_status"
+
+# ...and the rest of the route, which is a different question from "what is the
+# next turn" and had no tool to answer it. Asked for the directions, RIO said
+# she could not read them -- correctly, given what she had: nav_status returns
+# ONE maneuver, because that is what an announcement needs, and the list was in
+# the browser's tracker with nothing exposing it. Reading it out when the driver
+# asks is answering, which she is for, and it does not touch the boundary that
+# matters: she still never CALLS a turn, because that is the arbiter's job and
+# it is done at the junction, not on request.
+NAV_DIRECTIONS_TOOL_NAME = "nav_directions"
+
 VEHICLE_TOOL_NAME = "vehicle_status"
 
 # ...and the one thing on this list she DOES rather than reports. A driver who
@@ -161,6 +172,41 @@ NAV_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
+NAV_DIRECTIONS_SCHEMA = {
+    "type": "function",
+    "name": NAV_DIRECTIONS_TOOL_NAME,
+    "description": (
+        "The turn-by-turn directions for the route we are on: the upcoming "
+        "maneuvers in order, each with the instruction, the road, how far away "
+        "it is and which way it turns. Call this whenever the driver asks for "
+        "the directions, the route, 'what are the turns', 'what's after that', "
+        "'read me the directions', 'how do we get there' — anything that wants "
+        "more than the single next maneuver nav_status returns. Returns the "
+        "next five by default; pass a count, or \"all\" for the whole route.\n"
+        "Reading these out because you were asked is ANSWERING and it is what "
+        "this tool is for. It is still not a cue to call a turn: each one is "
+        "announced by the navigation system at the moment it happens, and that "
+        "is not yours. Some maneuvers come with a landmark the map expects to "
+        "be there — say so as an expectation ('there should be a Shell'), "
+        "never as something you can see."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "count": {
+                "type": "string",
+                "description": (
+                    "How many upcoming maneuvers to return: a number as text "
+                    "(\"3\"), or \"all\" for the whole remaining route. "
+                    "Omit for the next five."
+                ),
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
 VEHICLE_SCHEMA = {
     "type": "function",
     "name": VEHICLE_TOOL_NAME,
@@ -248,8 +294,15 @@ navigation system is about to say exactly that and you would be talking over
 it.
 
 Asked, you answer freely: "where are we going", "how far", "what's the next
-turn", "is everything okay with the car". Unasked, you say nothing about any of
-it.
+turn", "read me the directions", "is everything okay with the car".
+Unasked, you say nothing about any of it.
+
+Reading the directions when the driver asks for them is ANSWERING, and it is
+not the thing this rule is about. The rule is about CALLING a turn — saying
+"left here" at the junction, over the driver, because a tool result mentioned
+it. That call belongs to the navigation system and is made at the moment it is
+useful. A driver asking "what are the turns?" three miles earlier is asking a
+question, and a question gets an answer.
 
 Being asked to DO something is not an exception to this, it is the other half
 of it. "Take me to the Getty" is not an announcement waiting to happen, it is
@@ -290,12 +343,43 @@ prescribed: use the destination name the tool hands back, spelled its way
 rather than the way you heard it — LAX and LAS are one letter apart and only
 one of them is where they are going — and say it once.
 
+The tool hands you the route itself as well — how many turns, and the first few
+spelled out — so you can confirm from that without asking anything else. Do not
+read them out as part of the confirmation; one line is the confirmation. If the
+driver then asks what the turns are, that is nav_directions and it is answering.
+
 If it comes back asking WHICH ONE, it has found more than one place that
 answers to what they said, and choosing between them is not yours to do. Ask —
 name them, briefly — and when the driver answers, call start_navigation again
 with what they chose. If it could not find the place at all, say so and ask
 them to put it another way. If the route itself failed, say that plainly too.
 None of those three are cues to hand the job back to the driver.
+
+WHEN THE DRIVER ASKS FOR THE DIRECTIONS
+
+"What are the directions?" "What are the turns?" "How do we get there?" "What's
+after Lincoln?" Call nav_directions and read what comes back — that is what it
+is for, and refusing to read a route you are driving is not a boundary, it is a
+gap.
+
+Say it the way a person gives directions, not the way a screen lists them. One
+flowing line or two: "First a right onto Lincoln in about half a mile, then
+left on Sunset, then it's straight for six miles." Round the distances — "about
+half a mile", "a couple of miles" — because nobody says four hundred and twenty
+metres. Name the roads exactly as the tool spells them. Stop after the first
+few unless they asked for all of it, and offer the rest rather than reciting
+it.
+
+Some turns come back with a landmark. Say it as an EXPECTATION, because that is
+what it is: the map found a petrol station near that junction and nobody has
+looked at it yet. "Then a left onto Sunset — there should be a Shell on the
+corner." Never "there's a Shell", never "you'll see a Shell". If a landmark is
+really there, the car says so at the turn, once it has actually seen it.
+
+And it stays an answer. You are reading a route, not calling it: no "turn left
+here", no "get ready to turn", nothing that sounds like an instruction for
+right now. Each of those turns gets called by the navigation system when it
+arrives.
 
 WHEN THE DRIVER ASKS ABOUT THE ROUTE, OR ABOUT THE CAR
 
@@ -469,8 +553,8 @@ def session_config() -> dict:
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
-        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, VEHICLE_SCHEMA,
-                  NAVIGATE_SCHEMA],
+        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
+                  VEHICLE_SCHEMA, NAVIGATE_SCHEMA],
         "tool_choice": "auto",
     }
 
@@ -663,6 +747,12 @@ def run_tool(name: str, arguments, session_key: str = "default") -> dict:
         # source for "how far to the next turn" is how two answers to one
         # question happen. See rio_realtime.js: local tools.
         return {"ok": False, "note": "nav_status is answered by the panel"}
+    if name == NAV_DIRECTIONS_TOOL_NAME:
+        # Same reason as nav_status, one step further: the route lives on the
+        # server but WHERE ALONG IT WE ARE does not, and "how far to the turn
+        # after next" is a question about both. The server could answer it from
+        # the route alone and would be measuring from the start of the drive.
+        return {"ok": False, "note": "nav_directions is answered by the panel"}
     if name == NAVIGATE_TOOL_NAME:
         # Also the browser, and for a stronger reason than nav_status: this
         # one is not a read. The server can resolve a destination — it does,
@@ -693,7 +783,8 @@ def status() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "reasoning_model": config.OPENAI_REASONING_MODEL,
-        "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME, VEHICLE_TOOL_NAME,
+        "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME,
+                  NAV_DIRECTIONS_TOOL_NAME, VEHICLE_TOOL_NAME,
                   NAVIGATE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),

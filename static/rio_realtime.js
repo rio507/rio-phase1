@@ -87,6 +87,120 @@
     return out;
   }
 
+  /* nav_directions — the turn-by-turn, because she was asked for it.
+   *
+   * nav_status answers "what is the next turn", which is the question an
+   * announcement needs. "What are the directions?" is a different question and
+   * RIO could not answer it: the maneuver list was in the tracker the whole
+   * time and nothing exposed it, so she said she could not read them. She
+   * could. Nothing was stopping her but the shape of the tools.
+   *
+   * READING IS ANSWERING. The boundary this sits next to is about ANNOUNCING —
+   * calling a turn at the moment it needs calling, over the driver, from a
+   * tool result that happened to mention it. That is the arbiter's job and
+   * still is. Reading the route out when the driver asks for it is the
+   * opposite: it is a question with an answer, and refusing to answer it was
+   * never the point of the rule.
+   *
+   * Landmarks ride along where the map found one, and they are marked as
+   * EXPECTATIONS rather than sightings. A landmark in the route is a candidate
+   * from a places lookup; the thing that turns one into "there's the Shell,
+   * go left after it" is the visual verifier at the junction, and that has not
+   * run yet when the directions are being read. "There should be a Shell" is
+   * true at this point. "There's a Shell" is not.
+   */
+  var REL_PHRASE = {
+    NEAR: 'by', JUST_AFTER: 'just after', JUST_BEFORE: 'just before',
+  };
+
+  function landmarkOf(man) {
+    // The best candidate is the first: landmarks.py sorts by salience, then
+    // relation confidence, then distance, and truncates. Taking anything else
+    // would be second-guessing a ranking made with more information.
+    var a = (man && man.anchors && man.anchors.length) ? man.anchors[0] : null;
+    if (!a || !a.label) return null;
+    var rel = REL_PHRASE[a.relation] || 'near';
+    return {
+      label: a.spoken_label || a.label,
+      relation: a.relation,
+      // The fragment, not a sentence: RIO writes the sentence. Handing her the
+      // prepared line (a.speech, "Turn left just after the Shell.") would be
+      // handing her the ANNOUNCEMENT, which is exactly the thing she must not
+      // say on her own initiative.
+      phrase: rel + ' ' + (a.spoken_label || a.label),
+      confidence: a.relation_confidence,
+      verified: false,
+    };
+  }
+
+  function navDirections(args) {
+    var nav = root.RIO && root.RIO.nav;
+    if (!nav || typeof nav.directions !== 'function') {
+      return { ok: true, routing: false,
+               note: 'no route is set — say that, do not invent turns' };
+    }
+    // "all" (or 0, or anything unreadable as a positive number) means the whole
+    // route. A model asked for "the directions" says "all" as often as it says
+    // nothing, and both mean the same thing.
+    var raw = args && (args.count !== undefined ? args.count : args.n);
+    var count = 5;
+    if (typeof raw === 'string' && /^all$/i.test(raw.trim())) count = null;
+    else if (raw !== undefined && raw !== null && raw !== '') {
+      var n = parseInt(raw, 10);
+      count = (isFinite(n) && n > 0) ? Math.min(n, 40) : null;
+    }
+
+    var d = nav.directions(count);
+    if (!d) {
+      return { ok: true, routing: false,
+               note: 'no route is set — say that, do not invent turns' };
+    }
+    var mans = d.maneuvers || [];
+    var steps = mans.map(function (m, i) {
+      var step = {
+        step: i + 1,
+        instruction: m.instruction,
+        road_name: m.road_name,
+        maneuver_type: m.maneuver_type,
+        direction: m.direction,
+        // From where the car is now, which is what "how far to it" means when
+        // the question is asked mid-drive.
+        distance_m: m.distance_m,
+        // ...and from the previous step, which is what makes a list of turns
+        // read as directions rather than as a table.
+        leg_m: m.leg_m,
+      };
+      var lm = landmarkOf(m);
+      if (lm) step.landmark = lm;
+      return step;
+    });
+
+    return {
+      ok: true,
+      routing: true,
+      destination: (d.destination && (d.destination.display_name ||
+                                      d.destination.formatted_address)) || null,
+      distance_remaining_m: Math.round(d.remaining_m || 0),
+      eta_epoch: d.eta_epoch || null,
+      total_maneuvers: d.total_maneuvers,
+      maneuvers_left: mans.length,
+      truncated: count !== null && d.total_maneuvers > steps.length,
+      route_state: d.route_state,
+      gps_state: d.gps_state,
+      arrived: !!d.arrived,
+      steps: steps,
+      rules: 'The driver asked for these, so read them — that is answering, ' +
+             'not announcing. In your own voice and in one flowing sentence ' +
+             'or two, not as a numbered list: name the roads, round the ' +
+             'distances the way a person would, and stop after the first few ' +
+             'unless they asked for all of it. A landmark here is what the ' +
+             'MAP expects, not something anyone has seen: say "there should ' +
+             'be a Shell", never "there\'s a Shell". Do NOT call any of ' +
+             'these turns as instructions now — when each one arrives the ' +
+             'navigation system calls it itself.',
+    };
+  }
+
   /* start_navigation — the driver said "take me there", so she takes them.
    *
    * This is answered in the panel for the same reason nav_status is, plus a
@@ -135,6 +249,31 @@
       if (out.status === 'routed') {
         var route = out.route || {};
         var dest = out.destination || route.destination || {};
+        // The first turns, taken from the ROUTE THIS CALL JUST LOADED rather
+        // than from the tracker.
+        //
+        // The tracker is already attached by the time this resolves — setRoute
+        // calls attach() before it returns — so a nav_status or a
+        // nav_directions in the same turn does see the route. But "already
+        // attached" and "has had a GPS fix" are different things, and until
+        // the first fix lands the tracker's distances are measured from the
+        // start of the route rather than from the car. Carrying the summary in
+        // this result means the confirmation RIO speaks needs no second call
+        // and cannot race anything: it is the route she just started, as the
+        // provider described it.
+        var mans = route.maneuvers || [];
+        var first = mans.slice(0, 3).map(function (m, i) {
+          var step = {
+            step: i + 1, instruction: m.instruction, road_name: m.road_name,
+            maneuver_type: m.type, direction: m.direction,
+            // From the START of the route here, not from the car: this is the
+            // route as loaded, before anyone has driven any of it.
+            distance_from_start_m: Math.round(m.route_distance_position || 0),
+          };
+          var lm = landmarkOf(m);
+          if (lm) step.landmark = lm;
+          return step;
+        });
         return {
           ok: true, routing: true, status: 'routed',
           // The provider's own spelling of the place, not the driver's and
@@ -144,11 +283,18 @@
             ? Math.max(1, Math.round(route.duration_s / 60)) : null,
           distance_km: route.total_distance_m
             ? Math.round(route.total_distance_m / 100) / 10 : null,
+          eta_epoch: route.eta_epoch || null,
+          total_maneuvers: mans.length,
+          first_steps: first,
           rules: 'The route is live and the car is navigating already. ' +
                  'Confirm it once, briefly, in your own words, using this ' +
                  'destination name exactly as spelled here. Do NOT tell the ' +
-                 'driver to set it themselves — it is set. Do NOT read out ' +
-                 'the turns: the navigation system calls those itself.',
+                 'driver to set it themselves — it is set. Do not read the ' +
+                 'turns out now: confirming is one line. If they ASK for the ' +
+                 'directions, call nav_directions and read them — that is ' +
+                 'answering. What you never do is call a turn as it arrives; ' +
+                 'the navigation system does that itself, at the moment it ' +
+                 'matters.',
         };
       }
       if (out.status === 'ambiguous') {
@@ -185,7 +331,8 @@
     });
   }
 
-  var LOCAL_TOOLS = { nav_status: navStatus, start_navigation: startNavigation };
+  var LOCAL_TOOLS = { nav_status: navStatus, nav_directions: navDirections,
+                      start_navigation: startNavigation };
 
   /* ---------------------------------------------------------------------
      The controller: events in, decisions out.
@@ -630,6 +777,7 @@
     createController: createController,
     connect: connect,
     navStatus: navStatus,
+    navDirections: navDirections,
     startNavigation: startNavigation,
     localTools: LOCAL_TOOLS,
     active: function () { return active; },
@@ -639,6 +787,7 @@
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController, navStatus: navStatus,
+                       navDirections: navDirections,
                        startNavigation: startNavigation,
                        localTools: LOCAL_TOOLS };
   }

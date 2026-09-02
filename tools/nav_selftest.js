@@ -617,6 +617,68 @@ section('starting inside the window — no line begun too late to finish');
 }
 
 // ---------------------------------------------------------------------------
+section('the turn-by-turn — the list a driver asks for, not the next call');
+// ---------------------------------------------------------------------------
+{
+  /* state() answers "what is the NEXT turn", which is what an announcement
+     needs. Asked "what are the directions", RIO had nothing to read from: the
+     list was in here all along and nothing exposed it. upcoming() is that,
+     measured from where the car actually is. */
+  const tracker = navcore.create(synthRoute({ anchors: [SHELL_ANCHOR] }));
+  const p0 = tracker.pointAt(0);
+  tracker.position({ lat: p0.lat, lng: p0.lng, speed: 15, t: 0 });
+
+  const all = tracker.upcoming();
+  ok(all.length === 3, 'every maneuver still ahead is listed (' + all.length + ')');
+  ok(all[0].road_name === 'Lincoln Boulevard' && all[1].road_name === 'Fell Street',
+     'in route order, with the road names a driver would recognise');
+  ok(all[0].distance_m === 1200 && all[1].distance_m === 2100,
+     'distances are measured from the car, not from the route start (' +
+     all[0].distance_m + ' m, ' + all[1].distance_m + ' m)');
+  ok(all[0].leg_m === 1200 && all[1].leg_m === 900,
+     'and each leg is the gap from the previous turn — "then straight for ' +
+     'nine hundred metres" (' + all[1].leg_m + ' m)');
+  ok(all[0].anchors.length === 1 && all[0].anchors[0].label === 'Shell',
+     'a maneuver carries its landmark candidates for whoever reads it');
+  ok(all[2].anchors.length === 0, 'and a maneuver without one carries none');
+
+  ok(tracker.upcoming(2).length === 2, 'a count truncates the list');
+  ok(tracker.upcoming(99).length === 3, 'asking for more than exist is not an error');
+  ok(tracker.upcoming(0).length === 0, 'and zero is zero, not "all"');
+
+  /* Drive to just before the first turn: the distances have to move with the
+     car, or the answer is wrong in the way nobody notices until they follow
+     it. Driven in steps rather than teleported, because the projection is
+     windowed on purpose — a single 1 km jump is not a fix, it is a bug, and
+     the tracker treats it as one. */
+  // Continues from where the last call left off: `along` is monotonic on
+  // purpose, and restarting the drive from the beginning each time would be
+  // asking the tracker to accept the car teleporting backwards.
+  let driven = 0;
+  function driveTo(s_end) {
+    for (let s = driven + 20; s <= s_end; s += 20) {
+      const p = tracker.pointAt(s);
+      tracker.position({ lat: p.lat, lng: p.lng, speed: 15, t: s / 15 });
+      driven = s;
+    }
+  }
+  driveTo(1000);
+  const mid = tracker.upcoming();
+  ok(mid.length === 3 && Math.abs(mid[0].distance_m - 200) <= 15,
+     'after a kilometre the next turn is ~200 m away, not 1200 (' +
+     mid[0].distance_m + ' m)');
+  ok(Math.abs(mid[0].leg_m - 200) <= 15,
+     'the first leg is measured from the car too (' + mid[0].leg_m + ' m)');
+
+  /* Past the first turn: it drops off the list. A driver asking for the
+     directions after a turn is asking what is LEFT. */
+  driveTo(1400);
+  const after = tracker.upcoming();
+  ok(after.length === 2 && after[0].road_name === 'Fell Street',
+     'a maneuver already driven through is no longer in the directions');
+}
+
+// ---------------------------------------------------------------------------
 section('the arbiter — one mouth (unchanged contracts)');
 // ---------------------------------------------------------------------------
 {

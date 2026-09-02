@@ -121,10 +121,19 @@ fi
 # 2. System packages
 # ---------------------------------------------------------------------------
 # ffmpeg: ElevenLabs audio muxing. nano: editing on the box. git: push/pull.
-log "apt packages (ffmpeg nano git)"
+#
+# nodejs: two of this project's test suites are JavaScript, because two of the
+# things worth testing are -- the arbiter and the route tracker both run in the
+# browser, and both are written as pure modules precisely so `node` can drive
+# them without a page. Without it, `node tools/nav_selftest.js` and
+# `node tools/realtime_selftest.js` are 240-odd checks nobody can run, and the
+# pod comes up able to verify only half of itself. Ubuntu's node is 12, which
+# is ancient and entirely sufficient: those files are deliberately ES5/ES6 with
+# no build step.
+log "apt packages (ffmpeg nano git nodejs)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends ffmpeg nano git
+apt-get install -y -qq --no-install-recommends ffmpeg nano git nodejs
 
 # ---------------------------------------------------------------------------
 # 3. Python dependencies

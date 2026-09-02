@@ -825,6 +825,35 @@
         st.context = planner ? planner.state() : null;
         return st;
       },
+
+      /* The turn-by-turn, from the SAME tracker state() answers from.
+       *
+       * Deliberately not a second read of the route object: the route knows
+       * where its maneuvers are, only the tracker knows where the car is, and
+       * "how far to the turn after next" is a question about both. Reading the
+       * route directly would produce distances measured from the start of the
+       * drive, which is the kind of answer that is wrong in a way nobody
+       * notices until they are following it.
+       *
+       * `count` omitted gives the whole remaining route.
+       */
+      directions: function (count) {
+        if (!tracker || !route) return null;
+        var st = tracker.state();
+        return {
+          destination: route.destination,
+          route_id: route.route_id,
+          generation_id: route.generation_id,
+          landmarks_state: route.landmarks_state || null,
+          total_maneuvers: (route.maneuvers || []).length,
+          remaining_m: st.remaining_m,
+          eta_epoch: route.eta_epoch,
+          route_state: st.route_state,
+          gps_state: st.gps_state,
+          arrived: !!st.arrived,
+          maneuvers: tracker.upcoming(count),
+        };
+      },
     };
 
     paintRoute();

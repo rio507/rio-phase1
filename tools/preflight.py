@@ -77,6 +77,11 @@ def check_apt():
     check(shutil.which("ffmpeg"), "ffmpeg",
           "Whisper gets no audio: /talk fails on every utterance.",
           "apt-get install -y ffmpeg")
+    check(shutil.which("node") or shutil.which("nodejs"), "nodejs",
+          "the two JavaScript test suites cannot run: `node tools/nav_selftest.js` "
+          "and `node tools/realtime_selftest.js` are the only checks the route "
+          "tracker and the speech arbiter have, and both live in the browser.",
+          "apt-get install -y nodejs")
     check(shutil.which("git"), "git", "no version control in the container.",
           "apt-get install -y git")
 
