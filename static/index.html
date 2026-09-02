@@ -415,6 +415,33 @@
 
   /* Band/tau strip. Sits under the LIVE badge (top-left, z-index 3) so neither
      covers the other, and stays out of #camfull's corner. */
+  /* The source badge. Top-left of the camera box, opposite the LIVE badge:
+     the two answer different questions ("is a drive running" vs "of what") and
+     both have to be readable at a glance. */
+  .cam-source {
+    /* Top RIGHT, under the fullscreen button. The left column is taken: the
+       LIVE badge and the headway HUD both live there and already shuffle
+       around each other when a drive starts. */
+    position: absolute; top: 36px; right: 8px; z-index: 3;
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 9px; border-radius: 4px;
+    background: rgba(2, 3, 8, 0.72);
+    border: 1px solid rgba(120, 165, 205, 0.35);
+    border-left-width: 3px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--text-dim);
+    max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cam-source.src-camera { border-left-color: var(--blue); color: var(--text); }
+  /* Amber, like everything else on this page that means "not the normal
+     arrangement": a drive running off a file is a test, not a drive. */
+  .cam-source.src-clip { border-left-color: var(--amber); color: var(--amber); }
+  .cam-source.src-none { border-left-color: var(--text-dimmer); }
+  /* Nothing to dodge on this side, so it stays put whether or not a drive
+     is running -- which also means it does not move at the exact moment the
+     driver is checking what it says. */
+
   #headwayhud {
     position: absolute; top: 8px; left: 8px;
     display: none; flex-direction: column; gap: 4px;
@@ -1370,6 +1397,10 @@
       <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
       <div class="cam-badge">Live</div>
       <div class="cam-nosignal">No Signal</div>
+      <!-- WHICH PICTURE. The bug this replaces was invisible: the clip stayed
+           on screen while the frames came from the phone's front camera, and
+           nothing said so. -->
+      <div id="camsource" class="cam-source src-camera">REAR CAM</div>
       <div id="headwayhud" class="hw-UNKNOWN">
         <span class="hw-band" id="hwband">Standby</span>
         <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
@@ -1395,6 +1426,10 @@
       <input type="file" id="upload" accept="image/*,video/*" style="display:none">
       <button id="grab" class="hud-btn" style="display:none;">Grab This Frame</button>
       <button id="runheadway" class="hud-btn" style="display:none;">Run Headway On Video</button>
+      <!-- The way back. Shown only while a clip is the source, because that is
+           the only state it changes, and explicit because the clip must never
+           be dropped by anything else. -->
+      <button id="usecamera" class="hud-btn" style="display:none;">Use Camera Instead</button>
 
       <!-- Manual speed override. GPS has no speed on a desk, and tau is
            meaningless without one, so a bench test needs to supply it. -->
@@ -1772,6 +1807,12 @@ window.RIO = (function () {
 })();
 </script>
 
+<!-- WHICH PICTURE RIO IS LOOKING AT. Loaded here, before every module that
+     starts a feed, because all of them ask it rather than deciding for
+     themselves — see the file's header for the bug that came of them
+     deciding. -->
+<script src="/static/rio_source.js"></script>
+
 <script>
 /* ---- HUD render layer. Pure presentation: every entry point is called by the
    existing pipeline scripts below and none of them change control flow. ---- */
@@ -2055,29 +2096,40 @@ let live = null, liveMode = true, liveBusy = false;
    endpoint at a slower cadence for as long as the conversation lasts. Nothing
    server-side knows the difference, which is the point. */
 const LIVE_FRAME_MS = 500;                     // 2 fps: plenty to answer from
-let liveFrames = { timer: null, stream: null };
+let liveFrames = { timer: null, feed: null };
 
+/* Give her something to see for the length of a conversation.
+ *
+ * THIS IS WHERE THE CLIP USED TO BE THROWN AWAY. The line was
+ * `getUserMedia({ facingMode: 'environment' })`, unconditionally, because the
+ * feature was written as "the live session starts its own feed" — and a feed
+ * of its own is exactly what it must not have. It asks what the source is,
+ * like every other start path, and with a clip loaded it opens no camera and
+ * feeds frames from the clip instead.
+ */
 async function startLiveFrames() {
-  if (RIO.driving || liveFrames.timer || !RIO.mediaAvailable()) return false;
-  let stream;
+  if (RIO.driving || liveFrames.timer) return false;
+  if (RIO.source.kind() === 'none') return false;
+  let feed;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment' }, audio: false });
+    feed = await RIO.source.startFeed();
   } catch (e) {
     // No camera, or refused. The conversation still works; RIO simply cannot
     // see, and the look tool says so rather than inventing a road.
-    console.warn('[live] no camera for this session:', e);
+    console.warn('[live] no picture for this session:', e);
     return false;
   }
-  liveFrames.stream = stream;
-  video.srcObject = stream;
-  try { await video.play(); } catch (e) {}
+  if (feed.error || !feed.element) {
+    console.warn('[live] no picture for this session:', feed.error);
+    return false;
+  }
+  liveFrames.feed = feed;
   const tick = async () => {
     if (!liveFrames.timer) return;
     // A drive starting mid-conversation takes over: it feeds the same ring
     // faster, and two feeds would be two uploads of the same road.
     if (!RIO.driving) {
-      try { await RIO.headway.captureFromVideo(video); } catch (e) {}
+      try { await RIO.headway.captureFromVideo(feed.element); } catch (e) {}
     }
     if (liveFrames.timer) liveFrames.timer = setTimeout(tick, LIVE_FRAME_MS);
   };
@@ -2087,11 +2139,11 @@ async function startLiveFrames() {
 
 function stopLiveFrames() {
   if (liveFrames.timer) { clearTimeout(liveFrames.timer); liveFrames.timer = null; }
-  if (liveFrames.stream) {
-    liveFrames.stream.getTracks().forEach(t => t.stop());
-    liveFrames.stream = null;
-    if (!RIO.driving) video.srcObject = null;
-  }
+  // Releases a camera if this feed opened one; a clip feed owns nothing, so
+  // the clip is still loaded and still the source when the conversation ends.
+  // A drive running underneath keeps its own feed either way.
+  if (liveFrames.feed && !RIO.driving) RIO.source.stopFeed(liveFrames.feed);
+  liveFrames.feed = null;
 }
 
 async function toggleLive() {
@@ -2163,11 +2215,19 @@ frameBtn.addEventListener('click', async () => {
   if (!RIO.mediaAvailable()) { obs.textContent = RIO.mediaError(); return; }
   let blob, temp = null;
   try {
-    if (RIO.videoStream) {
+    if (RIO.source.isClip()) {
+      // A clip is the source: grab the frame the driver is looking at, rather
+      // than opening a camera behind it.
+      blob = await RIO.frameFromVideo(RIO.source.element());
+    } else if (RIO.videoStream) {
       // A drive is running: reuse the live stream instead of re-prompting.
       blob = await RIO.frameFromVideo(document.getElementById('video'));
     } else {
-      temp = await navigator.mediaDevices.getUserMedia({ video: true });
+      // A one-off camera, released in the finally below. Rear-facing like
+      // every other camera on this page — `video: true` gave whichever the
+      // device felt like, which on a phone is the front one.
+      temp = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: RIO.source.facing() }, audio: false });
       const video = document.createElement('video');
       video.srcObject = temp;
       video.playsInline = true; video.muted = true;
@@ -2231,6 +2291,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let wakeLock = null;
   let frames = 0;
   let hwFrames = 0;
+  let source = null;     // the feed this drive is running on, from RIO.source
+
+  // The element to capture from RIGHT NOW. Falls back to the source's own
+  // answer so a frame taken outside a drive still comes from the right place.
+  const feedEl = () => (source && source.element) || RIO.source.element();
 
   const headwayOn = () => !!(RIO.headway && RIO.headway.enabled);
   const perceiveInterval = () => headwayOn() ? PERCEIVE_MS_HEADWAY : PERCEIVE_MS_SOLO;
@@ -2241,7 +2306,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (inflight || !RIO.driving) return;
     inflight = true;
     try {
-      const blob = await RIO.frameFromVideo(video);
+      const el = feedEl();
+      if (!el) return;
+      const blob = await RIO.frameFromVideo(el);
       const fd = new FormData();
       fd.append('image', blob, 'frame.jpg');
       // /perceive returns the same caption /observe would, under the same
@@ -2250,7 +2317,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
       const j = await r.json();
       obs.textContent = j.observation || '(empty)';
-      if (RIO.overlay) RIO.overlay.render(j, video);
+      if (RIO.overlay) RIO.overlay.render(j, feedEl());
       frames++;
       RIO.ui.observation(j.observation);
       RIO.ui.frameSent(frames);
@@ -2326,7 +2393,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (headwayOn()) {
         const t0 = performance.now();
         try {
-          const j = await RIO.headway.captureFromVideo(video);
+          const j = await RIO.headway.captureFromVideo(feedEl());
           // The frame path learns about a dead session sooner than the
           // heartbeat does, because it runs sixteen times as often.
           if (j && j.stale) { await staleStop(); return; }
@@ -2353,18 +2420,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // Must happen here, before any await, while the tap is still trusted.
     if (RIO.headway) { RIO.headway.unlock(); RIO.headway.startWatch(); }
 
-    if (!RIO.mediaAvailable()) { say(RIO.mediaError()); return; }
+    // WHATEVER THE SOURCE IS. With a clip loaded this opens no camera at all:
+    // the driver put a video on the screen and pressing Start Drive on it
+    // meant "drive this", not "throw it away and look at me". See
+    // static/rio_source.js.
+    if (RIO.source.kind() === 'none') { say(RIO.mediaError()); return; }
 
     say('Starting drive...');
-    let stream;
+    let feed;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }, audio: false
-      });
+      feed = await RIO.source.startFeed();
     } catch (e) {
       say(RIO.mediaError(e));
       return;
     }
+    if (feed.error || !feed.element) {
+      say(RIO.mediaError(feed.error || 'no source'));
+      return;
+    }
+    const stream = feed.stream;
+    // The element frames come from for the rest of this drive. Not `video`:
+    // with a clip that element is empty, and capturing it would send black
+    // frames that look exactly like a dark road.
+    source = feed;
 
     let sid;
     try {
@@ -2376,15 +2454,16 @@ document.addEventListener('DOMContentLoaded', () => {
       sid = (await r.json()).session_id;
       if (!sid) throw new Error('no session_id in response');
     } catch (e) {
-      stream.getTracks().forEach(t => t.stop());
+      RIO.source.stopFeed(feed);
+      source = null;
       say('Could not start session: ' + e);
       return;
     }
 
     RIO.sessionId = sid;
-    RIO.videoStream = stream;
-    video.srcObject = stream;
-    try { await video.play(); } catch (e) { /* autoplay+muted should cover this */ }
+    // Only a camera feed owns a stream; a clip owns nothing, and the rest of
+    // the page reads RIO.videoStream to mean "a camera is open".
+    RIO.videoStream = stream || null;
 
     // Keep the screen awake; a sleeping screen throttles the timer to nothing.
     try {
@@ -2415,11 +2494,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // Clear session first so in-flight captures stop tagging themselves.
     RIO.sessionId = null;
 
-    if (RIO.videoStream) {
-      RIO.videoStream.getTracks().forEach(t => t.stop());
-      RIO.videoStream = null;
-    }
-    video.srcObject = null;
+    // Releases the camera if this drive opened one, and does nothing if the
+    // source was a clip — which stays loaded, because ending a drive is not a
+    // decision about what RIO is looking at.
+    RIO.source.stopFeed(source);
+    source = null;
+    RIO.videoStream = null;
 
     if (wakeLock) { try { await wakeLock.release(); } catch (e) {} wakeLock = null; }
 
@@ -2501,15 +2581,22 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!file) return;
     if (RIO.overlay) RIO.overlay.clear();   // stale boxes describe the old file
     if (file.type.startsWith('image/')) {
+      // A still is one frame to look at, not a source to drive from, so the
+      // SOURCE is deliberately untouched here.
       // The overlay element is left to the camera-box logic: #campreview is
       // painted by the preview script off this same change event.
       sendFrame(file);
       preview.style.display = 'none';
       grabBtn.style.display = 'none';
     } else if (file.type.startsWith('video/')) {
-      preview.src = URL.createObjectURL(file);
+      const url = URL.createObjectURL(file);
+      preview.src = url;
       preview.style.display = 'block';
       grabBtn.style.display = 'block';
+      // THE SOURCE IS NOW THIS CLIP, and stays that way until the driver says
+      // otherwise. Start Drive and a live session both read it; neither opens
+      // a camera while it is set. See static/rio_source.js.
+      RIO.source.setClip(url, file.name || 'clip');
     }
   });
 
@@ -3020,7 +3107,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function ensureScout() {
     const scout = document.getElementById('scout');
     if (!scout) return null;
-    const src = preview.currentSrc || preview.src;
+    // The clip, from the owner rather than from whichever element happens to
+    // have a src on it. One question, one answer, everywhere on this page.
+    const clip = (RIO.source && RIO.source.element()) || preview;
+    const src = clip.currentSrc || clip.src;
     if (!src) return null;
     if (scout.getAttribute('data-src') !== src) {
       scout.src = src;
@@ -3070,6 +3160,13 @@ document.addEventListener('DOMContentLoaded', () => {
   async function runVideo() {
     if (videoRunning) { videoRunning = false; return; }
     if (!preview || !preview.videoWidth) return;
+    // A replay is a drive on a clip, so it says so out loud rather than
+    // running while the badge reads REAR CAM. The Run button is only offered
+    // after an upload, so this is a backstop against a stale button, not a
+    // path the driver is expected to reach.
+    if (RIO.source && !RIO.source.isClip()) {
+      RIO.source.setClip(preview.currentSrc || preview.src, 'clip');
+    }
     unlock();
     if (manualSpeed() === null) {
       if (speedHint) speedHint.textContent =
@@ -3149,6 +3246,45 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     videoRunning = false;
     runBtn.textContent = 'Run Headway On Video';
+  }
+
+  /* ---------------- the source badge, and the way back -------------------
+     One subscriber, painting what RIO.source says. The button is the only
+     thing on the page that clears a clip, and it is only visible while there
+     is one to clear -- a control that does nothing most of the time teaches
+     people to ignore it. */
+  const sourceBadge = document.getElementById('camsource');
+  const useCamBtn = document.getElementById('usecamera');
+
+  if (RIO.source && RIO.source.onChange) {
+    RIO.source.onChange(function (src) {
+      if (sourceBadge) {
+        sourceBadge.textContent = src.label;
+        sourceBadge.className = 'cam-source src-' + src.kind;
+      }
+      if (useCamBtn) {
+        useCamBtn.style.display = (src.kind === 'clip') ? 'block' : 'none';
+      }
+    });
+  }
+
+  if (useCamBtn) {
+    useCamBtn.addEventListener('click', () => {
+      // Stop the replay first: a clip left playing behind a live camera is a
+      // second moving picture nobody is looking at.
+      videoRunning = false;
+      RIO.source.useCamera();
+      if (preview) {
+        try { preview.pause(); } catch (e) {}
+        preview.removeAttribute('src');
+        preview.load();
+        preview.style.display = 'none';
+      }
+      document.body.classList.remove('previewing');
+      if (RIO.overlay) RIO.overlay.clear();
+      if (runBtn) runBtn.style.display = 'none';
+      resetHud();
+    });
   }
 
   if (runBtn) runBtn.addEventListener('click', runVideo);
@@ -3258,6 +3394,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const video = document.getElementById('video');
     const preview = document.getElementById('preview');
     const img = document.getElementById('campreview');
+    // The source owner has the final say on video: during a drive off a clip
+    // the live element is empty, and preferring it because a drive is running
+    // would map every box onto a black frame.
+    if (RIO.source) {
+      const owned = RIO.source.element();
+      if (owned && dims(owned)) return owned;
+    }
     if (document.body.classList.contains('driving') && dims(video)) return video;
     if (preview && preview.style.display !== 'none' && dims(preview)) return preview;
     if (img && img.style.display !== 'none' && dims(img)) return img;

@@ -586,9 +586,17 @@ section('awareness — the three tools a live session needs');
      'the drive frame loop still stops itself when no drive is running');
   ok(/async function startLiveFrames/.test(html),
      'and a live session now starts its own feed');
-  ok(/RIO\.headway\.captureFromVideo\(video\)/.test(
-       (html.match(/async function startLiveFrames[\s\S]*?\n}/) || [''])[0]),
+  const liveBody = (html.match(/async function startLiveFrames[\s\S]*?\n}/) || [''])[0];
+  ok(/RIO\.headway\.captureFromVideo\(/.test(liveBody),
      'through the SAME capture path the drive uses — no second pipeline');
+  // ...from whatever the SOURCE is. It used to capture `video`, the live
+  // camera element, having just opened a camera to fill it — which is how an
+  // uploaded clip got replaced by the driver's face the moment a conversation
+  // started. See static/rio_source.js and tools/source_selftest.js.
+  ok(/captureFromVideo\(feed\.element\)/.test(liveBody),
+     'and from the source the driver chose, not a camera of its own');
+  ok(!/getUserMedia/.test(liveBody),
+     'which it no longer opens');
   ok(/if \(RIO\.driving \|\| liveFrames\.timer/.test(html),
      'and not at all when a drive is already feeding the ring faster');
   ok(/stopLiveFrames\(\)/.test(html) &&
