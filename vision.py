@@ -8,6 +8,7 @@ different model class; torch stays at 2.4.1+cu124 (4.57 only wants >= 2.2).
 import io
 import os
 import threading
+import time
 import torch
 from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
@@ -25,6 +26,15 @@ _processor = None
 _model = None
 _lock = threading.Lock()
 _last_observation = ""
+# WHEN that observation was made, and of what. The cache used to be a bare
+# string, which was fine while its only reader asked "what did she last see"
+# and answered a conversation turn with it. It is not fine now that a live
+# answer can be served from it: a caption with no timestamp cannot be told
+# apart from a current one, and describing a road the car left thirty seconds
+# ago -- confidently, in the present tense -- is the failure this whole
+# subsystem exists to prevent.
+_last_observed_at = 0.0
+_last_observed_frame = None
 
 
 # Where the weights go. Pinned rather than "auto".
@@ -60,14 +70,39 @@ def _ensure_loaded():
         print("[vision] Loaded.", flush=True)
 
 
-def observe(image_bytes: bytes) -> str:
+def _downscale(pil, max_side: int):
+    """Fit the long edge to `max_side`, or leave it alone.
+
+    Prefill scales with vision tokens, and vision tokens scale with pixels. The
+    observer's whole job is one short factual sentence about the scene, which
+    does not need 720p: measured on this GPU, full frame 432 ms, 768 px 377 ms,
+    512 px 360 ms, and the caption at 512 was the same sentence. That is ~17%
+    off a call this now makes once a second in the background, and the smaller
+    frame leaves that much more of the card for the 4 fps headway loop it runs
+    beside.
+    """
+    if not max_side:
+        return pil
+    w, h = pil.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return pil
+    scale = max_side / float(longest)
+    return pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                      Image.BILINEAR)
+
+
+def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
     """Run VLM on a new frame, cache + return the observation."""
-    global _last_observation
+    global _last_observation, _last_observed_at, _last_observed_frame
     if not config.VISION_ENABLED:
         return ""
+    if max_side is None:
+        max_side = config.OBSERVER_MAX_SIDE_PX
     with _lock:
         _ensure_loaded()
-        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        pil = _downscale(Image.open(io.BytesIO(image_bytes)).convert("RGB"),
+                         max_side)
         msgs = [{"role": "user", "content": [
             {"type": "image", "image": pil},
             {"type": "text", "text": TEACHER_PROMPT},
@@ -81,6 +116,8 @@ def observe(image_bytes: bytes) -> str:
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
         _last_observation = text
+        _last_observed_at = time.time()
+        _last_observed_frame = frame_id
         return text
 
 
@@ -118,6 +155,24 @@ def get_observation() -> str:
     return _last_observation if config.VISION_ENABLED else ""
 
 
+def observation() -> dict:
+    """The cached observation WITH its age. -> {text, at, age_s, frame_id}
+
+    The age is the whole point. Any caller that would speak this to a driver
+    has to be able to decide whether it is still true, and a bare string cannot
+    be asked. `text` is empty when nothing has been observed.
+    """
+    if not config.VISION_ENABLED:
+        return {"text": "", "at": 0.0, "age_s": None, "frame_id": None}
+    at = _last_observed_at
+    return {
+        "text": _last_observation,
+        "at": at,
+        "age_s": (time.time() - at) if at else None,
+        "frame_id": _last_observed_frame,
+    }
+
+
 def set_observation(text: str) -> None:
     """Publish an observation produced by another path (e.g. /perceive).
 
@@ -125,9 +180,10 @@ def set_observation(text: str) -> None:
     that get_observation() serves to RIO would never refresh and she would talk
     about the road as if the last /observe frame were still current.
     """
-    global _last_observation
+    global _last_observation, _last_observed_at
     if text:
         _last_observation = text
+        _last_observed_at = time.time()
 
 
 def get_handles():

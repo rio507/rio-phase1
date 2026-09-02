@@ -43,6 +43,7 @@ become a way in.
 """
 import json
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -117,7 +118,10 @@ TOOL_SCHEMA = {
         "use it for chat, for anything about the car's own sensors, for "
         "anything about the route, or for finding a place near the car — those "
         "are already answered elsewhere, and a restaurant, a petrol station or "
-        "a shop is find_places, which is one quick call to live data. Say a "
+        "a shop is find_places, which is one quick call to live data. Never "
+        "use it for anything you can SEE either — the road, a car, a sign, a "
+        "building — that is the look tool and the camera, and this one has no "
+        "picture to answer from. Say a "
         "short natural line to the driver before calling it, because it takes a "
         "few seconds."
     ),
@@ -403,8 +407,15 @@ still never do is call the turns along the way.
 
 WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
 
-Use the look tool, and say something first — "let me look" — because it takes a
-couple of seconds. What comes back is short factual background: describe it in
+Use the look tool. Never use the research tool for anything you can see: it has
+no picture, and a description of a road it cannot look at is invention with a
+delay in front of it.
+
+Say something first — "let me look" — because it can take a couple of seconds.
+Often it will not: a plain "what do you see" comes back immediately, because
+the camera is already being watched and the answer was ready before you asked.
+When it comes back that fast, just answer — a holding line in front of an
+instant answer is the only slow part left. What comes back is short factual background: describe it in
 your own words, as you would anything else. Answer with what it gives you and
 nothing more; if it says it cannot see, or asks which one the driver meant, say
 that, in your own words.
@@ -763,6 +774,54 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
             "model": config.OPENAI_REASONING_MODEL}
 
 
+# --- the fast path's gate ---------------------------------------------------
+# A question that a one-sentence description of the road actually answers.
+#
+# Deliberately a small list of phrasings rather than a classifier. The router
+# can answer "is this a scene question?" properly, and it does for everything
+# else — but when its rules are unsure it asks a MODEL, which was measured at
+# ~1 s on "what's on the left". Paying a second of remote classification to
+# find out whether we may skip two seconds of remote answering is most of the
+# saving spent on deciding to save it.
+#
+# So the fast path is gated on recognising the question, not on understanding
+# it: these phrasings mean "describe what is out there" and nothing else, and
+# anything not on the list takes the ordinary route through the router.
+_GENERIC_SCENE = re.compile(
+    r"^\s*(?:so\s+|and\s+|hey\s+|ok(?:ay)?\s+|rio[,\s]+)*"
+    r"(?:"
+    r"what(?:'?s| is| are| do you| can you)?\s+(?:do\s+you\s+)?see\b"
+    r"|what(?:'?s| is)\s+(?:it\s+)?(?:out\s+there|around|going\s+on|happening)\b"
+    r"|what(?:'?s| is)\s+(?:the\s+)?(?:road|traffic|scene|view|street)\s+like\b"
+    r"|what(?:'?s| is)\s+(?:it\s+)?like\s+out\s+there\b"
+    r"|describe\s+(?:the\s+)?(?:road|scene|view|street|surroundings)\b"
+    r"|anything\s+i\s+should\s+know\b"
+    r"|how(?:'?s| is)\s+(?:the\s+)?(?:road|traffic)\b"
+    r")",
+    re.IGNORECASE)
+
+# ...and the words that mean this is NOT that question, whatever it looks like.
+# A caption says what is out there; it does not say what is on the LEFT, what
+# that sign reads, or what colour the third one is. Those need a crop and a
+# model that will look at it.
+# `right(?!\s+now)`: "what's around us right now" is a scene question, and the
+# first version of this list read the "right" in it as a direction and sent the
+# most generic question there is down the slow path.
+_NEEDS_SPECIFICS = re.compile(
+    r"\b(left|right(?!\s+now)|behind|beside|next\s+to|that|those|this|these|sign|says?|"
+    r"reads?|colou?r|make|model|plate|licen[cs]e|building|shop|store|logo|"
+    r"how\s+far|how\s+many|which)\b",
+    re.IGNORECASE)
+
+
+def is_generic_scene_question(q: str) -> bool:
+    """May this question be answered from the running observation?"""
+    q = (q or "").strip()
+    if not q or _NEEDS_SPECIFICS.search(q):
+        return False
+    return bool(_GENERIC_SCENE.search(q))
+
+
 def look(question: str, session_key: str = "default") -> dict:
     """RIO's eyes: the existing visual pipeline, called from a live session.
 
@@ -788,19 +847,79 @@ def look(question: str, session_key: str = "default") -> dict:
         return {"ok": False, "note": "no question"}
     t0 = time.time()
     try:
+        import observer
         import router as request_router
         import visual_qa
 
         session = visual_qa.get_session(session_key)
+
+        # THE FAST PATH, and it comes FIRST -- before the router, because the
+        # router is itself a possible remote call and this is the branch that
+        # exists to avoid remote calls. Measured: the full turn is ~2.0 s, 99%
+        # of it one call to a reasoning model, and the answer to "what do you
+        # see" is a sentence the observer wrote about a frame that arrived a
+        # moment ago. See observer.py.
+        #
+        # A pending clarification blocks it: RIO has just asked "which one?",
+        # and the next thing the driver says is an answer to that, not a
+        # request for the view. Nothing else about the conversation blocks it --
+        # in particular, not whether a car was discussed earlier, which was the
+        # first version of this condition and made every scene question slow
+        # for the rest of a conversation once one object had been mentioned.
+        observer.start(session_key)
+        observer.touch(session_key)
+        if (is_generic_scene_question(q)
+                and session.pending_clarification() is None):
+            hit = observer.fresh(session_key)
+            if not hit:
+                # The background loop is one tick behind frames that ARE
+                # current: describe the frame in front of the car now, locally,
+                # instead of paying the full remote turn for a question one
+                # forward pass would answer. Returns {} when there is no recent
+                # frame either, and then the full path says so properly.
+                hit = observer.observe_now(session_key)
+            if hit:
+                took = round((time.time() - t0) * 1000, 1)
+                return {
+                    "ok": True,
+                    "answer": hit["text"],
+                    "took_ms": took,
+                    "fast_path": True,
+                    "on_demand": bool(hit.get("on_demand")),
+                    "seen_s_ago": hit["age_s"],
+                    "rules": (
+                        "This is what the camera is seeing right now — "
+                        f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
+                        "words, briefly, as the road in front of you. Do not "
+                        "read it out as a caption and do not add anything it "
+                        "does not contain: if the driver wants detail about one "
+                        "particular thing, ask this tool again about that thing "
+                        "and it will look properly."
+                    ),
+                }
+
         route = request_router.classify(
             q,
             has_referent=session.active_referent() is not None,
             pending_clarification=session.pending_clarification() is not None)
         if not request_router.is_visual(route["request_type"]):
+            # The model has already decided this question is about what is out
+            # there -- that is what calling `look` MEANS -- so a classifier
+            # reading it as non-visual is overruled rather than producing an
+            # answer with no picture behind it.
             route = dict(route, request_type=request_router.SCENE,
                          requires_full_frame=True, requires_object_crop=False,
                          method="forced_by_look_tool")
-        va = visual_qa.answer(session_key, q, route)
+        # The observer yields to the LOCAL half of this turn and only to that
+        # half. prepare() resolves the reference, crops, and runs Qwen for
+        # colour and body style -- the same GPU, and the question somebody is
+        # waiting for wins it. text() is a remote call and leaves the card
+        # idle, which is the best second in the whole turn to describe the road:
+        # holding through it starved the observer so thoroughly that the fast
+        # path stopped hitting at all, each slow answer making the next question
+        # slow too.
+        with observer.hold(session_key):
+            va = visual_qa.answer(session_key, q, route)
         text = (va.text() or "").strip()
     except Exception as e:
         took = round((time.time() - t0) * 1000, 1)
@@ -910,6 +1029,18 @@ def run_tool(name: str, arguments, session_key: str = "default",
                     str(arguments.get("context") or ""))
 
 
+def _observer_status() -> dict:
+    try:
+        import observer
+
+        return {"enabled": bool(config.OBSERVER_ENABLED),
+                "period_s": config.OBSERVER_PERIOD_S,
+                "fresh_s": config.OBSERVER_FRESH_S,
+                "sessions": observer.status()}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}"}
+
+
 def status() -> dict:
     """What the panel and /health need to know, without calling anything."""
     return {
@@ -921,6 +1052,10 @@ def status() -> dict:
                   NAV_DIRECTIONS_TOOL_NAME, PLACES_TOOL_NAME,
                   VEHICLE_TOOL_NAME, NAVIGATE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
+        # What the running observer is doing, if anything. A live session that
+        # feels slow on visual questions is either not observing or observing
+        # something stale, and both are visible here.
+        "observer": _observer_status(),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),
     }

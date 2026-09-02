@@ -264,6 +264,38 @@ ENRICH_MAX_OBJECTS = 3
 ENRICH_TTL_S = 20.0
 ENRICH_MAX_NEW_TOKENS = 48
 
+# --- the running observation (observer.py) ----------------------------------
+# "What do you see?" was slow, and the measurement said why: the multimodal
+# answer is a remote call to a reasoning model — ~1.1 s to the first word, ~2.0
+# s in full, and 99% of the wait at p50. That price is right for "what colour
+# is the car on the left" and wrong for the question a driver asks most, which
+# is the same question about the same road every time.
+#
+# So during a live conversation the scene is described BEFORE it is asked
+# about: Qwen, resident and local, over the newest frame in the ring, about
+# once a second. A scene question is then answered out of that cache instead of
+# out of a network call.
+OBSERVER_ENABLED = True
+
+# ~1 Hz. Measured cost is ~0.4 s of GPU per observation, on the same card the
+# 4 fps headway loop is using, so this is a real share of it — and the reason
+# the loop runs only while a conversation is open.
+OBSERVER_PERIOD_S = 1.0
+
+# How old a cached description may be and still be spoken as current. At 60
+# km/h a second is 17 metres, which is the same road; ten seconds is not. Past
+# this the fast path declines and the full path looks at the road NOW — the
+# refusal is the honesty, not a fallback that got unlucky.
+OBSERVER_FRESH_S = 2.0
+
+# The observer stops when nobody has asked to see anything for this long. It
+# costs GPU that detection, depth and lanes are also asking for.
+OBSERVER_IDLE_S = 90.0
+
+# Long edge fed to Qwen for an observation. Measured on this GPU: full frame
+# 432 ms, 768 px 377 ms, 512 px 360 ms — with the same sentence coming back.
+OBSERVER_MAX_SIDE_PX = 512
+
 # --- the multimodal turn ----------------------------------------------------
 OPENAI_VISUAL_MODEL = OPENAI_CHAT_MODEL
 # Roomier than the 300 the voice path uses: a visual answer is two or three

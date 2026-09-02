@@ -335,10 +335,24 @@ def run_firewall():
     # external API and the obvious place for someone to reach for
     # navigation/geo.py -- which would drag the speech planner across the
     # firewall for the sake of a haversine.
-    ok(live_imports <= {"json", "os", "threading", "time", "typing", "openai",
-                        "config", "visual_qa", "router", "vehicle_health",
-                        "places", "base64", "io", "wave"},
+    # `observer` and `re` arrived with the fast path for visual questions: the
+    # observer is a read that runs Qwen over frames already in the ring, and it
+    # is checked below like places is.
+    ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
+                        "openai", "config", "visual_qa", "router",
+                        "vehicle_health", "places", "observer",
+                        "base64", "io", "wave"},
        f"and imports only read-side code and stdlib ({sorted(live_imports)})")
+
+    observer_imports = _imports_of("observer.py")
+    hits = sorted(observer_imports & unreachable)
+    ok(not hits,
+       "observer.py cannot reach anything that decides to speak either"
+       + (f" (found {hits})" if hits else ""))
+    ok("visual_qa" not in observer_imports and "router" not in observer_imports,
+       "and it describes frames without going near the turn that answers "
+       "questions — one direction only, or the fast path becomes a second "
+       "answering pipeline")
 
     places_imports = _imports_of("places.py")
     hits = sorted(places_imports & unreachable)
@@ -1923,6 +1937,112 @@ def run_places():
         places.httpx = real_http
 
 
+
+# ---------------------------------------------------------------------------
+# THE FAST PATH — a prepared answer, and the freshness rule that makes it safe
+# ---------------------------------------------------------------------------
+def run_fast_path():
+    section("J. looking fast — answered before it was asked, or not at all")
+    import observer
+
+    # 1. THE GATE. Which questions a one-sentence description of the road can
+    #    answer, decided locally: asking the router costs a model call (~1 s
+    #    measured) to find out whether we may skip a model call.
+    generic = ["what do you see", "what do you see out there",
+               "what's around us right now", "describe the road ahead",
+               "what's the road like", "anything I should know about ahead",
+               "how is the traffic", "what is going on out there",
+               "okay what do you see", "what do you see, Rio?"]
+    for q in generic:
+        ok(realtime.is_generic_scene_question(q), f"generic scene question: {q!r}")
+
+    specific = ["what's on the left", "what's that car ahead",
+                "what colour is the car in front", "what does that sign say",
+                "how far is the car ahead", "what's that building on the right",
+                "which one is closer", "read me that sign"]
+    for q in specific:
+        ok(not realtime.is_generic_scene_question(q),
+           f"needs a proper look: {q!r}")
+
+    ok(realtime.is_generic_scene_question("what's around us right now"),
+       "'right now' is a time, not a direction — the first version of the "
+       "specificity list read it as one and sent the most generic question "
+       "there is down the slow path")
+
+    # 2. THE FRESHNESS RULE. The whole reason a cached answer is honest.
+    key = "fastpath_test"
+    observer.stop_all()
+    observer._sessions[key] = {
+        "stop": __import__("threading").Event(), "last_used": time.time(),
+        "record": None, "n": 0, "errors": 0, "started": time.time(), "hold": 0,
+    }
+    st = observer._sessions[key]
+
+    now = time.time()
+    st["record"] = {"text": "Cars ahead on a wet road.", "at": now,
+                    "frame_wall_t": now - 0.4, "frame_id": "f1",
+                    "frame_age_s": 0.4}
+    hit = observer.fresh(key)
+    ok(hit and hit["text"].startswith("Cars ahead"),
+       f"a description of the road half a second ago is still the road "
+       f"({hit.get('age_s')}s)")
+
+    st["record"] = dict(st["record"],
+                        frame_wall_t=now - (config.OBSERVER_FRESH_S + 1.0))
+    ok(observer.fresh(key) == {},
+       f"...and one from {config.OBSERVER_FRESH_S + 1:.0f}s ago is refused — at "
+       "60 km/h that is a different road, and describing it as current is the "
+       "failure this whole subsystem exists to prevent")
+    ok(observer.cached(key).get("text"),
+       "the stale record is still THERE, so a caller can say how old it is "
+       "rather than pretending nothing was ever seen")
+
+    # Age is measured from the FRAME, not from the observation: Qwen taking
+    # 400 ms to describe a picture does not make the picture newer.
+    st["record"] = {"text": "x", "at": time.time(),
+                    "frame_wall_t": time.time() - 30.0, "frame_id": "f2"}
+    ok(observer.fresh(key) == {},
+       "a fresh observation OF AN OLD FRAME is old — the frame's clock is the "
+       "one the driver is being told about")
+
+    st["record"] = None
+    ok(observer.fresh(key) == {} and observer.cached(key) == {},
+       "and with nothing observed at all there is nothing to serve")
+
+    # 3. THE HOLD. The observer and the visual turn want the same GPU.
+    with observer.hold(key):
+        ok(observer._sessions[key]["hold"] == 1,
+           "a real question holds the observer off the GPU while it prepares")
+        with observer.hold(key):
+            ok(observer._sessions[key]["hold"] == 2,
+               "and two overlapping questions nest rather than the first one "
+               "releasing for both")
+    ok(observer._sessions[key]["hold"] == 0, "released afterwards")
+
+    observer.stop(key)
+    observer._sessions.pop(key, None)
+
+    # 4. THE CONFIG IS THE CONTRACT.
+    ok(config.OBSERVER_FRESH_S <= 3.0,
+       f"freshness window is short ({config.OBSERVER_FRESH_S}s) — a road "
+       "description ages out fast")
+    ok(config.OBSERVER_PERIOD_S <= 2.0,
+       f"and the observer runs often enough to keep one ({config.OBSERVER_PERIOD_S}s)")
+    ok(config.OBSERVER_MAX_SIDE_PX <= 768,
+       f"frames are downscaled for it ({config.OBSERVER_MAX_SIDE_PX}px): "
+       "prefill scales with pixels and the caption does not")
+
+    # 5. THE INSTRUCTION. A visual question must never reach the research tool.
+    cfg = realtime.session_config()
+    by_name = {t["name"]: t for t in cfg["tools"]}
+    deep = by_name[realtime.TOOL_NAME]["description"]
+    ok("look" in deep and "camera" in deep.lower(),
+       "the research tool's own description sends visual questions to look")
+    flat = re.sub(r"\s+", " ", cfg["instructions"])
+    ok("never use the research tool for anything you can see" in flat.lower(),
+       "and the instructions say it in the section about looking")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -1942,6 +2062,7 @@ def main():
     run_awareness()
     run_routing()
     run_places()
+    run_fast_path()
     if args.live:
         run_live()
         run_verbatim()

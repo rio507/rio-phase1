@@ -551,8 +551,32 @@ def realtime_session_endpoint(session_id: str = Query(default=None)):
                 "enabled": True, "status": realtime.status()}
     sessions.log_live(session_id, "session_started",
                       {"model": out["model"], "voice": out["voice"]})
+    # Start describing the road NOW, not when she is first asked about it.
+    # A live conversation is exactly the context where "what do you see" is
+    # asked, and the observer needs a second's head start to have an answer
+    # ready — see observer.py, and the measurement in tools/visual_latency.py.
+    try:
+        import observer
+
+        observer.start(_visual_key(session_id))
+    except Exception as e:
+        # A missing observation costs speed, never the conversation.
+        print(f"[realtime] observer not started: {type(e).__name__}: {e}",
+              flush=True)
     out["enabled"] = True
     return out
+
+
+@app.get("/realtime/status")
+def realtime_status_endpoint():
+    """What the live path is doing, read-only.
+
+    Added while diagnosing a slow "what do you see": the fast path either has a
+    fresh observation or it does not, and until this existed there was no way
+    to ask which — the answer was inferred from latency, which is how a
+    contended GPU and a stopped observer look identical from outside.
+    """
+    return realtime.status()
 
 
 @app.post("/realtime/tool")
@@ -2088,6 +2112,15 @@ def _teardown_session(session_id: str, reason: str = "closed") -> bool:
     # should stop existing. The referent goes too — a car discussed on the last
     # drive must not be what "what year is it?" attaches to on the next one.
     key = _visual_key(session_id)
+    # Stop describing a road nobody is driving on. It holds the same GPU the
+    # detector and the depth model want, and its whole justification is that a
+    # conversation is open.
+    try:
+        import observer
+
+        observer.stop(key)
+    except Exception:
+        pass
     framebuf.drop_ring(key)
     visual_qa.drop_session(key)
     # The drive cycle ends with the drive. Note what does NOT happen here: no
