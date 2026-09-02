@@ -87,7 +87,105 @@
     return out;
   }
 
-  var LOCAL_TOOLS = { nav_status: navStatus };
+  /* start_navigation — the driver said "take me there", so she takes them.
+   *
+   * This is answered in the panel for the same reason nav_status is, plus a
+   * stronger one. The route is loaded by RIO.nav and tracked by RIO.nav; a
+   * server-side version of this could resolve a destination but could not
+   * make the car navigate to it, so it would have to hand the browser a
+   * result and hope — which is exactly the arrangement that ended with RIO
+   * describing a route and then asking the driver to set it themselves.
+   *
+   * Nothing about routing is written here. `RIO.nav.routeToQuery` is the
+   * function the destination box calls when the driver presses Enter: the
+   * same resolution, the same "which Getty?" question, the same /nav/route
+   * call, the same tracker and planner attached to the same bus. A spoken
+   * destination and a typed one are the same event by the time they get past
+   * this line, and the only thing added here is the shape RIO needs to be
+   * able to speak about what happened.
+   */
+  function startNavigation(args) {
+    var nav = root.RIO && root.RIO.nav;
+    if (!nav || typeof nav.routeToQuery !== 'function') {
+      return Promise.resolve({ ok: false, note: 'no navigation on this page' });
+    }
+    var text = String((args && (args.destination || args.query)) || '').trim();
+    if (!text) {
+      return Promise.resolve({ ok: false, note: 'no destination' });
+    }
+    // Announcement audio is unlocked inside a user gesture everywhere else on
+    // this page. A route RIO starts has no gesture behind it — the gesture was
+    // starting the conversation — so it is unlocked here, before the first
+    // turn call needs it rather than at it.
+    if (typeof nav.unlock === 'function') { try { nav.unlock(); } catch (e) {} }
+
+    return Promise.resolve(nav.routeToQuery(text)).then(function (out) {
+      out = out || {};
+      // Into the drive's log, through the bus every other nav event uses: a
+      // review of this drive should be able to see that the route was set by
+      // voice, what was asked for, and what came of it.
+      var bus = root.RIO && root.RIO.bus;
+      if (bus && bus.emit) {
+        try {
+          bus.emit('NAV_VOICE_DESTINATION',
+                   { query: text, status: out.status || 'unknown' });
+        } catch (e) { /* logging must never break a route */ }
+      }
+
+      if (out.status === 'routed') {
+        var route = out.route || {};
+        var dest = out.destination || route.destination || {};
+        return {
+          ok: true, routing: true, status: 'routed',
+          // The provider's own spelling of the place, not the driver's and
+          // not the transcriber's. This is the word she repeats back.
+          destination: dest.display_name || dest.formatted_address || text,
+          minutes: route.duration_s
+            ? Math.max(1, Math.round(route.duration_s / 60)) : null,
+          distance_km: route.total_distance_m
+            ? Math.round(route.total_distance_m / 100) / 10 : null,
+          rules: 'The route is live and the car is navigating already. ' +
+                 'Confirm it once, briefly, in your own words, using this ' +
+                 'destination name exactly as spelled here. Do NOT tell the ' +
+                 'driver to set it themselves — it is set. Do NOT read out ' +
+                 'the turns: the navigation system calls those itself.',
+        };
+      }
+      if (out.status === 'ambiguous') {
+        return {
+          ok: true, routing: false, status: 'ambiguous',
+          query: out.query || text,
+          candidates: (out.candidates || []).map(function (c) {
+            return { name: c.display_name || c.formatted_address || '',
+                     address: c.formatted_address || '' };
+          }),
+          rules: 'More than one place answers to that. Do NOT pick one. Ask ' +
+                 'the driver which of these they meant, naming them, and when ' +
+                 'they answer call start_navigation again with their choice.',
+        };
+      }
+      if (out.status === 'not_found') {
+        return {
+          ok: true, routing: false, status: 'not_found',
+          query: out.query || text,
+          rules: 'Say you could not find that place and ask them to say it ' +
+                 'another way. Do not route to something else instead, and do ' +
+                 'not tell them to type it in.',
+        };
+      }
+      return {
+        ok: false, routing: false, status: 'failed',
+        note: out.error || 'route failed',
+        destination: (out.destination && (out.destination.display_name ||
+                                          out.destination.formatted_address)) || null,
+        rules: 'The route did not start. Say so plainly, with the reason if ' +
+               'it is something the driver can do anything about. Do not ' +
+               'send them to the screen to do it themselves.',
+      };
+    });
+  }
+
+  var LOCAL_TOOLS = { nav_status: navStatus, start_navigation: startNavigation };
 
   /* ---------------------------------------------------------------------
      The controller: events in, decisions out.
@@ -532,6 +630,7 @@
     createController: createController,
     connect: connect,
     navStatus: navStatus,
+    startNavigation: startNavigation,
     localTools: LOCAL_TOOLS,
     active: function () { return active; },
     /* Tests and the panel: pretend a session is open, or that none is. */
@@ -540,6 +639,7 @@
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController, navStatus: navStatus,
+                       startNavigation: startNavigation,
                        localTools: LOCAL_TOOLS };
   }
 })(typeof window !== 'undefined' ? window : globalThis);

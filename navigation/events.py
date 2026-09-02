@@ -17,6 +17,11 @@ Two rules about what may be written alongside these names:
 ROUTE_STARTED = "NAV_ROUTE_STARTED"
 ROUTE_FAILED = "NAV_ROUTE_FAILED"
 DESTINATION_AMBIGUOUS = "NAV_DESTINATION_AMBIGUOUS"
+# A destination RIO set herself, on the driver's word, rather than one typed
+# into the panel. Same route, same tracker, same everything downstream — but a
+# review of the drive should be able to see which of the two it was, and what
+# was actually asked for out loud.
+VOICE_DESTINATION = "NAV_VOICE_DESTINATION"
 MANEUVER_SELECTED = "NAV_MANEUVER_SELECTED"
 EARLY_GUIDANCE = "NAV_EARLY_GUIDANCE"
 CONTEXT_ACQUISITION_STARTED = "NAV_CONTEXT_ACQUISITION_STARTED"

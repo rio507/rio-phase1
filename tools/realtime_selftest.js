@@ -346,7 +346,10 @@ section('dictation — a deterministic line, in RIO\'s voice, word for word');
   h.arbiter.say(warning);
   await tick();
   const cancelAt = h.types().indexOf('response.cancel');
-  h.controller.speak('You\'re too close.');
+  // Nothing ever answers this dictation, so it times out ~700 ms later. Only
+  // the ORDER of the two events matters here; the rejection is caught so a
+  // longer-lived run (--server) does not print it as an unhandled one.
+  h.controller.speak('You\'re too close.').catch(() => {});
   await tick();
   const speakAt = h.types().lastIndexOf('response.create');
   ok(cancelAt >= 0 && cancelAt < speakAt,
@@ -588,6 +591,449 @@ section('awareness — the three tools a live session needs');
   ok(/stopLiveFrames\(\)/.test(html) &&
      (html.match(/stopLiveFrames\(\)/g) || []).length >= 3,
      'stopped when the conversation ends, and when it fails to start');
+}
+
+// ---------------------------------------------------------------------------
+section('routing — asked to go somewhere, she takes them there');
+// ---------------------------------------------------------------------------
+/* The bug this covers: RIO could describe a route in detail and then tell the
+   driver to set it themselves, because every navigation tool she had was a
+   read. She now has one that acts, and the things worth asserting about it are
+   that it goes through the panel's OWN routing entry point, that the route is
+   really live afterwards, and that ambiguity still stops her — a tool that
+   silently picked one of two Gettys would be worse than the bug. */
+
+/* A stand-in for the navigation panel, with the same surface rio_nav.js
+   exposes: routeToQuery resolves an outcome, state() answers nav_status from
+   whatever is actually routed. `behaviour` decides what the provider says. */
+function fakePanel(behaviour) {
+  const panel = { asked: [], unlocked: false, routed: null, logged: [] };
+  panel.nav = {
+    unlock: () => { panel.unlocked = true; },
+    routeToQuery: (text) => {
+      panel.asked.push(text);
+      const out = behaviour(text, panel.asked.length);
+      if (out.status === 'routed') panel.routed = out;
+      return Promise.resolve(out);
+    },
+    state: () => (panel.routed ? {
+      destination: panel.routed.destination,
+      remaining_m: panel.routed.route.total_distance_m,
+      eta_epoch: panel.routed.route.eta_epoch, speed_ms: 14,
+      maneuver: null, to_maneuver_m: null, tta_s: null,
+      maneuver_state: 'NONE', maneuvers_left: 8,
+      route_state: 'ON_ROUTE', gps_state: 'GPS_OK', arrived: false,
+    } : null),
+  };
+  global.RIO = global.RIO || {};
+  global.RIO.nav = panel.nav;
+  global.RIO.bus = { emit: (type, payload) => panel.logged.push([type, payload]) };
+  return panel;
+}
+
+const LAX = {
+  status: 'routed',
+  destination: { display_name: 'Los Angeles International Airport',
+                 formatted_address: '1 World Way, Los Angeles, CA 90045' },
+  route: { total_distance_m: 21400, duration_s: 1080, eta_epoch: 1787790000 },
+};
+
+/* The tool bridge exactly as connect() wires it: names in LOCAL_TOOLS are
+   answered in the page, everything else goes to the server. */
+function panelTools() {
+  return (name, args) => (rt.localTools[name]
+    ? Promise.resolve(rt.localTools[name](args))
+    : Promise.resolve({ ok: false, note: 'not local' }));
+}
+
+{
+  // 1. "TAKE ME TO LAX." One tool call, one route, one confirmation.
+  const panel = fakePanel(() => LAX);
+  const h = harness({ tool: panelTools() });
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'n1',
+    arguments: JSON.stringify({ destination: 'take me to LAX' }),
+  });
+  await tick(); await tick(); await tick();
+
+  ok(panel.asked.length === 1 && panel.asked[0] === 'take me to LAX',
+     'the spoken destination reaches routeToQuery — the same function the '
+     + 'destination box calls on Enter, not a second router');
+  ok(panel.unlocked, 'and announcement audio is unlocked, so the first turn '
+     + 'call is not the thing that discovers it was not');
+
+  const out = JSON.parse(h.sent.find(e => e.type === 'conversation.item.create')
+                              .item.output);
+  ok(out.ok === true && out.routing === true && out.status === 'routed',
+     'the tool comes back saying the route is live');
+  ok(out.destination === 'Los Angeles International Airport',
+     "spelled the PROVIDER's way, not the driver's — LAX and LAS are one "
+     + 'letter apart and she repeats back the one that was routed to');
+  ok(out.minutes === 18, 'with the number she confirms with (' + out.minutes
+     + ' minutes)');
+  ok(/do NOT tell the driver to set it themselves/i.test(out.rules || ''),
+     'and the result itself closes the door on the old behaviour');
+  ok(/do NOT read out the turns/i.test(out.rules || ''),
+     'while leaving the turns exactly where they were: not hers');
+  ok(h.types().indexOf('response.create') >= 0,
+     'she is then asked to say so out loud — the driver hears a confirmation, '
+     + 'not silence');
+
+  // ROUTE ACTIVE, checked the way the driver would check it: by asking.
+  const st = rt.navStatus();
+  ok(st.ok && st.routing === true &&
+     st.destination === 'Los Angeles International Airport',
+     'and the route is genuinely active afterwards — nav_status answers from '
+     + 'it with no dashboard step in between');
+  ok(panel.logged.some(e => e[0] === 'NAV_VOICE_DESTINATION' &&
+                            e[1].status === 'routed'),
+     'the drive log records that this one was set by voice');
+}
+
+{
+  // 2. AMBIGUITY SURVIVES. Two Gettys eight miles apart: she asks, and only
+  //    then routes. This is the rule the tool is most able to break, because
+  //    it is now the thing holding the steering wheel.
+  const GETTY = [
+    { display_name: 'The Getty Center', formatted_address: '1200 Getty Center Dr' },
+    { display_name: 'Getty Villa', formatted_address: '17985 Pacific Coast Hwy' },
+  ];
+  const ROUTED = {
+    status: 'routed',
+    destination: { display_name: 'Getty Villa',
+                   formatted_address: '17985 Pacific Coast Hwy' },
+    route: { total_distance_m: 12800, duration_s: 900, eta_epoch: 1787790000 },
+  };
+  const panel = fakePanel((text, n) => (n === 1
+    ? { status: 'ambiguous', query: 'the Getty', candidates: GETTY }
+    : ROUTED));
+  const h = harness({ tool: panelTools() });
+
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'a1',
+    arguments: JSON.stringify({ destination: "let's go to the Getty" }),
+  });
+  await tick(); await tick(); await tick();
+
+  const first = JSON.parse(h.sent.filter(e => e.type === 'conversation.item.create')
+                                 .pop().item.output);
+  ok(first.ok === true && first.routing === false && first.status === 'ambiguous',
+     'an ambiguous destination is a real answer, not a failure — but nothing '
+     + 'is routed');
+  ok(first.candidates.length === 2 &&
+     first.candidates[0].name === 'The Getty Center' &&
+     first.candidates[1].name === 'Getty Villa',
+     'she is handed both places, by name, to put to the driver');
+  ok(/do NOT pick one/i.test(first.rules || ''),
+     'and told in the result itself not to choose');
+  ok(/call start_navigation again/i.test(first.rules || ''),
+     'and what to do with the answer when it comes');
+  ok(rt.navStatus().routing === false,
+     'meanwhile no route exists — the question was asked before anything was '
+     + 'set, which is the whole point');
+  ok(h.types().indexOf('response.create') >= 0,
+     'she is asked to speak, and what she has to say is a question');
+
+  // The driver answers. NOW she routes.
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'a2',
+    arguments: JSON.stringify({ destination: 'Getty Villa' }),
+  });
+  await tick(); await tick(); await tick();
+
+  const second = JSON.parse(h.sent.filter(e => e.type === 'conversation.item.create')
+                                  .pop().item.output);
+  ok(second.ok && second.routing === true && second.destination === 'Getty Villa',
+     'the chosen one routes on the second call');
+  ok(panel.asked.length === 2 && panel.asked[1] === 'Getty Villa',
+     'through the same entry point, with the driver’s choice as the query');
+  ok(rt.navStatus().destination === 'Getty Villa',
+     'and the route is now active to the place the driver actually named');
+}
+
+{
+  // 3. THE UNHAPPY ONES. Neither is an excuse to hand the job back.
+  const nf = fakePanel(() => ({ status: 'not_found', query: 'the blue one' }));
+  const h1 = harness({ tool: panelTools() });
+  h1.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'x1',
+    arguments: JSON.stringify({ destination: 'the blue one' }),
+  });
+  await tick(); await tick(); await tick();
+  const miss = JSON.parse(h1.sent.find(e => e.type === 'conversation.item.create')
+                                 .item.output);
+  ok(miss.ok === true && miss.status === 'not_found' && miss.routing === false,
+     '"I could not find it" is an answer she gives, not an error she hides');
+  ok(/not tell them to type it in/i.test(miss.rules || ''),
+     'and still not a reason to send the driver to the keyboard');
+  ok(nf.asked.length === 1, 'one attempt, no retry with a guess');
+
+  const fail = fakePanel(() => ({ status: 'failed',
+                                  error: 'no position — allow location' }));
+  const h2 = harness({ tool: panelTools() });
+  h2.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'x2',
+    arguments: JSON.stringify({ destination: 'LAX' }),
+  });
+  await tick(); await tick(); await tick();
+  const broke = JSON.parse(h2.sent.find(e => e.type === 'conversation.item.create')
+                                  .item.output);
+  ok(broke.ok === false && broke.status === 'failed',
+     'a route that would not build comes back as a failure');
+  ok(/allow location/.test(broke.note || ''),
+     'carrying the reason, because this one the driver can actually fix');
+  ok(/not.*screen/i.test(broke.rules || ''),
+     'and even here she does not defer to the dashboard');
+  ok(fail.asked.length === 1, 'and does not retry into a second routing call');
+
+  const blank = await rt.localTools.start_navigation({ destination: '  ' });
+  ok(blank.ok === false && /no destination/.test(blank.note),
+     'an empty destination is answered rather than routed on — a model can '
+     + 'emit anything');
+
+  // No panel at all — the tool is called on a page that has no navigation.
+  delete global.RIO.nav;
+  const h3 = harness({ tool: panelTools() });
+  h3.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'x3',
+    arguments: JSON.stringify({ destination: 'LAX' }),
+  });
+  await tick(); await tick(); await tick();
+  const none = JSON.parse(h3.sent.find(e => e.type === 'conversation.item.create')
+                                 .item.output);
+  ok(none.ok === false, 'with no navigation on the page it answers, rather '
+     + 'than throwing into the session');
+  delete global.RIO.bus;
+}
+
+{
+  // 4. ONE ROUTER, NOT TWO. The reuse is the point of the fix: if this file
+  //    ever grows its own /nav/route call, a spoken destination and a typed
+  //    one stop being the same event and start being two things that drift.
+  const fs = require('fs');
+  const rtSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'rio_realtime.js'), 'utf8');
+  ok(/nav\.routeToQuery\(/.test(rtSrc),
+     'the tool calls the panel’s own routing entry point');
+  ok(!/fetch\([^)]*nav\/(route|destination)/.test(rtSrc),
+     'and asks the routing endpoints for nothing itself');
+
+  const navSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'static', 'rio_nav.js'), 'utf8');
+  ok((navSrc.match(/fetch\(RIO\.url\('\/nav\/route'\)/g) || []).length === 1,
+     'there is still exactly one place in the panel that loads a route');
+  ok(/routeToQuery: routeToQuery/.test(navSrc),
+     'and it is reachable by name, which is how the voice path reaches it');
+}
+
+// ---------------------------------------------------------------------------
+// LIVE — the real panel, the real server, over HTTP.
+//
+//   node tools/realtime_selftest.js --server [http://127.0.0.1:8888]
+//
+// Everything above runs against fakes, which is what makes it fast and what
+// makes it prove decisions rather than plumbing. This part proves the
+// plumbing, and it is the half that was actually broken: a driver asking to be
+// taken somewhere ends with a route loaded and a tracker running, and nobody
+// touched the dashboard.
+//
+// Nothing is stubbed here except the browser itself. static/rio_nav.js is
+// loaded as written — the same routing, the same tracker, the same bus — with
+// a DOM that answers "no such element" to everything, a fetch that speaks
+// HTTP, and a Geolocation that reports one fixed position. The destination is
+// resolved by the running server, against whichever provider it is configured
+// with.
+// ---------------------------------------------------------------------------
+// node 12 has no fetch, and this needs about a tenth of one.
+function installFetch() {
+  if (global.fetch) return;
+  const http = require('http');
+  const { URL } = require('url');
+  global.fetch = function (url, opts) {
+    opts = opts || {};
+    return new Promise((resolve, reject) => {
+      const u = new URL(url);
+      const req = http.request({
+        hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+        method: opts.method || 'GET', headers: opts.headers || {},
+      }, (res) => {
+        let body = '';
+        res.on('data', (d) => { body += d; });
+        res.on('end', () => resolve({
+          ok: res.statusCode < 400, status: res.statusCode,
+          text: () => Promise.resolve(body),
+          json: () => Promise.resolve(JSON.parse(body)),
+        }));
+      });
+      req.on('error', reject);
+      if (opts.body) req.write(opts.body);
+      req.end();
+    });
+  };
+}
+
+function installBrowser(base, sessionId, origin) {
+  installFetch();
+  global.window = global;                       // so the panel's `root` is here
+  const noElement = () => null;
+  const stubNode = () => ({
+    style: {}, textContent: '', innerHTML: '', appendChild: () => {},
+    querySelector: () => stubNode(), addEventListener: () => {},
+    setAttribute: () => {},
+  });
+  const docHandlers = {};
+  global.document = {
+    addEventListener: (t, f) => { (docHandlers[t] = docHandlers[t] || []).push(f); },
+    getElementById: noElement,
+    createElement: stubNode,
+    createTextNode: () => ({}),
+    head: { appendChild: () => {} },
+  };
+  global.Audio = function () {
+    return { preload: '', muted: false, currentTime: 0,
+             play: () => Promise.resolve(), pause: () => {} };
+  };
+  // The one GPS watch the page owns, reporting a fixed position. `sink` is
+  // where the panel's subscription lands, so this harness can drive the car
+  // along the route afterwards exactly as a real fix would.
+  const gps = { sink: null };
+  global.navigator = {
+    geolocation: {
+      getCurrentPosition: (okc) => okc({ coords: { latitude: origin.lat,
+                                                   longitude: origin.lng,
+                                                   accuracy: 8 } }),
+    },
+  };
+  global.RIO = {
+    sessionId: sessionId,
+    url: (p) => base + p + (p.indexOf('?') >= 0 ? '&' : '?') +
+                'session_id=' + encodeURIComponent(sessionId),
+    headway: { startWatch: () => {}, onPosition: (fn) => { gps.sink = fn; } },
+    speak: { provider: () => ({ play: () => Promise.resolve(), stop: () => {} }) },
+  };
+
+  require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_navplan.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_nav.js'));
+  (docHandlers.DOMContentLoaded || []).forEach((f) => f());
+  return gps;
+}
+
+async function liveRouting(base) {
+  section('LIVE — the real panel against ' + base);
+  installFetch();
+
+  const post = (p, body) => global.fetch(base + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  }).then((r) => r.json());
+
+  // A real drive session, so what RIO does by voice lands in a real log.
+  const started = await post('/session/start', {});
+  const sessionId = started.session_id;
+  ok(!!sessionId, 'the server opened a drive session (' + sessionId + ')');
+
+  const ORIGIN = { lat: 34.0219, lng: -118.4814 };     // Santa Monica
+  const gps = installBrowser(base, sessionId, ORIGIN);
+  ok(!!(global.RIO.nav && global.RIO.nav.routeToQuery),
+     'the real navigation panel loaded outside a browser');
+  ok(rt.navStatus().routing === false,
+     'and starts with no route — nothing is set until she sets it');
+
+  const attached = [];
+  global.RIO.bus.on('NAV_ROUTE_ATTACHED', (ev) => attached.push(ev));
+
+  // THE WHOLE POINT: one tool call, spoken destination in, live route out.
+  const result = await rt.localTools.start_navigation(
+    { destination: 'take me to Griffith Observatory' });
+  ok(result.ok === true && result.routing === true,
+     'a spoken destination came back routed: ' + JSON.stringify({
+       destination: result.destination, minutes: result.minutes,
+       km: result.distance_km }));
+  ok(/griffith/i.test(result.destination || ''),
+     'named by the provider that resolved it (' + result.destination + ')');
+  ok(result.minutes > 0 && result.distance_km > 0,
+     'with a real ETA and distance to confirm out loud');
+  ok(attached.length === 1 && attached[0].n_maneuvers > 1,
+     'the route attached to the panel with ' +
+     (attached[0] ? attached[0].n_maneuvers : 0) + ' maneuvers — the same '
+     + 'event the destination box produces');
+
+  // ...and the tracker is RUNNING, which is the difference between a route
+  // that exists and a car that is being navigated. Fed through the panel's own
+  // GPS subscription, from the route's own geometry.
+  const st0 = rt.navStatus();
+  ok(st0.routing === true && /griffith/i.test(st0.destination || ''),
+     'nav_status now answers from the live route');
+  ok(!!gps.sink, 'the panel is subscribed to the position watch');
+
+  const route = global.RIO.nav.route;
+  ok(!!(route && route.geometry && route.geometry.length > 2),
+     'the route carries geometry to drive along');
+  const before = rt.navStatus().distance_remaining_m;
+  for (const idx of [0, 12, 30]) {
+    const pt = route.geometry[Math.min(idx, route.geometry.length - 1)];
+    gps.sink({ coords: { latitude: pt[0], longitude: pt[1], speed: 13,
+                         heading: null, accuracy: 6 } });
+    await new Promise((r) => setTimeout(r, 1100));
+  }
+  const st1 = rt.navStatus();
+  ok(st1.route_state === 'ON_ROUTE',
+     'driving the first few hundred metres of it tracks ON_ROUTE');
+  ok(st1.distance_remaining_m < before,
+     'and the distance remaining actually came down (' + before + ' m -> ' +
+     st1.distance_remaining_m + ' m) — the tracker is running, not just loaded');
+  ok(!!st1.next_maneuver && st1.next_maneuver.distance_m >= 0,
+     'with a next maneuver selected: ' +
+     (st1.next_maneuver ? st1.next_maneuver.instruction : 'none'));
+
+  // Ambiguity, against the real provider. Whatever it returns, the rule is the
+  // same: nothing new gets routed on a question.
+  const amb = await rt.localTools.start_navigation({ destination: 'take me to LAX' });
+  if (amb.status === 'ambiguous') {
+    ok(amb.routing === false && amb.candidates.length > 1,
+       'an ambiguous destination asks which one — ' +
+       amb.candidates.map((c) => c.name).join(' / '));
+    ok(rt.navStatus().destination === st1.destination,
+       'and changes nothing while it waits for the answer');
+    const chosen = amb.candidates[0].name;
+    const after = await rt.localTools.start_navigation({ destination: chosen });
+    ok(after.routing === true,
+       'the driver’s choice then routes on its own tool call (' +
+       after.destination + ')');
+  } else {
+    ok(amb.status === 'routed' || amb.status === 'not_found',
+       'the provider read "LAX" as ' + amb.status + ' — no ambiguity to '
+       + 'exercise against this provider today');
+  }
+
+  // The drive log should say a human voice set this, not the box.
+  await new Promise((r) => setTimeout(r, 400));
+  const log = await global.fetch(
+    base + '/session/' + encodeURIComponent(sessionId))
+    .then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const events = (log && log.events) || [];
+  const logged = events.map((e) => (e.payload || {}).event);
+  ok(logged.indexOf('NAV_VOICE_DESTINATION') >= 0,
+     'the drive log records that this destination came from her voice');
+  ok(logged.indexOf('NAV_ROUTE_STARTED') >= 0,
+     'alongside the ordinary route record — one drive, one story, whoever '
+     + 'asked for it');
+  await post('/session/end?session_id=' + encodeURIComponent(sessionId), {});
+}
+
+const serverArg = process.argv.indexOf('--server');
+if (serverArg >= 0) {
+  const base = (process.argv[serverArg + 1] || '').indexOf('http') === 0
+    ? process.argv[serverArg + 1] : 'http://127.0.0.1:8888';
+  await liveRouting(base);
 }
 
 console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ') + checks + ' checks');

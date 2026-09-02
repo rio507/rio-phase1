@@ -500,8 +500,17 @@
       });
     }
 
+    /* The one way a route is ever loaded, whoever asked for it: the box, a
+       suggestion picked from the list, a reroute, or RIO herself on the
+       driver's word.
+
+       It resolves to an OUTCOME — {ok, route} or {ok, error} — rather than to
+       nothing. The panel never needed that (it reads the result off the page
+       it has just painted), but a caller who has to say out loud whether the
+       car is now going somewhere does, and giving this one a return value is
+       cheaper than giving her a second way to start a route. */
     function setRoute(opts) {
-      if (routing) return Promise.resolve();
+      if (routing) return Promise.resolve({ ok: false, error: 'already routing' });
       routing = true;
       if (!opts.reroute_of) lastRequest = opts;
       status(opts.reroute_of ? 'Off route · rerouting…' : 'Routing…');
@@ -519,17 +528,33 @@
         .then(function (j) {
           if (j.error) throw new Error(j.error);
           attach(j);
+          return { ok: true, route: j };
         })
         .catch(function (e) {
           status('No route · ' + (e && e.message ? e.message : e));
           RIO.bus.emit('NAV_ROUTE_FAILED', { error: String(e && e.message || e),
                                              destination: opts.destination || opts.label || '' });
+          return { ok: false, error: String(e && e.message || e) };
         })
-        .then(function () { routing = false; });
+        .then(function (outcome) { routing = false; return outcome; });
     }
 
     /* Free text in, one destination or a question out. RIO does not silently
-       pick between two plausible readings of "the Getty". */
+       pick between two plausible readings of "the Getty".
+
+       This is the whole of "go somewhere", and there is deliberately only one
+       of it. The destination box calls it on Enter; RIO calls it when the
+       driver tells her to take them somewhere. Same resolution, same
+       ambiguity question, same route load, same tracker — a spoken
+       destination is not a second path through this file, it is this path
+       with a different caller.
+
+       Resolves to what happened, for that caller's sake:
+         { status: 'routed',    destination, route }
+         { status: 'ambiguous', query, candidates }   // and the list is shown
+         { status: 'not_found', query }
+         { status: 'failed',    error }
+       The panel ignores it and reads the page. RIO has to say it out loud. */
     function routeToQuery(text) {
       status('Finding …');
       // The fallback path, and the one that has to keep working when
@@ -550,18 +575,32 @@
             // id. The candidates carry place ids, which is all the resolution
             // needs.
             offerDestinations(j.candidates);
-            return;
+            return { status: 'ambiguous', query: j.query || text,
+                     candidates: (j.candidates || []).slice(0, 3) };
           }
           if (j.status !== 'resolved') {
             status('No route · could not find "' + text + '"');
-            return;
+            return { status: 'not_found', query: j.query || text };
           }
           var d = j.destination;
           return setRoute({ place_id: d.provider_place_id || '',
                             destination: d.provider_place_id ? '' : d.formatted_address,
-                            label: d.display_name || d.formatted_address });
+                            label: d.display_name || d.formatted_address })
+            .then(function (res) {
+              if (res && res.ok) {
+                return { status: 'routed', destination: d, route: res.route };
+              }
+              // Resolved to a real place and still could not be routed to:
+              // no fix to start from, or the provider refused. Not the same
+              // answer as "I could not find it", and never dressed up as one.
+              return { status: 'failed', destination: d,
+                       error: (res && res.error) || 'could not build a route' };
+            });
         })
-        .catch(function (e) { status('No route · ' + (e && e.message || e)); });
+        .catch(function (e) {
+          status('No route · ' + (e && e.message || e));
+          return { status: 'failed', error: String(e && e.message || e) };
+        });
     }
 
     function clearRoute(reason) {

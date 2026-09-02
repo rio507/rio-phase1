@@ -24,6 +24,11 @@ Six parts:
   E. FIREWALL — nothing that speaks deterministically can reach either model.
      Same check headway and navigation already run on their own policy code.
   F. ENDPOINTS — the two handlers, including the switched-off path.
+
+...and, further down, the tools that came later: her eyes (G), the
+deterministic lines she is dictated (H), what she can find out when asked (I),
+and the one tool that ACTS rather than reports — starting a route because the
+driver asked to be taken somewhere (J).
 """
 import argparse
 import inspect
@@ -33,6 +38,7 @@ import re
 import subprocess
 import sys
 import time
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -80,6 +86,8 @@ def run_session():
     tools = [t["name"] for t in s["tools"]]
     ok(tools[:2] == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME],
        f"the session carries her tools ({tools})")
+    ok(realtime.NAVIGATE_TOOL_NAME in tools,
+       "including the one that acts rather than reports: she can start a route")
     schema = s["tools"][0]
     ok("question" in schema["parameters"]["properties"],
        "the escalation takes a question")
@@ -162,6 +170,11 @@ def run_dispatch():
                       ({}, "no question")):
         r = realtime.run_tool(realtime.LOOK_TOOL_NAME, args)
         ok(r.get("ok") is False, f"look with {why} -> ok:false, not an exception")
+
+    r = realtime.run_tool(realtime.NAVIGATE_TOOL_NAME, {"destination": "LAX"})
+    ok(r.get("ok") is False and "panel" in r.get("note", ""),
+       "start_navigation is refused server-side — resolving a destination here "
+       "and hoping the browser routes to it is the arrangement it replaces")
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +584,9 @@ def run_awareness():
     s = realtime.session_config()
     names = [t["name"] for t in s["tools"]]
     ok(names == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
-                 realtime.NAV_TOOL_NAME, realtime.VEHICLE_TOOL_NAME],
-       f"four tools: think, look, route, car ({names})")
+                 realtime.NAV_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
+                 realtime.NAVIGATE_TOOL_NAME],
+       f"five tools: think, look, route, car — and go ({names})")
 
     nav_desc = s["tools"][2]["description"]
     veh_desc = s["tools"][3]["description"]
@@ -631,6 +645,75 @@ def run_awareness():
     ok(r["ok"] is False and "panel" in r["note"],
        "nav_status is refused server-side: progress lives in the browser, and "
        "a second source would be a second answer")
+
+
+# ---------------------------------------------------------------------------
+# J. Going somewhere
+# ---------------------------------------------------------------------------
+def run_routing():
+    """The tool that ACTS, and the instructions that stop it acting alone.
+
+    The bug: asked to be taken somewhere, RIO described the route and told the
+    driver to set it themselves — every navigation tool she had was a read. The
+    fix is one tool that does what the destination box does. What has to be
+    true of it, and is checked here, is that its description and her
+    instructions both say she routes herself, that they still forbid picking
+    between two plausible places, and that none of it moves the turns.
+    """
+    section("J. going somewhere — the one tool that does rather than reports")
+    s = realtime.session_config()
+    schema = next(t for t in s["tools"] if t["name"] == realtime.NAVIGATE_TOOL_NAME)
+    desc = schema["description"]
+
+    ok("destination" in schema["parameters"]["properties"],
+       "start_navigation takes a destination")
+    ok(schema["parameters"]["required"] == ["destination"],
+       "and requires one — there is no 'route to wherever'")
+    for phrase, why in (
+            ("take me to", "it is described in the words a driver actually uses"),
+            ("makes the route live", "it says plainly that it ACTS"),
+            ("never tell the driver to set it themselves",
+             "and that the manual path is not hers to suggest"),
+            ("WHICH ONE", "ambiguity is part of the contract, not an error"),
+            ("Never pick one yourself", "and picking is forbidden in the schema too"),
+    ):
+        ok(phrase.lower() in desc.lower(), f"{why} ({phrase!r})")
+    ok("still calls those out loud itself" in desc,
+       "and the turns stay with the navigation system, said in the tool's own "
+       "description so it cannot be read as a promotion")
+
+    instr = s["instructions"]
+    ok("WHEN THE DRIVER ASKS TO GO SOMEWHERE" in instr,
+       "the instructions have a section for it")
+    # Wrapped at 79 columns like the rest of the prompt, so these are matched
+    # against the unwrapped text rather than against one particular line break.
+    flat = re.sub(r"\s+", " ", instr)
+    for phrase in ("Call start_navigation, straight away",
+                   "Never tell the driver to type it in",
+                   "call start_navigation again with what they chose",
+                   "use the destination name the tool hands back"):
+        ok(phrase in flat, f"and spell it out: {phrase!r}")
+    ok("What you still never do is call the turns" in flat,
+       "the announce/answer boundary is re-stated where it is most likely to "
+       "be misread: she starts routes, she does not call turns")
+    # The boundary itself must not have been softened to make room.
+    ok("YOU ANSWER. YOU DO NOT ANNOUNCE." in instr,
+       "and the original boundary is still there, in those words")
+    ok("never announce a turn" in instr.lower(),
+       "including the turn rule it has always had")
+
+    # Nothing about deterministic navigation speech moved.
+    import navigation.speech as navspeech
+    ok(navspeech.destination_reply("resolved", name="LAX") == "Routing to LAX.",
+       "the hold-to-talk path still speaks its own fixed line, untouched")
+
+    # The panel is the only implementation. A second one on the server would be
+    # a second answer to "where are we going", which is the thing nav_status
+    # exists to avoid.
+    src = inspect.getsource(realtime)
+    ok("resolve_destination" not in src,
+       "realtime.py resolves no destinations of its own")
+    ok("build_route" not in src, "and builds no routes")
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +877,28 @@ def run_latency():
 # ---------------------------------------------------------------------------
 # The full chain, against the running server
 # ---------------------------------------------------------------------------
+CLOSED = "[session closed — no events]"
+
+
+def _rate_limit_wait(event) -> Optional[float]:
+    """Seconds to wait, if this response failed on the realtime token cap.
+
+    A rate-limited response arrives as an ordinary `response.done` with status
+    "failed" and no output — indistinguishable, from the outside, from a model
+    that decided to say nothing and use no tools. That is the most misleading
+    failure this file can report, so it is recognised by name and waited out
+    rather than asserted against.
+    """
+    details = getattr(getattr(event, "response", None), "status_details", None)
+    if details is None:
+        return None
+    text = str(details)
+    if "rate_limit" not in text:
+        return None
+    m = re.search(r"try again in ([0-9.]+)\s*s", text)
+    return min(30.0, float(m.group(1)) + 1.0) if m else 5.0
+
+
 def _ask_live(conn, question, tool_handler, timeout_s=120.0):
     """Ask a real session a question, answer whatever it reaches for, and
     return (everything it said, which tools it called).
@@ -806,6 +911,16 @@ def _ask_live(conn, question, tool_handler, timeout_s=120.0):
     follow-up response is only asked for once that response is done —
     otherwise the API refuses it, which is what a first cut of this function
     did to itself.
+
+    Which response, though, is counted rather than assumed. Breaking on the
+    first `response.done` seen works right up until there is a response in
+    flight that this function did not ask for, and then it leaves one `done`
+    unread in the stream — after which EVERY later question returns instantly
+    with nothing, because the first event it sees is that leftover. The
+    symptom is a model that appears to have stopped answering and stopped
+    using its tools, which is a spectacularly misleading thing for a test to
+    report. So: count what opened, count what closed, and leave when nothing
+    is open and nothing is owed.
     """
     conn.conversation.item.create(item={
         "type": "message", "role": "user",
@@ -813,8 +928,10 @@ def _ask_live(conn, question, tool_handler, timeout_s=120.0):
     conn.response.create()
 
     said, called, need_followup = [], [], False
+    seen, started, active, waited = 0, 0, 0, 0
     t0 = time.time()
     for event in conn:
+        seen += 1
         if time.time() - t0 > timeout_s:
             break
         if event.type == "response.function_call_arguments.done":
@@ -828,15 +945,35 @@ def _ask_live(conn, question, tool_handler, timeout_s=120.0):
         elif event.type == "response.output_audio_transcript.done":
             if event.transcript:
                 said.append(event.transcript.strip())
+        elif event.type == "response.created":
+            started += 1
+            active += 1
         elif event.type == "response.done":
+            active -= 1
+            pause = _rate_limit_wait(event)
+            if pause is not None and waited < 4:
+                waited += 1
+                print(f"    (realtime token cap — waiting {pause:.0f}s and "
+                      "asking again)")
+                time.sleep(pause)
+                conn.response.create()
+                continue
             if need_followup:
                 need_followup = False
                 conn.response.create()      # safe now: nothing is active
                 continue
-            break
+            if started and active <= 0:
+                break
         elif event.type == "error":
             said.append(f"[error: {getattr(event, 'error', '')}]")
             break
+    if not seen:
+        # The iterator ended without yielding anything: the socket is gone, not
+        # the model's willingness to answer. Said so explicitly, because a
+        # dropped connection otherwise reads as "she ignored every tool she
+        # has", and that is the one conclusion this test must never reach by
+        # accident.
+        return CLOSED, called
     return " ".join(said).strip(), called
 
 
@@ -866,10 +1003,64 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
     use_pending = {"on": False}
     calls = []
 
+    # The panel's other half of the routing tool, played the way the browser
+    # plays it: resolve against the running server, then route against it. The
+    # shaping is deliberately the same shape rio_realtime.js produces, because
+    # what is under test here is whether the MODEL reaches for this at all and
+    # what she says afterwards — the panel's real code is exercised end to end
+    # by `node tools/realtime_selftest.js --server`.
+    ORIGIN = (34.0219, -118.4814)
+
+    def route_by_voice(spoken):
+        d = httpx.post(f"{base}/nav/destination", timeout=60,
+                       json={"q": spoken, "lat": ORIGIN[0],
+                             "lng": ORIGIN[1]}).json()
+        if d.get("status") == "ambiguous":
+            return {"ok": True, "routing": False, "status": "ambiguous",
+                    "query": d.get("query"),
+                    "candidates": [{"name": c["display_name"],
+                                    "address": c["formatted_address"]}
+                                   for c in d["candidates"]],
+                    "rules": "More than one place answers to that. Do NOT pick "
+                             "one. Ask the driver which of these they meant, "
+                             "naming them, and when they answer call "
+                             "start_navigation again with their choice."}
+        if d.get("status") != "resolved":
+            return {"ok": True, "routing": False, "status": "not_found",
+                    "query": d.get("query"),
+                    "rules": "Say you could not find that place and ask them "
+                             "to say it another way."}
+        dest = d["destination"]
+        r = httpx.post(f"{base}/nav/route", timeout=90, json={
+            "lat": ORIGIN[0], "lng": ORIGIN[1],
+            "place_id": dest.get("provider_place_id") or "",
+            "destination": "" if dest.get("provider_place_id")
+                           else dest["formatted_address"],
+            "label": dest["display_name"]}).json()
+        if r.get("error"):
+            return {"ok": False, "status": "failed", "note": r["error"],
+                    "rules": "The route did not start. Say so plainly."}
+        # From here on the drive really is going there, so the tool that
+        # answers "where are we going" has to agree.
+        nav_state["destination"] = r["destination"]["display_name"]
+        return {"ok": True, "routing": True, "status": "routed",
+                "destination": r["destination"]["display_name"],
+                "minutes": max(1, round(r["duration_s"] / 60)),
+                "distance_km": round(r["total_distance_m"] / 100) / 10,
+                "rules": "The route is live and the car is navigating already. "
+                         "Confirm it once, briefly, in your own words, using "
+                         "this destination name exactly as spelled here. Do "
+                         "NOT tell the driver to set it themselves — it is "
+                         "set. Do NOT read out the turns: the navigation "
+                         "system calls those itself."}
+
     def tool_handler(name, arguments):
         calls.append(name)
         if name == realtime.NAV_TOOL_NAME:
             return nav_state
+        if name == realtime.NAVIGATE_TOOL_NAME:
+            args = json.loads(arguments or "{}")
+            return route_by_voice(str(args.get("destination") or ""))
         if name == realtime.VEHICLE_TOOL_NAME and use_pending["on"]:
             return pending_vehicle
         r = httpx.post(f"{base}/realtime/tool", timeout=90,
@@ -878,36 +1069,87 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
         return r.json()
 
     # 5. FRAME SUPPLY, over HTTP, exactly as the browser posts it.
-    with open("/tmp/road.jpg", "rb") as fh:
-        frame = fh.read()
-    for i in range(3):
-        httpx.post(f"{base}/headway_frame", timeout=60,
-                   files={"image": ("frame.jpg", frame, "image/jpeg")},
-                   data={"v_host": "14.0", "v_host_age_s": "0.2",
-                         "frame_t": str(i)})
-    scene = httpx.get(f"{base}/scene", timeout=30).json()
-    ok(len(scene.get("objects") or []) > 0,
-       f"the frame ring fills from posted frames — {len(scene.get('objects') or [])} "
-       "objects in the scene graph")
+    #
+    # The frame is a road photograph from outside this repo — RIO_CHAIN_FRAME,
+    # or /tmp/road.jpg. Without one there is nothing for her to look at, so the
+    # visual exchange is skipped rather than asserted against an empty ring:
+    # everything else in this chain is about the route and the car and does not
+    # need a camera.
+    frame_path = os.getenv("RIO_CHAIN_FRAME", "/tmp/road.jpg")
+    have_frame = os.path.exists(frame_path)
+    if have_frame:
+        with open(frame_path, "rb") as fh:
+            frame = fh.read()
+        for i in range(3):
+            httpx.post(f"{base}/headway_frame", timeout=60,
+                       files={"image": ("frame.jpg", frame, "image/jpeg")},
+                       data={"v_host": "14.0", "v_host_age_s": "0.2",
+                             "frame_t": str(i)})
+        scene = httpx.get(f"{base}/scene", timeout=30).json()
+        ok(len(scene.get("objects") or []) > 0,
+           f"the frame ring fills from posted frames — "
+           f"{len(scene.get('objects') or [])} objects in the scene graph")
+    else:
+        print(f"    (no frame at {frame_path} — skipping the visual exchange; "
+              "set RIO_CHAIN_FRAME to a road photo to include it)")
 
-    with realtime.client().realtime.connect(
-            model=config.OPENAI_REALTIME_MODEL) as conn:
+    # A live socket lasting several exchanges is not something this test can
+    # assume — it has been seen dropping between questions — so the session is
+    # held where it can be reopened, and a question that came back to a closed
+    # one is asked again on a fresh session. The conversation history is lost
+    # across that, which is why every question below stands on its own instead
+    # of referring back to the last one.
+    box = {"conn": None, "ctx": None}
+
+    def open_session():
+        ctx = realtime.client().realtime.connect(
+            model=config.OPENAI_REALTIME_MODEL)
+        conn = ctx.__enter__()
         conn.session.update(session=dict(realtime.session_config(),
                                          output_modalities=["audio"]))
+        box["ctx"], box["conn"] = ctx, conn
+        return conn
+
+    def close_session():
+        if box["ctx"] is not None:
+            try:
+                box["ctx"].__exit__(None, None, None)
+            except Exception:
+                pass
+        box["ctx"], box["conn"] = None, None
+
+    def ask(question):
+        said, used = _ask_live(box["conn"], question, tool_handler)
+        if said == CLOSED:
+            print("    (the live session dropped — reopening and asking again)")
+            close_session()
+            open_session()
+            said, used = _ask_live(box["conn"], question, tool_handler)
+        elif not said and not used:
+            # A response that contained nothing at all — no speech, no tool.
+            # That is not an answer of any kind, so it is asked once more
+            # rather than reported as a behavioural failure. If she really is
+            # ignoring the question, the second one is empty too.
+            print("    (empty response — asking once more)")
+            said, used = _ask_live(box["conn"], question, tool_handler)
+        return said, used
+
+    try:
+        open_session()
 
         # 1. A visual question must reach the camera.
-        said, used = _ask_live(conn, "What's ahead of us right now?", tool_handler)
-        print(f"    Q: what's ahead of us right now?\n    A: {said[:220]}")
-        ok(realtime.LOOK_TOOL_NAME in used, f"she looks ({used})")
-        ok(any(w in said.lower() for w in
-               ("car", "sedan", "suv", "street", "road", "traffic", "ahead",
-                "lane", "building")),
-           "and answers from what the camera actually returned")
+        if have_frame:
+            said, used = ask("What's ahead of us right now?")
+            print(f"    Q: what's ahead of us right now?\n    A: {said[:220]}")
+            ok(realtime.LOOK_TOOL_NAME in used, f"she looks ({used})")
+            ok(any(w in said.lower() for w in
+                   ("car", "sedan", "suv", "street", "road", "traffic", "ahead",
+                    "lane", "building")),
+               "and answers from what the camera actually returned")
 
         # 2. A route question must reach the tracker.
         calls.clear()
-        said, used = _ask_live(conn, "How far is it and where are we headed?",
-                               tool_handler)
+        said, used = ask("How far is it and where are we headed?")
         print(f"    Q: how far is it and where are we headed?\n    A: {said[:220]}")
         ok(realtime.NAV_TOOL_NAME in used, f"she checks the route ({used})")
         ok("griffith" in said.lower(),
@@ -920,16 +1162,61 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
 
         # 3. A vehicle question with a pending code must keep the provenance.
         use_pending["on"] = True
-        said, used = _ask_live(conn, "Is anything wrong with the car?", tool_handler)
+        said, used = ask("Is anything wrong with the car?")
         print(f"    Q: is anything wrong with the car?\n    A: {said[:260]}")
         ok(realtime.VEHICLE_TOOL_NAME in used, f"she checks the car ({used})")
-        low = said.lower()
+        low = said.lower().replace("\u2019", "'")
         ok(any(p in low for p in ("not confirm", "hasn't confirmed", "has not confirmed",
                                   "pending", "not yet confirmed")),
            "and preserves detected-but-not-confirmed rather than upgrading it "
            "to a fault")
         ok(not re.search(r"\b\d+\s*(psi|pounds)\b", low),
            "and invents no numbers the data did not contain")
+
+        # 5. "TAKE ME TO X" — the bug this whole tool exists for. She must
+        #    reach for start_navigation rather than describing a route and
+        #    handing the job back.
+        calls.clear()
+        said, used = ask("Take me to Griffith Observatory.")
+        print(f"    Q: take me to Griffith Observatory\n    A: {said[:260]}")
+        ok(realtime.NAVIGATE_TOOL_NAME in used,
+           f"she starts the route herself ({used})")
+        ok("griffith" in said.lower(),
+           "and confirms it by the name the provider resolved")
+        deferral = re.search(
+            r"(set|enter|type|put|punch|add|input)[^.?!]{0,40}"
+            r"(destination|address|it in|that in)"
+            r"|(dashboard|the screen|the panel|the nav system|navigation app)",
+            said.lower())
+        ok(deferral is None,
+           "and does NOT tell the driver to set it themselves — the failure "
+           f"this replaces ({deferral.group(0) if deferral else 'no deferral'})")
+        ok(not re.search(r"\b(turn left|turn right|take the next)\b",
+                         said.lower()),
+           "and still does not call the turns on the route she just started")
+
+        # 6. ...and ambiguity still stops her, now that stopping costs her
+        #    something: she is the one who would have to route.
+        calls.clear()
+        said, used = ask("Take me to LAX instead.")
+        print(f"    Q: take me to LAX instead\n    A: {said[:260]}")
+        ok(realtime.NAVIGATE_TOOL_NAME in used,
+           f"she reaches for the same tool ({used})")
+        amb = httpx.post(f"{base}/nav/destination", timeout=60,
+                         json={"q": "LAX", "lat": 34.0219,
+                               "lng": -118.4814}).json()
+        if amb.get("status") == "ambiguous":
+            ok("?" in said,
+               "the provider read that as more than one place, and she asks "
+               "which one rather than picking")
+            ok(any(c["display_name"].split()[0].lower() in said.lower()
+                   for c in amb["candidates"]),
+               "naming what she found, so the question can be answered")
+        else:
+            ok(True, f"the provider resolved LAX outright ({amb.get('status')}) "
+                     "— no ambiguity to exercise today")
+    finally:
+        close_session()
 
 
 def main():
@@ -949,6 +1236,7 @@ def main():
     run_look()
     run_dictation()
     run_awareness()
+    run_routing()
     if args.live:
         run_live()
         run_verbatim()

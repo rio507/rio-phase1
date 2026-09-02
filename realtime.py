@@ -1,4 +1,4 @@
-"""RIO live: one speech-to-speech session, and one tool she can reach for.
+"""RIO live: one speech-to-speech session, and the things she can reach for.
 
 WHAT CHANGED, AND WHAT DID NOT
 ------------------------------
@@ -27,6 +27,19 @@ the answer as her own. And if it fails, times out, or is switched off, she
 carries on and answers from what she already has: the tool returning
 `ok: false` is an ordinary outcome the instructions tell her how to handle,
 not an error the driver hears about.
+
+AND ONE THING SHE DOES
+----------------------
+The rest of her tools are reads: the camera, the route, the car, the reasoning
+model. `start_navigation` is not. Asked to be taken somewhere, RIO sets the
+destination herself, through the same path the dashboard's destination box
+uses, and confirms it — where she used to describe the route and tell the
+driver to set it themselves.
+
+That is not a crack in the rule above. Announcing is speaking unasked;
+routing is doing what was asked. The turns are the part that does not move:
+navigation calls those, out loud, from its own tables, and nothing here may
+become a way in.
 """
 import json
 import os
@@ -60,6 +73,16 @@ LOOK_TOOL_NAME = "look"
 # a source of truth in this system and neither of them is the model.
 NAV_TOOL_NAME = "nav_status"
 VEHICLE_TOOL_NAME = "vehicle_status"
+
+# ...and the one thing on this list she DOES rather than reports. A driver who
+# says "take me to the Getty" has not asked for information about the Getty;
+# they have asked to be taken there, and until this existed the only honest
+# thing RIO could do with that was describe the place and tell them to type it
+# into the panel themselves. Setting a destination was already a solved problem
+# on this page — the box resolves it, loads the route and starts the tracker —
+# and this is that same path with RIO's voice as the caller. It is answered in
+# the browser, where the route and the tracker live.
+NAVIGATE_TOOL_NAME = "start_navigation"
 
 TOOL_SCHEMA = {
     "type": "function",
@@ -155,6 +178,43 @@ VEHICLE_SCHEMA = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
+NAVIGATE_SCHEMA = {
+    "type": "function",
+    "name": NAVIGATE_TOOL_NAME,
+    "description": (
+        "Start navigating somewhere. This is how the driver actually gets "
+        "taken to a place: 'take me to the Getty', 'navigate to LAX', "
+        "'let's go to Ralphs', 'directions to 1200 Getty Center Drive'. It "
+        "resolves the destination and makes the route live — the same thing "
+        "that happens when a destination is typed into the panel — so you "
+        "never tell the driver to set it themselves. Call it as soon as they "
+        "ask; do not ask permission first.\n"
+        "It can come back asking WHICH ONE: more than one place answers to "
+        "what they said. Put that question to the driver in your own words and "
+        "call this again with their answer. Never pick one yourself.\n"
+        "Setting the route does not make you the voice of the turns. The "
+        "navigation system still calls those out loud itself, and you still "
+        "must not."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "destination": {
+                "type": "string",
+                "description": (
+                    "The place the driver asked for, in their own words. "
+                    "Leading phrases like 'take me to' are stripped for you, "
+                    "so the sentence as they said it is fine. If they have "
+                    "just chosen between places you offered, pass the full "
+                    "name of the one they chose."
+                ),
+            },
+        },
+        "required": ["destination"],
+        "additionalProperties": False,
+    },
+}
+
 # Appended to RIO's own personality prompt. Only the things that are true of a
 # LIVE session and not of the text path: how to be interrupted, how long to
 # talk for, and when to reach for the tool.
@@ -190,8 +250,16 @@ it.
 Asked, you answer freely: "where are we going", "how far", "what's the next
 turn", "is everything okay with the car". Unasked, you say nothing about any of
 it.
+
+Being asked to DO something is not an exception to this, it is the other half
+of it. "Take me to the Getty" is not an announcement waiting to happen, it is
+an instruction, and carrying it out is answering. So you start routes. What you
+still never do is call the turns along the way.
+
 - Never invent anything about the car, the route, or the road. You have tools
-  for all three and they are the only way you know any of it.
+  for all three and they are the only way you know any of it — including
+  setting a destination, which is a tool and not something you can ask the
+  driver to do for you.
 - You cannot see. The camera is a tool — `look` — and it is the only way you
   know what is out of the window. Anything about the road, another vehicle, a
   sign, a building or the surroundings goes through it, every time, even when
@@ -206,6 +274,28 @@ couple of seconds. What comes back is short factual background: describe it in
 your own words, as you would anything else. Answer with what it gives you and
 nothing more; if it says it cannot see, or asks which one the driver meant, say
 that, in your own words.
+
+WHEN THE DRIVER ASKS TO GO SOMEWHERE
+
+"Take me to the Getty." "Navigate to LAX." "Let's go get coffee at the Ralphs
+on Lincoln." Call start_navigation, straight away. It sets the destination and
+starts the route — the same route the panel would have loaded — and it is
+YOURS. Never tell the driver to type it in, to set it on the screen, or to do
+anything about it themselves. That was the old arrangement and it was a bad
+one: you were describing a drive you would not begin.
+
+Then say one short line confirming it, in your own words: "Getting you to the
+Getty — about eighteen minutes." Two rules about that line and nothing else is
+prescribed: use the destination name the tool hands back, spelled its way
+rather than the way you heard it — LAX and LAS are one letter apart and only
+one of them is where they are going — and say it once.
+
+If it comes back asking WHICH ONE, it has found more than one place that
+answers to what they said, and choosing between them is not yours to do. Ask —
+name them, briefly — and when the driver answers, call start_navigation again
+with what they chose. If it could not find the place at all, say so and ask
+them to put it another way. If the route itself failed, say that plainly too.
+None of those three are cues to hand the job back to the driver.
 
 WHEN THE DRIVER ASKS ABOUT THE ROUTE, OR ABOUT THE CAR
 
@@ -379,7 +469,8 @@ def session_config() -> dict:
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
-        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, VEHICLE_SCHEMA],
+        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, VEHICLE_SCHEMA,
+                  NAVIGATE_SCHEMA],
         "tool_choice": "auto",
     }
 
@@ -394,7 +485,8 @@ def mint_client_secret() -> dict:
     one key a browser is allowed to see is the Maps render key, which cannot do
     anything but draw a map.
     """
-    secret = client().realtime.client_secrets.create(session=session_config())
+    cfg = session_config()
+    secret = client().realtime.client_secrets.create(session=cfg)
     data = secret.model_dump()
     return {
         "client_secret": data.get("value"),
@@ -402,6 +494,7 @@ def mint_client_secret() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "tool": TOOL_NAME,
+        "tools": [t["name"] for t in cfg["tools"]],
         # Dictation policy travels WITH the session, so the browser holds no
         # copy of the verbatim instruction that could drift from this one. What
         # RIO is told to read a warning as is decided here, once.
@@ -570,6 +663,14 @@ def run_tool(name: str, arguments, session_key: str = "default") -> dict:
         # source for "how far to the next turn" is how two answers to one
         # question happen. See rio_realtime.js: local tools.
         return {"ok": False, "note": "nav_status is answered by the panel"}
+    if name == NAVIGATE_TOOL_NAME:
+        # Also the browser, and for a stronger reason than nav_status: this
+        # one is not a read. The server can resolve a destination — it does,
+        # at /nav/destination, which is what the panel calls — but it cannot
+        # make the car navigate to it, because the route is loaded and tracked
+        # in the page. A second implementation here could only resolve and
+        # hope, which is the arrangement this tool exists to end.
+        return {"ok": False, "note": "start_navigation is answered by the panel"}
     if name not in (TOOL_NAME, LOOK_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
@@ -592,7 +693,8 @@ def status() -> dict:
         "model": config.OPENAI_REALTIME_MODEL,
         "voice": config.OPENAI_REALTIME_VOICE,
         "reasoning_model": config.OPENAI_REASONING_MODEL,
-        "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME, VEHICLE_TOOL_NAME],
+        "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME, VEHICLE_TOOL_NAME,
+                  NAVIGATE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),

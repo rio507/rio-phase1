@@ -376,6 +376,16 @@ box through the same provider, so an autocomplete outage costs prediction and
 nothing else. An ambiguous submission still asks which one was meant, and the
 choice renders through the same list.
 
+**And "take me there" is the same path.** A destination asked for out loud in a
+live session — `start_navigation`, docs/realtime_conversation.md — does not get
+its own router. It calls `routeToQuery()`, which is what Enter and **Route**
+call: the same `/nav/destination` resolution, the same ambiguity question shown
+in the same list, the same `/nav/route` call, the same tracker. RIO sets the
+destination herself and says so; what she never does is pick between two
+plausible places, which is the rule that made §4 worth writing in the first
+place. Spoken routes are logged as `NAV_VOICE_DESTINATION` beside the ordinary
+`NAV_ROUTE_STARTED`, so a review can tell which was which.
+
 One thing worth knowing about the seam: the panel maps a suggestion to a row in
 exactly one function (`toSuggestion`), which drops any entry without an id or
 without something to read. When the panel and the endpoint once disagreed about
@@ -437,6 +447,7 @@ node tools/nav_selftest.js                     # tracker, planner, arbiter
 node tools/nav_selftest.js route.json          # ...against real geometry
 python -m tools.nav_server_selftest            # provider, relations, gates, speech
 python -m tools.nav_server_selftest --live     # + one real provider route
+node tools/realtime_selftest.js --server       # a spoken destination, end to end
 ```
 
 Between them they cover the required list: normal navigation; the contextual

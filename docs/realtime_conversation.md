@@ -49,9 +49,9 @@ endpoints), `static/rio_realtime.js` (WebRTC + arbitration + tool bridge),
 
 ## What she can find out, and what she must not say
 
-A live session starts knowing nothing about this drive. Four tools give her the
-three things a driver actually asks about, each reusing the pipeline that
-already answers it:
+A live session starts knowing nothing about this drive. Five tools give her the
+things a driver actually asks about — and the one thing they ask her to *do* —
+each reusing the pipeline that already handles it:
 
 | tool | answers | source | runs |
 |---|---|---|---|
@@ -59,12 +59,19 @@ already answers it:
 | `nav_status` | destination, ETA, next maneuver, off-route, GPS | `RIO.nav.state()` — the dashboard card's own state | **browser** |
 | `vehicle_status` | live signals, DTCs, findings | `vehicle_health.context(full=True)` — the conversation-layer builder | server |
 | `deep_dive` | research and hard questions | `gpt-5.6-sol` via Responses | server |
+| `start_navigation` | *takes the driver somewhere* | `RIO.nav.routeToQuery()` — the destination box's own entry point | **browser** |
 
 `nav_status` is answered in the panel because that is where the truth is: the
 route comes from the server but PROGRESS along it does not — the tracker runs
 in the page at 1 Hz with no network, which was a deliberate choice about
 announcement timing. A second source on the server would be a second answer,
 and the wrong one would be the one that sounded authoritative.
+
+`start_navigation` is in the panel for the same reason and a stronger one: it
+is not a read. The server can resolve a destination — it does, at
+`/nav/destination` — but it cannot make the car navigate to one, because the
+route is loaded and the tracker started in the page. A server-side version
+could only resolve and hope.
 
 `vehicle_status` calls the same builder an ordinary conversation turn gets, so
 a live answer and a hold-to-talk answer cannot disagree about the same tire. It
@@ -84,6 +91,46 @@ That boundary is held three ways, not one: the instructions say it in those
 words, every `nav_status` result repeats it, and the ladder enforces it anyway
 — anything the model says is conversation priority, so a turn call pre-empts
 her mid-word regardless of what she thought she was doing.
+
+### The one thing she initiates: going somewhere
+
+Every navigation tool she had was a read, so "take me to the Getty" had exactly
+one honest ending: she described the place and told the driver to set it on the
+dashboard themselves. A route she can describe and cannot start is not
+assistance, it is narration.
+
+`start_navigation(destination)` is that ending removed. It calls
+`RIO.nav.routeToQuery()` — the function the destination box calls when the
+driver presses Enter — so a spoken destination and a typed one are the same
+event: same `/nav/destination` resolution, same "which Getty?" question, same
+`/nav/route` call, same tracker, same planner, same bus. Nothing about routing
+was written for the voice path, and there is still exactly one place in the
+panel that loads a route.
+
+This is not a hole in **she answers, she does not announce**; it is the other
+half of it. Being asked to go somewhere is an instruction, and carrying it out
+IS answering. What does not move is the turns: navigation still calls those,
+out loud, and she still must not — said in her instructions, in the tool's own
+description, in the result the tool hands back, and enforced by the ladder
+regardless.
+
+Ambiguity survives intact, and matters more now that she is the one who would
+route: two Gettys eight miles apart come back as a question, the panel shows
+both, and she asks which one before anything is set (§4). "Not found" is the
+same shape — she says she could not find it and asks for another way to say it.
+None of the three outcomes is a reason to hand the job back to the driver.
+
+The confirmation is hers to phrase — "Getting you to the Getty, about eighteen
+minutes" — with one constraint: the destination name comes back from the tool
+spelled the provider's way, and that is the word she repeats. She heard "LAX";
+the route went to whatever the provider resolved; those are not always the same
+place. (The hold-to-talk path answers the same request with a fixed line,
+`navigation/speech.py: destination_reply`, and is untouched.)
+
+A route she started is logged as `NAV_VOICE_DESTINATION` on the same bus every
+other navigation event uses, alongside the ordinary `NAV_ROUTE_STARTED`: one
+drive, one story, and a review can see which destinations were spoken and which
+were typed.
 
 ### The frame supply — what was actually missing
 
@@ -259,9 +306,11 @@ path to hold-to-talk.
 ## Testing
 
 ```
-node tools/realtime_selftest.js          # arbitration, barge-in, the tool bridge
-python -m tools.realtime_selftest        # session, config, dispatch, failure, firewall
-python -m tools.realtime_selftest --live # + both real models, once each
+node tools/realtime_selftest.js           # arbitration, barge-in, the tool bridge
+node tools/realtime_selftest.js --server  # + the real panel, routing over HTTP
+python -m tools.realtime_selftest         # session, config, dispatch, failure, firewall
+python -m tools.realtime_selftest --live  # + both real models, once each
+python -m tools.realtime_selftest --chain # + a real session driving the real server
 ```
 
 The interesting failures do not need audio: a warning arriving mid-sentence, a
@@ -269,6 +318,16 @@ driver talking over her, a tool that times out. All of them are reachable
 through the event stream, which is why every decision in
 `static/rio_realtime.js` lives in `createController()` — a pure handler over an
 injected transport, driven in the tests against the *real* arbiter.
+
+Routing is the exception that does need something real, because the claim is
+that a spoken destination ends with a loaded route and a running tracker.
+`--server` loads `static/rio_nav.js` **as written** into node behind a stub DOM,
+a stub Geolocation and a ten-line `fetch`, points it at the running server, and
+calls the tool: the destination is resolved by whichever provider is configured,
+the route comes back with its real maneuvers, and the car is then driven along
+its own geometry to prove the remaining distance actually falls. `--chain` adds
+the model's own judgement — asked out loud to be taken somewhere, does she reach
+for the tool, and does she confirm rather than send the driver to the dashboard.
 
 ---
 
