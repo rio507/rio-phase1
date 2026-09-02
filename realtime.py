@@ -50,6 +50,9 @@ from typing import Optional
 from openai import OpenAI
 
 import config
+# Place search lives in its own module for the same reason visual_qa does: it is
+# a pipeline with a bill and a licence attached, not a branch of this file.
+import places
 
 _client: Optional[OpenAI] = None
 _client_lock = threading.Lock()
@@ -83,6 +86,14 @@ NAV_TOOL_NAME = "nav_status"
 # it is done at the junction, not on request.
 NAV_DIRECTIONS_TOOL_NAME = "nav_directions"
 
+# What is actually around the car. A model asked "what's good near here" will
+# answer -- fluently, confidently, from a world that was current when its
+# weights were made. Places that have closed, prices that moved, hours that were
+# never true. The driver then drives there. So place questions leave the model
+# entirely and go to Google Places, and the model's job is to say the answer
+# well rather than to know it. Server-side, because the key stays here.
+PLACES_TOOL_NAME = "find_places"
+
 VEHICLE_TOOL_NAME = "vehicle_status"
 
 # ...and the one thing on this list she DOES rather than reports. A driver who
@@ -100,11 +111,13 @@ TOOL_SCHEMA = {
     "name": TOOL_NAME,
     "description": (
         "Think harder about something, or look it up. Use this when the driver "
-        "asks something that needs current information (opening hours, prices, "
-        "news, anything that changes), specific factual research, or careful "
+        "asks something that needs current information (news, background, "
+        "anything that changes), specific factual research, or careful "
         "multi-step reasoning you cannot do well in a couple of seconds. Do NOT "
-        "use it for chat, for anything about the car's own sensors, or for "
-        "anything about the route — those are already answered elsewhere. Say a "
+        "use it for chat, for anything about the car's own sensors, for "
+        "anything about the route, or for finding a place near the car — those "
+        "are already answered elsewhere, and a restaurant, a petrol station or "
+        "a shop is find_places, which is one quick call to live data. Say a "
         "short natural line to the driver before calling it, because it takes a "
         "few seconds."
     ),
@@ -207,6 +220,60 @@ NAV_DIRECTIONS_SCHEMA = {
     },
 }
 
+PLACES_SCHEMA = {
+    "type": "function",
+    "name": PLACES_TOOL_NAME,
+    "description": (
+        "Find real businesses and places around the car: restaurants, coffee, "
+        "petrol, parking, shops, anything with an address. Call this for ANY "
+        "question about places — 'what's good round here', 'where's the nearest "
+        "petrol', 'find me a coffee', 'is there parking near the beach', 'is "
+        "the Blue Bottle on Main open'. It returns live Google Places data: "
+        "name, rating and how many reviews, price, whether it is open now, how "
+        "far away it is and roughly how long to drive there.\n"
+        "You do NOT know any of this yourself. Anything you remember about a "
+        "restaurant is from when you were trained — it may have closed, moved "
+        "or changed hands, and the driver will act on what you say. So never "
+        "answer a place question from memory, and never use the research tool "
+        "for one: this is the tool for it, and if it comes back empty or fails "
+        "you say you could not pull it up rather than filling the gap."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "What to look for, in ordinary words: 'coffee', 'tacos', "
+                    "'petrol station', 'Blue Bottle Coffee', 'parking'."
+                ),
+            },
+            "near": {
+                "type": "string",
+                "description": (
+                    "An area, ONLY if the driver named one ('Santa Monica', "
+                    "'downtown', 'near the pier'). Leave it out for 'near me', "
+                    "'round here' or no area at all — the car's own position is "
+                    "used then."
+                ),
+            },
+            "open_now": {
+                "type": "boolean",
+                "description": (
+                    "True when they want somewhere open right now — 'open', "
+                    "'still open', 'open right now'. Leave it out otherwise."
+                ),
+            },
+            "count": {
+                "type": "integer",
+                "description": "How many results to fetch. Omit for five.",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
 VEHICLE_SCHEMA = {
     "type": "function",
     "name": VEHICLE_TOOL_NAME,
@@ -235,6 +302,9 @@ NAVIGATE_SCHEMA = {
         "that happens when a destination is typed into the panel — so you "
         "never tell the driver to set it themselves. Call it as soon as they "
         "ask; do not ask permission first.\n"
+        "If the driver is choosing one of the places find_places just gave "
+        "you, pass that result's place_id as well as its name — it is already "
+        "resolved.\n"
         "It can come back asking WHICH ONE: more than one place answers to "
         "what they said. Put that question to the driver in your own words and "
         "call this again with their answer. Never pick one yourself.\n"
@@ -253,6 +323,17 @@ NAVIGATE_SCHEMA = {
                     "so the sentence as they said it is fine. If they have "
                     "just chosen between places you offered, pass the full "
                     "name of the one they chose."
+                ),
+            },
+            "place_id": {
+                "type": "string",
+                "description": (
+                    "The place_id from a find_places result, when the driver "
+                    "picked one of the places you just read out ('the second "
+                    "one', 'the Blue Bottle'). Pass it WITH the name: it is the "
+                    "exact place, already resolved, so nothing has to be looked "
+                    "up again and there is no chance of routing to a different "
+                    "branch of the same chain. Leave it out for anywhere else."
                 ),
             },
         },
@@ -396,6 +477,46 @@ Answering about the car, three rules that are not negotiable:
   * A code that is detected but NOT CONFIRMED is exactly that. Say it that way —
     "the car has picked something up but hasn't confirmed it yet" — and never
     upgrade it to a fault.
+
+WHEN THE DRIVER ASKS ABOUT A PLACE
+
+"What's good round here." "Where's the nearest petrol." "Find me a coffee."
+"Is the Blue Bottle on Main open?" "Anywhere to park near the pier?" All of
+these go to find_places, every time, without exception.
+
+You do not know any of this. What you remember about restaurants is from when
+you were trained: some of those places have closed, moved, changed hands or
+changed their hours, and the driver is going to DRIVE to whatever you say. A
+confident wrong answer about a business is worse than no answer at all, because
+they act on it. So the rule has no soft edge — never name a business, a rating,
+a price or an opening time that did not come back from find_places in this
+conversation. Not as a guess, not as "I think there's a", not as a suggestion
+to check.
+
+Do not use the research tool for this either. It is for questions that need
+thinking or looking up in general; a place round the corner is what find_places
+is, and it is one quick call.
+
+Reading the results: the best two or three, not the list. Name it, say what
+makes it worth picking — the rating, how close it is, whether it is open — and
+offer the rest. "Two good ones close by: Dogtown Coffee, four point four, about
+four minutes, open now. Or Blue Bottle, a bit further but rated higher. Want
+the others?" The drive time is an estimate, so it is always "about".
+
+If the search comes back with nothing, say so and offer to look for something
+else or somewhere else. If it fails, say plainly that you could not pull it up
+right now. Neither of those is a cue to remember a place instead.
+
+If it says it does not know where the car is, ask which area to search — one
+short question — and call it again with that area.
+
+WHEN THEY PICK ONE
+
+"Take me to the second one." "Let's go to the Blue Bottle." That is
+start_navigation, and the result you already have carries the place_id for
+every place you read out. Pass that id along with the name: it is the same
+place, already resolved, so there is nothing to look up again and no chance of
+landing on a different branch of the same chain three miles the other way.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
@@ -554,7 +675,7 @@ def session_config() -> dict:
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
         "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
-                  VEHICLE_SCHEMA, NAVIGATE_SCHEMA],
+                  PLACES_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA],
         "tool_choice": "auto",
     }
 
@@ -732,12 +853,18 @@ def vehicle_status() -> dict:
                       "A code detected but not confirmed stays not confirmed.")}
 
 
-def run_tool(name: str, arguments, session_key: str = "default") -> dict:
+def run_tool(name: str, arguments, session_key: str = "default",
+             where=None) -> dict:
     """Dispatch one tool call from the live session.
 
     An unknown tool name is answered, not raised: the session is a model and a
     model can produce a name that is not in its own tool list. `ok: false` is a
     thing RIO already knows how to handle, and a 500 is not.
+
+    `where` is the car's last GPS fix, attached by the panel to every tool call.
+    Only find_places reads it, and only as a location bias -- the browser is the
+    one that knows where the car is, for the same reason nav_status is answered
+    there.
     """
     if name == VEHICLE_TOOL_NAME:
         return vehicle_status()
@@ -761,7 +888,7 @@ def run_tool(name: str, arguments, session_key: str = "default") -> dict:
         # in the page. A second implementation here could only resolve and
         # hope, which is the arrangement this tool exists to end.
         return {"ok": False, "note": "start_navigation is answered by the panel"}
-    if name not in (TOOL_NAME, LOOK_TOOL_NAME):
+    if name not in (TOOL_NAME, LOOK_TOOL_NAME, PLACES_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
         try:
@@ -772,6 +899,13 @@ def run_tool(name: str, arguments, session_key: str = "default") -> dict:
         return {"ok": False, "note": "unreadable arguments"}
     if name == LOOK_TOOL_NAME:
         return look(str(arguments.get("question") or ""), session_key)
+    if name == PLACES_TOOL_NAME:
+        return places.find_places(
+            query=str(arguments.get("query") or ""),
+            near=str(arguments.get("near") or ""),
+            open_now=bool(arguments.get("open_now")),
+            count=arguments.get("count"),
+            where=where, session_key=session_key)
     return escalate(str(arguments.get("question") or ""),
                     str(arguments.get("context") or ""))
 
@@ -784,8 +918,8 @@ def status() -> dict:
         "voice": config.OPENAI_REALTIME_VOICE,
         "reasoning_model": config.OPENAI_REASONING_MODEL,
         "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME,
-                  NAV_DIRECTIONS_TOOL_NAME, VEHICLE_TOOL_NAME,
-                  NAVIGATE_TOOL_NAME],
+                  NAV_DIRECTIONS_TOOL_NAME, PLACES_TOOL_NAME,
+                  VEHICLE_TOOL_NAME, NAVIGATE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),

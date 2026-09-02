@@ -49,7 +49,7 @@ endpoints), `static/rio_realtime.js` (WebRTC + arbitration + tool bridge),
 
 ## What she can find out, and what she must not say
 
-A live session starts knowing nothing about this drive. Six tools give her the
+A live session starts knowing nothing about this drive. Seven tools give her the
 things a driver actually asks about — and the one thing they ask her to *do* —
 each reusing the pipeline that already handles it:
 
@@ -58,6 +58,7 @@ each reusing the pipeline that already handles it:
 | `look` | what is out of the window | `visual_qa.answer()` — frame ring, selector, crop, multimodal turn | server |
 | `nav_status` | destination, ETA, next maneuver, off-route, GPS | `RIO.nav.state()` — the dashboard card's own state | **browser** |
 | `nav_directions` | the upcoming turns, in order, with landmarks | `RIO.nav.directions()` → the tracker's `upcoming()` | **browser** |
+| `find_places` | real businesses near the car: rating, price, open now, how far | `places.find_places()` — Google Places (New) Text Search | server |
 | `vehicle_status` | live signals, DTCs, findings | `vehicle_health.context(full=True)` — the conversation-layer builder | server |
 | `deep_dive` | research and hard questions | `gpt-5.6-sol` via Responses | server |
 | `start_navigation` | *takes the driver somewhere* | `RIO.nav.routeToQuery()` — the destination box's own entry point | **browser** |
@@ -83,6 +84,32 @@ permission written into the instructions; the distances come from the tracker
 rather than the route because "how far to the turn after next" is a question
 about where the car is, and reading them off the route would answer it from the
 start of the drive.
+
+`find_places` is the same principle applied to the last thing the model was
+still answering from memory. It knows a great deal about restaurants in the
+abstract and nothing about the ones on this street: what it remembers is the
+world as it was when the weights were made, and some of those places have
+closed, moved or changed hands. The driver then *drives there*, which is what
+makes a confident wrong answer about a business worse than no answer. So place
+questions leave the model entirely, and its job is to say the result well.
+
+It runs on the server because the key does. It needs a position, which the
+server does not have — the GPS watch is in the page, the same reason
+`nav_status` is answered there — so the panel attaches the car's last fix to
+every server tool call and `places.py` decides whether it is fresh enough to
+use. With no fix and no area named, it returns `need_location` and RIO asks
+which area to search, because a search silently run 30 km away returns results
+that are real, correct, useless, and indistinguishable from good ones.
+
+One call per question, and the field mask is the bill: Places (New) prices by
+the fields requested, so `FIELD_MASK` is exactly what RIO speaks and nothing
+else. Distance is computed from coordinates the search already returned; the
+drive time is an ESTIMATE from that distance rather than a Routes call per
+result, and it is labelled as one everywhere it appears. The real ETA arrives
+seconds later, when she routes there — which she does by passing the result's
+`place_id` into `start_navigation`, so "take me to the second one" reaches the
+exact place she read out rather than re-resolving a name that can land on a
+different branch of the same chain.
 
 `vehicle_status` calls the same builder an ordinary conversation turn gets, so
 a live answer and a hold-to-talk answer cannot disagree about the same tire. It

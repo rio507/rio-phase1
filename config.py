@@ -120,6 +120,43 @@ SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
 
 VISION_ENABLED = True
 
+# ---------------------------------------------------------------------------
+# Place search (places.py) — what is actually around the car
+# ---------------------------------------------------------------------------
+# RIO answers "what's good round here" from Google Places, never from the
+# model's memory of restaurants. See places.py's header for why that is not a
+# preference.
+PLACES_ENABLED = True
+
+# Results per question. Five is what a driver can hold in their head; RIO reads
+# the best two or three of them and offers the rest. It is also the cap on the
+# billed request, since maxResultCount is sent.
+PLACES_MAX_RESULTS = 5
+
+# The bias circle for "near me". Wide enough that a quiet suburb still returns
+# somewhere to eat, tight enough that "near me" does not mean the next city.
+PLACES_BIAS_RADIUS_M = 8000.0
+
+# A GPS fix older than this is not where the car is. Refused rather than used:
+# "near me" answered from a ten-minute-old position is wrong in the one way the
+# driver cannot detect. RIO asks for an area instead.
+PLACES_FIX_MAX_AGE_S = 600.0
+
+# The drive-time ESTIMATE (places.drive_minutes). Not a routed time — that
+# would be a Routes call per result, five billed requests to decorate one
+# sentence. 9 m/s is ~32 km/h, an urban average with lights; 1.35 is the usual
+# straight-line-to-road detour factor. Both are only ever spoken as "about".
+PLACES_DRIVE_SPEED_MS = 9.0
+PLACES_DETOUR_FACTOR = 1.35
+
+PLACES_TIMEOUT_S = 8.0
+
+# How long "the second one" still means something. Long enough for a couple of
+# exchanges about the list, short enough that open-now cannot have flipped
+# unnoticed.
+PLACES_CACHE_TTL_S = 180.0
+
+
 # --- replay presentation buffer ---------------------------------------------
 # Seconds the ANALYSIS stream runs ahead of the picture during an uploaded-clip
 # headway run. It is the fix for a rendering fault, not a detection one: a box

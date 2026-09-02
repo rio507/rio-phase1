@@ -224,7 +224,8 @@
       return Promise.resolve({ ok: false, note: 'no navigation on this page' });
     }
     var text = String((args && (args.destination || args.query)) || '').trim();
-    if (!text) {
+    var placeId = String((args && args.place_id) || '').trim();
+    if (!text && !placeId) {
       return Promise.resolve({ ok: false, note: 'no destination' });
     }
     // Announcement audio is unlocked inside a user gesture everywhere else on
@@ -233,7 +234,30 @@
     // turn call needs it rather than at it.
     if (typeof nav.unlock === 'function') { try { nav.unlock(); } catch (e) {} }
 
-    return Promise.resolve(nav.routeToQuery(text)).then(function (out) {
+    /* A place_id means find_places already resolved this exact place, so the
+     * resolution step is skipped entirely: setRoute takes the id the way the
+     * autocomplete list does when the driver taps a suggestion.
+     *
+     * This is not only a saved call. Re-resolving "Blue Bottle" as text can
+     * land on a different branch three miles the other way, and the driver
+     * would have no way to tell -- they asked for the one RIO just read out,
+     * with the rating and the four-minute drive, and would be taken somewhere
+     * else with the right name.
+     */
+    var started = (placeId && typeof nav.setRoute === 'function')
+      ? Promise.resolve(nav.setRoute({ place_id: placeId, label: text }))
+          .then(function (res) {
+            if (res && res.ok) {
+              return { status: 'routed',
+                       destination: (res.route && res.route.destination) || null,
+                       route: res.route };
+            }
+            return { status: 'failed',
+                     error: (res && res.error) || 'could not build a route' };
+          })
+      : Promise.resolve(nav.routeToQuery(text));
+
+    return started.then(function (out) {
       out = out || {};
       // Into the drive's log, through the bus every other nav event uses: a
       // review of this drive should be able to see that the route was set by
@@ -242,7 +266,12 @@
       if (bus && bus.emit) {
         try {
           bus.emit('NAV_VOICE_DESTINATION',
-                   { query: text, status: out.status || 'unknown' });
+                   { query: text, status: out.status || 'unknown',
+                     // Which path resolved it, because "she routed to the
+                     // place she had just read out" and "she re-resolved a
+                     // name" are different events in a review.
+                     place_id: placeId || null,
+                     from_places: !!placeId });
         } catch (e) { /* logging must never break a route */ }
       }
 
@@ -333,6 +362,40 @@
 
   var LOCAL_TOOLS = { nav_status: navStatus, nav_directions: navDirections,
                       start_navigation: startNavigation };
+
+  /* ---------------------------------------------------------------------
+     Where the car is, for the tools that run on the SERVER.
+
+     find_places needs a position to make "near me" mean anything, and the
+     server does not have one: the GPS watch lives in this page, which is the
+     same reason nav_status is answered here. So the fix rides along with every
+     server tool call, and the server decides whether it is fresh enough to
+     use.
+
+     Age is computed HERE, from one clock. Sending a timestamp and letting the
+     server subtract its own would put two clocks in an argument about whether
+     a fix is stale, and a phone's clock is not the server's.
+     --------------------------------------------------------------------- */
+  var lastFix = null;
+
+  function noteFix(pos) {
+    var c = pos && (pos.coords || pos);
+    if (!c) return;
+    var lat = (typeof c.latitude === 'number') ? c.latitude : c.lat;
+    var lng = (typeof c.longitude === 'number') ? c.longitude : c.lng;
+    if (typeof lat !== 'number' || typeof lng !== 'number') return;
+    if (!isFinite(lat) || !isFinite(lng)) return;
+    lastFix = { lat: lat, lng: lng,
+                accuracy_m: (typeof c.accuracy === 'number') ? c.accuracy : null,
+                at: Date.now() };
+  }
+
+  function currentFix() {
+    if (!lastFix) return null;
+    return { lat: lastFix.lat, lng: lastFix.lng,
+             accuracy_m: lastFix.accuracy_m,
+             age_s: Math.max(0, (Date.now() - lastFix.at) / 1000) };
+  }
 
   /* ---------------------------------------------------------------------
      The controller: events in, decisions out.
@@ -649,6 +712,15 @@
      --------------------------------------------------------------------- */
   function connect(opts) {
     opts = opts || {};
+    // The shared watch, subscribed to rather than started: rio_nav.js reads the
+    // same one, and two Geolocation watches on one page is two batteries'
+    // worth of GPS for one car.
+    if (root.RIO && root.RIO.headway && root.RIO.headway.onPosition) {
+      try { root.RIO.headway.onPosition(noteFix); } catch (e) {}
+      if (root.RIO.headway.startWatch) {
+        try { root.RIO.headway.startWatch(); } catch (e) {}
+      }
+    }
     var arbiter = opts.arbiter || (root.RIO && root.RIO.speech);
     var url = opts.url || function (p) { return p; };
     var element = opts.element;
@@ -700,7 +772,11 @@
             }
             return fetch(url('/realtime/tool'), {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ name: name, arguments: args }),
+              // `where` is the car's own fix. Only find_places reads it, but it
+              // is attached to every call rather than to one, so a tool that
+              // needs it later does not have to re-plumb this.
+              body: JSON.stringify({ name: name, arguments: args,
+                                     where: currentFix() }),
             }).then(function (r) { return r.json(); });
           },
           // Muting the ELEMENT rather than pausing it: the track is live, and a
@@ -778,6 +854,8 @@
     connect: connect,
     navStatus: navStatus,
     navDirections: navDirections,
+    noteFix: noteFix,
+    currentFix: currentFix,
     startNavigation: startNavigation,
     localTools: LOCAL_TOOLS,
     active: function () { return active; },
@@ -788,6 +866,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController, navStatus: navStatus,
                        navDirections: navDirections,
+                       noteFix: noteFix, currentFix: currentFix,
                        startNavigation: startNavigation,
                        localTools: LOCAL_TOOLS };
   }

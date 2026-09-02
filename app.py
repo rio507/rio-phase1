@@ -569,14 +569,30 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
     """
     name = str(body.get("name") or "")
     args = body.get("arguments")
+    # The car's last GPS fix, attached by the panel to every tool call. The
+    # browser is the only thing that knows where the car is -- the same reason
+    # nav_status is answered there -- and find_places needs it to make "near me"
+    # mean anything. Absent or stale, the tool asks the driver for an area
+    # rather than searching somewhere plausible.
+    where = body.get("where")
     # The visual tool needs the session's own frame ring — the same key the
     # hold-to-talk path uses, so a live question and a recorded one look at the
     # same few seconds of road.
-    result = realtime.run_tool(name, args, session_key=_visual_key(session_id))
+    result = realtime.run_tool(name, args, session_key=_visual_key(session_id),
+                               where=where)
     logged = {"tool": name, "ok": bool(result.get("ok")),
               "took_ms": result.get("took_ms")}
     if isinstance(args, dict):
         logged["question"] = str(args.get("question") or "")[:400]
+        # A place search is worth reviewing afterwards: what was asked, where it
+        # was searched, and what came back that RIO was then speaking from.
+        if args.get("query"):
+            logged["query"] = str(args["query"])[:200]
+            logged["near"] = str(args.get("near") or "")[:120]
+            logged["open_now"] = bool(args.get("open_now"))
+    if result.get("results") is not None:
+        logged["n_results"] = len(result.get("results") or [])
+        logged["names"] = [r.get("name") for r in (result.get("results") or [])][:5]
     if not result.get("ok"):
         logged["note"] = result.get("note")
     sessions.log_live(session_id, "tool_call", logged)

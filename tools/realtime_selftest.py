@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import config          # noqa: E402
+import places          # noqa: E402
 import realtime        # noqa: E402
 
 PASS, FAIL = [], []
@@ -328,10 +329,25 @@ def run_firewall():
     # closing or that a turn is four seconds away.
     # base64/io/wave arrived with clip rendering: turning PCM deltas into a WAV
     # so the pre-rendered warnings can be produced in the same voice.
+    # `places` is read-side by the same test the others pass: it answers a
+    # question and cannot start a sentence. It is checked below rather than
+    # taken on trust, because it is the one module here that talks to an
+    # external API and the obvious place for someone to reach for
+    # navigation/geo.py -- which would drag the speech planner across the
+    # firewall for the sake of a haversine.
     ok(live_imports <= {"json", "os", "threading", "time", "typing", "openai",
                         "config", "visual_qa", "router", "vehicle_health",
-                        "base64", "io", "wave"},
+                        "places", "base64", "io", "wave"},
        f"and imports only read-side code and stdlib ({sorted(live_imports)})")
+
+    places_imports = _imports_of("places.py")
+    hits = sorted(places_imports & unreachable)
+    ok(not hits,
+       "places.py cannot reach anything that decides to speak either"
+       + (f" (found {hits})" if hits else ""))
+    ok("navigation" not in places_imports,
+       "and does not import navigation for its geometry — one haversine is "
+       "cheaper than a route through the firewall")
 
     # The instructions are the other half of it: the model is told in words,
     # because a model that CAN say a sentence has to be told not to.
@@ -585,8 +601,10 @@ def run_awareness():
     names = [t["name"] for t in s["tools"]]
     ok(names == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
                  realtime.NAV_TOOL_NAME, realtime.NAV_DIRECTIONS_TOOL_NAME,
-                 realtime.VEHICLE_TOOL_NAME, realtime.NAVIGATE_TOOL_NAME],
-       f"six tools: think, look, route, directions, car — and go ({names})")
+                 realtime.PLACES_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
+                 realtime.NAVIGATE_TOOL_NAME],
+       f"seven tools: think, look, route, directions, places, car — and go "
+       f"({names})")
 
     # By name, not by index. The list has grown once and will again, and an
     # index here means the next tool inserted silently re-points three
@@ -617,6 +635,9 @@ def run_awareness():
            f"the {what} tool's own description says it is for answering, not announcing")
 
     instr = s["instructions"]
+    # Line-wrap tolerant copy: these are paragraphs, and a phrase that happens
+    # to straddle a newline is not a different instruction.
+    flat_instr = re.sub(r"\s+", " ", instr)
     ok("YOU ANSWER. YOU DO NOT ANNOUNCE." in instr,
        "the boundary is stated in the instructions, in those words")
     for phrase in ("never announce a turn", "not a cue", "Unasked, you say nothing"):
@@ -628,6 +649,24 @@ def run_awareness():
     # READING IS ANSWERING. The bug was RIO saying she could not read the
     # directions of a route she was driving; the fix is a tool AND permission,
     # and permission that is not written down is not permission.
+    # PLACES. The instruction is the other half of the tool: a model that has
+    # the tool and permission to guess will still sometimes guess.
+    ok("WHEN THE DRIVER ASKS ABOUT A PLACE" in instr,
+       "the instructions have a section for place questions")
+    ok(realtime.PLACES_TOOL_NAME in instr, "naming find_places")
+    ok("never name a business, a rating, a price or an opening time that did "
+       "not come back from find_places" in flat_instr,
+       "and forbidding a business, rating, price or opening time that did not "
+       "come from it")
+    ok("Do not use the research tool for this" in instr,
+       "with place questions routed away from deep_dive explicitly")
+    ok("could not pull it up" in instr,
+       "the honest failure line is given to her as words, not as a principle")
+    ok("ask which area to search" in flat_instr,
+       "and a no-location answer is a question, not a guess")
+    ok("WHEN THEY PICK ONE" in instr and "place_id" in instr,
+       "picking one of the results chains into start_navigation by place_id")
+
     ok("WHEN THE DRIVER ASKS FOR THE DIRECTIONS" in instr,
        "the instructions have a section for being asked to read the route")
     ok("Reading the directions when the driver asks for them is ANSWERING" in instr,
@@ -784,6 +823,76 @@ def spoken_norm(text: str) -> str:
     t = re.sub(r"\b(?:([a-z]) )+([a-z])\b",
                lambda m: m.group(0).replace(" ", ""), t)
     return " ".join(t.split())
+
+
+# ---------------------------------------------------------------------------
+# The memory-vs-tool check
+# ---------------------------------------------------------------------------
+# Capitalised words that are not businesses: geography this test asks about,
+# and the ordinary furniture of a spoken sentence. Anything NOT here and not in
+# the tool's own results is a name the model supplied itself.
+_NOT_A_BUSINESS = {
+    "santa monica", "los angeles", "california", "downtown", "main street",
+    "ocean avenue", "third street", "third street promenade", "the promenade",
+    "griffith observatory", "lax", "i-10", "pacific coast highway",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+    "sunday", "google", "gps", "rio", "okay", "ok",
+}
+
+# Words that carry no identity on their own: a phrase made only of these is a
+# description ("Coffee Shops"), not a name.
+_GENERIC = {
+    "coffee", "shop", "shops", "cafe", "café", "place", "places", "spot",
+    "spots", "bar", "restaurant", "taco", "tacos", "food", "station",
+    "stations", "parking", "petrol", "gas", "open", "now", "here", "near",
+    "the", "and", "or", "one", "two", "three", "a", "an", "of", "in", "at",
+    "good", "great", "close", "by", "minutes", "stars", "rated", "reviews",
+}
+
+_NAME_RUN = re.compile(
+    r"\b([A-Z][\w'&.\-]*(?:\s+(?:of|the|and|de|la|du|des)\s+[A-Z][\w'&.\-]*"
+    r"|\s+[A-Z][\w'&.\-]*)+)")
+
+
+def _invented_names(said: str, allowed_names) -> list:
+    """Business-shaped names in `said` that the tool did not return.
+
+    The failure this catches is the dangerous one: four real places and one
+    remembered one, in the same sentence, in the same tone. Nothing about the
+    sentence gives it away, and the driver drives to whichever they liked the
+    sound of.
+
+    Multi-word Title Case only, and that is a deliberate floor rather than an
+    oversight: a single capitalised word in a transcript is as often a sentence
+    opening as a brand, and a check that fires on "Two" is a check that gets
+    switched off. A one-word invention ("Verve") would slip through this and be
+    caught by the ok() below it, which requires that the names she DID say came
+    from the list.
+    """
+    allowed = " | ".join(list(allowed_names or []) + list(_NOT_A_BUSINESS)).lower()
+    out = []
+    for m in _NAME_RUN.finditer(said or ""):
+        # The token pattern allows an internal dot for "St." and "Mrs.", which
+        # means a phrase ending a sentence swallows the full stop. Stripped, or
+        # "Third Street Promenade." never matches "third street promenade".
+        phrase = " ".join(m.group(1).split()).strip(".,;:!?'\"-&")
+        if not phrase:
+            continue
+        low = phrase.lower()
+        if low in allowed or low in _NOT_A_BUSINESS:
+            continue
+        if any(low in a for a in [allowed]) and low in allowed:
+            continue
+        # Contained in one of the returned names (or one of them in it):
+        # "Dogtown" out of "Dogtown Coffee" is the same business.
+        if any(low in n.lower() or n.lower() in low
+               for n in (allowed_names or []) if n):
+            continue
+        toks = [t.strip(".,'&-").lower() for t in phrase.split()]
+        if all(t in _GENERIC or t in _NOT_A_BUSINESS for t in toks if t):
+            continue
+        out.append(phrase)
+    return sorted(set(out))
 
 
 def run_live():
@@ -1051,6 +1160,9 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
     # by `node tools/realtime_selftest.js --server`.
     ORIGIN = (34.0219, -118.4814)
     live_route = {}
+    last_places = {}
+    places_fail = {"on": False}
+    tool_args = []
 
     REL_PHRASE = {"NEAR": "by", "JUST_AFTER": "just after",
                   "JUST_BEFORE": "just before"}
@@ -1077,7 +1189,33 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
             }
         return step
 
-    def route_by_voice(spoken):
+    def route_by_voice(spoken, place_id=""):
+        # A place_id means find_places already resolved this exact place, so
+        # resolution is skipped and the route is built straight from the id --
+        # the same shortcut rio_realtime.js takes. Without this the harness
+        # would send "the second one" to the geocoder and the test would be
+        # measuring something the browser never does.
+        if place_id:
+            r = httpx.post(f"{base}/nav/route", timeout=90, json={
+                "lat": ORIGIN[0], "lng": ORIGIN[1], "place_id": place_id,
+                "destination": "", "label": spoken}).json()
+            if r.get("error"):
+                return {"ok": False, "status": "failed", "note": r["error"],
+                        "rules": "The route did not start. Say so plainly."}
+            nav_state["destination"] = r["destination"]["display_name"]
+            live_route["route"] = r
+            return {"ok": True, "routing": True, "status": "routed",
+                    "destination": r["destination"]["display_name"],
+                    "minutes": max(1, round(r["duration_s"] / 60)),
+                    "distance_km": round(r["total_distance_m"] / 100) / 10,
+                    "from_places": True,
+                    "rules": "The route is live and the car is navigating "
+                             "already. Confirm it once, briefly, using this "
+                             "destination name. Do NOT tell the driver to set "
+                             "it themselves."}
+        return _route_by_query(spoken)
+
+    def _route_by_query(spoken):
         # Kept because the ambiguity check below has to probe the query SHE
         # sent, not the one the test imagined she would. Asked to "take me to
         # LAX" she may reasonably say "Los Angeles International Airport",
@@ -1186,13 +1324,35 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
 
     def tool_handler(name, arguments):
         calls.append(name)
+        tool_args.append(arguments)
         if name == realtime.NAV_TOOL_NAME:
             return nav_state
         if name == realtime.NAV_DIRECTIONS_TOOL_NAME:
             return read_directions(arguments)
+        if name == realtime.PLACES_TOOL_NAME:
+            # Through the real endpoint, with a fix the panel would have
+            # attached: this is the one tool whose answer comes from outside
+            # the system entirely, so the chain test uses the real one.
+            body = {"name": name, "arguments": json.loads(arguments or "{}"),
+                    "where": {"lat": ORIGIN[0], "lng": ORIGIN[1],
+                              "accuracy_m": 12, "age_s": 2}}
+            if places_fail["on"]:
+                # A forced failure, to see what she says when the search does
+                # not come back. Shaped exactly as places.py shapes one.
+                return {"ok": False, "note": "ConnectError",
+                        "rules": "The search did not come back. Say plainly "
+                                 "that you could not pull that up right now, "
+                                 "in your own words. Do NOT name a business "
+                                 "from memory, do NOT guess, and do not offer "
+                                 "one you 'think' is there."}
+            out = httpx.post(f"{base}/realtime/tool", timeout=60,
+                             json=body).json()
+            last_places["result"] = out
+            return out
         if name == realtime.NAVIGATE_TOOL_NAME:
             args = json.loads(arguments or "{}")
-            return route_by_voice(str(args.get("destination") or ""))
+            return route_by_voice(str(args.get("destination") or ""),
+                                  str(args.get("place_id") or ""))
         if name == realtime.VEHICLE_TOOL_NAME and use_pending["on"]:
             return pending_vehicle
         r = httpx.post(f"{base}/realtime/tool", timeout=90,
@@ -1406,6 +1566,99 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
             ok(True, "(this route came back with no landmark candidates — "
                      "nothing to preview, and inventing one would be the bug)")
 
+        # 7. PLACES. The question RIO used to answer from the model's own
+        #    memory of restaurants, which is a description of the world as it
+        #    was when the weights were made.
+        calls.clear()
+        last_places.clear()
+        said, used = ask("Coffee shops near me, open right now?")
+        print(f"    Q: coffee shops near me, open right now?\n    A: {said[:320]}")
+        ok(realtime.PLACES_TOOL_NAME in used,
+           f"she looks it up rather than remembering ({used})")
+        ok(realtime.TOOL_NAME not in used,
+           "and does NOT send a local place question to the research tool")
+
+        res = (last_places.get("result") or {})
+        names = [r.get("name", "") for r in (res.get("results") or [])]
+        print(f"    (Places returned: {names})")
+        ok(res.get("ok") is True and names,
+           f"the search itself worked against the live API ({len(names)} results)")
+
+        # THE CHECK THIS SECTION EXISTS FOR: every place named in the answer
+        # came back from the tool. A model that invents one business among four
+        # real ones is more dangerous than one that invents all five, because
+        # nothing about the sentence gives it away.
+        invented = _invented_names(said, names)
+        ok(not invented,
+           "every business she named came from the tool "
+           f"({invented if invented else 'no invented names'})")
+        ok(any(n.lower() in said.lower() for n in names),
+           f"and at least one of them is actually in the answer ({names[:2]})")
+
+        # open_now was asked for, so it was asked of Google rather than guessed.
+        args_seen = [json.loads(a or "{}") for a in tool_args
+                     if a and '"query"' in a]
+        ok(any(a.get("open_now") for a in args_seen),
+           f"'open right now' reached the tool as a filter ({args_seen})")
+
+        # 8. AN AREA, NOT THE CAR.
+        calls.clear(); last_places.clear(); tool_args.clear()
+        said, used = ask("What's good for coffee in Santa Monica?")
+        print(f"    Q: what's good for coffee in Santa Monica?\n    A: {said[:280]}")
+        ok(realtime.PLACES_TOOL_NAME in used, f"same tool ({used})")
+        args_seen = [json.loads(a or "{}") for a in tool_args
+                     if a and '"query"' in a]
+        ok(any("santa monica" in (a.get("near", "") + " "
+                                  + a.get("query", "")).lower()
+               for a in args_seen),
+           f"with the area she was given, not the car's position ({args_seen})")
+        res2 = (last_places.get("result") or {})
+        names2 = [r.get("name", "") for r in (res2.get("results") or [])]
+        invented2 = _invented_names(said, names2)
+        ok(not invented2,
+           f"and again, only names the tool returned ({invented2 or 'none invented'})")
+
+        # 9. "TAKE ME TO THE SECOND ONE." The list is still in the conversation
+        #    and each entry carries the id that skips resolution.
+        if len(names2) >= 2:
+            calls.clear(); tool_args.clear()
+            said, used = ask("Take me to the second one.")
+            print(f"    Q: take me to the second one\n    A: {said[:240]}")
+            ok(realtime.NAVIGATE_TOOL_NAME in used,
+               f"she routes to it ({used})")
+            nav_args = [json.loads(a or "{}") for a in tool_args
+                        if a and "destination" in (a or "")]
+            passed_id = [a.get("place_id") for a in nav_args if a.get("place_id")]
+            want = [r.get("place_id") for r in (res2.get("results") or [])][1:2]
+            ok(bool(passed_id),
+               f"passing the place_id from the list rather than a name to "
+               f"re-resolve ({passed_id or 'none passed'})")
+            ok(not passed_id or passed_id[0] in
+               [r.get("place_id") for r in (res2.get("results") or [])],
+               f"and it is one of the ids she was given (wanted {want})")
+        else:
+            ok(True, "(fewer than two results came back — nothing to pick a "
+                     "second one from)")
+
+        # 10. FAILURE. The one moment the old behaviour would return.
+        calls.clear()
+        places_fail["on"] = True
+        try:
+            said, used = ask("Find me a taco place near here.")
+        finally:
+            places_fail["on"] = False
+        print(f"    Q: find me a taco place near here (search failing)\n"
+              f"    A: {said[:240]}")
+        low = said.lower()
+        ok(realtime.PLACES_TOOL_NAME in used, f"she still reaches for it ({used})")
+        ok(any(p in low for p in ("couldn't", "could not", "can't", "cannot",
+                                  "unable", "not able", "trouble", "failed")),
+           "and says plainly that she could not pull it up")
+        invented3 = _invented_names(said, [])
+        ok(not invented3,
+           f"naming no business at all rather than one she remembers "
+           f"({invented3 or 'no names'})")
+
         # 6. ...and ambiguity still stops her, now that stopping costs her
         #    something: she is the one who would have to route.
         calls.clear()
@@ -1434,6 +1687,237 @@ def run_chain(base: str = "http://127.0.0.1:8888"):
         close_session()
 
 
+
+# ---------------------------------------------------------------------------
+# PLACES — what is actually around the car, never what the model remembers
+# ---------------------------------------------------------------------------
+class _FakeHTTP:
+    """One captured Places request and one canned response.
+
+    The request is the interesting half: the field mask is the bill, and the
+    location bias is the difference between "near me" and "somewhere in this
+    state". Both are asserted rather than assumed.
+    """
+
+    def __init__(self, payload=None, raise_with=None, status=200):
+        self.payload = payload if payload is not None else {"places": []}
+        self.raise_with = raise_with
+        self.status = status
+        self.calls = []
+
+    def post(self, url, timeout=None, json=None, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers,
+                           "timeout": timeout})
+        if self.raise_with:
+            raise self.raise_with
+        outer = self
+
+        class _R:
+            def raise_for_status(self):
+                if outer.status >= 400:
+                    raise RuntimeError(f"HTTP {outer.status}")
+
+            def json(self):
+                return outer.payload
+        return _R()
+
+
+def _place(name, pid, lat, lng, rating=None, count=None, price=None,
+           open_now=None, address="somewhere"):
+    p = {"id": pid, "displayName": {"text": name}, "formattedAddress": address,
+         "location": {"latitude": lat, "longitude": lng}}
+    if rating is not None:
+        p["rating"] = rating
+    if count is not None:
+        p["userRatingCount"] = count
+    if price is not None:
+        p["priceLevel"] = price
+    if open_now is not None:
+        p["currentOpeningHours"] = {"openNow": open_now}
+    return p
+
+
+SM_FIX = {"lat": 34.0195, "lng": -118.4912, "accuracy_m": 12, "age_s": 3}
+
+TWO_COFFEES = {"places": [
+    _place("Dogtown Coffee", "p_dogtown", 34.0110, -118.4950, 4.4, 1900,
+           "PRICE_LEVEL_INEXPENSIVE", True, "1116 Main St, Santa Monica"),
+    _place("Blue Bottle Coffee", "p_bluebottle", 34.0250, -118.4880, 4.6, 820,
+           "PRICE_LEVEL_MODERATE", True, "1402 3rd Street Promenade"),
+]}
+
+
+def run_places():
+    section("I. places — real businesses, never remembered ones")
+    real_http = places.httpx
+    try:
+        # 1. "COFFEE NEAR ME, OPEN NOW." The car's fix biases the search, and
+        #    the open-now filter is passed to Google rather than applied by RIO
+        #    to a list she cannot see the hours of.
+        fake = _FakeHTTP(TWO_COFFEES)
+        places.httpx = fake
+        r = realtime.run_tool(realtime.PLACES_TOOL_NAME,
+                              {"query": "coffee", "open_now": True},
+                              session_key="drive_1", where=SM_FIX)
+        ok(r.get("ok") and r["n"] == 2, "a place question comes back with places")
+        req = fake.calls[0]
+        ok(len(fake.calls) == 1, "one Places call per question, not one per result")
+        ok(req["json"]["openNow"] is True,
+           "open-now is filtered by Google, which knows the hours")
+        bias = req["json"].get("locationBias", {}).get("circle", {})
+        ok(abs(bias.get("center", {}).get("latitude", 0) - SM_FIX["lat"]) < 1e-9,
+           "and biased to the car's own fix, so 'near me' means near the car")
+        ok(bias.get("radius") == config.PLACES_BIAS_RADIUS_M,
+           f"within {config.PLACES_BIAS_RADIUS_M:.0f} m")
+        ok("in" not in req["json"]["textQuery"],
+           f"the text query stays the driver's words ({req['json']['textQuery']!r})")
+
+        # THE BILL. Places (New) charges by field mask, so the mask is the
+        # bill and every field in it has to be one RIO actually says.
+        mask = set(req["headers"]["X-Goog-FieldMask"].split(","))
+        spoken = {"places.id", "places.displayName", "places.formattedAddress",
+                  "places.location", "places.rating", "places.userRatingCount",
+                  "places.priceLevel", "places.currentOpeningHours.openNow"}
+        ok(mask == spoken,
+           f"the field mask is exactly what she speaks ({len(mask)} fields)")
+        ok(not any(f.startswith("places.photos") or f.startswith("places.reviews")
+                   or "editorialSummary" in f for f in mask),
+           "no photos, reviews or editorial summary — each would bill on every "
+           "question for something nobody hears")
+        ok(req["json"]["maxResultCount"] <= config.PLACES_MAX_RESULTS,
+           "and it asks for at most the number she can read out")
+
+        # 2. WHAT COMES BACK IS WHAT SHE CAN SAY.
+        first = r["results"][0]
+        ok(first["name"] == "Dogtown Coffee" and first["place_id"] == "p_dogtown",
+           "each result carries its name and its place_id")
+        ok(first["rating"] == 4.4 and first["ratings_count"] == 1900,
+           "the rating and how many people rated it — 4.2 from nine reviews is "
+           "not 4.2 from nine hundred")
+        ok(first["price_level"] == 1 and first["open_now"] is True,
+           "price and whether it is open now")
+        ok(first["distance_m"] is not None and 900 < first["distance_m"] < 1200,
+           f"and how far it is from the CAR ({first['distance_m']} m)")
+        ok(first["drive_minutes_est"] >= 1,
+           f"with a drive time (~{first['drive_minutes_est']} min)")
+        ok("est" in "drive_minutes_est" and "estimate" in r["rules"].lower(),
+           "named and described as an ESTIMATE — a routed time would be five "
+           "more billed calls")
+        ok("Answer ONLY from this list" in r["rules"],
+           "and the result tells her the list is the whole of what she knows")
+
+        # 3. AN AREA WAS NAMED. The car's position is then irrelevant and must
+        #    not bias anything: "coffee in Santa Monica" from downtown is a
+        #    question about Santa Monica.
+        fake = _FakeHTTP(TWO_COFFEES)
+        places.httpx = fake
+        r2 = realtime.run_tool(realtime.PLACES_TOOL_NAME,
+                              {"query": "good coffee", "near": "Santa Monica"},
+                              session_key="drive_1", where=SM_FIX)
+        req2 = fake.calls[0]
+        ok(req2["json"]["textQuery"] == "good coffee in Santa Monica",
+           "a named area goes into the query")
+        ok("locationBias" not in req2["json"],
+           "and the car's position does NOT also bias it")
+        ok(r2["area"] == "Santa Monica", "the answer says where it searched")
+
+        # 4. NO FIX, NO AREA. She asks. This is the one case where guessing is
+        #    invisible: results 30 km away are real, correct and useless.
+        fake = _FakeHTTP(TWO_COFFEES)
+        places.httpx = fake
+        r3 = realtime.run_tool(realtime.PLACES_TOOL_NAME, {"query": "coffee"},
+                              session_key="drive_1", where=None)
+        ok(r3["ok"] is False and r3.get("need_location"),
+           "with no fix and no area she is told to ask, not to search")
+        ok(not fake.calls, "and nothing is billed for a question she cannot answer")
+        ok("Ask the driver which area" in r3["rules"]
+           and "do NOT search anyway" in r3["rules"].replace("Do NOT", "do NOT"),
+           "in one short question, and without guessing a location")
+
+        # A stale fix is the same answer: the car has been moving.
+        fake = _FakeHTTP(TWO_COFFEES)
+        places.httpx = fake
+        r4 = realtime.run_tool(
+            realtime.PLACES_TOOL_NAME, {"query": "coffee"}, session_key="drive_1",
+            where={"lat": 34.0, "lng": -118.5,
+                   "age_s": config.PLACES_FIX_MAX_AGE_S + 1})
+        ok(r4["ok"] is False and r4["note"] == "stale_fix",
+           f"a fix older than {config.PLACES_FIX_MAX_AGE_S:.0f}s is refused, not used")
+
+        # 5. FAILURE IS HONEST. The alternative is the behaviour this tool
+        #    exists to remove, and it is worse for being invisible.
+        fake = _FakeHTTP(raise_with=RuntimeError("connection reset"))
+        places.httpx = fake
+        r5 = realtime.run_tool(realtime.PLACES_TOOL_NAME, {"query": "tacos"},
+                              session_key="drive_1", where=SM_FIX)
+        ok(r5["ok"] is False, "a failed search fails")
+        ok("could not pull that up" in r5["rules"],
+           "with the words she should say")
+        ok("do NOT" in r5["rules"] and "memory" in r5["rules"],
+           "and an explicit instruction not to answer from memory instead")
+        ok("results" not in r5, "and no result list at all to be tempted by")
+
+        # Nothing found is not the same as failing, and neither is an invitation.
+        fake = _FakeHTTP({"places": []})
+        places.httpx = fake
+        r6 = realtime.run_tool(realtime.PLACES_TOOL_NAME,
+                              {"query": "michelin star drive through"},
+                              session_key="drive_1", where=SM_FIX)
+        ok(r6["ok"] is True and r6["n"] == 0,
+           "an empty result is a successful search that found nothing")
+        ok("Do NOT fill the silence" in r6["rules"],
+           "and still not a cue to remember somewhere")
+
+        # 6. THE FOLLOW-THROUGH. "Take me to the second one" works because the
+        #    results are still in session context and each one carries the id
+        #    that skips resolution.
+        fake = _FakeHTTP(TWO_COFFEES)
+        places.httpx = fake
+        realtime.run_tool(realtime.PLACES_TOOL_NAME, {"query": "coffee"},
+                          session_key="drive_1", where=SM_FIX)
+        kept = places.last_results("drive_1")
+        ok(len(kept.get("results") or []) == 2,
+           "the list she just read is kept for the session")
+        ok(kept["results"][1]["place_id"] == "p_bluebottle",
+           "so 'the second one' has an id behind it")
+        ok(places.last_results("another_drive") == {},
+           "and it is per session — one drive's list is not another's")
+
+        # 7. PRICE, RATING AND OPENING STATE ARE NEVER INVENTED.
+        fake = _FakeHTTP({"places": [_place("Nameless Diner", "p_x",
+                                            34.02, -118.49)]})
+        places.httpx = fake
+        r7 = realtime.run_tool(realtime.PLACES_TOOL_NAME, {"query": "diner"},
+                              session_key="drive_1", where=SM_FIX)
+        got = r7["results"][0]
+        ok(got["rating"] is None and got["ratings_count"] is None
+           and got["price_level"] is None and got["open_now"] is None,
+           "a place with no rating comes back with none — 'unrated' and 4.0 "
+           "are different things to say")
+        # 8. THE CHECKER ITSELF. The chain test leans on _invented_names to
+        #    catch a remembered business among real ones, so it is checked
+        #    here against sentences RIO plausibly says.
+        real_two = ["Dogtown Coffee", "Blue Bottle Coffee"]
+        ok(_invented_names(
+            "Two good ones close by: Dogtown Coffee, four point four, about "
+            "four minutes; or Blue Bottle Coffee, rated higher.", real_two) == [],
+           "the checker passes an answer built only from the tool's results")
+        ok(_invented_names(
+            "Dogtown Coffee is closest, though Verve Coffee Roasters on Main "
+            "is the better one.", real_two) == ["Verve Coffee Roasters"],
+           "and catches the one name that was not in them")
+        ok(_invented_names("I could not pull that up right now.", []) == [],
+           "an honest failure names nothing and trips nothing")
+        ok(_invented_names(
+            "There are a few coffee shops in Santa Monica near the Third "
+            "Street Promenade.", []) == [],
+           "geography and generic words are not businesses")
+        ok(_invented_names("Dogtown is about four minutes.", real_two) == [],
+           "and part of a returned name is that name, not a new one")
+    finally:
+        places.httpx = real_http
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -1452,6 +1936,7 @@ def main():
     run_dictation()
     run_awareness()
     run_routing()
+    run_places()
     if args.live:
         run_live()
         run_verbatim()

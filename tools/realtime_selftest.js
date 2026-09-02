@@ -845,6 +845,47 @@ function panelTools() {
 }
 
 {
+  // 1b-ii. "TAKE ME TO THE SECOND ONE." A place RIO just read out is already
+  //        resolved: find_places returned its place_id, so start_navigation
+  //        routes to THAT place rather than re-resolving a name. Re-resolving
+  //        "Blue Bottle" as text can land on a different branch three miles
+  //        away, with the right name and the wrong coffee.
+  const panel = fakePanel(() => LAX);
+  let setRouteArgs = null;
+  panel.nav.setRoute = (opts) => {
+    setRouteArgs = opts;
+    return Promise.resolve({ ok: true, route: {
+      total_distance_m: 1200, duration_s: 240, eta_epoch: 1787790000,
+      destination: { display_name: 'Blue Bottle Coffee' }, maneuvers: [] } });
+  };
+  const h = harness({ tool: panelTools() });
+  h.controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'start_navigation', call_id: 'p1',
+    arguments: JSON.stringify({ destination: 'Blue Bottle Coffee',
+                                place_id: 'p_bluebottle' }),
+  });
+  await tick(); await tick(); await tick();
+
+  ok(panel.asked.length === 0,
+     'a place_id skips resolution entirely — routeToQuery is never called');
+  ok(setRouteArgs && setRouteArgs.place_id === 'p_bluebottle',
+     'the id goes straight to setRoute, the way tapping a suggestion does');
+  ok(setRouteArgs && setRouteArgs.label === 'Blue Bottle Coffee',
+     'with the name for the panel to show');
+  const out = JSON.parse(h.sent.find(e => e.type === 'conversation.item.create')
+                              .item.output);
+  ok(out.ok === true && out.status === 'routed',
+     'and the route comes back live, like any other');
+  ok(out.destination === 'Blue Bottle Coffee',
+     'named by the route it actually built (' + out.destination + ')');
+  ok(panel.logged.some(e => e[0] === 'NAV_VOICE_DESTINATION'
+                            && e[1].from_places === true
+                            && e[1].place_id === 'p_bluebottle'),
+     'and the drive log records that this one came from a place she read out');
+}
+
+{
   // 1c. NO ROUTE. The honest answer, not an invented one.
   fakePanel(() => LAX);
   global.RIO.nav.directions = () => null;

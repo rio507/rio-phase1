@@ -31,8 +31,11 @@ checkpoint gets an exception rather than a licensing incident.
 
 ## 2. Navigation provider data — OPEN, and required before production
 
-RIO's routing, geocoding, place autocomplete and place search currently come
-from Google APIs, reached only through `navigation/providers/google.py`.
+RIO's routing, geocoding, place autocomplete and landmark lookups currently
+come from Google APIs, reached only through `navigation/providers/google.py`;
+conversational place search is the same vendor through a second, deliberately
+separate door (`places.py`), because it is a different use with different terms
+— see the sub-section below.
 Everything downstream of that file speaks RIO's canonical model and knows
 nothing about Google (`navigation/model.py`, `navigation/provider.py`).
 
@@ -81,6 +84,43 @@ route and place names held in memory for the duration of a drive.
   never written to disk. Confirm that is inside the permitted caching window,
   and confirm what may appear in the session log — currently the label, the
   relation and the confidences, not the place id.
+
+#### Places SEARCH, spoken as an answer (`places.py`) — a distinct use
+
+The landmark questions above are about place data used as *navigational
+context*. `find_places` is a different use of the same API and needs its own
+answers: the driver asks "what's good round here", a Text Search runs, and RIO
+**reads business names, ratings, review counts, price levels and opening status
+out loud**. That is Places content presented as the substance of an answer, not
+as a landmark beside a turn.
+
+- **Display requirements away from a map.** Google's terms attach display
+  obligations to Places content — attribution ("Powered by Google"), and rules
+  about showing ratings and reviews. RIO's answer is *audible* and the dashboard
+  may not be showing a map at that moment. Settle what must be displayed, where,
+  and whether an audible answer changes it. The tool result carries an
+  `attribution` field so that whatever the answer is can be implemented in one
+  place.
+- **Ratings and review counts read aloud.** Whether a rating and its review
+  count may be spoken, and whether they must be attributed to Google when they
+  are. RIO currently says "four point four" without naming the source.
+- **Third-party content in a synthesised voice.** Same question as the spoken
+  route instructions above, for a different content class: business names and
+  editorial-adjacent facts rather than road names.
+- **Prohibition on re-use.** Confirm what may be retained from a search.
+  `places.py` keeps the last result list in memory for
+  `PLACES_CACHE_TTL_S` (3 minutes) so "take me to the second one" resolves, and
+  `sessions.log_live` records the query and the returned NAMES for review.
+  Confirm both, and in particular whether logging names is caching.
+- **place_id retention and re-use.** A place_id from a search is passed into
+  `start_navigation` to skip re-resolution. Google's terms treat place ids as
+  cacheable indefinitely where other fields are not; confirm that, and confirm
+  that using one as a routing destination is within scope.
+- **Field mask as a licensing surface, not only a billing one.** `FIELD_MASK`
+  in `places.py` is currently id, name, address, location, rating, review count,
+  price level and open-now. Any field added there is a new content class with
+  its own display terms — photos and reviews especially — so the mask should be
+  read as part of this review and not treated as a performance setting.
 
 ### What is already true, and makes substitution cheap
 
