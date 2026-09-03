@@ -371,7 +371,13 @@
           elMapIdle.textContent = 'Map Offline';
           elMapIdle.title = String(e && e.message || e);
         }
-        console.warn('[nav] map unavailable:', e);
+        // The MESSAGE, not the Error. A stack here says where the promise
+        // was rejected, which is this function every time and has never been
+        // the question — the question is which of the three reasons it was
+        // (no key, script blocked, script failed), and that is the message.
+        // Logged once per page: mapsFailed is set above and drawRoute returns
+        // early after it. The panel's own tile carries the same text.
+        console.warn('[nav] map unavailable:', String(e && e.message || e));
       });
     }
 
