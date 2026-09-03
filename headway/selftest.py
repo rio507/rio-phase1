@@ -483,6 +483,61 @@ def _lane_result(conf=0.9, w=1280, h=720, left=(560, 300), right=(720, 980)):
             "image": {"w": w, "h": h}}
 
 
+def test_lane_shape():
+    """The statistic that decides whether a decoded line is a lane at all.
+
+    It exists because confidence cannot do this job. `_lane_confidence` asks how
+    much of a lane the net asserts and how sure it is where it does; a zigzag is
+    a lane the net is confident about and wrong about. Measured on real frames
+    the two are close to independent (correlation -0.17 over 22 lanes), and the
+    single most confident lane in that set was one the net had invented. So the
+    overlay gate is a shape test, and this is it.
+    """
+    from . import lanes as L
+
+    W, H = 1280, 720
+    straight = _lane(560, 300, h=H, n=30)
+    check("a straight lane fits a smooth curve",
+          L.shape_residual(straight, W, H) < L.SHAPE_RESIDUAL_MAX,
+          str(L.shape_residual(straight, W, H)))
+
+    # A real bend is a curve, not noise, and a quadratic is exactly what
+    # describes one -- so a curved lane must not be mistaken for a bad one.
+    curved = [(x + 0.0009 * (y - 0.42 * H) ** 2, y) for x, y in straight]
+    check("a curved lane is still a lane",
+          L.shape_residual(curved, W, H) < L.SHAPE_RESIDUAL_MAX,
+          str(L.shape_residual(curved, W, H)))
+
+    # The failure this is for: x jumping back and forth between anchors, which
+    # is what the net emits when it asserts a lane across pixels that have none.
+    zigzag = [(x + (60 if i % 2 else -60), y)
+              for i, (x, y) in enumerate(straight)]
+    check("a zigzag is not a lane",
+          L.shape_residual(zigzag, W, H) > L.SHAPE_RESIDUAL_MAX,
+          str(L.shape_residual(zigzag, W, H)))
+
+    # The column branch decodes lanes nearer horizontal than vertical. Fitting
+    # x = f(y) to one of those is ill-conditioned enough to fail a perfectly
+    # good outer boundary, so the fit follows the lane's own dominant axis.
+    horizontal = [(40 + i * 40, 500 + i * 2) for i in range(30)]
+    check("a near-horizontal lane is judged along its own axis",
+          L.shape_residual(horizontal, W, H) < L.SHAPE_RESIDUAL_MAX,
+          str(L.shape_residual(horizontal, W, H)))
+
+    # Too short to fit is not the same as bad, and must not be reported as bad:
+    # a short lane is already the thing the confidence score marks down.
+    check("too few points is unknown, not a verdict",
+          L.shape_residual(straight[:3], W, H) is None)
+    check("a degenerate lane is unknown too",
+          L.shape_residual([(500.0, 400.0)] * 8, W, H) is None)
+
+    # Scale-free: the same lane on a bigger frame is the same lane.
+    big = [(x * 2, y * 2) for x, y in straight]
+    r1, r2 = L.shape_residual(straight, W, H), L.shape_residual(big, W * 2, H * 2)
+    check("the statistic is a fraction of the frame, not a pixel count",
+          abs(r1 - r2) < 1e-4, "%s vs %s" % (r1, r2))
+
+
 def test_corridor_source():
     from . import anchor as A
     from . import lanes as L
@@ -1721,6 +1776,7 @@ def main():
     test_cooldowns()
     test_cutin_and_warmup()
     test_purity()
+    test_lane_shape()
     test_corridor_source()
     test_anchor_enumerates_corridor_selects()
     test_one_selection_for_both_sources()

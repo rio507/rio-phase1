@@ -3485,11 +3485,35 @@ document.addEventListener('DOMContentLoaded', () => {
 
   /* Detected lane lines. Thin cyan, same family as the corridor stroke — these
      are the geometry the corridor is built from, so they read as one system
-     rather than a second opinion. All four are drawn the same weight: the ego
-     pair is already called out by the corridor's dashed outline sitting on top
-     of it, so colouring it twice would just be noise. Kept to 1px so a busy
-     four-lane detection cannot compete with the lead box for attention. */
-  function drawLanes(m, lanes) {
+     rather than a second opinion. Kept to 1px so a busy four-lane detection
+     cannot compete with the lead box for attention.
+
+     They used to be drawn all at one weight, off the polylines alone, because
+     the polylines were all the server sent. That is how a lane the net had
+     invented across bare tarmac arrived on screen looking exactly as certain
+     as the paint next to it — four confident cyan lines, one of them a zigzag
+     across the road. The server now sends what each line is worth alongside
+     it, and this draws accordingly:
+
+       lane_plausible  the pipeline's judgement on the SHAPE of the line. A
+                       lane is straight or gently curving; a polyline that
+                       wanders is not a lane, whatever the net thinks of it.
+                       False means do not draw it at all.
+       lane_scores     how much of the lane the net asserts and how sure it is.
+                       This sets the WEIGHT, and it is deliberately not the
+                       gate: measured on this pipeline, confidence and
+                       jaggedness are uncorrelated, and the single most
+                       confident lane in the sample was an invented one. The
+                       floor below is a backstop against a line the net barely
+                       claims, not the thing keeping the noise off the screen.
+                       See headway/lanes.py SHAPE_RESIDUAL_MAX.
+
+     Both arrays are parallel to `lanes` and both are optional: an older server
+     sends neither, and every lane is then drawn as it always was. */
+  const LANE_DRAW_MIN = 0.35;         // barely-asserted lines are not drawn
+  const LANE_ALPHA = [0.30, 0.75];    // at the floor / at full confidence
+
+  function drawLanes(m, lanes, scores, plausible) {
     if (!lanes || !lanes.length) return;
     ctx.save();
     ctx.lineWidth = 1;
@@ -3497,14 +3521,23 @@ document.addEventListener('DOMContentLoaded', () => {
     ctx.lineCap = 'round';
     ctx.shadowColor = 'rgba(95,179,232,0.55)';
     ctx.shadowBlur = 5;
-    lanes.forEach(pts => {
+    lanes.forEach((pts, i) => {
       if (!pts || pts.length < 2) return;
+      if (plausible && plausible[i] === false) return;
+      const conf = (scores && typeof scores[i] === 'number') ? scores[i] : null;
+      if (conf !== null && conf < LANE_DRAW_MIN) return;
+      // Linear from the floor to full, so the difference between a line the
+      // pipeline is sure of and one it is scraping is visible rather than
+      // asserted in a log nobody is reading while driving.
+      const t = (conf === null) ? 1
+              : Math.max(0, Math.min(1, (conf - LANE_DRAW_MIN) / (1 - LANE_DRAW_MIN)));
+      const alpha = LANE_ALPHA[0] + t * (LANE_ALPHA[1] - LANE_ALPHA[0]);
       ctx.beginPath();
-      for (let i = 0; i < pts.length; i++) {
-        const x = m.x(pts[i][0]), y = m.y(pts[i][1]);
-        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      for (let j = 0; j < pts.length; j++) {
+        const x = m.x(pts[j][0]), y = m.y(pts[j][1]);
+        if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
-      ctx.strokeStyle = 'rgba(95,179,232,0.75)';
+      ctx.strokeStyle = 'rgba(95,179,232,' + alpha.toFixed(3) + ')';
       ctx.stroke();
     });
     ctx.restore();
@@ -3645,7 +3678,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // just double-stroke identical geometry.
     if (!drewCorridor) drawCorridor(m, r.corridor);
     // Lanes under the boxes, over the corridor fill.
-    drawLanes(m, r.lanes);
+    drawLanes(m, r.lanes, r.lane_scores, r.lane_plausible);
 
     const objs = (r.scene_objects || []).filter(o => o && o.box);
     // Lead last, so its brackets sit on top of anything it overlaps.
@@ -3820,7 +3853,8 @@ document.addEventListener('DOMContentLoaded', () => {
         // /perceive gates its lead on the same corridor headway does, so it
         // carries the same lane lines. Drawn here for the frames between
         // headway results.
-        drawLanes(m, last.result.lanes);
+        drawLanes(m, last.result.lanes, last.result.lane_scores,
+                  last.result.lane_plausible);
         if (!hwFresh) {
           const boxes = last.result.boxes || [];
           // Lead last so its brackets sit on top of any box it overlaps.

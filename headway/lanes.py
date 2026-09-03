@@ -107,6 +107,33 @@ ROW_COVERAGE_FULL = 0.5
 COL_COVERAGE_FULL = 0.25
 MIN_LANE_POINTS = 6
 
+# How far a polyline may wander from a smooth curve and still be a lane line,
+# as an RMS distance in fractions of the frame's long side. On a 1280 px frame
+# 0.005 is about 6 px.
+#
+# THIS IS NOT A CONFIDENCE THRESHOLD, AND CONFIDENCE CANNOT DO THIS JOB.
+# `_lane_confidence` asks how much of a lane the net asserts and how sure it is
+# where it does; a zigzag is a lane the net is confident about and wrong about,
+# so the two statistics are close to independent. Measured over 22 decoded
+# lanes on this pod: correlation between confidence and jaggedness -0.17, and
+# the highest-confidence lane in the whole set (0.955) was one of the invented
+# ones. A gate that kept every genuine lane (the lowest scored 0.71) would have
+# had to sit below 0.71, and every invented lane scored 0.77 or better -- so
+# there is no threshold on confidence that removes the noise and keeps the
+# road, which is why there is a second statistic here at all.
+#
+# Shape does separate. Genuine lanes, including on frames degraded to the point
+# of being hard to look at (0.15x brightness, 21 px blur, JPEG quality 5), fit
+# a quadratic to within 0.0008-0.0026. Lanes decoded off pictures containing no
+# road whatsoever ran 0.0164-0.0222, and the one visibly jagged line in the
+# degraded set measured 0.0081. 0.005 sits at roughly twice the worst genuine
+# lane and well under the noise.
+#
+# The sample behind those numbers is 16 genuine lanes from one highway clip.
+# That is enough to place a threshold with this much margin and not enough to
+# tune one, which is why the margin is wide and the number is round.
+SHAPE_RESIDUAL_MAX = 0.005
+
 # Where "the bottom of the image" is sampled for ego-pair selection. Not the
 # very last row: on most dashcams that is bonnet, wiper or vignette.
 BOTTOM_REF_FRAC = 0.95
@@ -288,6 +315,44 @@ def _lane_from_col(pos, valid, p_exist, lane, width, height):
                             float(p_exist[ks, lane].mean()))
     return {"points": list(zip(xs[order].tolist(), ys[order].tolist())),
             "confidence": conf, "source": "col", "lane_index": int(lane)}
+
+
+def shape_residual(points, width, height):
+    """How far a decoded lane wanders from a smooth curve. -> fraction, or None.
+
+    A lane line in a road scene is straight or gently curving, whatever the
+    camera or the bend; a quadratic describes one to within a couple of pixels.
+    What it does not describe is a polyline whose x jumps back and forth between
+    anchors, which is what the net emits when it is asserting a lane across
+    pixels that contain no lane -- and what reaches the screen as a zigzag.
+
+    Fitted along the lane's OWN dominant axis. The column branch decodes lanes
+    that are nearer horizontal than vertical (x is the anchor there, y is
+    predicted), and fitting x = f(y) to one of those is ill-conditioned enough
+    to fail a perfectly good outer boundary.
+    """
+    if not points or len(points) < 5:
+        return None
+    a = np.asarray(points, dtype=float)
+    if a.ndim != 2 or a.shape[1] != 2:
+        return None
+    span_x = float(a[:, 0].max() - a[:, 0].min())
+    span_y = float(a[:, 1].max() - a[:, 1].min())
+    if span_x >= span_y:
+        u, v = a[:, 0], a[:, 1]
+    else:
+        u, v = a[:, 1], a[:, 0]
+    if float(u.max() - u.min()) < 1e-6:
+        return None
+    try:
+        coef = np.polyfit(u, v, 2)
+    except Exception:
+        # A degenerate fit is not evidence of a good lane, but it is not
+        # evidence of a bad one either. Unknown, and the caller keeps the lane.
+        return None
+    resid = v - np.polyval(coef, u)
+    scale = float(max(width, height)) or 1.0
+    return float(np.sqrt(float((resid ** 2).mean())) / scale)
 
 
 def _lane_confidence(coverage, coverage_full, certainty):
@@ -489,6 +554,13 @@ def detect_lanes(frame, weights_path: str = None) -> dict:
         confidence  0..1 for the EGO PAIR specifically -- the number the
                     corridor-source switch reads. Individual lanes carry their
                     own confidence in `lane_conf`.
+        lane_residual   per lane, how far it wanders from a smooth curve, as a
+                    fraction of the frame's long side. None where the lane is
+                    too short to fit. See shape_residual.
+        lane_plausible  per lane, whether that residual is a lane's. This is
+                    what the overlay draws on, and it is a SEPARATE question
+                    from lane_conf -- a zigzag is a lane the net is confident
+                    about and wrong about.
     """
     t0 = time.perf_counter()
     _ensure_loaded(weights_path)
@@ -523,10 +595,24 @@ def detect_lanes(frame, weights_path: str = None) -> dict:
     ego, confidence = select_ego_pair(lanes, w, h)
     t_end = time.perf_counter()
 
+    # Per-lane shape, alongside the per-lane confidence that was already here.
+    # Both are reported and neither is applied: this function's job is to say
+    # what it decoded and how much each claim is worth, and dropping a lane here
+    # would take it out of the corridor build and out of the logs a bad corridor
+    # is reviewed from. The consumers gate.
+    residuals = [shape_residual(lane["points"], w, h) for lane in lanes]
+
     return {
         "lanes": [lane["points"] for lane in lanes],
         "lane_conf": [round(lane["confidence"], 3) for lane in lanes],
         "lane_index": [lane["lane_index"] for lane in lanes],
+        "lane_residual": [None if r is None else round(r, 5) for r in residuals],
+        # A lane whose shape is one. Unknown (too few points to fit) counts as
+        # plausible: the alternative is hiding a real boundary because it was
+        # short, and a short lane is already the one the confidence score is
+        # marking down.
+        "lane_plausible": [r is None or r <= SHAPE_RESIDUAL_MAX
+                           for r in residuals],
         "ego_left": ego["ego_left"],
         "ego_right": ego["ego_right"],
         "confidence": round(confidence, 3),

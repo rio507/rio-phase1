@@ -688,11 +688,21 @@ class LiveSession:
             "corridor_source": self.corridor.source,
             "lane_conf": round(lane_conf, 3),
             "lane_info": lane_info,
-            # Every detected lane, not just the ego pair — the overlay draws
-            # them all, and a review of a bad corridor needs to see which line
-            # the ego pair was picked out of.
+            # Every detected lane, not just the ego pair — a review of a bad
+            # corridor needs to see which line the ego pair was picked out of,
+            # so every one of them ships whether or not it is worth drawing.
+            #
+            # WHETHER IT IS WORTH DRAWING SHIPS WITH IT. The overlay used to
+            # get the polylines alone and drew all four at one weight, which is
+            # how a lane the net invented across bare tarmac reached the screen
+            # looking exactly as certain as the paint beside it. These two
+            # arrays are parallel to `lanes`: what each claim is worth, and
+            # whether its shape is a lane's at all. See lanes.shape_residual
+            # for why the second one is not the first one.
             "lanes": [[[round(float(x), 1), round(float(y), 1)] for x, y in pts]
                       for pts in ((lane_result or {}).get("lanes") or [])],
+            "lane_scores": list((lane_result or {}).get("lane_conf") or []),
+            "lane_plausible": list((lane_result or {}).get("lane_plausible") or []),
             "lead_geo": lead_geo,
             "lead_out_of_corridor": self.out_of_corridor,
 

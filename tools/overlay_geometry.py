@@ -102,6 +102,29 @@ except Exception:
 
 
 
+# The lane cases, one per marker, cycled. Each is a lane drawn straight down a
+# marker's centre column, and each carries a different verdict from the server
+# so that one screenshot answers three questions at once: does a lane the
+# pipeline stands behind get drawn, does one it has rejected on shape stay off
+# the screen, and does one it barely asserts stay off too.
+#
+# The middle case is the one that matters. It is CONFIDENT and implausible --
+# exactly the lane that used to reach the screen looking like paint -- so a
+# gate built on confidence alone passes the other two and fails this one.
+LANE_CASES = [
+    {"score": 0.90, "plausible": True, "drawn": True,
+     "why": "confident and lane-shaped"},
+    {"score": 0.90, "plausible": False, "drawn": False,
+     "why": "confident and NOT lane-shaped"},
+    {"score": 0.10, "plausible": True, "drawn": False,
+     "why": "barely asserted"},
+]
+
+
+def lane_case(i):
+    return LANE_CASES[i % len(LANE_CASES)]
+
+
 # --------------------------------------------------------------------------
 # reading the screen
 # --------------------------------------------------------------------------
@@ -118,6 +141,27 @@ def overlay_mask(rgb_on, rgb_off):
     """
     d = np.abs(rgb_on.astype(np.int16) - rgb_off.astype(np.int16)).max(axis=2)
     return d > 24
+
+
+def lane_through(mask, cx, cy, tol=TOL_PX):
+    """Is there an overlay stroke within `tol` of this marker's centre column?
+
+    Not box_edges: that scans outward until it finds something, so with the
+    lane absent it happily reports the NEXT marker's lane a hundred pixels away
+    and the run reads as drawn-but-misplaced instead of correctly-suppressed.
+    """
+    h, w = mask.shape
+    cy = int(round(cy))
+    if not (0 <= cy < h):
+        return None
+    lo, hi = int(round(cx - tol)), int(round(cx + tol))
+    lo, hi = max(0, lo), min(w - 1, hi)
+    if hi < lo:
+        return None
+    hits = [x for x in range(lo, hi + 1) if mask[cy, x]]
+    if not hits:
+        return None
+    return float(sum(hits)) / len(hits)
 
 
 def box_edges(mask, cx, cy):
@@ -210,19 +254,24 @@ class Echo:
             "box": m["box"], "label": "car", "range_m": None,
             "confirmed": True, "is_lead": False, "vulnerable": False,
         } for m in found]
-        lanes = []
+        lanes, lane_scores, lane_plausible = [], [], []
         if self.lanes:
             # A vertical line straight down each marker's centre. If the lane
             # transform and the box transform ever disagree, the line misses
-            # the square it was drawn through.
-            for m in found:
+            # the square it was drawn through -- and the per-lane verdicts say
+            # which of them should have been drawn at all.
+            for i, m in enumerate(found):
                 cx = (m["box"][0] + m["box"][2]) / 2.0
                 lanes.append([[cx, 0], [cx, h - 1]])
+                case = lane_case(i)
+                lane_scores.append(case["score"])
+                lane_plausible.append(case["plausible"])
         ft = _form_field(body, "frame_t")
         route.fulfill(status=200, content_type="application/json", body=json.dumps({
             "ok": True, "band": "NORMAL", "distance_m": None, "tau_s": None,
             "trend": None, "speak": None,
             "corridor": [], "lanes": lanes,
+            "lane_scores": lane_scores, "lane_plausible": lane_plausible,
             "scene_objects": [] if self.lanes else objs,
             "lead_box": None, "image": {"w": w, "h": h},
             "frame_t": float(ft) if ft not in (None, "") else None,
@@ -582,11 +631,11 @@ def measure(shot_on, shot_off, truth, metrics, chrome=(), crop=None,
 
     rows = []
     skipped = []
-    for m in screen:
+    for i, m in enumerate(screen):
         cx, cy = m["center"]
-        hit = occluded(m["box"])
-        if hit:
-            skipped.append({"marker_screen": m["box"], "under": hit})
+        under = occluded(m["box"])
+        if under:
+            skipped.append({"marker_screen": m["box"], "under": under})
             continue
         t = None if motion else truth_for(m)
         exp = None
@@ -597,6 +646,24 @@ def measure(shot_on, shot_off, truth, metrics, chrome=(), crop=None,
             exp = [x1, y1, x2, y2]
             ref_center_err = round(max(abs((x1 + x2) / 2 - cx),
                                        abs((y1 + y2) / 2 - cy)), 2)
+        if lanes:
+            # The echo built lane i from marker i, and both sides sort the
+            # markers the same way, so the index is the join.
+            case = lane_case(i)
+            hit = lane_through(mask, cx, cy)
+            rows.append({"marker_name": t["name"] if t else None,
+                         "marker_center": [round(v, 1) for v in m["center"]],
+                         "case": case["why"],
+                         "expected": "drawn" if case["drawn"] else "suppressed",
+                         "observed": "drawn" if hit is not None else "suppressed",
+                         "drawn": None if hit is None else [round(hit, 1)],
+                         "center_err_px": (None if hit is None
+                                           else round(abs(hit - cx), 2)),
+                         "edge_err_px": None,
+                         "ok": ((hit is not None) == case["drawn"]
+                                and (hit is None or abs(hit - cx) <= TOL_PX))})
+            continue
+
         drawn = box_edges(mask, cx, cy)
         row = {"marker_name": t["name"] if t else None,
                "marker_screen": [round(v, 1) for v in m["box"]],
@@ -606,13 +673,6 @@ def measure(shot_on, shot_off, truth, metrics, chrome=(), crop=None,
         if drawn is None:
             row.update({"drawn": None, "center_err_px": None, "edge_err_px": None,
                         "ok": False, "why": "no overlay stroke around marker"})
-            rows.append(row)
-            continue
-        if lanes:
-            err = max(abs(drawn[0] - cx), abs(drawn[2] - cx))
-            row.update({"drawn": [round(v, 1) for v in drawn],
-                        "center_err_px": round(err, 2), "edge_err_px": None,
-                        "ok": err <= TOL_PX})
             rows.append(row)
             continue
         cerr = max(abs((drawn[0] + drawn[2]) / 2 - cx),
@@ -790,6 +850,11 @@ def main():
                  m["canvas"]["attrW"], m["canvas"]["attrH"],
                  m["canvas"]["cssW"], m["canvas"]["cssH"], m["dpr"]))
         for row in e["placement"]["rows"]:
+            if "case" in row:
+                print("    marker@%-16s %-28s expected %-10s got %-10s%s"
+                      % (row["marker_center"], row["case"], row["expected"],
+                         row["observed"], "" if row["ok"] else "   <-- FAIL"))
+                continue
             print("    %-6s marker@%-16s drawn %-26s centre err %-6s edge err %-6s%s"
                   % (row.get("marker_name"), row["marker_center"], row["drawn"],
                      row["center_err_px"], row["edge_err_px"],

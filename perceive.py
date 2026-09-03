@@ -375,6 +375,8 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "lane_conf": lane_info.get("lane_conf"),
             "lanes": [[[round(float(x), 1), round(float(y), 1)] for x, y in pts]
                       for pts in ((lane_result or {}).get("lanes") or [])],
+            "lane_scores": list((lane_result or {}).get("lane_conf") or []),
+            "lane_plausible": list((lane_result or {}).get("lane_plausible") or []),
             "caption": caption, "observation": caption,
             "image": {"w": width, "h": height},
             "lead_range_m": lead_range,
@@ -391,8 +393,13 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
                      for x, y in corridor.polygon()],
         "corridor_source": corridor.source,
         "lane_conf": lane_info.get("lane_conf"),
+        # Parallel to `lanes`: what each line is worth, and whether its shape
+        # is a lane's. The overlay draws this endpoint's lanes on the same
+        # canvas as headway's, so it has to be told the same things about them.
         "lanes": [[[round(float(x), 1), round(float(y), 1)] for x, y in pts]
                   for pts in ((lane_result or {}).get("lanes") or [])],
+        "lane_scores": list((lane_result or {}).get("lane_conf") or []),
+        "lane_plausible": list((lane_result or {}).get("lane_plausible") or []),
         "caption": caption,
         # Same text under the key the existing dashboard code already reads.
         "observation": caption,
