@@ -587,6 +587,46 @@ def realtime_status_endpoint():
     return realtime.status()
 
 
+@app.post("/realtime/cutoff")
+def realtime_cutoff_endpoint(body: dict = Body(...),
+                             session_id: str = Query(default=None)):
+    """One answer stopped early, and why — reported by the page.
+
+    The classification has to happen in the browser: the difference between a
+    driver interrupting and a cabin doing it is a question about audio timing
+    and about a transcript that did or did not arrive, and neither is visible
+    from here. What this adds is the ability to ASK, over ten turns of a real
+    drive, which of the four causes is actually happening — which was the thing
+    missing when the complaint was "her voice keeps cutting out".
+
+    Never fails the caller. A diagnostic that can break a live session is worse
+    than no diagnostic.
+    """
+    try:
+        kind = str(body.get("kind") or "cutoff")
+        cause = str(body.get("cause") or "other")
+        detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+        rec = realtime.record_cutoff(kind, cause, detail)
+        sessions.log_live(session_id, "cutoff", rec)
+        return {"ok": True}
+    except Exception as e:
+        print(f"[realtime] cutoff report failed: {type(e).__name__}: {e}", flush=True)
+        return {"ok": False}
+
+
+@app.get("/realtime/cutoffs")
+def realtime_cutoffs_endpoint():
+    """The tally, and the policy it was collected under."""
+    return realtime.cutoff_tally()
+
+
+@app.post("/realtime/cutoffs/reset")
+def realtime_cutoffs_reset_endpoint():
+    """Start a measured run from zero."""
+    realtime.reset_cutoffs()
+    return {"ok": True}
+
+
 @app.post("/realtime/tool")
 def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
     """The one tool the live session can call: think harder, or look it up.

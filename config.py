@@ -111,6 +111,44 @@ DEEP_ANSWER_MAX_TOKENS = 320
 # is meant to be unreachable in ordinary conversation rather than typical.
 REALTIME_MAX_RESPONSE_TOKENS = 200
 
+# --- when RIO should stop talking, and when she should not ------------------
+# The complaint these exist for: her answers cut out mid-sentence and the
+# driver had to ask again. Three of the four causes were one cause — the voice
+# activity detector firing on RIO's own voice coming back through the cabin, or
+# on a cough, a door, a wiper — and the answer being thrown away for it.
+#
+# Server VAD defaults (threshold 0.5, 300 ms prefix, 500 ms silence) are tuned
+# for a quiet room with a headset. A car is neither. The threshold goes up so
+# ordinary cabin noise does not read as speech, and the silence window goes up
+# so a pause for breath mid-question does not end the driver's turn early.
+REALTIME_VAD_THRESHOLD = 0.62
+REALTIME_VAD_PREFIX_MS = 300
+REALTIME_VAD_SILENCE_MS = 700
+
+# INTERRUPTION IS THE CLIENT'S DECISION, NOT THE SERVER'S — see
+# realtime.session_config. The browser mutes RIO the instant the detector fires
+# and only cancels her generation if the speech is still going after this long.
+# Anything shorter than this was a noise, and a noise must not cost an answer.
+#
+# 300 ms is about the shortest real word. Below it the gate lets noise through;
+# far above it the driver hears a gap before she stops generating (she is
+# already silent — the mute is immediate), and the audio that gets discarded
+# grows.
+REALTIME_BARGE_SUSTAIN_MS = 300
+
+# After a cancel, how long to wait for a transcript before concluding there was
+# never anyone there. A real interruption produces one: the words are already
+# in the input buffer and transcription follows within a beat. Silence past
+# this means the detector fired on nothing, and the answer it cost gets
+# finished. Generous, because a slow transcription that resumed over the top of
+# a driver who really was talking is the one failure worse than the original.
+REALTIME_BARGE_CONFIRM_MS = 1500
+
+# How many times one answer may be resumed. One: an answer that is cut off,
+# resumed, and cut off again is in an argument with the cabin, and repeating
+# "as I was saying" is worse than stopping.
+REALTIME_MAX_RESUMES = 1
+
 OPENAI_TEMPERATURE = 1
 # gpt-5.5 is a reasoning model: max_completion_tokens covers reasoning AND output.
 # At 120 the reasoning pass could eat the whole budget and RIO returned an empty

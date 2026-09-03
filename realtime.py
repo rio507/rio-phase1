@@ -590,6 +590,46 @@ VERBATIM_INSTRUCTION = (
 )
 
 
+# The other half of the interruption story. When an answer is cut off and it
+# turns out nobody had spoken -- the detector fired on noise, or a warning took
+# the mouth for four seconds -- the answer is finished rather than dropped.
+#
+# `instructions` on a response REPLACES the session's, so this has to be
+# self-contained: it says who she is, what happened, and how much of it to say.
+# Deliberately short. This is a continuation of a sentence, not a fresh turn,
+# and the failure to avoid is her restarting the whole answer -- which is what
+# the driver was doing by hand before this existed.
+#
+# Written here rather than in the browser for the same reason the verbatim
+# instruction is: what RIO is told to say is decided in one place, and the page
+# holds no copy of it to drift from.
+RESUME_INSTRUCTION = (
+    "You are RIO, the driver's in-car assistant.\n"
+    "You were part-way through an answer and were cut off -- by background "
+    "noise or by a safety announcement, NOT by the driver. Nobody asked you to "
+    "stop and nobody has asked you anything new.\n"
+    "Finish that answer now, in one or two short sentences. Begin with "
+    "\"As I was saying\".\n"
+    "Do NOT start the answer again, do not greet, do not apologise, and do not "
+    "repeat what you already said -- carry on from where the text below "
+    "stops.\n\n"
+    "WHAT YOU HAD SAID SO FAR:\n"
+)
+
+
+def resume_response(said_so_far: str) -> dict:
+    """The `response.create` payload that finishes an interrupted answer.
+
+    In the conversation, unlike a dictated line: the truncated half is already
+    in the history, and leaving the other half out of it would make the next
+    question land against an answer that stops mid-sentence.
+    """
+    return {
+        "output_modalities": ["audio"],
+        "instructions": RESUME_INSTRUCTION + (said_so_far or "").strip(),
+    }
+
+
 def verbatim_response(text: str) -> dict:
     """The `response.create` payload that speaks one deterministic line.
 
@@ -662,6 +702,79 @@ def render_speech(text: str, timeout_s: float = 30.0) -> dict:
             "seconds": round(len(pcm) / 48000.0, 2)}
 
 
+# ---------------------------------------------------------------------------
+# WHY AN ANSWER STOPPED — the tally
+# ---------------------------------------------------------------------------
+# "Her voice keeps cutting out" is four faults wearing one coat, and the only
+# way to tell which one a car is actually suffering from is to count them
+# separately while somebody drives it. The browser classifies each cut-off (it
+# is the only place that can: the cause is a question about audio timing and a
+# transcript that never arrived) and posts it here, so a ten-turn test produces
+# a number instead of an impression.
+#
+# In memory and per process, like the headway session registry: this is a
+# diagnostic for the drive that is happening now, and the durable copy is the
+# session JSONL, which sessions.log_live_cutoff writes.
+_CUTOFF_CAUSES = ("false_barge_in", "barge_in", "preempted",
+                  "token_cap", "transport", "other")
+_cutoff_lock = threading.Lock()
+_cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
+                  "resumed": 0, "resume_skipped": 0, "blips_absorbed": 0,
+                  "recent": []}
+_CUTOFF_RECENT_MAX = 50
+
+
+def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
+    """One cut-off, one resume, or one absorbed blip, as reported by the page."""
+    with _cutoff_lock:
+        if kind == "cutoff":
+            c = cause if cause in _CUTOFF_CAUSES else "other"
+            _cutoffs["tally"][c] += 1
+        elif kind in ("resumed", "resume_skipped", "blips_absorbed"):
+            _cutoffs[kind] += 1
+        rec = {"t": round(time.time(), 3), "kind": kind, "cause": cause}
+        rec.update({k: v for k, v in (detail or {}).items()
+                    if k in ("response_id", "reason", "detail", "said_chars", "by")})
+        _cutoffs["recent"].append(rec)
+        if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
+            _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]
+        return rec
+
+
+def cutoff_tally() -> dict:
+    with _cutoff_lock:
+        t = dict(_cutoffs["tally"])
+        return {
+            "cutoffs": t,
+            "cutoffs_total": sum(t.values()),
+            # Barge-ins the sustain gate absorbed before they cost anything.
+            # Under the old behaviour every one of these was a lost answer, so
+            # this is the number that says whether the fix is doing anything.
+            "blips_absorbed": _cutoffs["blips_absorbed"],
+            "resumed": _cutoffs["resumed"],
+            "resume_skipped": _cutoffs["resume_skipped"],
+            "recent": list(_cutoffs["recent"]),
+            "policy": {
+                "vad_threshold": config.REALTIME_VAD_THRESHOLD,
+                "vad_prefix_ms": config.REALTIME_VAD_PREFIX_MS,
+                "vad_silence_ms": config.REALTIME_VAD_SILENCE_MS,
+                "barge_sustain_ms": config.REALTIME_BARGE_SUSTAIN_MS,
+                "barge_confirm_ms": config.REALTIME_BARGE_CONFIRM_MS,
+                "max_resumes": config.REALTIME_MAX_RESUMES,
+                "server_interrupt_response": False,
+            },
+        }
+
+
+def reset_cutoffs() -> None:
+    with _cutoff_lock:
+        _cutoffs["tally"] = {c: 0 for c in _CUTOFF_CAUSES}
+        _cutoffs["resumed"] = 0
+        _cutoffs["resume_skipped"] = 0
+        _cutoffs["blips_absorbed"] = 0
+        _cutoffs["recent"] = []
+
+
 def client() -> OpenAI:
     global _client
     with _client_lock:
@@ -680,10 +793,24 @@ def session_config() -> dict:
 
     Two choices worth stating:
 
-    `turn_detection` is server VAD with interruption ON. That is barge-in: the
-    driver starts talking, the model stops, immediately, without waiting for a
-    button. In a car that is not a nicety — it is how you stop a machine that
-    is mid-paragraph when you need to say something.
+    `turn_detection` is server VAD, tuned for a cabin rather than a headset,
+    with `interrupt_response` OFF — and that last one is the interesting choice.
+
+    Interruption still happens, and still happens instantly. It happens in the
+    BROWSER: static/rio_realtime.js mutes RIO on the first sample the detector
+    calls speech, before any round trip, so she is never audible over the
+    driver. What it does NOT do instantly is throw her answer away. It waits
+    REALTIME_BARGE_SUSTAIN_MS to see whether the speech is still going, and
+    only then cancels her generation.
+
+    That gap is the whole point. With `interrupt_response: True` the server
+    cancels on the first frame that crosses the threshold, and in a car the
+    thing that crosses it is very often RIO's own voice coming back through the
+    cabin, or a cough, or the indicator. The answer was gone before anything
+    could ask whether a person had actually said something, and the driver had
+    to ask again. Deciding it here would be deciding it 300 ms and one network
+    hop away from the microphone; the browser already has the audio and the
+    element to mute, so the browser decides.
 
     `transcription` names the SAME Whisper model the rest of the system uses.
     The live session does not need a transcript to work, but the session log,
@@ -700,8 +827,12 @@ def session_config() -> dict:
                 "transcription": {"model": config.OPENAI_STT_MODEL},
                 "turn_detection": {
                     "type": "server_vad",
+                    "threshold": float(config.REALTIME_VAD_THRESHOLD),
+                    "prefix_padding_ms": int(config.REALTIME_VAD_PREFIX_MS),
+                    "silence_duration_ms": int(config.REALTIME_VAD_SILENCE_MS),
                     "create_response": True,
-                    "interrupt_response": True,
+                    # See the docstring: the browser owns interruption.
+                    "interrupt_response": False,
                 },
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
@@ -743,6 +874,13 @@ def mint_client_secret() -> dict:
         # copy of the verbatim instruction that could drift from this one. What
         # RIO is told to read a warning as is decided here, once.
         "verbatim_instruction": VERBATIM_INSTRUCTION,
+        # ...and so does the resume policy, for the same reason: one place
+        # decides what she says and how long she waits before deciding nobody
+        # spoke. See rio_realtime.js createController.
+        "resume_instruction": RESUME_INSTRUCTION,
+        "barge_sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS),
+        "barge_confirm_ms": int(config.REALTIME_BARGE_CONFIRM_MS),
+        "max_resumes": int(config.REALTIME_MAX_RESUMES),
         "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED),
         "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
         "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),

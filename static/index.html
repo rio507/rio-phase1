@@ -2181,6 +2181,44 @@ async function toggleLive() {
     RIO.ui.voice('idle');
     return;
   }
+/* Every cut-off, every resume, every absorbed blip, to the server.
+ *
+ * The classification is made here because only here can it be made -- whether
+ * a driver interrupted or a cabin did is a question about audio timing and
+ * about a transcript that did or did not arrive. But a tally that lives in one
+ * browser tab cannot be asked about after a drive, and "her voice keeps cutting
+ * out" needs a number over ten turns rather than a memory of the last one.
+ *
+ * Fire and forget, and swallowing every error: a diagnostic that can break a
+ * live session is worse than no diagnostic. */
+const LIVE_REPORTED = {
+  LIVE_CUTOFF: 'cutoff',
+  LIVE_RESUME: 'resumed',
+  LIVE_RESUME_SKIPPED: 'resume_skipped',
+  LIVE_BARGE_ABSORBED: 'blips_absorbed',
+};
+
+function reportLive(ev) {
+  const kind = ev && LIVE_REPORTED[ev.type];
+  if (!kind) return;
+  try {
+    fetch(RIO.url('/realtime/cutoff'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: kind,
+        cause: ev.cause || (kind === 'cutoff' ? 'other' : kind),
+        detail: {
+          response_id: ev.response_id || null,
+          reason: ev.reason || null,
+          detail: ev.detail || null,
+          said_chars: ev.said_chars === undefined ? null : ev.said_chars,
+          by: ev.by || null,
+        },
+      }),
+    }).catch(() => {});
+  } catch (e) { /* never let reporting touch the session */ }
+}
+
   liveBusy = true;
   micBtn.textContent = 'Connecting…';
   try {
@@ -2194,6 +2232,12 @@ async function toggleLive() {
         else if (ev.type === 'LIVE_RESPONSE_END') RIO.ui.voice('listening');
         else if (ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
         else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
+        else if (ev.type === 'LIVE_RESUME') {
+          // Say so on screen. An answer that finishes itself after a warning is
+          // a good thing that looks like a glitch if it is never explained.
+          obs.textContent = 'Picking up where she left off…';
+        }
+        reportLive(ev);
       },
     });
     micBtn.textContent = 'End conversation';

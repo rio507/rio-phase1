@@ -75,10 +75,57 @@ def run_session():
 
     td = s["audio"]["input"]["turn_detection"]
     ok(td["type"] == "server_vad", "the server listens for turns itself")
-    ok(td.get("interrupt_response") is True,
-       "BARGE-IN: the driver talking stops her, without a button")
     ok(td.get("create_response") is True,
-       "and a finished sentence gets an answer without one either")
+       "a finished sentence gets an answer without a button")
+
+    # BARGE-IN STILL HAPPENS, AND STILL WITHOUT A BUTTON. It happens in the
+    # browser now, which is why this asserts the opposite of what it used to.
+    # The old arrangement had the server cancel her generation on the first
+    # frame of audio that crossed a threshold, and in a car the thing that
+    # crosses it is very often her own voice through the cabin, or a cough, or
+    # the indicator -- the answer was gone before anything could ask whether a
+    # person had actually spoken. The page mutes her instantly (which is the
+    # part that must never be late) and cancels only if the speech is still
+    # going after REALTIME_BARGE_SUSTAIN_MS. See rio_realtime.js bargeIn() and
+    # the node selftest, which drives the whole state machine.
+    ok(td.get("interrupt_response") is False,
+       "interruption is the BROWSER's decision, not the server's — it is the "
+       "only side that can tell a driver from a door")
+    ok(td.get("threshold") == config.REALTIME_VAD_THRESHOLD
+       and td["threshold"] > 0.5,
+       f"the detector is tuned for a cabin rather than a headset "
+       f"(threshold {td.get('threshold')} vs the 0.5 default)")
+    ok(td.get("silence_duration_ms") == config.REALTIME_VAD_SILENCE_MS
+       and td["silence_duration_ms"] > 500,
+       f"and a pause for breath does not end the driver's turn early "
+       f"({td.get('silence_duration_ms')} ms vs the 500 ms default)")
+    ok(td.get("prefix_padding_ms") == config.REALTIME_VAD_PREFIX_MS,
+       "with the prefix padding stated rather than defaulted")
+
+    # The other half of the policy, which the browser must not hold its own
+    # copy of — same discipline as the verbatim dictation instruction.
+    mint = realtime.mint_client_secret.__doc__ or ""
+    ok(realtime.RESUME_INSTRUCTION.strip().startswith("You are RIO"),
+       "the resume line introduces her, because response instructions REPLACE "
+       "the session's rather than adding to them")
+    ok("As I was saying" in realtime.RESUME_INSTRUCTION,
+       "and says how to pick the answer back up")
+    ok("not start the answer again" in realtime.RESUME_INSTRUCTION.lower()
+       or "do not start the answer again" in realtime.RESUME_INSTRUCTION.lower(),
+       "...and, explicitly, not to start it over — which is what the driver "
+       "was doing by hand before this existed")
+    rr = realtime.resume_response("half an answer")
+    ok(rr["instructions"].endswith("half an answer"),
+       "the resume carries what she had already said, so she continues")
+    ok(rr.get("conversation") != "none",
+       "IN the conversation, unlike a dictated line: the truncated half is "
+       "already in the history and the other half belongs with it")
+    ok(config.REALTIME_BARGE_SUSTAIN_MS >= 200
+       and config.REALTIME_BARGE_SUSTAIN_MS <= 600,
+       f"the sustain gate is about the length of a short word "
+       f"({config.REALTIME_BARGE_SUSTAIN_MS} ms)")
+    ok(config.REALTIME_BARGE_CONFIRM_MS > config.REALTIME_BARGE_SUSTAIN_MS,
+       "and the wait for a transcript is longer than the gate that precedes it")
 
     ok(s["audio"]["input"]["transcription"]["model"] == config.OPENAI_STT_MODEL,
        f"transcripts still come from Whisper ({config.OPENAI_STT_MODEL}) — the "

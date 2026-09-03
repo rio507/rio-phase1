@@ -35,6 +35,8 @@ function ok(cond, what) {
 }
 function section(name) { console.log('\n=== ' + name + ' ==='); }
 const tick = () => new Promise(r => setTimeout(r, 0));
+// Long enough for both barge-in timers in the harness (4 ms + 8 ms) to run.
+const settle = () => new Promise(r => setTimeout(r, 40));
 
 /* One live session on a fake wire. `sent` is what went to the model, `muted`
    is what the driver can actually hear. */
@@ -53,9 +55,25 @@ function harness(opts) {
       unmute: () => { audio.muted = false; },
     },
     onEvent: (ev) => events.push(ev),
+    // Milliseconds instead of hundreds of them. The real values live in
+    // config.py and travel with the session; what these tests check is the
+    // SHAPE of the decision -- what happens before the gate, after it, and
+    // after the transcript does or does not arrive -- and that shape is the
+    // same at 4 ms as at 300.
+    bargeSustainMs: opts.bargeSustainMs === undefined ? 4 : opts.bargeSustainMs,
+    bargeConfirmMs: opts.bargeConfirmMs === undefined ? 8 : opts.bargeConfirmMs,
+    maxResumes: opts.maxResumes,
+    resumeInstruction: 'RESUME>>',
   });
   return { arbiter, sent, events, audio, controller,
-           types: () => sent.map(e => e.type) };
+           types: () => sent.map(e => e.type),
+           evTypes: () => events.map(e => e.type),
+           cutoffs: () => controller.state().cutoffs,
+           // The resume, if one was asked for: a response.create carrying the
+           // resume instruction rather than any other kind.
+           resumeSent: () => sent.filter(
+             e => e.type === 'response.create' && e.response &&
+                  /^RESUME>>/.test(e.response.instructions || '')) };
 }
 
 function item(props) {
@@ -148,6 +166,8 @@ section('barge-in — the driver starts talking');
 {
   const h = harness();
   h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The car ahead is about' });
   await tick();
   ok(h.audio.muted === false, 'she is talking');
   h.controller.handle({ type: 'input_audio_buffer.speech_started' });
@@ -155,9 +175,361 @@ section('barge-in — the driver starts talking');
   ok(h.audio.muted === true,
      'the moment the driver speaks, she goes quiet — locally, without waiting '
      + 'for the server to agree');
-  ok(h.arbiter.state().speaking === null, 'and the mouth is released');
+  ok(h.arbiter.state().speaking !== null,
+     'but the answer is NOT thrown away yet — muting is instant and undoable, '
+     + 'cancelling is not');
+  ok(h.types().indexOf('response.cancel') < 0,
+     'and nothing has been cancelled inside the sustain window');
   ok(h.controller.state().counters.barge_ins === 1, 'counted as a barge-in');
   ok(h.events.some(e => e.type === 'LIVE_BARGE_IN'), 'and reported as one');
+
+  await settle();
+  ok(h.types().indexOf('response.cancel') >= 0,
+     'speech that outlasts the gate does cancel her');
+  ok(h.arbiter.state().speaking === null, 'and the mouth is released');
+}
+
+// ---------------------------------------------------------------------------
+section('a noise that is not a driver — the answer survives it');
+// ---------------------------------------------------------------------------
+{
+  // A blip inside the sustain window: a cough, a door, RIO's own voice coming
+  // back through the cabin. The old behaviour threw the whole answer away for
+  // one of these, which is the bug this section exists for.
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The car ahead is about' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await tick();
+  ok(h.audio.muted === true, 'she still goes quiet instantly — that part never changes');
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  await tick();
+
+  ok(h.audio.muted === false, 'the noise stops inside the gate and she carries on');
+  ok(h.arbiter.state().speaking !== null, 'the answer was never given up');
+  ok(h.types().indexOf('response.cancel') < 0, 'nothing was ever cancelled');
+  ok(h.types().indexOf('input_audio_buffer.clear') >= 0,
+     'and the blip is cleared out of the input buffer, best effort, so it does '
+     + 'not commit as a turn of its own');
+  ok(h.controller.state().counters.blips_absorbed === 1, 'counted as absorbed');
+  ok(h.resumeSent().length === 0, 'nothing to resume — she never stopped');
+
+  await settle();
+  ok(h.arbiter.state().speaking !== null, 'and it stays that way past the gate');
+}
+
+// ---------------------------------------------------------------------------
+section('FALSE barge-in — the detector fired and nobody spoke');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The car ahead is about thirty' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await new Promise(r => setTimeout(r, 6));   // outlasts the gate...
+  ok(h.types().indexOf('response.cancel') >= 0, 'she stops generating');
+  // ...the noise stops, and then nothing arrives. No transcript, because there
+  // was nobody. The wait for one is timed from HERE, not from the cancel.
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  await settle();
+
+  ok(h.cutoffs().false_barge_in === 1,
+     'with no transcript behind it, the cut-off is classified as FALSE');
+  ok(h.cutoffs().barge_in === 0, 'and not as a real one');
+
+  const r = h.resumeSent();
+  ok(r.length === 1, 'the unfinished answer is resumed, once');
+  ok(/thirty/.test(r[0].response.instructions),
+     'carrying what she had already said, so she continues instead of '
+     + 'starting the answer again');
+  ok(h.events.some(e => e.type === 'LIVE_RESUME' && e.cause === 'false_barge_in'),
+     'and it says why it resumed');
+}
+
+// ---------------------------------------------------------------------------
+section('REAL interruption — a transcript followed, so it stays interrupted');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The car ahead is about thirty' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await tick(); await new Promise(r => setTimeout(r, 6));   // past the gate
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: 'no, the other one' });
+  await settle();
+
+  ok(h.cutoffs().barge_in === 1, 'classified as a real interruption');
+  ok(h.cutoffs().false_barge_in === 0, 'and not a false one');
+  ok(h.resumeSent().length === 0,
+     'and NOT resumed — finishing an answer somebody deliberately cut off is '
+     + 'the rude version of the bug this fixes');
+}
+
+// ---------------------------------------------------------------------------
+section('...and an empty transcript is evidence, not a failure');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'It is a silver estate' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await tick(); await new Promise(r => setTimeout(r, 6));
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  // The transcriber ran and found no words. That is the transcriber telling us
+  // there was nobody there, and it arrives sooner than the timeout does.
+  h.controller.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: '   ' });
+  await settle();
+  ok(h.cutoffs().false_barge_in === 1, 'read as a false barge-in');
+  ok(h.resumeSent().length === 1, 'and resumed without waiting out the timer');
+}
+
+// ---------------------------------------------------------------------------
+section('ARBITER pre-emption — a warning takes the mouth, and gives it back');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'That building on the left is' });
+  await tick();
+  ok(h.arbiter.state().speaking !== null, 'she has the mouth');
+
+  const warning = item({ priority: h.arbiter.P.SAFETY, group: 'headway',
+                         id: 'hw1', text: 'Too close' });
+  h.arbiter.say(warning);
+  await tick();
+
+  ok(h.types().indexOf('response.cancel') >= 0,
+     'the warning cuts her off mid-sentence — unchanged, and it has to be');
+  ok(h.cutoffs().preempted === 1, 'the cut-off is recorded as a pre-emption');
+  const cut = h.events.filter(e => e.type === 'LIVE_CUTOFF').pop();
+  ok(cut && cut.by && cut.by.priority === h.arbiter.P.SAFETY,
+     'naming what pre-empted it, and at what priority');
+  ok(h.resumeSent().length === 0, 'nothing is resumed while the warning is speaking');
+
+  warning.finish();
+  await settle();
+  ok(h.resumeSent().length === 1,
+     'and once the warning is done the interrupted answer finishes itself, '
+     + 'instead of the driver having to ask again');
+  ok(/building on the left/.test(h.resumeSent()[0].response.instructions),
+     'from where it left off');
+}
+
+// ---------------------------------------------------------------------------
+section('a LONG real interruption is still a real interruption');
+// ---------------------------------------------------------------------------
+{
+  /* The failure this exists for was in the fix, not in the original bug, and a
+     ten-turn probe found it: the wait for a transcript was timed from the
+     CANCEL. A driver saying two seconds of sentence produces a transcript two
+     and a half seconds after the detector fired, the window expired long
+     before, and RIO resumed her old answer over the top of somebody who was
+     still finishing theirs -- worse than the cut-out it replaced.
+
+     The clock starts when the SPEECH stops, which is the only moment after
+     which a transcript can be expected at all. */
+  const h = harness({ bargeConfirmMs: 8 });
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The building on the left' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  // A long sentence: far longer than the confirmation window would allow if
+  // that window were being measured from the cancel.
+  await new Promise(r => setTimeout(r, 60));
+  ok(h.cutoffs().false_barge_in === 0,
+     'while the driver is still talking, nothing has been declared false');
+  ok(h.resumeSent().length === 0, '...and nothing has resumed over them');
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: 'what is that building on the left' });
+  await settle();
+  ok(h.cutoffs().barge_in === 1, 'and when the words land it is a real interruption');
+  ok(h.resumeSent().length === 0, 'still not resumed');
+}
+
+// ---------------------------------------------------------------------------
+section('DESK TEST — a clip\'s warnings still fire, and stop costing the answer');
+// ---------------------------------------------------------------------------
+{
+  /* Running headway on an uploaded clip is a test OF the warning path, so the
+     warnings have to fire exactly as they do on the road -- same priority,
+     same interruption, same voice. What they must not do any more is take the
+     conversation down with them silently, which on a desk is how a warning
+     working correctly looked identical to the live session having died.
+
+     This is the real shape of it: the warning claims the mouth at P1 and its
+     audio IS a dictation through the same session. */
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The white van has been' });
+  await tick();
+
+  let released;
+  const warning = {
+    priority: h.arbiter.P.SAFETY, group: 'headway', id: 'headway:too_close',
+    text: 'Too close', ttlMs: 2500,
+    play: () => h.controller.speak('Too close.').then(() => {}),
+    stop: () => {},
+  };
+  h.arbiter.say(warning);
+  await tick();
+
+  ok(h.controller.state().dictating === true,
+     'the warning speaks in her own voice, dictated through the live session');
+  ok(h.cutoffs().preempted === 1, 'the answer underneath it is recorded as pre-empted');
+  ok(h.resumeSent().length === 0, 'and nothing resumes while the warning is talking');
+
+  // The dictation plays and finishes.
+  const dictated = h.sent.filter(e => e.type === 'response.create' &&
+                                 e.response && e.response.conversation === 'none');
+  ok(dictated.length === 1, 'the line went out as a verbatim, out-of-band response');
+  h.controller.handle({ type: 'output_audio_buffer.started', response_id: 'd1' });
+  await tick();
+  h.controller.handle({ type: 'response.done', response: { id: 'd1' } });
+  await settle();
+
+  ok(h.resumeSent().length === 1,
+     'the warning done, the interrupted answer finishes itself — on a desk and '
+     + 'on the road, by the same rule');
+  ok(/white van/.test(h.resumeSent()[0].response.instructions),
+     'from where the warning cut it off');
+}
+
+// ---------------------------------------------------------------------------
+section('a warning does not yield to a cough');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  const p = h.controller.speak('Too close.');
+  p.catch(() => {});
+  h.controller.handle({ type: 'output_audio_buffer.started', response_id: 'd1' });
+  await tick();
+  ok(h.audio.muted === false, 'the warning is speaking');
+
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle();
+  ok(h.audio.muted === false,
+     'and it keeps speaking through the driver — the one thing on the ladder '
+     + 'that outranks them is the one that must not be silenced by a cough');
+  ok(h.types().indexOf('response.cancel') < 0, 'nothing cancels it');
+  ok(h.events.some(e => e.type === 'LIVE_BARGE_IN' && e.yielded === false),
+     'recorded as a barge-in that was refused, not one that never happened');
+}
+
+// ---------------------------------------------------------------------------
+section('resuming is bounded, and real speech ends it');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  // Cut off, resumed, cut off again: the second one is not resumed. An answer
+  // in an argument with the cabin should stop, not keep saying "as I was
+  // saying".
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'first half' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await new Promise(r => setTimeout(r, 6));
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  await settle();
+  ok(h.resumeSent().length === 1, 'first cut-off resumes');
+
+  h.controller.handle({ type: 'response.created', response: { id: 'r2' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r2', delta: 'second half' });
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await new Promise(r => setTimeout(r, 6));
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  await settle();
+  ok(h.resumeSent().length === 1, 'the second does not — one resume per answer');
+  ok(h.controller.state().counters.resume_skipped === 1, 'and says it declined');
+}
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'half an answer' });
+  await tick();
+  h.controller.handle({ type: 'response.done',
+                        response: { id: 'r1', status: 'completed' } });
+  await tick();
+  ok(h.cutoffs().false_barge_in + h.cutoffs().barge_in + h.cutoffs().preempted
+     + h.cutoffs().other === 0,
+     'an answer that simply finished is not a cut-off of any kind');
+}
+
+// ---------------------------------------------------------------------------
+section('the token cap is a limit, not a fault — counted, never resumed');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'a very long answer indeed' });
+  await tick();
+  h.controller.handle({
+    type: 'response.done',
+    response: { id: 'r1', status: 'incomplete',
+                status_details: { reason: 'max_output_tokens' } } });
+  await settle();
+  ok(h.cutoffs().token_cap === 1,
+     'the cap is recorded, so an answer that stops at the same length every '
+     + 'time is a fault with a name rather than an impression');
+  ok(h.resumeSent().length === 0,
+     'and not resumed — resuming it would be arguing with the limit');
+}
+
+// ---------------------------------------------------------------------------
+section('the wire going away is its own cause');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'mid sentence' });
+  await tick();
+  h.controller.transportLost('datachannel_closed');
+  await settle();
+  ok(h.cutoffs().transport === 1,
+     'a dead channel is counted as a dead channel, not as her stopping');
+  ok(h.resumeSent().length === 0, 'and nothing is resumed into a session that is gone');
+  ok(h.audio.muted === true, 'the element is muted rather than left live');
+}
+
+// ---------------------------------------------------------------------------
+section('the microphone asks for the constraints that make this work at all');
+// ---------------------------------------------------------------------------
+{
+  const c = rt.micConstraints || {};
+  ok(c.echoCancellation === true,
+     'echoCancellation — without it the loudest thing the detector hears while '
+     + 'she talks is her, and she interrupts herself');
+  ok(c.noiseSuppression === true, 'noiseSuppression — road and wind');
+  ok(c.autoGainControl === true, 'autoGainControl');
+  const src = require('fs').readFileSync(
+    path.join(__dirname, '..', 'static', 'rio_realtime.js'), 'utf8');
+  const call = (src.match(/getUserMedia\(([^)]*)\)/) || [])[1] || '';
+  ok(/MIC_CONSTRAINTS/.test(call),
+     'and the real getUserMedia call uses them rather than a second copy that '
+     + 'can drift');
 }
 
 // ---------------------------------------------------------------------------

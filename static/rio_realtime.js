@@ -34,6 +34,22 @@
 
   var CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
 
+  /* Echo cancellation is not optional in a car. RIO's voice comes out of the
+     same box the microphone is in, so without it the loudest thing the
+     detector hears while she is talking is her -- she interrupts herself, and
+     the driver watches her abandon an answer nobody asked her to stop. AGC and
+     noise suppression are the same argument for road noise and wind.
+     
+     Named rather than inline so the selftest can assert on them: this is a
+     three-word constraint object whose absence is invisible until you are in a
+     moving car, which is exactly the kind of thing that gets dropped in a
+     refactor and not noticed for a month. */
+  var MIC_CONSTRAINTS = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  };
+
   /* ---------------------------------------------------------------------
      Tools answered HERE, in the panel, rather than on the server.
 
@@ -420,8 +436,64 @@
     var stopped = false;
     var counters = { responses: 0, interrupted: 0, barge_ins: 0,
                      tool_calls: 0, tool_failures: 0,
-                     dictated: 0, dictation_failures: 0 };
+                     dictated: 0, dictation_failures: 0,
+                     // Barge-ins absorbed before they cost anything: the
+                     // detector fired, RIO went quiet, the noise stopped
+                     // inside the sustain window and she carried straight on.
+                     // The single most useful number here -- every one of
+                     // these used to be a lost answer.
+                     blips_absorbed: 0,
+                     resumed: 0, resume_skipped: 0, resume_failures: 0 };
+
+    /* WHY EVERY ANSWER STOPPED. One counter per cause, because "she cuts out"
+       is four different faults wearing one coat and they have four different
+       fixes:
+
+         false_barge_in  the detector called it speech and no words followed.
+                         Echo, a cough, a door. Resumable, and the reason this
+                         whole mechanism exists.
+         barge_in        the driver really did talk over her. Working as
+                         intended, and never resumed -- finishing an answer
+                         somebody deliberately cut off is the rude version of
+                         this bug.
+         preempted       a warning, a turn or a health line took the mouth.
+                         Resumed once the mouth comes back.
+         token_cap       she hit REALTIME_MAX_RESPONSE_TOKENS. A deliberate
+                         ceiling, not a fault, and NOT resumed: resuming it
+                         would be arguing with the limit.
+         transport       the data channel or the peer connection went away.
+                         Nothing to resume into.
+         other           the arbiter's watchdog, an error, a session ending. */
+    var cutoffs = { false_barge_in: 0, barge_in: 0, preempted: 0,
+                    token_cap: 0, transport: 0, other: 0 };
+
     var lastTranscript = '';
+    /* What she has said so far in the response now playing, accumulated from
+       the audio transcript deltas. This is what a resume carries: without it
+       the continuation is a guess, and a model asked to continue from a guess
+       starts the answer again -- which is the thing the driver was already
+       doing by hand. */
+    var partial = '';
+    var pendingBarge = null;    // { responseId, cancelled, timer, confirm, said }
+    var pendingResume = null;   // { cause, said }
+    var resumeChain = 0;        // resumes spent on THIS answer
+    var lastArbiterStart = null;
+
+    /* If the detector never says the speech ended, nothing will ever classify
+       the cut-off and the state would leak for the rest of the drive. This is
+       not a decision about anyone -- it is a cleanup, counted as `other` so it
+       cannot masquerade as a diagnosis. Twenty seconds is longer than any
+       utterance and shorter than a drive. */
+    var BARGE_BACKSTOP_MS = 20000;
+
+    var bargeSustainMs = cfg.bargeSustainMs || 300;
+    var bargeConfirmMs = cfg.bargeConfirmMs || 1500;
+    var maxResumes = (cfg.maxResumes === undefined || cfg.maxResumes === null)
+      ? 1 : cfg.maxResumes;
+    var resumeInstruction = cfg.resumeInstruction ||
+      'You were cut off part-way through an answer by noise, not by the ' +
+      'driver. Finish it in one or two short sentences, beginning with ' +
+      '"As I was saying". Do not start over.\n\nWHAT YOU HAD SAID SO FAR:\n';
     /* A dictated line — a warning, a turn, a health announcement — in flight.
        It is NOT a conversation response and must never be treated as one: it
        does not claim the mouth (its caller already holds it, at its own
@@ -438,6 +510,102 @@
       for (var i = 0; i < listeners.length; i++) {
         try { listeners[i](ev); } catch (e) { /* never let a listener mute RIO */ }
       }
+    }
+
+    /* One answer stopped early, and why. Recorded once per cut-off, at the
+       point the cause is actually known rather than at the point the audio
+       stopped -- those are different moments for a barge-in, which is not
+       classifiable until the transcript either arrives or does not. */
+    function noteCutoff(cause, detail) {
+      if (cutoffs[cause] === undefined) cause = 'other';
+      cutoffs[cause]++;
+      var ev = detail || {};
+      ev.cause = cause;
+      ev.said_chars = (ev.said || '').length;
+      delete ev.said;
+      emit('LIVE_CUTOFF', ev);
+    }
+
+    /* Stop the model generating, and clear the audio it has already queued.
+       Both, always: cancelling generation alone leaves whatever is in the
+       output buffer to play out from under a warning. */
+    function cancelGeneration() {
+      try { send({ type: 'response.cancel' }); } catch (e) {}
+      try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+    }
+
+    function clearBarge() {
+      if (!pendingBarge) return;
+      if (pendingBarge.timer) clearTimeout(pendingBarge.timer);
+      if (pendingBarge.confirm) clearTimeout(pendingBarge.confirm);
+      if (pendingBarge.backstop) clearTimeout(pendingBarge.backstop);
+      pendingBarge = null;
+    }
+
+    /* Is the mouth free? A resume is a conversation-priority thing and must
+       wait behind whatever took it away -- resuming into the middle of the
+       warning that pre-empted you is the same fault in the other direction. */
+    function mouthFree() {
+      if (!arbiter || typeof arbiter.state !== 'function') return true;
+      try { return !arbiter.state().speaking; } catch (e) { return true; }
+    }
+
+    /* Remember an answer worth finishing. Not every cut-off is: an answer
+       nobody had started hearing has nothing to carry on from, and one that
+       has already been resumed once is in an argument with the cabin. */
+    function armResume(cause, said) {
+      if (stopped) return;
+      said = (said || '').trim();
+      if (!said) return;
+      if (resumeChain >= maxResumes) {
+        counters.resume_skipped++;
+        emit('LIVE_RESUME_SKIPPED', { cause: cause, reason: 'budget' });
+        return;
+      }
+      pendingResume = { cause: cause, said: said };
+    }
+
+    /* ...and finish it, once there is a mouth to finish it with. Called on
+       every event that could free one: the arbiter releasing, a dictation
+       ending, the cut-off being classified. */
+    function tryResume() {
+      if (!pendingResume || stopped || speaking || dictation) return;
+      if (!mouthFree()) return;
+      var r = pendingResume;
+      pendingResume = null;
+      resumeChain++;
+      counters.resumed++;
+      emit('LIVE_RESUME', { cause: r.cause, said: r.said });
+      try {
+        send({
+          type: 'response.create',
+          response: {
+            output_modalities: ['audio'],
+            // In the conversation, not out of band: the truncated half is
+            // already in the history and leaving the other half out would make
+            // the next question land against an answer that stops mid-sentence.
+            instructions: resumeInstruction + r.said,
+          },
+        });
+      } catch (e) {
+        counters.resume_failures++;
+        emit('LIVE_RESUME_FAILED', { cause: r.cause });
+      }
+    }
+
+    /* The arbiter tells us two things worth knowing: what took the mouth (so a
+       pre-emption can say what pre-empted it) and when it is free again (so
+       the answer it interrupted can be finished). */
+    if (arbiter && typeof arbiter.onEvent === 'function') {
+      arbiter.onEvent(function (ev) {
+        if (!ev || stopped) return;
+        if (ev.type === 'start') lastArbiterStart = ev.item || null;
+        if (ev.type === 'end' || ev.type === 'drop') {
+          // Next tick: the arbiter is mid-pump and `current` is not settled
+          // until it returns.
+          setTimeout(tryResume, 0);
+        }
+      });
     }
 
     /* RIO has started saying something. Claim the mouth for it.
@@ -459,6 +627,7 @@
       var entry = { responseId: responseId, resolve: null, cancelled: false };
       speaking = entry;
       counters.responses++;
+      partial = '';
       audio.unmute();
       arbiter.say({
         priority: arbiter.P.CONVO,
@@ -479,15 +648,53 @@
            warning and reappear halfway through a sentence. */
         stop: function () {
           entry.cancelled = true;
+          entry.said = partial;         // captured before the deltas stop
           audio.mute();
-          try { send({ type: 'response.cancel' }); } catch (e) {}
-          try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+          cancelGeneration();
         },
         onDone: function (reason) {
           if (speaking === entry) speaking = null;
-          if (reason !== 'spoken') {
+          if (reason === 'spoken') {
+            /* NOT a signal that the answer finished. `spoken` is what the
+               arbiter is told whenever the mouth is handed back cleanly, and a
+               barge-in hands it back cleanly -- endResponse resolves the item
+               so the queue moves on. The resume budget is reset where the
+               model says the answer actually completed (response.done, status
+               completed) and where the driver starts a turn of their own. */
+          } else {
             counters.interrupted++;
             audio.mute();
+            var said = entry.said || partial;
+            if (reason === 'preempted') {
+              /* Something that matters more took the mouth mid-sentence. That
+                 is correct and stays correct -- but the answer underneath it
+                 was not wrong, it was just outranked, and dropping it made the
+                 driver ask again for something RIO had already worked out.
+                 It waits, and finishes when the mouth comes back.
+
+                 Recorded a tick later, because at this instant the arbiter has
+                 stopped us and has NOT yet started whatever stopped us -- both
+                 happen inside one say() and this is the middle of it. Asking
+                 now for the name of the pre-empting item gets the name of the
+                 item being pre-empted. */
+              armResume('preempted', said);
+              setTimeout(function () {
+                noteCutoff('preempted', {
+                  response_id: responseId, said: said,
+                  by: lastArbiterStart ? {
+                    id: lastArbiterStart.id, group: lastArbiterStart.group,
+                    priority: lastArbiterStart.priority,
+                  } : null,
+                });
+                tryResume();
+              }, 0);
+            } else if (reason !== 'superseded') {
+              /* superseded is ordinary turn-taking -- a newer answer replacing
+                 an older one in the same group -- and is nobody's fault and
+                 nothing to resume. Everything else (the watchdog, an error, a
+                 clear) is counted so it cannot hide inside "she cut out". */
+              noteCutoff('other', { response_id: responseId, reason: reason });
+            }
           }
           emit('LIVE_RESPONSE_END', { response_id: responseId, reason: reason });
         },
@@ -503,20 +710,169 @@
       if (entry.resolve) entry.resolve();          // the arbiter marks it spoken
     }
 
-    /* The driver started talking. The server interrupts the response itself —
-       that is what interrupt_response is for — but the audio already in the
-       element keeps playing for a moment, and a machine that talks over you
-       after you have started is the single most irritating thing an assistant
-       can do. So mute locally on the first sign of speech, immediately. */
+    /* THE DRIVER MIGHT HAVE STARTED TALKING.
+     *
+     * "Might" is the whole change. This used to be certain: the detector fired,
+     * RIO went quiet and her answer was thrown away, and the server had already
+     * cancelled her generation before this code ran. In a car the thing that
+     * fires the detector is very often not the driver -- it is RIO's own voice
+     * returning through the cabin, a cough, an indicator, a door -- and every
+     * one of those cost a complete answer that the driver then had to ask for
+     * again. That is the bug.
+     *
+     * Two clocks now, and they do different jobs:
+     *
+     *   MUTE IS INSTANT and unconditional. Talking over the driver is the one
+     *   thing that must never happen, it costs nothing to be wrong about, and
+     *   it is undoable -- if the noise stops, she is unmuted mid-sentence and
+     *   carries on. The driver loses a few hundred milliseconds of audio, not
+     *   an answer.
+     *
+     *   CANCELLING IS DELAYED by bargeSustainMs. Below that it was a noise and
+     *   nothing is cancelled at all: the input buffer is cleared so the blip
+     *   cannot become a turn of its own, and she is unmuted. Above it, she
+     *   stops generating -- and even then the cut-off is not yet classified,
+     *   because whether a person was there is a question only the transcript
+     *   can answer. See transcriptArrived().
+     *
+     * The server no longer does any of this (interrupt_response is off, see
+     * realtime.session_config): deciding it there would be deciding it a
+     * network hop away from the microphone, on the first sample that crossed a
+     * threshold, with nothing available to check the guess against.
+     */
     function bargeIn() {
       counters.barge_ins++;
-      audio.mute();
-      if (speaking) {
-        emit('LIVE_BARGE_IN', { response_id: speaking.responseId });
-        endResponse(speaking.responseId);
-      } else {
-        emit('LIVE_BARGE_IN', {});
+      /* A DICTATION IS NOT YIELDED. A gap warning, a turn or a tire fault is
+         the one thing on this ladder that outranks the driver -- that is what
+         the priority tiers are for, and cutting through the person in the seat
+         is precisely its job. Muting it because somebody coughed hands the
+         cabin a veto over the safety channel, which is the same fault as the
+         one being fixed here and with a much worse ending. Conversation
+         yields; warnings do not. */
+      if (dictation) {
+        emit('LIVE_BARGE_IN', { during: 'dictation', yielded: false });
+        return;
       }
+      audio.mute();                      // instant, always, undoable
+      if (!speaking || pendingBarge) {
+        emit('LIVE_BARGE_IN', { response_id: speaking ? speaking.responseId : null });
+        return;
+      }
+      var rid = speaking.responseId;
+      emit('LIVE_BARGE_IN', { response_id: rid });
+      pendingBarge = { responseId: rid, cancelled: false, timer: null,
+                       confirm: null, said: '' };
+      pendingBarge.timer = setTimeout(function () {
+        if (!pendingBarge) return;
+        pendingBarge.timer = null;
+        pendingBarge.cancelled = true;
+        pendingBarge.said = partial;
+        // Sustained past the gate: stop generating and hand back the mouth.
+        cancelGeneration();
+        endResponse(rid);
+        /* Cancelled, and NOT yet blamed on anyone. The clock that decides
+           whether there was a person there does not start here -- it starts
+           when the speech stops, in speechStopped(). See the note there; this
+           is only the backstop for a detector that never says it stopped. */
+        pendingBarge.backstop = setTimeout(function () {
+          if (!pendingBarge) return;
+          var said = pendingBarge.said;
+          pendingBarge = null;
+          noteCutoff('other', { response_id: rid, said: said,
+                                reason: 'speech_never_ended' });
+        }, BARGE_BACKSTOP_MS);
+      }, bargeSustainMs);
+    }
+
+    /* The speech stopped. Two very different situations, decided by whether
+       the gate had already closed.
+     *
+     * Before the gate: nothing was ever cancelled and she simply carries on.
+     * The input buffer is cleared on the way past, best effort -- the server
+     * may already have committed the blip by the time this lands, and what
+     * actually stops it becoming a second answer over the top of the first is
+     * the API's own rule that a conversation has one active response at a
+     * time. The clear is worth sending anyway for the case where it arrives in
+     * time, and costs nothing when it does not.
+     *
+     * After it: she has already been stopped, and NOW the wait for a transcript
+     * begins. Starting that clock at the cancel instead -- which is what this
+     * did first, and what the ten-turn probe caught -- times the wait against
+     * the wrong event entirely. A driver saying two seconds' worth of sentence
+     * produces a transcript two and a half seconds after the detector fired,
+     * and a confirmation window measured from the cancel would have expired
+     * long before, declared that nobody had spoken, and had RIO resume her old
+     * answer over the top of a driver who was still finishing theirs. That is
+     * the one failure worse than the bug this whole change is fixing.
+     *
+     * Measured from here, the window means what it is supposed to mean: the
+     * words are already in the buffer, transcription follows within a beat, and
+     * silence past it really is silence.
+     */
+    function speechStopped() {
+      if (!pendingBarge) return;
+      if (!pendingBarge.cancelled) {
+        clearBarge();
+        try { send({ type: 'input_audio_buffer.clear' }); } catch (e) {}
+        counters.blips_absorbed++;
+        emit('LIVE_BARGE_ABSORBED', {
+          response_id: speaking ? speaking.responseId : null });
+        if (speaking && !speaking.cancelled && !stopped) audio.unmute();
+        return;
+      }
+      if (pendingBarge.confirm) return;          // already waiting
+      if (pendingBarge.backstop) {
+        clearTimeout(pendingBarge.backstop);
+        pendingBarge.backstop = null;
+      }
+      var rid = pendingBarge.responseId;
+      pendingBarge.confirm = setTimeout(function () {
+        if (!pendingBarge) return;
+        var said = pendingBarge.said;
+        pendingBarge = null;
+        noteCutoff('false_barge_in', { response_id: rid, said: said,
+                                      detail: 'no transcript followed' });
+        armResume('false_barge_in', said);
+        tryResume();
+      }, bargeConfirmMs);
+    }
+
+    /* The words, or the absence of them. This is what classifies a barge-in,
+       and it is the only thing that can: a detector says "energy", a
+       transcript says "someone spoke". An empty transcript is a real answer
+       here and not a failure -- it is the transcriber saying there was nothing
+       to write down. */
+    function transcriptArrived(text) {
+      var real = !!(text && text.trim());
+      if (real) {
+        // A new turn from the driver. Whatever was outstanding is theirs to
+        // have interrupted, and the resume budget starts again.
+        pendingResume = null;
+        resumeChain = 0;
+      }
+      if (!pendingBarge) return;
+      var rid = pendingBarge.responseId;
+      var said = pendingBarge.said || partial;
+      var wasCancelled = pendingBarge.cancelled;
+      clearBarge();
+      if (!wasCancelled) {
+        // Words arrived before the gate even closed. Real, and early: cancel
+        // now rather than waiting out a timer that is about to agree.
+        if (real && speaking && speaking.responseId === rid) {
+          cancelGeneration();
+          endResponse(rid);
+          noteCutoff('barge_in', { response_id: rid, said: partial });
+        }
+        return;
+      }
+      if (real) {
+        noteCutoff('barge_in', { response_id: rid, said: said });
+        return;                          // deliberate. Never resumed.
+      }
+      noteCutoff('false_barge_in', { response_id: rid, said: said,
+                                    detail: 'empty transcript' });
+      armResume('false_barge_in', said);
+      tryResume();
     }
 
     function dictationStarted() {
@@ -544,6 +900,14 @@
         emit('LIVE_DICTATION_END', { text: d.text, transcript: d.transcript || '' });
         d.resolve({ transcript: d.transcript || '' });
       }
+      /* A dictated line is what usually pre-empts a conversation -- a gap
+         warning, a turn, a tire fault. It does not go through the arbiter, so
+         the arbiter's own "mouth is free" event is not enough on its own:
+         the answer it interrupted waits here too. This is also the whole of
+         what desk-testing a clip needs. The warnings from an uploaded video
+         still fire, exactly as they do on the road, and they stop costing the
+         conversation that was underneath them. */
+      setTimeout(tryResume, 0);
     }
 
     function toolCall(name, callId, argsJson) {
@@ -609,17 +973,52 @@
               finishDictation(null);
               break;
             }
+            /* A response can be "done" because it finished or because it ran
+               out of room, and the difference is invisible from the audio. The
+               cap is deliberate (REALTIME_MAX_RESPONSE_TOKENS) so this is
+               counted and never resumed -- resuming it would be arguing with
+               the limit -- but it is counted, because a driver hearing an
+               answer stop at the same length every time is hearing a fault
+               with a name. */
+            if (ev.type === 'response.done' && ev.response) {
+              var det = ev.response.status_details || {};
+              if (ev.response.status === 'completed') {
+                // A whole answer got out. Whatever chain of interruptions led
+                // here is over, and the next one starts with a full budget.
+                resumeChain = 0;
+              }
+              if (ev.response.status === 'incomplete'
+                  && det.reason === 'max_output_tokens') {
+                noteCutoff('token_cap', { response_id: ev.response.id,
+                                         said: partial });
+              } else if (ev.response.status === 'failed') {
+                noteCutoff('other', { response_id: ev.response.id,
+                                     reason: 'response_failed' });
+              }
+            }
             endResponse((ev.response && ev.response.id) || ev.response_id);
+            break;
+          case 'response.output_audio_transcript.delta':
+            // What she is saying, as she says it. The only record of how far
+            // an answer got, and therefore the only thing a resume can carry.
+            if (!dictation || dictation.responseId !== ev.response_id) {
+              partial += (ev.delta || '');
+            }
             break;
           case 'response.output_audio_transcript.done':
             // What the model says it said. The tests compare it with what it
             // was asked to say; in the car it is what the log records.
             if (dictation && dictation.responseId === ev.response_id) {
               dictation.transcript = ev.transcript || '';
+            } else if (ev.transcript) {
+              partial = ev.transcript;
             }
             break;
           case 'input_audio_buffer.speech_started':
             bargeIn();
+            break;
+          case 'input_audio_buffer.speech_stopped':
+            speechStopped();
             break;
           case 'response.function_call_arguments.done':
             toolCall(ev.name, ev.call_id, ev.arguments);
@@ -627,6 +1026,20 @@
           case 'conversation.item.input_audio_transcription.completed':
             lastTranscript = ev.transcript || '';
             emit('LIVE_TRANSCRIPT', { transcript: lastTranscript, role: 'driver' });
+            transcriptArrived(lastTranscript);
+            break;
+          case 'conversation.item.input_audio_transcription.failed':
+            // The transcriber could not make words out of it. That is not
+            // proof nobody spoke, but it is the same evidence an empty
+            // transcript gives, and the safe reading of "we cannot tell" is
+            // the one that does not talk over a driver who might be mid-word:
+            // classified, not resumed.
+            if (pendingBarge) {
+              noteCutoff(pendingBarge.cancelled ? 'barge_in' : 'other',
+                         { response_id: pendingBarge.responseId,
+                           reason: 'transcription_failed' });
+              clearBarge();
+            }
             break;
           case 'error':
             emit('LIVE_ERROR', { error: (ev.error && ev.error.message) || 'unknown' });
@@ -685,11 +1098,32 @@
         });
       },
 
+      /* The wire went away mid-sentence -- the data channel closed, or ICE
+         gave up. Called by connect(), which is the only thing that can see it:
+         nothing arrives on a dead channel, so this failure is invisible from
+         the event stream and used to be indistinguishable from RIO simply
+         stopping. Counted, and never resumed: there is nothing left to resume
+         into. */
+      transportLost: function (reason) {
+        if (stopped) return;
+        if (speaking || pendingBarge) {
+          noteCutoff('transport', {
+            response_id: speaking ? speaking.responseId : null,
+            reason: reason || 'closed', said: partial });
+        }
+        clearBarge();
+        pendingResume = null;
+        emit('LIVE_TRANSPORT_LOST', { reason: reason || 'closed' });
+        this.stop();
+      },
+
       /* Ending the session releases the mouth: an item left claimed would
          block every conversational reply for the rest of the drive. */
       stop: function () {
         stopped = true;
         audio.mute();
+        clearBarge();
+        pendingResume = null;
         if (dictation) finishDictation('session_stopped');
         if (speaking) endResponse(speaking.responseId);
       },
@@ -702,6 +1136,16 @@
           stopped: stopped,
           last_transcript: lastTranscript,
           counters: counters,
+          // The answer to "why does she keep cutting out", as a tally rather
+          // than as an impression. Read it from the console after a drive, or
+          // let the panel post it -- see /realtime/cutoffs.
+          cutoffs: cutoffs,
+          pending_barge: !!pendingBarge,
+          pending_resume: pendingResume ? pendingResume.cause : null,
+          said_so_far: partial,
+          policy: { barge_sustain_ms: bargeSustainMs,
+                    barge_confirm_ms: bargeConfirmMs,
+                    max_resumes: maxResumes },
         };
       },
     };
@@ -733,13 +1177,7 @@
           throw new Error((j && j.error) || 'no session');
         }
         session = j;
-        // Echo cancellation is not optional in a car: RIO's own voice comes
-        // out of the same box the microphone is in, and without it she hears
-        // herself and interrupts herself.
-        return navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true,
-                   autoGainControl: true },
-        });
+        return navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS });
       })
       .then(function (mic) {
         var pc = new RTCPeerConnection();
@@ -759,6 +1197,13 @@
           // from the one the tests check.
           verbatimInstruction: session.verbatim_instruction,
           speakTimeoutMs: session.speak_timeout_ms,
+          // Interruption policy, decided in config.py and carried here with
+          // the session exactly as the dictation policy is. The browser holds
+          // no numbers of its own to drift from the ones the tests check.
+          resumeInstruction: session.resume_instruction,
+          bargeSustainMs: session.barge_sustain_ms,
+          bargeConfirmMs: session.barge_confirm_ms,
+          maxResumes: session.max_resumes,
           send: function (obj) {
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));
           },
@@ -792,6 +1237,19 @@
           var ev;
           try { ev = JSON.parse(e.data); } catch (err) { return; }
           controller.handle(ev);
+        };
+
+        /* A session that dies mid-answer looks exactly like an answer that
+           stopped, and the driver reports the same symptom for both. These are
+           the only places the difference is visible -- nothing arrives on a
+           dead channel to tell the controller about it. */
+        channel.onclose = function () { controller.transportLost('datachannel_closed'); };
+        channel.onerror = function () { controller.transportLost('datachannel_error'); };
+        pc.onconnectionstatechange = function () {
+          if (pc.connectionState === 'failed' || pc.connectionState === 'closed'
+              || pc.connectionState === 'disconnected') {
+            controller.transportLost('peer_' + pc.connectionState);
+          }
         };
 
         return pc.createOffer()
@@ -858,6 +1316,7 @@
     currentFix: currentFix,
     startNavigation: startNavigation,
     localTools: LOCAL_TOOLS,
+    micConstraints: MIC_CONSTRAINTS,
     active: function () { return active; },
     /* Tests and the panel: pretend a session is open, or that none is. */
     _setActive: function (h) { active = h; },
@@ -868,6 +1327,7 @@
                        navDirections: navDirections,
                        noteFix: noteFix, currentFix: currentFix,
                        startNavigation: startNavigation,
-                       localTools: LOCAL_TOOLS };
+                       localTools: LOCAL_TOOLS,
+                       micConstraints: MIC_CONSTRAINTS };
   }
 })(typeof window !== 'undefined' ? window : globalThis);
