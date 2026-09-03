@@ -132,10 +132,11 @@ def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, 
     _write(session_id, "perceive", {
         "frame_bytes": frame_bytes_len,
         "caption": result.get("caption", ""),
-        "boxes": result.get("boxes", []),
+        # What Qwen said it saw, beside the caption it said it in. Not boxes
+        # anything drew and not boxes carrying a range -- see perceive.py.
+        "qwen_boxes": result.get("qwen_boxes", []),
         "corridor": result.get("corridor", []),
         "image": result.get("image", {}),
-        "lead_range_m": result.get("lead_range_m"),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),
     })

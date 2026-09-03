@@ -53,6 +53,7 @@ from headway import live as headway_live
 from headway import live_policy
 from headway import lanes as headway_lanes
 from headway import detect as headway_detect
+from headway import depth as headway_depth
 
 # Set once the warm thread has finished, successfully or not.
 #
@@ -84,10 +85,17 @@ def _warm_vision():
     t = time.time()
     try:
         vision.warm()
-        # /perceive's second model (Depth Anything V2 Metric-Small). Warmed on
-        # the same thread, after Qwen, so the overlay's first frame does not pay
-        # the depth load while a drive is already running.
-        perceive.warm()
+        # Depth Anything V2 Metric-Small. Warmed on the same thread, after
+        # Qwen, so a live frame does not pay the load while a drive is already
+        # running. It used to be warmed through perceive.warm(), back when
+        # /perceive measured a distance inside every box Qwen drew; that path
+        # is gone and depth belongs to the headway loop, which is the only
+        # thing that ranges anything now.
+        try:
+            headway_depth.warm()
+            print("[vision] depth warm", flush=True)
+        except Exception as e:
+            print(f"[vision] depth unavailable: {e}", flush=True)
         # UFLDv2 lane geometry. Same reasoning, and it matters more here: this
         # one runs on EVERY headway frame, so an unwarmed first call would put
         # a ~2 s weight load inside a live frame instead of a 2 ms forward.
@@ -712,28 +720,39 @@ async def observe(image: UploadFile = File(...), session_id: str = Query(default
 @app.post("/perceive")
 async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Query(default=None),
                             debug: int = Query(default=0)):
-    """Structured perception for the dashboard overlay. /observe is unchanged.
+    """The caption and the deterministic geometry under it. /observe unchanged.
 
-    Returns the same caption /observe would, plus boxes, per-object distance and
-    the ego corridor, so the Camera panel can draw what RIO is looking at.
+    Returns the same caption /observe would, plus the ego corridor and the
+    detected lane lines, so the Camera panel can draw the geometry RIO is
+    reasoning over. It does NOT return boxes to draw -- see perceive.py.
+
+    In a threadpool, like /headway_frame and for a sharper version of the same
+    reason. The work is a blocking Qwen generate of one to four seconds, and it
+    used to run directly in this coroutine, which meant it blocked the event
+    loop and therefore every other request the server had -- including the
+    4 fps /headway_frame stream. That was survivable while a caption and a
+    headway run never overlapped on a clip. They do now: playing a clip starts
+    detection, and the caption keeps ticking underneath it, so a blocking
+    generate here would stall the detection loop for seconds at a time and put
+    the stutter squarely on the feature that made them overlap.
     """
     # Same gate as /headway_frame, same reason: this path runs Qwen and Depth
     # Anything, and doing that while Qwen is mid-load is what breaks the load.
     if not _warm_done.is_set():
-        return {"boxes": [], "corridor": [], "caption": "", "observation": "",
+        return {"qwen_boxes": [], "corridor": [], "caption": "", "observation": "",
                 "skipped": "warming", "timing_ms": {"total": 0.0}}
 
     # ...and the same staleness rule. This one costs a full Qwen generate, so
     # it is the more expensive of the two to serve for nobody.
     if session_id and not sessions.touch(session_id):
-        return {"boxes": [], "corridor": [], "caption": "", "observation": "",
+        return {"qwen_boxes": [], "corridor": [], "caption": "", "observation": "",
                 "stale": True, "reason": "unknown_session",
                 "timing_ms": {"total": 0.0}}
 
     import time as _t
     _t0 = _t.time()
     image_bytes = await image.read()
-    result = perceive.perceive(image_bytes, debug=bool(debug))
+    result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug))
     sessions.log_perceive(session_id, len(image_bytes), result, (_t.time() - _t0) * 1000)
     return result
 

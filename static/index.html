@@ -206,6 +206,22 @@
     background: var(--surface-2);
     border: 1px solid var(--border-strong);
   }
+  /* Reads as a setting rather than an action: shorter than the buttons it sits
+     with, and hollow when off, the same on/off language #layers and #headway
+     already use at the top of the column. */
+  .detect-toggle {
+    min-height: 40px; font-size: 11px;
+    color: var(--accent-bright);
+    background: rgba(95,179,232,0.10);
+  }
+  .detect-toggle::before { content: '\25C9\00a0\00a0'; }
+  .detect-toggle[aria-pressed="false"] {
+    color: var(--text-dimmer);
+    background: transparent;
+    border-color: var(--border);
+  }
+  .detect-toggle[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
+
   .upload-label {
     color: var(--green);
     background: rgba(110,231,199,0.07);
@@ -1426,6 +1442,13 @@
       <input type="file" id="upload" accept="image/*,video/*" style="display:none">
       <button id="grab" class="hud-btn" style="display:none;">Grab This Frame</button>
       <button id="runheadway" class="hud-btn" style="display:none;">Run Headway On Video</button>
+      <!-- Detection follows the play button by default. Off, a clip plays with
+           no boxes at all, which is a real state a driver may want (watching
+           the footage rather than the analysis) and is now the ONLY way to see
+           a clip unannotated -- there is no second box layer to fall back to. -->
+      <button id="autodetect" class="hud-btn detect-toggle" type="button"
+              aria-pressed="true" style="display:none;"
+              title="Start detection automatically whenever the clip is playing">Auto-Detect On Play</button>
       <!-- The way back. Shown only while a clip is the source, because that is
            the only state it changes, and explicit because the clip must never
            be dropped by anything else. -->
@@ -2610,15 +2633,37 @@ document.addEventListener('DOMContentLoaded', () => {
     cv.toBlob(b => sendFrame(b, preview), 'image/jpeg', 0.85);
   });
 
+  /* Caption cadence on a clip. A headway run owns the GPU -- a /perceive is a
+     full Qwen generate and would starve the 4 fps loop it competes with -- so
+     it used to be silenced outright while one was running. That was fine while
+     a run was something you opted into; now that playing a clip starts one, it
+     would mean a played clip never produces a caption at all, and the caption
+     is what keeps RIO's view of the road current (vision.set_observation).
+
+     So it slows instead of stopping, to the same pair of numbers the live
+     drive loop already uses for the same trade: often enough to keep the
+     Perception column alive, rarely enough that the detection loop barely
+     notices. */
+  const PERCEIVE_MS_SOLO = 1500;
+  const PERCEIVE_MS_HEADWAY = 15000;
+
   let watcher = null;
   let inflight = false;
+  // -Infinity, not 0: `performance.now()` is time since the page loaded, so a
+  // zero here means the first caption waits for the page to be fifteen seconds
+  // old rather than for the cadence to elapse -- which on a short clip means
+  // no caption at all. Never-called has to compare as "long ago".
+  let lastPerceive = -Infinity;
+
   preview.addEventListener('play', () => {
     if (watcher) clearInterval(watcher);
     watcher = setInterval(() => {
       if (preview.paused || preview.ended || inflight) return;
-      // A headway run on this clip owns the GPU: a /perceive every 1.5 s is a
-      // full Qwen generate and would starve the 4 fps loop it is competing with.
-      if (RIO.headway && RIO.headway.videoRunning) return;
+      const running = !!(RIO.headway && RIO.headway.videoRunning);
+      const due = running ? PERCEIVE_MS_HEADWAY : PERCEIVE_MS_SOLO;
+      const now = performance.now();
+      if (now - lastPerceive < due) return;
+      lastPerceive = now;
       inflight = true;
       const cv = document.createElement('canvas');
       cv.width = preview.videoWidth;
@@ -2627,7 +2672,7 @@ document.addEventListener('DOMContentLoaded', () => {
       cv.toBlob(async b => {
         try { await sendFrame(b, preview); } finally { inflight = false; }
       }, 'image/jpeg', 0.85);
-    }, 1500);
+    }, 500);
   });
   preview.addEventListener('pause', () => { if (watcher) clearInterval(watcher); });
   preview.addEventListener('ended', () => { if (watcher) clearInterval(watcher); });
@@ -3157,7 +3202,16 @@ document.addEventListener('DOMContentLoaded', () => {
     return drift;
   }
 
+  /* True from the moment a start is accepted to the moment the loop owns the
+     `videoRunning` flag. There is an await in between -- the session reset --
+     and without this a second start landing inside that window passes the
+     `videoRunning` guard and runs a second loop against the same clip, two
+     frames deep on every request. A double-tap on the button could just about
+     do it; play events cannot help it, since a seek fires one. */
+  let videoStarting = false;
+
   async function runVideo() {
+    if (videoStarting) return;
     if (videoRunning) { videoRunning = false; return; }
     if (!preview || !preview.videoWidth) return;
     // A replay is a drive on a clip, so it says so out loud rather than
@@ -3172,7 +3226,12 @@ document.addEventListener('DOMContentLoaded', () => {
       if (speedHint) speedHint.textContent =
         'Set a speed override first — no speed means no classification';
     }
-    await resetSession();
+    videoStarting = true;
+    try {
+      await resetSession();
+    } finally {
+      videoStarting = false;
+    }
     if (RIO.overlay && RIO.overlay.resetLag) RIO.overlay.resetLag();
     videoRunning = true;
     runBtn.textContent = 'Stop Headway Run';
@@ -3291,14 +3350,67 @@ document.addEventListener('DOMContentLoaded', () => {
   ['pause', 'ended'].forEach(ev =>
     preview && preview.addEventListener(ev, () => { videoRunning = false; }));
 
-  // The Run button only makes sense once a clip is in the box.
+  /* ---------------- detection follows the play button --------------------
+
+     Pressing play on a clip now starts the detection loop, and this is the
+     default rather than a convenience. Until it was, a clip that was merely
+     playing showed boxes from /perceive -- a language model's rectangles,
+     drawn every ~1.5 s, in roughly the right shape and not always the right
+     place. Those are gone, so a played clip with no detection running would
+     show no boxes at all and look like a broken overlay rather than a
+     deliberate one. Play means analyse; the toggle beside the Run button turns
+     that off for someone who wants to watch the footage plain.
+
+     Not a call to runVideo(): that function is the BUTTON's handler and it
+     toggles, so calling it while a run is up would stop the run instead of
+     leaving it alone. Two play events in a row are ordinary -- a seek fires
+     one -- so the guard has to be a guard and not a toggle. */
+  let autoRun = true;
+
+  function autoStart() {
+    if (!autoRun || videoRunning) return;
+    if (!enabled) return;              // Headway switched off is switched off
+    if (RIO.driving) return;           // a live drive owns the capture loop
+    if (!(RIO.source && RIO.source.isClip())) return;
+    if (!preview || preview.paused || !preview.videoWidth) return;
+    runVideo();
+  }
+
+  /* Four events, because `play` alone does not mean what it sounds like: it
+     fires the instant `paused` flips, which on a freshly uploaded clip is
+     before a single byte has been decoded. videoWidth is still 0 there, the
+     start is correctly refused, and nothing ever asks again -- the clip plays
+     to the end with no boxes on it. `playing`, `loadeddata` and `canplay` are
+     the moments the element actually has pixels; whichever arrives first wins
+     and the rest are no-ops against the `videoRunning` guard. */
+  ['play', 'playing', 'loadeddata', 'canplay'].forEach(ev => {
+    if (preview) preview.addEventListener(ev, autoStart);
+  });
+
+  // The Run button and its toggle only make sense once a clip is in the box.
+  const autoBtn = document.getElementById('autodetect');
+  const showClipControls = (on) => {
+    if (runBtn) runBtn.style.display = on ? 'flex' : 'none';
+    if (autoBtn) autoBtn.style.display = on ? 'flex' : 'none';
+  };
+
+  if (autoBtn) {
+    autoBtn.addEventListener('click', () => {
+      autoRun = !autoRun;
+      autoBtn.setAttribute('aria-pressed', autoRun ? 'true' : 'false');
+      // Acted on immediately in both directions: switched on over a clip that
+      // is already playing it starts now rather than at the next play, and
+      // switched off it stops rather than running until the clip ends.
+      if (autoRun) autoStart();
+      else if (videoRunning) runVideo();
+    });
+  }
+
   const upload = document.getElementById('upload');
   if (upload) {
     upload.addEventListener('change', (e) => {
       const f = e.target.files[0];
-      if (runBtn) {
-        runBtn.style.display = (f && f.type.startsWith('video/')) ? 'flex' : 'none';
-      }
+      showClipControls(!!(f && f.type.startsWith('video/')));
     });
   }
 
@@ -3350,11 +3462,10 @@ document.addEventListener('DOMContentLoaded', () => {
   if (!wrap || !canvas) return;
   const ctx = canvas.getContext('2d');
 
-  const VULNERABLE = ['pedestrian', 'person', 'cyclist', 'bicycle', 'motorcyclist'];
   const CYAN = '#5fb3e8', AMBER = '#ffb84d', LEAD = '#9bd6ff';
 
   let enabled = true;
-  let last = null;            // { result, el }  -- /perceive
+  let last = null;            // { result, el }  -- /perceive: geometry only
 
   /* /headway_frame results, oldest first, each tagged with the moment it
      describes. NOT a single "latest result": a result is drawn when the video
@@ -3576,38 +3687,6 @@ document.addEventListener('DOMContentLoaded', () => {
     ctx.restore();
   }
 
-  function drawBox(m, b) {
-    const x1 = m.x(b.box[0]), y1 = m.y(b.box[1]);
-    const x2 = m.x(b.box[2]), y2 = m.y(b.box[3]);
-    const label = String(b.label || 'object').toLowerCase();
-    const color = b.lead ? LEAD : (VULNERABLE.indexOf(label) >= 0 ? AMBER : CYAN);
-
-    ctx.save();
-    ctx.strokeStyle = color;
-    // `confirmed` is absent on older responses, which means "assume yes" —
-    // the field is additive and its absence must not dim every box.
-    const confirmed = (b.confirmed === undefined) ? true : !!b.confirmed;
-    ctx.globalAlpha = confirmed ? 1 : 0.55;
-    ctx.lineWidth = b.lead ? 1.5 : 1;
-    ctx.shadowColor = color;
-    ctx.shadowBlur = b.lead ? 10 : 6;
-    if (!confirmed) ctx.setLineDash([3, 3]);
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.restore();
-
-    if (b.lead) drawBrackets(x1, y1, x2, y2, LEAD);
-
-    let text = label;
-    // Same rule as the headway layer: a range the server refused (implausible
-    // for the box size, or a box too small to measure) prints "--".
-    text += (typeof b.distance_m === 'number')
-      ? ' · ' + b.distance_m.toFixed(1) + 'm' : ' · --';
-    if (b.lead) text = '▸ ' + text;
-    // Above the box, unless that would clip off the top of the frame.
-    const ty = (y1 - 5 < 12) ? Math.min(y2 + 14, wrap.clientHeight - 2) : y1 - 5;
-    drawLabel(text, Math.max(2, x1), ty, color);
-  }
-
   /* Extrapolate a box forward by the tracker's own velocity estimate.
 
      Between results a box is drawn where the object WAS, and at 4 fps a car
@@ -3717,12 +3796,13 @@ document.addEventListener('DOMContentLoaded', () => {
     drawLabel(bits.join(' · '), Math.max(2, px.x1), ty, color);
   }
 
-  /* How long a headway result stays the authority on what is in the scene.
-     While one is fresh, the /perceive box layer is not drawn at all: both
-     describe the same road users, /headway_frame does it every frame from a
-     detector while /perceive does it every ~15 s from a language model, and
-     drawing both put two boxes of different vintages on one car. The caption
-     and the corridor from /perceive are unaffected -- only its boxes. */
+  /* How long a headway result keeps the extrapolation loop running.
+
+     It used to mean more than that: while a result was fresh the /perceive box
+     layer was suppressed, because both layers described the same road users
+     and drawing both put two boxes of different vintages on one car. There is
+     only one box layer now, so all this bounds is how long the overlay keeps
+     repainting between results before it lets the frame go stale. */
   const HW_AUTHORITATIVE_MS = 1500;
 
   /* --- when a result belongs on the screen -------------------------------
@@ -3840,8 +3920,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const now = performance.now();
     const hw = dueEntry();
     const hwAge = hw ? entryAge(hw) : null;
-    const hwFresh = hw !== null && (now - hw.t) < HW_AUTHORITATIVE_MS;
-
+    /* /perceive contributes GEOMETRY ONLY: the corridor and the lane lines,
+       both deterministic and both from headway/. It used to contribute boxes
+       as well -- Qwen's, drawn whenever a headway result was not fresh -- and
+       that layer is gone. A language model is a describer of road scenes and
+       not a detector, and its rectangles landed far enough from their objects
+       often enough that they spent the credibility of the boxes that were
+       right. Every drawn box now comes from RF-DETR and the tracker, through
+       drawHeadway, and there is no arbitration between two box layers left to
+       get wrong. */
     let drewCorridor = false;
     if (last && last.result) {
       const el = dims(last.el) ? last.el : mediaEl();
@@ -3850,17 +3937,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (m) {
         drawCorridor(m, last.result.corridor);
         drewCorridor = !!(last.result.corridor && last.result.corridor.length);
-        // /perceive gates its lead on the same corridor headway does, so it
-        // carries the same lane lines. Drawn here for the frames between
-        // headway results.
+        // Drawn here for the frames between headway results.
         drawLanes(m, last.result.lanes, last.result.lane_scores,
                   last.result.lane_plausible);
-        if (!hwFresh) {
-          const boxes = last.result.boxes || [];
-          // Lead last so its brackets sit on top of any box it overlaps.
-          boxes.forEach(b => { if (!b.lead) drawBox(m, b); });
-          boxes.forEach(b => { if (b.lead) drawBox(m, b); });
-        }
       }
     }
 

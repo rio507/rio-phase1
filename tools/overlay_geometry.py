@@ -335,7 +335,7 @@ def run_one(pw, clip, truth, outdir, lanes=False, keep=False, headed=False,
     # one marker and the scan would measure whichever was outermost.
     page.route("**/perceive*", lambda r: r.fulfill(
         status=200, content_type="application/json",
-        body=json.dumps({"observation": "", "boxes": [], "corridor": [],
+        body=json.dumps({"observation": "", "qwen_boxes": [], "corridor": [],
                          "lanes": [], "image": {"w": 1, "h": 1}})))
 
     page.goto(BASE + "/", wait_until="domcontentloaded")
@@ -355,7 +355,23 @@ def run_one(pw, clip, truth, outdir, lanes=False, keep=False, headed=False,
     except Exception:
         pass
 
-    page.click("#runheadway")
+    # Playing a clip starts the detection loop on its own now, and #preview
+    # carries `autoplay`, so by the time the upload has a videoWidth the run is
+    # usually already up. Clicking Run there would TOGGLE IT OFF -- so the
+    # button is only used when the automatic start did not happen (the toggle
+    # switched off, a browser that refused autoplay).
+    started = page.evaluate(
+        "() => !!(window.RIO && RIO.headway && RIO.headway.videoRunning)")
+    if not started:
+        try:
+            page.wait_for_function(
+                "() => !!(window.RIO && RIO.headway && RIO.headway.videoRunning)",
+                timeout=3000)
+            started = True
+        except Exception:
+            started = False
+    if not started:
+        page.click("#runheadway")
     if fullscreen:
         # The other geometry: fullscreen drops the 16:9 lock and switches the
         # media to object-fit: contain, so the frame letterboxes instead of

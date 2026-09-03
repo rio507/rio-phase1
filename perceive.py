@@ -1,15 +1,29 @@
-"""Structured perception for the dashboard overlay: boxes + depth + corridor.
+"""The caption, and the deterministic geometry that goes under it.
 
 /observe answers "what do you see?" in one sentence. /perceive answers the same
-question *and* returns where each thing is and how far away, so the dashboard can
-draw it over the video. It is additive -- /observe is untouched and still serves
-RIO's voice path.
+question and returns the ego corridor and the detected lane lines with it. It is
+additive -- /observe is untouched and still serves RIO's voice path.
 
-Budget is one Qwen call plus one depth pass per frame, so the caption is produced
-by the SAME grounding call that produces the boxes rather than a second
-generate(). Everything geometric (corridor, lead choice) stays deterministic in
-headway/, per the design's LLM firewall: Qwen says which pixels, never which
-object matters.
+NOTHING HERE PRODUCES A BOX THE OVERLAY DRAWS, AND THAT IS THE POINT.
+It used to. Qwen was asked to ground its caption, the grounded boxes came back
+with a distance measured inside each one, and the dashboard drew them. The
+boxes were the right shape and the wrong place often enough to matter: a
+pedestrian bracket a hundred and fifty pixels off the pedestrians, a car-sized
+rectangle on empty tarmac with a confident number under it. A language model is
+a superb describer of a road scene and is not a detector, and mixing its output
+into the same overlay as RF-DETR's spent the credibility of the boxes that were
+right on the ones that were not.
+
+So the drawn boxes have ONE source now -- RF-DETR and the tracker, through
+/headway_frame -- and Qwen keeps the job it is actually good at. What it says it
+saw still ships, as `qwen_boxes`, because a caption is easier to review next to
+the pixels it was talking about; they are a record of a claim, they carry no
+measured distance, and nothing draws them. The depth pass that existed to put a
+number inside each one has gone with them.
+
+Everything geometric here (the corridor, the lane lines) is deterministic and
+comes out of headway/, per the design's LLM firewall: Qwen says what the road
+looks like, never where anything is.
 
 Model sharing: this lends vision.py's already-resident Qwen3-VL to
 headway.anchor through set_qwen_provider(), so a /perceive never pulls a second
@@ -18,7 +32,6 @@ copy of the weights.
 import io
 import json
 import re
-import threading
 import time
 
 import numpy as np
@@ -27,23 +40,18 @@ from PIL import Image
 import config
 import vision
 from headway import anchor as anchor_mod
-from headway import depth as depth_mod
 from headway import lanes as lanes_mod
-from headway import plausibility as plaus_mod
 
 # Lend the app's Qwen to headway. Import-time so any entry point into this
 # module (endpoint, warm, self-test) is covered before the first anchor call.
 anchor_mod.set_qwen_provider(vision.get_handles)
 
-# Labels the overlay knows how to colour. Anything else Qwen invents is kept but
-# drawn in the vehicle style, which is the safer default for a driving scene.
-VEHICLE_LABELS = {"car", "truck", "bus", "van", "motorcycle", "train"}
-VULNERABLE_LABELS = {"pedestrian", "person", "cyclist", "bicycle"}
-
-# Only these can be the lead. anchor.py's corridor logic exists to pick the
-# vehicle being followed; a pedestrian in the corridor is a hazard for the
-# warning path, not a headway target, and calling one "lead" would be wrong.
-LEAD_LABELS = VEHICLE_LABELS
+# These went with the boxes. VEHICLE_LABELS and VULNERABLE_LABELS told the
+# overlay which colour to stroke a Qwen box in; LEAD_LABELS said which of them
+# could be called the lead. Nothing here draws and nothing here picks a lead any
+# more, and headway/membership.py has owned the real versions of both lists for
+# as long as the detector has -- so a second copy under this roof could only
+# ever drift away from the one that decides something.
 
 # Prefill scales with vision tokens, so the frame is downscaled for the model
 # call. Boxes come back normalised (0-1000) and are rescaled to the ORIGINAL
@@ -79,8 +87,6 @@ PERCEIVE_PROMPT = (
     'If nothing is visible use an empty list: {"c": "<caption>", "o": []}'
 )
 
-_warm_lock = threading.Lock()
-_warmed = False
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +253,10 @@ def _parse(text: str, width: int, height: int):
 # Main entry point
 # ---------------------------------------------------------------------------
 def perceive(image_bytes: bytes, debug: bool = False) -> dict:
-    """One frame -> boxes with distances, ego corridor, and a caption.
+    """One frame -> a caption, the ego corridor, and the lane lines.
+
+    Plus `qwen_boxes`: what the model said it saw, as a record beside the
+    caption. Nothing here is drawn on the video -- see the module docstring.
 
     `debug` adds the raw model reply and token count to the response. Off by
     default: it is verbose and would bloat every session-log line.
@@ -259,7 +268,7 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
     if not config.VISION_ENABLED:
         corridor = anchor_mod.EgoCorridor(width, height)
         return {
-            "boxes": [], "corridor": [list(p) for p in corridor.polygon()],
+            "qwen_boxes": [], "corridor": [list(p) for p in corridor.polygon()],
             "caption": "", "observation": "",
             "image": {"w": width, "h": height},
             "timing_ms": {"total": 0.0},
@@ -269,16 +278,8 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
     t_qwen = time.time()
     caption, parsed = _parse(raw, width, height)
 
-    # BGR uint8 for depth_map: every headway consumer is OpenCV-native.
+    # BGR uint8 for the lane detector: every headway consumer is OpenCV-native.
     frame_bgr = np.ascontiguousarray(np.asarray(pil)[:, :, ::-1])
-    depth_map = None
-    try:
-        depth_map = depth_mod.depth_map(frame_bgr)
-    except Exception as e:
-        # A depth failure costs distances, not the whole frame: boxes and the
-        # caption are still worth returning to the overlay.
-        print(f"[perceive] depth failed: {e}", flush=True)
-    t_depth = time.time()
 
     # The SAME corridor the headway loop uses this frame, not a second opinion.
     # These two paths pick a lead independently -- headway to warn on, perceive
@@ -298,67 +299,24 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         print(f"[perceive] lane detection unavailable: {e}", flush=True)
     corridor, lane_info = anchor_mod.build_corridor(base_corridor, lane_result)
 
-    # The same size-vs-depth veto the live loop applies (headway/plausibility.py),
-    # for the same reason and on the same geometry. This path draws boxes with
-    # distances on them too, and a distance nobody checked is a distance that
-    # can be 6 m on a 10 px box -- which is precisely what the overlay was
-    # showing. Qwen proposes the pixels here rather than RF-DETR, which if
-    # anything makes the check more necessary: a language model will happily
-    # invent a box on road-end texture.
-    f_px = getattr(corridor, "f_px", None) or plaus_mod.focal_px(width)
-
-    boxes = []
-    for label, box in parsed:
-        x1, y1, x2, y2 = box
-        distance_m = None
-        conf = 0.0
-        reject = None
-        if depth_map is not None:
-            d, conf, _ = depth_mod.roi_depth(depth_map, box)
-            if np.isfinite(d) and conf > 0.2:
-                distance_m = round(float(d), 1)
-
-        # Bottom-centre is where the object meets the road -- the same anchor
-        # point anchor.py validates against the corridor.
-        u, v = (x1 + x2) / 2.0, y2
-        inside, geo = corridor.contains(u, v)
-        if distance_m is None and inside and "forward_m" in geo:
-            # No trustworthy depth: fall back to the corridor's flat-road range
-            # so the box still carries a distance the driver can read.
-            distance_m = round(float(geo["forward_m"]), 1)
-
-        verdict = plaus_mod.check(label, box, distance_m, f_px, image_h=height)
-        if distance_m is not None and not verdict["ok"]:
-            reject = verdict["reason"]
-            distance_m = None
-
-        boxes.append({
-            "label": label,
-            "box": [round(float(x1), 1), round(float(y1), 1),
-                    round(float(x2), 1), round(float(y2), 1)],
-            "distance_m": distance_m,
-            "lead": False,
-            "in_corridor": bool(inside),
-            "depth_conf": round(float(conf), 3),
-            # Parity with headway's scene_objects, so the overlay draws both
-            # layers by one rule: a box that cannot be measured shows "--".
-            "confirmed": bool(verdict["confirmed"]),
-            "range_reject": reject,
-        })
-
-    # Lead = nearest in-corridor vehicle, chosen by geometry exactly as
-    # anchor.anchor() does. Qwen's ordering never decides this.
-    lead_idx, lead_range = None, None
-    for i, b in enumerate(boxes):
-        if not b["in_corridor"] or b["label"] not in LEAD_LABELS:
-            continue
-        r = b["distance_m"]
-        if r is None:
-            continue
-        if lead_range is None or r < lead_range:
-            lead_idx, lead_range = i, r
-    if lead_idx is not None:
-        boxes[lead_idx]["lead"] = True
+    # What Qwen said it saw, in frame pixels, and nothing derived from it.
+    #
+    # There is no distance here and no lead. Both used to exist, and both
+    # existed only to be drawn: a depth median inside each box, a corridor
+    # fallback when the depth was untrustworthy, and a plausibility veto over
+    # the top of the two. That veto was doing real work -- it caught 6 m
+    # claimed on a 10 px box -- but the thing it was protecting was a number
+    # measured inside a rectangle that a language model had placed, and no
+    # amount of checking makes such a number worth putting on a screen next to
+    # a measured one. Range belongs to the path that has a detector and a
+    # tracker under it.
+    #
+    # The boxes themselves stay because they cost nothing and they make the
+    # caption reviewable: "four cars on the highway" is much easier to judge
+    # against the four rectangles the model was looking at when it said it.
+    qwen_boxes = [{"label": label,
+                   "box": [round(float(v), 1) for v in box]}
+                  for label, box in parsed]
 
     if caption:
         # Drive mode now calls /perceive instead of /observe, so this is the
@@ -368,7 +326,7 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
     t_end = time.time()
     if debug:
         return {
-            "boxes": boxes,
+            "qwen_boxes": qwen_boxes,
             "corridor": [[round(float(x), 1), round(float(y), 1)]
                          for x, y in corridor.polygon()],
             "corridor_source": corridor.source,
@@ -379,16 +337,15 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "lane_plausible": list((lane_result or {}).get("lane_plausible") or []),
             "caption": caption, "observation": caption,
             "image": {"w": width, "h": height},
-            "lead_range_m": lead_range,
             "raw": raw,
             "timing_ms": {
                 "qwen": round((t_qwen - t0) * 1000, 1),
-                "depth": round((t_depth - t_qwen) * 1000, 1),
+                "geometry": round((t_end - t_qwen) * 1000, 1),
                 "total": round((t_end - t0) * 1000, 1),
             },
         }
     return {
-        "boxes": boxes,
+        "qwen_boxes": qwen_boxes,
         "corridor": [[round(float(x), 1), round(float(y), 1)]
                      for x, y in corridor.polygon()],
         "corridor_source": corridor.source,
@@ -404,29 +361,11 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         # Same text under the key the existing dashboard code already reads.
         "observation": caption,
         "image": {"w": width, "h": height},
-        "lead_range_m": lead_range,
         "timing_ms": {
             "qwen": round((t_qwen - t0) * 1000, 1),
-            "depth": round((t_depth - t_qwen) * 1000, 1),
+            "geometry": round((t_end - t_qwen) * 1000, 1),
             "total": round((t_end - t0) * 1000, 1),
         },
     }
 
 
-def warm() -> None:
-    """Load the depth model and pay its kernel warmup.
-
-    Qwen is already warmed by vision.warm(); this only covers the second model
-    so the first real /perceive is not the one that waits for it.
-    """
-    global _warmed
-    if not config.VISION_ENABLED:
-        return
-    with _warm_lock:
-        if _warmed:
-            return
-        try:
-            depth_mod.warm()
-            _warmed = True
-        except Exception as e:
-            print(f"[perceive] depth warm failed: {e}", flush=True)
