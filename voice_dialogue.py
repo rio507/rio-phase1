@@ -76,6 +76,20 @@ SOCKET_ERROR = "socket_error"
 SOCKET_UNAVAILABLE = "socket_unavailable"
 SYNTH_ERROR = "synth_error"
 SERVICE_DOWN = "service_down"
+# Every dialogue seat in the workspace is taken. Its own cause, because it is
+# its own condition: nothing is broken, nothing will get better by retrying,
+# and the thing that fixes it is another car finishing a drive.
+NO_SEAT = "no_dialogue_seat"
+
+# How the service says so. It arrives two ways — as an error message on the
+# socket, and as the REASON on a 1008 close — and the reason text is all a
+# closed connection leaves behind, so both are matched on the same marker.
+_NO_SEAT_MARKERS = ("too_many_concurrent_requests", "too many concurrent requests")
+
+
+def _is_capacity(text) -> bool:
+    low = str(text or "").lower()
+    return any(m in low for m in _NO_SEAT_MARKERS)
 
 
 def api_key() -> str:
@@ -285,6 +299,9 @@ class DialogueSession:
         self._utt = None
         self._last_send = 0.0
         self._consecutive_failures = 0
+        # While this is in the future the dialogue socket is parked and every
+        # utterance goes to flash. See ELEVENLABS_CAPACITY_BACKOFF_S.
+        self._no_seat_until = 0.0
 
         self.degraded = False     # tier 2: ElevenLabs is out, cedar has it
         self.stats = {"utterances": 0, "reconnects": 0, "keepalives": 0,
@@ -320,6 +337,45 @@ class DialogueSession:
                   f"{type(e).__name__}: {str(e)[:160]}", flush=True)
             self._ws = None
             return False
+
+    def _parked(self) -> bool:
+        """Is the dialogue socket parked because the pool was full?"""
+        return time.time() < self._no_seat_until
+
+    async def _note_no_seat(self, where: str):
+        """Park the socket, and say so ONCE.
+
+        Once because this repeats per utterance otherwise, and a log that
+        repeats is a log nobody reads. The drive carries on in the same voice
+        on flash, which is the point: a full pool costs prosody, not speech.
+        """
+        first = not self._parked()
+        self._no_seat_until = time.time() + config.ELEVENLABS_CAPACITY_BACKOFF_S
+        # Let the connection go, whichever way the refusal arrived.
+        #
+        # It costs no seat to hold one — that is the whole surprise of this
+        # pool — but it buys nothing either: every synthesis on it is refused
+        # until a seat frees, and keeping it alive leaves TWO ways back to a
+        # working socket depending on whether the service closed the connection
+        # or merely answered on it. One way is easier to be sure of, and the
+        # tick's seat retry is that way.
+        ws, self._ws = self._ws, None
+        if ws:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        if not first:
+            return
+        self._note_fallback(NO_SEAT)
+        print(f"[voice] every dialogue seat in the workspace is in use "
+              f"({where}); this drive runs on "
+              f"{config.ELEVENLABS_DETERMINISTIC_MODEL} for the next "
+              f"{config.ELEVENLABS_CAPACITY_BACKOFF_S:.0f}s", flush=True)
+        await self._emit("fallback", {
+            "tier": "flash", "cause": NO_SEAT, "rid": None,
+            "model": config.ELEVENLABS_DETERMINISTIC_MODEL,
+            "retry_in_s": config.ELEVENLABS_CAPACITY_BACKOFF_S})
 
     async def start(self) -> bool:
         """Open the socket when the drive starts, not when RIO first speaks.
@@ -421,27 +477,46 @@ class DialogueSession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            if self._closed:
+            if self._closed or self._ws is not ws:
+                # A close WE caused — the session ending, or a capacity refusal
+                # that has already parked this socket. Reporting it as a drop
+                # is how a deliberate act ends up in the log looking like a
+                # fault, next to the line that explains what really happened.
                 return
             why = type(e).__name__
-            print(f"[voice] dialogue socket dropped: {why}: {str(e)[:120]}",
-                  flush=True)
+            # A 1008 close carrying `too_many_concurrent_requests` is not a
+            # dropped socket, and reconnecting is the wrong reflex: the new
+            # connection is accepted (a connection costs no seat) and the next
+            # utterance is refused exactly the same way.
+            if _is_capacity(e):
+                why = NO_SEAT
+                await self._note_no_seat("closed by the service")
+            else:
+                print(f"[voice] dialogue socket dropped: {why}: {str(e)[:120]}",
+                      flush=True)
         if self._closed or self._ws is not ws:
             return          # a deliberate close, or already replaced
         # An utterance in flight has to be rescued before the socket is
         # replaced, or the driver hears half an answer and no more.
         utt = self._utt
         if utt and not utt.done and not utt.cancelled:
-            await self._fall_back(utt, SOCKET_ERROR)
+            await self._fall_back(utt, NO_SEAT if why == NO_SEAT else SOCKET_ERROR)
+        if why == NO_SEAT:
+            self._ws = None       # parked, not replaced
+            return
         await self._reconnect(why)
 
     async def _on_message(self, m: dict):
         if m.get("error"):
-            print(f"[voice] dialogue error: {str(m.get('message'))[:160]}",
-                  flush=True)
+            capacity = _is_capacity(m.get("error")) or _is_capacity(m.get("message"))
+            if capacity:
+                await self._note_no_seat("refused on the socket")
+            else:
+                print(f"[voice] dialogue error: {str(m.get('message'))[:160]}",
+                      flush=True)
             utt = self._utt
             if utt and not utt.done and not utt.cancelled:
-                await self._fall_back(utt, SOCKET_ERROR)
+                await self._fall_back(utt, NO_SEAT if capacity else SOCKET_ERROR)
             return
 
         audio_b64 = m.get("audio")
@@ -578,6 +653,11 @@ class DialogueSession:
     async def _speak(self, utt: "_Utterance", phrase: str):
         if not phrase.strip():
             return
+        if self._parked() and not utt.on_flash:
+            # The pool was full a moment ago. Going back for a refusal per
+            # phrase costs a round trip and produces nothing.
+            utt.on_flash = True
+            utt.finals = utt.flushes
         if utt.on_flash:
             if utt.flushed_at is None:
                 utt.flushed_at = time.time()
@@ -735,6 +815,13 @@ class DialogueSession:
             if await self._send({"keep_alive": True}):
                 self.stats["keepalives"] += 1
 
+        # The back-off has run out and there is no socket. Try for a seat
+        # again — quietly, between utterances, where a failure costs nothing.
+        if (self._ws is None and not self._closed and not self.force_flash
+                and self._no_seat_until and not self._parked()):
+            self._no_seat_until = 0.0
+            await self._reconnect("seat retry")
+
         async with self._lock:
             utt = self._utt
             if utt and not utt.cancelled and not utt.ended:
@@ -755,6 +842,10 @@ class DialogueSession:
             "model": self.model,
             "voice_id": self.voice,
             "output_format": self.fmt,
+            # Parked on flash because the workspace's dialogue pool was full.
+            # Distinct from `degraded`, which is ElevenLabs not answering at
+            # all: this one is working exactly as designed, in a smaller voice.
+            "no_seat": self._parked(),
             "utterances": self.stats["utterances"],
             "reconnects": self.stats["reconnects"],
             "keepalives": self.stats["keepalives"],

@@ -29,6 +29,7 @@ reaches it.
 """
 import argparse
 import asyncio
+import json
 import os
 import sys
 import time
@@ -48,6 +49,12 @@ import voice_tags                                           # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 PASS, FAIL = [], []
+
+# Enough to fill this workspace's dialogue pool, with room over the measured 21
+# so the test discovers the limit rather than encoding it. If the plan changes
+# and the pool grows past this, the fill stops short and the check that says so
+# fails loudly instead of the section passing on a pool that is not full.
+POOL_PROBE_CAP = 30
 
 
 def ok(cond, what):
@@ -508,6 +515,97 @@ async def run_fallbacks():
        "network is flickering is worse than either of them")
 
 
+async def run_no_seat():
+    """The workspace's dialogue pool, filled for real, and what RIO does then.
+
+    MEASURED first, then asserted: this account (Starter) holds 21 concurrent
+    dialogue sessions — a separate and much larger pool than the standard
+    concurrency limit — and the seat is taken LAZILY. A connection costs
+    nothing; the refusal arrives the first time a session tries to synthesise,
+    as a 1008 close carrying `too_many_concurrent_requests`.
+
+    That shape is the reason this test exists. From inside a car it looks
+    exactly like a dropped socket, and the reflex that is right for a dropped
+    socket — reconnect — is wrong here: the new connection is accepted and the
+    next utterance is refused the same way, once per sentence, for the rest of
+    the drive.
+    """
+    section("I. a full dialogue pool — the one refusal that is not a fault")
+
+    import websockets
+
+    url = (vd.WS_URL + f"?model_id={config.ELEVENLABS_DIALOGUE_MODEL}"
+           f"&output_format={config.ELEVENLABS_OUTPUT_FORMAT}")
+    hdr = {"xi-api-key": vd.api_key()}
+    hogs = []
+
+    async def hog():
+        ws = await websockets.connect(url, additional_headers=hdr,
+                                      max_size=None, open_timeout=25)
+        await ws.send(json.dumps({"voices": [vd.voice_id()]}))
+        await ws.send(json.dumps({"inputs": [
+            {"text": "Holding a seat.", "voice_id": vd.voice_id(),
+             "new_turn": True}]}))
+        await ws.send(json.dumps({"flush": True}))
+        return ws
+
+    events = []
+
+    async def on_event(kind, detail):
+        events.append((kind, detail))
+
+    try:
+        # Fill it. Sequentially, so the count means something, and stopping the
+        # moment the service says it is full rather than guessing the number.
+        for _ in range(POOL_PROBE_CAP):
+            try:
+                hogs.append(await hog())
+                await asyncio.sleep(0.4)
+            except Exception:
+                break
+        ok(len(hogs) >= 2, f"held {len(hogs)} dialogue sessions to fill the pool")
+
+        s = vd.DialogueSession(on_audio=lambda *a: asyncio.sleep(0),
+                               on_event=on_event)
+        opened = await s.start()
+        ok(opened, "a car still CONNECTS with the pool full — a connection "
+                   "costs no seat, so nothing fails until she speaks")
+
+        heard = await _drive(s, "This is the first thing she says.", rid="p1",
+                             events=events, wait=25.0)
+        ok(any(d.get("cause") == vd.NO_SEAT
+               for k, d in events if k == "fallback"),
+           "the first utterance is refused, and it is recorded as a full pool "
+           "rather than as a dropped socket")
+        ok(heard["pcm"] > 0,
+           f"the driver still hears the line ({heard['pcm']} bytes), in the "
+           "same voice on the fast model")
+        ok(s.status()["no_seat"] is True,
+           "the dialogue socket is PARKED rather than reconnected — going back "
+           "for a refusal once per sentence is the failure this avoids")
+        ok(s._ws is None, "...and no connection is held while it is parked")
+
+        before = len([1 for k, d in events
+                      if k == "fallback" and d.get("cause") == vd.NO_SEAT])
+        await _drive(s, "And this is the second.", rid="p2", events=events,
+                     wait=25.0)
+        after = len([1 for k, d in events
+                     if k == "fallback" and d.get("cause") == vd.NO_SEAT])
+        ok(after == before,
+           "the second utterance goes straight to the fast model without "
+           "asking again, and without a second log line about it")
+        ok(not s.degraded,
+           "and a full pool is NOT the service being down: RIO keeps her own "
+           "voice rather than handing the drive back to cedar")
+        await s.close()
+    finally:
+        for ws in hogs:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
 def run_relay(base: str):
     section("I. the relay — the page never sees the key")
 
@@ -603,6 +701,10 @@ def main() -> int:
                     help="also open the real dialogue socket")
     ap.add_argument("--server", default=None,
                     help="check the relay against a running server")
+    ap.add_argument("--pool", action="store_true",
+                    help="fill the workspace's dialogue pool for real and "
+                         "check what a car does with none left (slow, and "
+                         "briefly uses every seat the account has)")
     args = ap.parse_args()
 
     run_session()
@@ -614,6 +716,8 @@ def main() -> int:
     if args.live:
         asyncio.run(run_live())
         asyncio.run(run_fallbacks())
+    if args.pool:
+        asyncio.run(run_no_seat())
     if args.server:
         run_relay(args.server.rstrip("/"))
 

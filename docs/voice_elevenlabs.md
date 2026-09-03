@@ -233,6 +233,19 @@ ElevenLabs has actually produced audio for — not at what was sent to it — so
 the driver hears one sentence with a change of texture in the middle rather
 than a clause twice.
 
+**The pool is full — which is neither of those.** Measured on this account
+(see below): a connection costs no dialogue seat, so the socket opens normally
+and the refusal arrives the first time RIO tries to *speak*, as a 1008 close
+carrying `too_many_concurrent_requests`. From inside a car that is
+indistinguishable from a dropped socket, and the reflex that is right for a
+dropped socket is wrong here — the reconnect succeeds, the next utterance is
+refused identically, and the drive spends itself reconnecting once per
+sentence. So a capacity refusal **parks** the dialogue socket for
+`ELEVENLABS_CAPACITY_BACKOFF_S` (60), runs every utterance on flash meanwhile,
+logs it once, and quietly asks for a seat again when the back-off expires. It
+is not counted as the service being down and never reaches cedar: a full pool
+costs prosody, not speech.
+
 **Tier 2 — the service is gone.** After
 `ELEVENLABS_FAILURES_BEFORE_CEDAR` (2) consecutive utterances where neither the
 socket nor flash produced anything, RIO takes her own voice back mid-drive: the
@@ -276,7 +289,9 @@ vocabulary.
 
 The rest lives in `config.py` under *WHOSE VOICE*: the chunker's two rules
 (`ELEVENLABS_CHUNK_MIN_TOKENS`, `ELEVENLABS_CHUNK_MAX_WAIT_MS`), the keep-alive
-interval, the output format, the tag policy and both fallback thresholds.
+interval, the output format, the tag policy, both fallback thresholds and
+`ELEVENLABS_CAPACITY_BACKOFF_S` — how long a car stays on flash after finding
+the dialogue pool full.
 
 > **A whitespace trap worth knowing about.** A key pasted out of a browser
 > arrives with a leading non-breaking space. Every call then fails with
@@ -293,6 +308,7 @@ interval, the output format, the tag policy and both fallback thresholds.
 python -m tools.voice_selftest                       # config, chunker, tags, firewall, clips
 python -m tools.voice_selftest --live                # + the real socket and both fallback tiers
 python -m tools.voice_selftest --server http://127.0.0.1:8888   # + the relay
+python -m tools.voice_selftest --pool                # + a genuinely full dialogue pool
 node tools/realtime_selftest.js                      # + the text-mode controller section
 node tools/live_voice_probe.js --voice elevenlabs    # the ten turns, through the sink
 python -m tools.voice_latency --turns 10             # the three voices, side by side
@@ -329,20 +345,56 @@ be about how fast the machine running them is.
   *rate* at which a real conversation reaches for a tag it does not get is a
   property of the model and the prompt, and wants a drive's worth of
   `/voice/status` behind it.
-* **Concurrency at the plan level.** See below.
+* **More than one car at once.** The limit is measured and the refusal path is
+  tested, but every measurement so far is one drive at a time. Nothing has
+  driven two RIOs against this workspace simultaneously.
 
 ---
 
-## One thing that needs a human
+## Concurrency — measured, because it is not published
 
-Dialogue sessions draw from a **separate pool** from ordinary synthesis — audio
-generated over the Text-to-Dialogue socket does not count toward the standard
-concurrency limit. This account is on the **Starter** tier, and the dialogue
-pool size for that tier is not exposed through the API.
+Dialogue sessions draw from a pool separate from ordinary synthesis, and
+ElevenLabs documents that fact without publishing the numbers: the per-tier
+table on the models page covers multilingual, flash, STT, realtime STT and
+music, and says nothing about dialogue. The subscription API does not expose it
+either. So it was measured, by opening sessions against this account until the
+service refused.
 
-This build holds **exactly one** dialogue connection per live RIO session, and
-closes the previous one if a page reloads mid-drive — so one car is one seat.
-That is fine for one driver and is the thing to check before a second one:
-someone with account access should confirm the Starter dialogue-session limit,
-because the failure mode if it is 1 is not an error, it is the second car
-starting every drive on cedar.
+**Starter holds 21 concurrent dialogue sessions.** The service says so itself:
+
+```
+too_many_concurrent_requests: Too many concurrent requests. Your current
+subscription is associated with a maximum of 21 concurrent requests
+```
+
+For scale, this tier's *standard* concurrency is 3 on multilingual v2 and 6 on
+flash — so the dialogue pool really is sized differently, and 21 cars talking
+at once is not a limit this product is going to reach soon.
+
+**The seat is taken lazily, and that is the part worth knowing.** Two probes
+disagreed before this was understood: thirty idle connections were all
+accepted, while twenty-two that had each generated once were not. A connection
+costs nothing; the seat is allocated at first synthesis and held until close.
+Which means:
+
+* the relay can open a car's socket at the start of a drive without spending
+  anything, which is exactly what it does — the ~90 ms of setup is paid before
+  RIO's first word rather than on it;
+* a page reload that briefly leaves two sockets open for one car costs one
+  seat, not two;
+* and a car that is going to be refused is refused **when she first speaks**,
+  not when the drive starts. That asymmetry is why the capacity path above
+  exists and why it is tested by filling the pool for real rather than by
+  simulating a refusal:
+
+```
+python -m tools.voice_selftest --pool
+```
+
+That test opens sessions until the service refuses, then drives a car through
+it: the connection succeeds, the first utterance falls back to flash and is
+recorded as a full pool rather than a dropped socket, the socket is parked
+rather than reconnected, the second utterance goes straight to flash without
+asking again, and the drive keeps RIO's own voice instead of reaching for
+cedar. It briefly uses every dialogue seat the account has, so it is behind its
+own flag rather than in the ordinary `--live` run.

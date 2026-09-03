@@ -259,6 +259,28 @@ ELEVENLABS_IDLE_TIMEOUT_MS = 20000
 # that does not arrive.
 ELEVENLABS_FIRST_BYTE_BUDGET_MS = 1500
 
+# ...and one condition that is neither a slow line nor a dead service.
+#
+# MEASURED on this account (Starter): the workspace may hold 21 concurrent
+# DIALOGUE sessions, which is a separate and much larger pool than the standard
+# concurrency limit (3 on multilingual v2, 6 on flash). The seat is taken
+# lazily — a connection alone costs nothing, and 22 idle sockets are all
+# accepted — so the refusal does not arrive at connect time. It arrives the
+# first time a session tries to SYNTHESISE, as a 1008 close carrying
+# `too_many_concurrent_requests`.
+#
+# Which means a car can open its socket cleanly at the start of a drive and be
+# cut off the moment RIO first speaks. That looks exactly like a dropped
+# socket, and the reconnect that is right for a dropped socket is wrong here:
+# the new connection is accepted, the next utterance is refused again, and the
+# drive spends itself reconnecting once per sentence into a pool that is full.
+#
+# So a capacity refusal parks the dialogue socket for this long and runs on
+# flash meanwhile — same voice, faster, and no churn. Sixty seconds because the
+# thing that frees a seat is another car finishing a drive, which is minutes
+# away, not milliseconds.
+ELEVENLABS_CAPACITY_BACKOFF_S = 60.0
+
 # TIER 2, per session: ElevenLabs is not answering at all — the socket will not
 # open and flash will not stream either. Then RIO's voice goes back to the live
 # session's own, mid-drive, by switching that session to audio output. Sticky
