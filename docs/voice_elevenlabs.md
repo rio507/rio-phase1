@@ -432,100 +432,99 @@ be about how fast the machine running them is.
 
 ---
 
-## "What do you see?" — where the time goes
+## "What do you see?" — the second model pass is gone
 
-The visual turn got slower when the voice changed, and the shape of it is not
-what the change made obvious. Measured end to end on the current path
-(`python -m tools.visual_latency --live --session auto`), with a seam at every
-stage, before and after the fixes below:
+A general question about the road is now answered by **speaking the running
+observation**, with no conversational model between the sentence and the
+driver. Measured end to end (`python -m tools.visual_latency --live --session
+auto`), three runs, ten questions each:
 
-| stage | before (p50/p95) | after (p50/p95) | whose time |
-|---|---|---|---|
-| turn end → `look()` called | 716 / 2178 ms | 704 / 1233 ms | the model |
-| `look()` → tool result | 4 / 5996 ms | **4 / 3421 ms** | ours |
-| tool result → first text token | 385 / 1697 ms | 607 / 766 ms | the model |
-| first token → first phrase out | 101 ms | **67 ms** | ours |
-| first phrase → FIRST AUDIO | 422 ms | 293 ms | the synthesiser |
-| **turn end → first audio, scene questions** | ~1629 ms | **~1480 ms** | |
-| turn end → first audio, all questions | 2464 / 5426 ms | 1898 / 4900 ms | |
-| observer cache hits | 4/8 | **7/10** | |
-| answer length | 23 / 44 words | 19 / 32 words | |
+| stage | was slow | gate fixed | **observer speaks** | whose |
+|---|---|---|---|---|
+| turn end → `look()` called | 716 ms | 704 | 588 | the model |
+| `look()` → tool result | 4 ms | 4 | 4 | ours |
+| tool result → first text token | 385 ms | 607 | **1** | — *gone* |
+| first token → first phrase out | 101 ms | 67 | **0** | — *gone* |
+| first phrase → first audio | 422 ms | 293 | 459 | the synthesiser |
+| **scene questions, turn end → first audio** | ~1629 ms | ~1480 | **1023 ms** (p95 1522) | |
+| object questions | — | — | 4720 ms | unchanged, and meant to be |
+| answer length | 23 words | 19 | **8** | |
 
-**The observer was never the problem.** It ran throughout — 304 observations
-over a ten-question run, `has_record` true — and every cache hit came back in
-**3–4 ms**. What was wrong was which questions reached it.
+**The two model stages collapsed to 1 ms.** What is left is the model deciding
+to call the camera (~590 ms, unavoidable — it has to hear the question) and the
+synthesiser (~460 ms). Best turns land at 891 ms.
 
-### The gate was judging the wrong sentence
+### The observer writes in her voice now
 
-`look()` decides whether a question can be answered from the running
-observation by matching it against a list of scene phrasings. Those phrasings
-are things *drivers* say. What arrives at the tool is what the *model* passed,
-and the model paraphrases: "what's around us right now" arrives as "describe
-the current scene", misses the list, and pays 2.3–6.0 s for a full remote
-visual turn to produce a sentence that was already sitting in memory.
-
-Two changes, and the second matters more than the first:
-
-* **The driver's own transcript now travels with the tool call.** The panel is
-  where Whisper's output lands, so it is the only thing that can send it, and
-  the gate judges it first. A paraphrase is now the fallback rather than the
-  authority.
-* **The rule is the right way round.** It was a whitelist of phrasings that
-  might be scene questions — a losing game, where every phrasing nobody thought
-  of costs two seconds. What actually disqualifies a caption from answering is
-  small, closed and already written down: the question asks about a *particular
-  thing*. So a short question with no object reference in it is a scene
-  question, and the whitelist survives only as the fast yes.
-
-Three of eight scene questions were taking the full path. Now the only
-questions that take it are the ones that should: "what's that car ahead",
-"what's on the left", "what colour is the car in front".
-
-### Two smaller things the numbers also named
-
-* **She was told to say "let me look" before calling the camera.** Those words
-  are composed *before* the call goes out, so the driver waits through them —
-  in front of a tool that usually answers in four milliseconds. She calls
-  first and speaks after now. The research tool, which really does take
-  seconds, keeps its holding line.
-* **Camera answers ran to 23 words at the median and 44 at p95**, against
-  instructions asking for one short sentence. Instructions are guidance; the
-  follow-up response after a `look` now carries
-  `REALTIME_LOOK_ANSWER_MAX_TOKENS` as an actual ceiling. 19 / 32 words after.
-
-### What did not turn out to be true
-
-Two reasonable suspicions, both cleared by measurement rather than argument:
-
-* **The observer is not gated on the old audio session.** It starts when the
-  session is minted, which text mode still does.
-* **v2's coarser chunking is not what delays the first word.** The first phrase
-  reaches the socket 67 ms after the model's first token. It was worth taking
-  to its floor anyway — the first phrase of an answer has nothing playing
-  behind it, so it now goes at three words or 120 ms rather than five or 250 —
-  but this stage was never the problem, and saying so is worth more than the
-  40 ms.
-
-### It is still above the target, and this is why
-
-The goal was ~1.2 s to first audio on a scene question. It is ~1.48 s, and the
-budget says where the rest is:
+The prompt was a captioning instruction — *"in one short sentence of 8 words or
+fewer, describe what you literally see"* — and produced captions, which is what
+it asked for. It is a voice brief now, with her register and examples of the
+rhythm:
 
 ```
-  ~700 ms   the model hearing the question and deciding to call the camera
-     4 ms   the camera answering
-  ~450 ms   the model composing a sentence from the answer
-    67 ms   the chunker deciding it is worth speaking
-  ~330 ms   v2 synthesising it
+Open freeway, light traffic — dry hills both sides
+Two lanes into town, wet road, brake lights ahead
 ```
 
-**About a second of that is two round trips to a remote model**, and roughly
-0.4 s is this system's. Getting under 1.2 s means removing one of the two model
-passes — speaking the observation with less of RIO's own composition on top of
-it — and that is a deliberate trade against the rule this codebase has held
-throughout: *she phrases it, the pipeline does not.* It is a decision about
-what RIO is, not a tuning parameter, so it is written down here rather than
-taken.
+Qwen writes in it. On a live drive: *"Open freeway light traffic dry hills both
+sides"*, and `unspeakable: 0` across 289 observations.
+
+### "She phrases it" became "she or her observer phrases it — never a raw caption"
+
+That rule used to be enforced by there being only one way for a camera answer
+to be spoken. There are two now, so the rule became a **check**: `persona.py`
+lints every observation against the bible's register — banned phrases, caption
+tells (*"the image"*, *"appears to be"*, *"there is a"*), first person, more
+than one sentence, more than fourteen words, a question, a list.
+
+* Passes → `speak_directly`, and the panel speaks it.
+* Fails → no `speak_directly`, and it goes back to **her** to compose, exactly
+  as before. The slow path is not deleted; it is the fallback.
+
+The banned-word list is **rendered into the system prompt from the same tuple
+the lint enforces**, so the words the model is told about and the words checked
+against it cannot drift — the same arrangement the audio-tag gate uses.
+
+A directly-spoken line is a full conversational utterance in every other
+respect: it claims the mouth at CONVO priority, a warning cuts through it, a
+barge-in stops it, and the session is told what she said as an assistant
+message (`output_text` — the API refuses `text` by name) so *"tell me more
+about that"* lands against a conversation that happened.
+
+**It is not resumed after a pre-emption**, and that is the right behaviour
+rather than a gap: it describes what the road looked like a second ago, and by
+the time the warning finishes, its second half describes somewhere the car has
+left. The observer will have written a newer one before she is asked again.
+
+### Which path each answer took
+
+`look()` returns `path`, and `/realtime/tool` logs it into the drive:
+
+| `path` | what happened | cost |
+|---|---|---|
+| `observer_direct` | the running line, spoken as written | ~4 ms + synthesis |
+| `observer_composed` | the line failed the lint; she composed over it | + a model pass |
+| `full_visual` | an object question: crop, resolve, remote multimodal | seconds |
+
+A drive that used to be mostly `observer_direct` and is now mostly
+`full_visual` has a different problem from one that is slow at every stage, and
+that is the first thing to look at when the camera feels slow again.
+`/realtime/status` also carries `unspeakable` and `speakable_now` per session.
+
+### Two bugs this found
+
+* **Contexts leaked.** The multi-context socket allows five at once, and an
+  utterance that fell back to flash never closed its context — `end()` skipped
+  the close for anything already on the fallback. Five slow lines in a drive
+  and the service closed the connection: *"Maximum simultaneous contexts per
+  WebSocket connection exceeded (5)"*, which then looked like a socket fault.
+  It cost three of seven scene answers ~1.7 s each, which is exactly the
+  first-byte budget plus a flash round trip. A context is given back on every
+  way out now.
+* **`voice_settings` may only appear in the first message on a connection.**
+  It was being sent per context, so every utterance after the first closed the
+  socket with a 1008, fell back, and reconnected — silently, because a fallback
+  that still makes audio still passes "she said something".
 
 ---
 

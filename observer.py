@@ -42,14 +42,39 @@ import threading
 import time
 
 import config
+import persona
 
 _lock = threading.Lock()
 _sessions = {}          # key -> {"thread", "stop", "last_used", "record", "n", "errors"}
 
 
+def _clean(text: str) -> str:
+    """Trim what a vision model adds around a sentence it was asked for.
+
+    Quotes, a stray "Answer:", a trailing full stop on something meant to be
+    spoken. None of this is the model failing — it is the shape of a chat
+    completion — and none of it should reach a speaker.
+    """
+    t = (text or "").strip().strip('"').strip("'").strip()
+    for prefix in ("answer:", "observation:", "sentence:", "rio:"):
+        if t.lower().startswith(prefix):
+            t = t[len(prefix):].strip()
+    return t.rstrip(".").strip()
+
+
 def _record(text, frame):
+    # IS THIS SPEAKABLE AS HER? Decided when the line is written rather than
+    # when a driver is waiting for it, and stored — the answer is a property of
+    # the sentence and does not change with time the way freshness does.
+    #
+    # A line that fails is still kept. It is a perfectly good description and
+    # the composed path still works from it; what it may not do is go straight
+    # to a speaker as something RIO said.
+    faults = persona.lint(text)
     return {
         "text": text,
+        "speakable": not faults,
+        "faults": faults,
         "at": time.time(),
         # The frame's OWN clock, not the observation's: the difference between
         # them is how long Qwen took, and a driver asking "what do you see"
@@ -108,12 +133,22 @@ def _tick(key, state):
     jpeg = getattr(frame, "jpeg", None)
     if not jpeg:
         return False
-    text = vision.observe(jpeg, frame_id=getattr(frame, "frame_id", None))
+    text = _clean(vision.observe(jpeg, frame_id=getattr(frame, "frame_id", None)))
     if not text:
         return False
+    rec = _record(text, frame)
     with _lock:
-        state["record"] = _record(text, frame)
+        state["record"] = rec
         state["n"] += 1
+        if not rec["speakable"]:
+            # Counted, and named. "She stopped sounding like herself" is a
+            # complaint somebody will make after a prompt change, and the
+            # answer wants to be a number with reasons attached rather than a
+            # shrug. Printed rarely, for the same reason errors are.
+            state["unspeakable"] = state.get("unspeakable", 0) + 1
+            if state["unspeakable"] in (1, 10, 100):
+                print(f"[observer] {key}: not in her voice ({rec['faults']}): "
+                      f"{text!r}", flush=True)
     return True
 
 
@@ -159,7 +194,7 @@ def start(session_key: str) -> bool:
             return False
         st = {"stop": threading.Event(), "last_used": time.time(),
               "record": None, "n": 0, "errors": 0, "started": time.time(),
-              "hold": 0}
+              "hold": 0, "unspeakable": 0}
         _sessions[key] = st
     st["thread"] = threading.Thread(target=_loop, args=(key, st),
                                     name=f"observer:{key}", daemon=True)
@@ -255,7 +290,7 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
     try:
         import vision
 
-        text = vision.observe(frame.jpeg, frame_id=frame.frame_id)
+        text = _clean(vision.observe(frame.jpeg, frame_id=frame.frame_id))
     except Exception as e:
         print(f"[observer] {key}: on-demand observation failed: "
               f"{type(e).__name__}: {e}", flush=True)
@@ -278,7 +313,13 @@ def status() -> dict:
         return {key: {"observations": st["n"], "errors": st["errors"],
                       "held": st.get("hold", 0),
                       "idle_s": round(time.time() - st["last_used"], 1),
-                      "has_record": bool(st.get("record"))}
+                      "has_record": bool(st.get("record")),
+                      # How often the running description came out in a voice
+                      # that is not hers, and so could not be spoken without
+                      # her composing over it.
+                      "unspeakable": st.get("unspeakable", 0),
+                      "speakable_now": bool((st.get("record") or {})
+                                            .get("speakable"))}
                 for key, st in _sessions.items()}
 
 

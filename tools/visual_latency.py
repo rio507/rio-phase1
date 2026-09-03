@@ -406,12 +406,33 @@ async def _one_visual_turn(conn, sink, http, base, session_id, question_pcm,
             # what this is measuring.
             marks["phrase_mark"]["armed"] = True
             marks["fast_path"] = bool(res.get("fast_path"))
+            marks["path"] = res.get("path")
             marks["on_demand"] = bool(res.get("on_demand"))
             marks["server_ms"] = res.get("took_ms")
             marks["seen_s_ago"] = res.get("seen_s_ago")
             await conn.conversation.item.create(item={
                 "type": "function_call_output",
                 "call_id": event.call_id, "output": _json.dumps(res)})
+            # THE DIRECT PATH, exactly as the panel does it: the observer's own
+            # sentence is spoken and no model is asked to compose one. A probe
+            # that still called response.create here would be measuring the
+            # path that was just removed.
+            if res.get("speak_directly") and res.get("speech") and sink:
+                await conn.conversation.item.create(item={
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text",
+                                 "text": res["speech"]}]})
+                marks["first_token"] = time.perf_counter()   # nothing to wait for
+                marks["answer"] = res["speech"]
+                await sink.begin(rid["id"] + ":direct")
+                await sink.delta(rid["id"] + ":direct", res["speech"])
+                await sink.end(rid["id"] + ":direct")
+                pm = marks["phrase_mark"]
+                deadline = time.perf_counter() + 8
+                while ("first_audio" not in pm
+                       and time.perf_counter() < deadline):
+                    await asyncio.sleep(0.02)
+                break
             await conn.response.create()
         elif t == "response.output_text.delta":
             # Only AFTER the tool result: the text before it is the holding
@@ -616,6 +637,7 @@ def _stage_row(marks, phrase_mark, obs):
         "server_ms": marks.get("server_ms"), "seen_s_ago": marks.get("seen_s_ago"),
         "answer": (marks.get("answer") or "").strip(),
         "asked": marks.get("asked"),
+        "path": marks.get("path"),
         "error": marks.get("error"),
         "capped": bool(marks.get("capped")),
         "observations": obs.get("observations"),
@@ -638,8 +660,8 @@ def _print_row(i, r):
         v = r.get(k)
         return f"{v:6.0f}" if v is not None else "     -"
 
-    flag = ("CACHE" if r.get("fast_path") and not r.get("on_demand")
-            else "qwen " if r.get("fast_path") else "FULL ")
+    flag = {"observer_direct": "SPEAK", "observer_composed": "cache",
+            "full_visual": "FULL "}.get(r.get("path"), "     ")
     asked = (r.get("asked") or "")
     rewrite = ""
     if asked and asked.strip().lower() != r["q"].strip().lower():
@@ -689,14 +711,15 @@ def _report_stages(rows, base, session_id, drive=None):
               f"p95 {pct(obj, 0.95):6.0f} ms   n={len(obj)}   "
               "— these are meant to be slow")
 
-    cache = sum(1 for r in rows if r.get("fast_path") and not r.get("on_demand"))
-    demand = sum(1 for r in rows if r.get("on_demand"))
-    full = sum(1 for r in rows if r.get("tool") and not r.get("fast_path"))
+    cache = sum(1 for r in rows if r.get("path") == "observer_direct")
+    demand = sum(1 for r in rows if r.get("path") == "observer_composed")
+    full = sum(1 for r in rows if r.get("path") == "full_visual")
     words = [r["answer_words"] for r in rows if r["answer_words"]]
-    print(f"\n    observer cache hits   {cache}/{len(rows)}")
-    print(f"    on-demand qwen passes {demand}/{len(rows)}   "
-          "(fast path, but a forward pass — the loop was behind)")
-    print(f"    full visual turns     {full}/{len(rows)}   "
+    print(f"\n    spoken from the observer  {cache}/{len(rows)}   "
+          "(no model composed it)")
+    print(f"    observer, composed by her {demand}/{len(rows)}   "
+          "(the line did not pass the lint)")
+    print(f"    full visual turns         {full}/{len(rows)}   "
           "(the remote multimodal path)")
     if words:
         print(f"    answer length         p50 {pct(words, 0.5)} words, "

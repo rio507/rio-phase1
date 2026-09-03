@@ -868,8 +868,21 @@ section('the clip bypass is untouched');
 section('awareness — the three tools a live session needs');
 // ---------------------------------------------------------------------------
 {
-  // 1. A visual question reaches the camera, and the observation comes back
-  //    into the session for RIO to phrase.
+  /* 1. A visual question reaches the camera, and what comes back is phrased —
+   *    by HER, or by her observer, but never spoken as a raw caption.
+   *
+   *    The rule used to be "she phrases it, the pipeline does not", and it was
+   *    enforced by there being exactly one way for a camera answer to be
+   *    spoken: hand it to the model and ask. That cost ~450 ms of remote
+   *    composition on an answer the camera had ready in four milliseconds, and
+   *    it was most of the wait on the commonest question there is.
+   *
+   *    So there are two ways now, and the rule became "she or her observer
+   *    phrases it — never a raw caption". The observer writes in her register
+   *    and the SERVER checks each line against persona.lint() before it may be
+   *    offered for direct speech; anything that fails comes back without
+   *    `speak_directly` and takes the composing path exactly as before. Both
+   *    halves are checked here. */
   const OBSERVATION = 'A white sedan two car lengths ahead in the same lane.';
   const h = harness({
     tool: (name, args) => {
@@ -887,7 +900,93 @@ section('awareness — the three tools a live session needs');
   ok(out && JSON.parse(out.item.output).answer === OBSERVATION,
      'a visual question puts the camera observation back into the session');
   ok(h.types().indexOf('response.create') >= 0,
-     'and asks her to answer from it — she phrases it, the pipeline does not');
+     'and an OBJECT question asks her to compose from it — that path is '
+     + 'unchanged, because a crop needs a sentence written about it');
+}
+
+{
+  // ...and a scene answer the observer already phrased is SPOKEN, not
+  // rewritten. This is the pass that was removed, and this is the check that
+  // it was removed only where the line is hers to begin with.
+  const eleven = require(path.join(__dirname, '..', 'static', 'rio_voice_eleven.js'));
+  const H = require(path.join(__dirname, 'voice_sink_harness.js'));
+  const SPOKEN = 'Open freeway, light traffic — dry hills both sides';
+  const arbiter = speech.makeArbiter();
+  const sent = [];
+  const events = [];
+  const rig = H.openSink(eleven, {});
+  const controller = rt.createController({
+    arbiter: arbiter,
+    send: (o) => sent.push(o),
+    tool: () => Promise.resolve({
+      ok: true, answer: SPOKEN, speech: SPOKEN, speak_directly: true,
+      path: 'observer_direct', took_ms: 4, seen_s_ago: 0.6 }),
+    audio: { mute: () => rig.sink.mute(), unmute: () => rig.sink.unmute() },
+    voice: rig.sink,
+    onEvent: (ev) => events.push(ev),
+  });
+  await rig.opened;
+  controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'look', call_id: 'v2',
+    arguments: JSON.stringify({ question: 'what do you see' }),
+  });
+  await settle();
+
+  ok(sent.filter(e => e.type === 'response.create').length === 0,
+     'a scene answer asks NO model to compose it — that pass is the thing '
+     + 'being removed');
+  const said = rig.wire.ops('delta').map(d => d.text).join('');
+  ok(said.indexOf('Open freeway') >= 0,
+     'the observer\'s own sentence goes straight to the synthesiser (' +
+     JSON.stringify(said) + ')');
+  ok(rig.wire.ops('begin').length === 1,
+     'as one utterance, with the mouth claimed for it');
+  ok(arbiter.state().speaking && /^live:direct/.test(arbiter.state().speaking.id),
+     'through the arbiter at conversation priority, so a warning still cuts '
+     + 'through it exactly as it cuts through anything she says');
+
+  const assistant = sent.find(e => e.type === 'conversation.item.create'
+                              && e.item && e.item.role === 'assistant');
+  ok(!!assistant, 'and the session is told what she said');
+  ok(assistant && assistant.item.content[0].type === 'output_text'
+     && assistant.item.content[0].text === SPOKEN,
+     'as an assistant message carrying the exact words — so "tell me more '
+     + 'about that" lands against a conversation that happened. output_text '
+     + 'because the API refuses `text` by name');
+  ok(controller.state().counters.spoken_directly === 1,
+     'and the drive counts how many answers skipped the model');
+}
+
+{
+  // A line that is NOT in her voice never reaches the speaker unrewritten.
+  // This is the whole of "never a raw caption": the server decides, and the
+  // panel does what it is told.
+  const eleven = require(path.join(__dirname, '..', 'static', 'rio_voice_eleven.js'));
+  const H = require(path.join(__dirname, 'voice_sink_harness.js'));
+  const CAPTION = 'The image shows a road with several cars on it.';
+  const sent = [];
+  const rig = H.openSink(eleven, {});
+  const controller = rt.createController({
+    arbiter: speech.makeArbiter(),
+    send: (o) => sent.push(o),
+    // No speak_directly: the server linted it and would not offer it.
+    tool: () => Promise.resolve({ ok: true, answer: CAPTION,
+                                  path: 'observer_composed', took_ms: 5 }),
+    audio: { mute: () => {}, unmute: () => {} },
+    voice: rig.sink,
+  });
+  await rig.opened;
+  controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'look', call_id: 'v3',
+    arguments: JSON.stringify({ question: 'what do you see' }),
+  });
+  await settle();
+  ok(sent.filter(e => e.type === 'response.create').length === 1,
+     'a caption the observer could not phrase goes back to HER to compose');
+  ok(rig.wire.ops('delta').length === 0,
+     'and not one word of it is spoken as it stands');
 }
 
 {

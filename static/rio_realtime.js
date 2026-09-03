@@ -467,7 +467,11 @@
                      resumed: 0, resume_skipped: 0, resume_failures: 0,
                      // Utterances the sink could not speak in the voice it was
                      // meant to, and the one time a drive gave up on it.
-                     voice_fallbacks: 0, voice_backend_changed: 0 };
+                     voice_fallbacks: 0, voice_backend_changed: 0,
+                     // Answers spoken straight from the running observation,
+                     // with no model between the sentence and the speaker.
+                     spoken_directly: 0 };
+    var directs = 0;
 
     /* WHY EVERY ANSWER STOPPED. One counter per cause, because "she cuts out"
        is four different faults wearing one coat and they have four different
@@ -576,8 +580,13 @@
        Both, always: cancelling generation alone leaves whatever is in the
        output buffer to play out from under a warning. */
     function cancelGeneration() {
-      try { send({ type: 'response.cancel' }); } catch (e) {}
-      try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+      /* A directly-spoken line has no response behind it to cancel. Sending
+         `response.cancel` with nothing generating is answered with an error
+         event, which is a real error in the log for a thing that worked. */
+      if (!(speaking && speaking.direct)) {
+        try { send({ type: 'response.cancel' }); } catch (e) {}
+        try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+      }
       /* The same two things, on the other side of the mouth: stop the words
          being produced, and throw away the sound already made from them. In
          text mode the second one is the sink's — the model's output buffer is
@@ -671,8 +680,9 @@
      * One arbiter item per RESPONSE, not per session: a session lasts a drive,
      * and an item that lasts a drive would either block every warning or be
      * pre-empted once and never recover. */
-    function beginResponse(responseId) {
+    function beginResponse(responseId, opts) {
       if (stopped) return;
+      opts = opts || {};
       /* The first response after a dictation was sent IS that dictation. It
          gets bound here rather than claiming the mouth: a warning arriving as
          a conversation-priority item would be a warning that yields to
@@ -703,7 +713,8 @@
         if (!speaking.finishing || speaking.responseId === responseId) return;
         endResponse(speaking.responseId);
       }
-      var entry = { responseId: responseId, resolve: null, cancelled: false };
+      var entry = { responseId: responseId, resolve: null, cancelled: false,
+                    direct: !!opts.direct };
       speaking = entry;
       counters.responses++;
       partial = '';
@@ -758,7 +769,13 @@
                  happen inside one say() and this is the middle of it. Asking
                  now for the name of the pre-empting item gets the name of the
                  item being pre-empted. */
-              armResume('preempted', said);
+              /* A DIRECT LINE IS NOT RESUMED, and that is the right
+                 behaviour rather than a gap. It describes what the road looked
+                 like a second ago; by the time the warning that pre-empted it
+                 has finished, the second half of it is a description of
+                 somewhere the car has left. The observer will have written a
+                 newer one before she is asked again. */
+              if (!entry.direct) armResume('preempted', said);
               setTimeout(function () {
                 noteCutoff('preempted', {
                   response_id: responseId, said: said,
@@ -870,7 +887,7 @@
       var rid = speaking.responseId;
       emit('LIVE_BARGE_IN', { response_id: rid });
       pendingBarge = { responseId: rid, cancelled: false, timer: null,
-                       confirm: null, said: '' };
+                       confirm: null, said: '', direct: !!speaking.direct };
       pendingBarge.timer = setTimeout(function () {
         if (!pendingBarge) return;
         pendingBarge.timer = null;
@@ -930,6 +947,7 @@
         return;
       }
       if (pendingBarge.confirm) return;          // already waiting
+      var wasDirect = pendingBarge.direct;
       if (pendingBarge.backstop) {
         clearTimeout(pendingBarge.backstop);
         pendingBarge.backstop = null;
@@ -941,8 +959,8 @@
         pendingBarge = null;
         noteCutoff('false_barge_in', { response_id: rid, said: said,
                                       detail: 'no transcript followed' });
-        armResume('false_barge_in', said);
-        tryResume();
+        // ...unless she was reading the road out. See beginResponse.
+        if (!wasDirect) { armResume('false_barge_in', said); tryResume(); }
       }, bargeConfirmMs);
     }
 
@@ -963,6 +981,7 @@
       var rid = pendingBarge.responseId;
       var said = pendingBarge.said || saidSoFar();
       var wasCancelled = pendingBarge.cancelled;
+      var wasDirect = pendingBarge.direct;
       clearBarge();
       if (!wasCancelled) {
         // Words arrived before the gate even closed. Real, and early: cancel
@@ -981,8 +1000,7 @@
       }
       noteCutoff('false_barge_in', { response_id: rid, said: said,
                                     detail: 'empty transcript' });
-      armResume('false_barge_in', said);
-      tryResume();
+      if (!wasDirect) { armResume('false_barge_in', said); tryResume(); }
     }
 
     function dictationStarted() {
@@ -1018,6 +1036,46 @@
          still fire, exactly as they do on the road, and they stop costing the
          conversation that was underneath them. */
       setTimeout(tryResume, 0);
+    }
+
+    /* SPEAK A LINE THAT NEEDS NO COMPOSING.
+     *
+     * The running observation is already one short sentence in RIO's register
+     * — the observer is prompted for her voice and the server checks the
+     * result against persona.lint() before ever offering it here — so for a
+     * general question about the road there is nothing for a model to add.
+     *
+     * Measured, that model pass cost ~450 ms of remote composition plus the
+     * round trip either side, on an answer the camera had ready in four
+     * milliseconds. This is the same sentence, spoken.
+     *
+     * It is a full conversational utterance in every other respect: it claims
+     * the mouth at CONVO priority through the arbiter, a warning cuts through
+     * it, a barge-in stops it, and the session is told what she said so the
+     * next question lands against a conversation that happened. What it does
+     * not do is ask a model to say it. */
+    function speakDirect(text, meta) {
+      var line = (text || '').trim();
+      if (!sink || stopped || !line) return Promise.resolve(false);
+      var id = 'direct:' + (++directs);
+      beginResponse(id, { direct: true });
+      var entry = speaking;
+      if (!entry || entry.responseId !== id) return Promise.resolve(false);
+      counters.spoken_directly++;
+      emit('LIVE_DIRECT_ANSWER', {
+        text: line, path: (meta && meta.path) || 'observer_direct',
+        seen_s_ago: meta && meta.seen_s_ago });
+      var release = function () {
+        if (speaking === entry) endResponse(id);
+        return true;
+      };
+      try {
+        sink.delta(id, line);
+        return sink.end(id).then(release, release);
+      } catch (e) {
+        release();
+        return Promise.resolve(false);
+      }
     }
 
     function toolCall(name, callId, argsJson) {
@@ -1059,13 +1117,38 @@
            *
            * Only for `look`, and only as a cap: an ordinary answer is a
            * fraction of it. Everything else keeps the session's own limit. */
+          /* ...unless the answer is already said. A scene question comes back
+             with the sentence itself, in her voice, and asking a model to
+             rewrite it is the slowest part of the turn.
+
+             The session is still told what came out, as an assistant message,
+             so "tell me more about that" lands against a conversation that
+             happened rather than a gap. `output_text` is the only content type
+             the API accepts for an assistant item — `text` is refused by
+             name. */
+          if (name === 'look' && result.speak_directly && result.speech && sink) {
+            send({
+              type: 'conversation.item.create',
+              item: { type: 'message', role: 'assistant',
+                      content: [{ type: 'output_text', text: result.speech }] },
+            });
+            speakDirect(result.speech, { path: result.path,
+                                         seen_s_ago: result.seen_s_ago });
+            emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
+                                       ok: true, path: result.path,
+                                       took_ms: result.took_ms || null,
+                                       spoke_directly: true });
+            return result;
+          }
           var ask = { type: 'response.create' };
           if (name === 'look' && lookAnswerMaxTokens) {
             ask.response = { max_output_tokens: lookAnswerMaxTokens };
           }
           send(ask);
           emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
-                                     ok: !!result.ok, took_ms: result.took_ms || null,
+                                     ok: !!result.ok, path: result.path || null,
+                                     took_ms: result.took_ms || null,
+                                     spoke_directly: false,
                                      note: result.note || null });
           return result;
         });
@@ -1190,6 +1273,11 @@
       },
 
       onEvent: function (fn) { if (typeof fn === 'function') listeners.push(fn); },
+
+      /* Say one line as her, with no model between it and the speaker. Only
+         the visual fast path uses this, and only for a line the server has
+         already checked against her register. */
+      speakDirect: speakDirect,
 
       /* Dictate one deterministic line — a warning, a turn, a health
          announcement — in RIO's voice, word for word.
@@ -1328,6 +1416,7 @@
           dictating: !!dictation,
           // Which mouth this session is using, and what the sink is doing.
           voice_backend: sink ? 'elevenlabs' : 'openai_realtime',
+          speaking_directly: !!(speaking && speaking.direct),
           voice: sink && sink.state ? sink.state() : null,
           generated: generated,
           response_id: speaking ? speaking.responseId : null,

@@ -45,6 +45,7 @@ import config                                               # noqa: E402
 import realtime                                             # noqa: E402
 import voice                                                # noqa: E402
 import voice_dialogue as vd                                 # noqa: E402
+import persona                                             # noqa: E402
 import voice_tags                                           # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
@@ -359,6 +360,69 @@ def run_scene_gate():
        "holding line")
 
 
+def run_persona():
+    """Her register, as a check rather than as a paragraph in a prompt.
+
+    This became load-bearing the moment a sentence written by the OBSERVER — a
+    local vision model captioning a frame once a second — became a sentence the
+    driver hears as RIO, with no conversational model in between. A caption is
+    not a character, and "The image shows a road with several cars on it" is a
+    perfectly good caption.
+
+    So the lint decides. Offline here; against real Qwen output under --live,
+    which is the half that matters, because a prompt that reads well and a
+    prompt that produces her voice are different claims.
+    """
+    section("B4. her register, on the line the pipeline writes")
+
+    hers = [
+        "Open freeway, light traffic — dry hills both sides",
+        "Two lanes into town, wet road, brake lights ahead",
+        "Quiet street, parked cars both sides, nobody about",
+        "Motorway opening out, sun low behind the ridge",
+    ]
+    for line in hers:
+        ok(persona.speakable(line), f"in her voice: {line!r}")
+
+    not_hers = [
+        ("The image shows a road with several cars on it.", "caption"),
+        ("I see a white van two lengths ahead.", "banned"),
+        ("A view of a highway. There are trees on both sides.", "caption"),
+        ("Absolutely — the road ahead is clear.", "banned"),
+        ("What would you like to know about the road?", "question"),
+        ("A street with cars, trees, buildings, people, and signs.", "list"),
+        ("The road ahead is long and it curves gently to the left past a "
+         "petrol station and then opens out again", "too long"),
+    ]
+    for line, why in not_hers:
+        faults = persona.lint(line)
+        ok(bool(faults), f"not in her voice ({why}): {line[:44]!r} -> {faults}")
+
+    # The list the model is TOLD and the list the lint ENFORCES are one list.
+    prompt = config.SYSTEM_PROMPT
+    ok("__BANNED_WORDS__" not in prompt, "the banned list is rendered, not left "
+                                         "as a placeholder")
+    for word in ("i see", "absolutely", "happy to help"):
+        ok(word in prompt.lower(),
+           f"...and {word!r} is in the prompt because it is in the lint")
+
+    # The observer prompt is a voice brief now, not a captioning instruction.
+    import rio_prompts
+
+    obs = rio_prompts.OBSERVER_PROMPT
+    ok("SPOKEN ALOUD" in obs,
+       "the observer is told its sentence is spoken, as her")
+    ok("Open freeway, light traffic" in obs,
+       "and shown the register rather than described it")
+
+    # Nothing unspeakable can be offered for direct speech. This is the join.
+    src = Path(REPO / "realtime.py").read_text()
+    ok('if hit.get("speakable"):' in src,
+       "look() offers a line for direct speech ONLY when it passed the lint")
+    ok('base["path"] = "observer_composed"' in src,
+       "and everything else keeps the composing path it always had")
+
+
 def run_firewall():
     section("E. firewall — the synthesiser cannot decide to speak")
 
@@ -620,6 +684,76 @@ async def run_live():
     ok(after_cancel["pcm"] > 0, "the next answer speaks normally afterwards")
 
     await s.close()
+
+
+def run_observer_voice(base: str, n: int = 6):
+    """Real observations off the running server, linted.
+
+    The offline half checks the lint. This checks the PROMPT — whether Qwen,
+    given RIO's register, actually writes in it — and there is no way to know
+    that without asking it. Reported as a rate rather than a pass/fail on each
+    line: a model is allowed an occasional caption, because the fast path
+    falls back to her composing one. What would be wrong is most of them.
+    """
+    section("J. what the observer actually writes, held to her bar")
+
+    import json as _json
+    import urllib.request
+
+    from tools.visual_latency import HttpDrive
+
+    try:
+        with HttpDrive(base, None, "/workspace/ufldv2/example.mp4", 0.25) as d:
+            urllib.request.urlopen(urllib.request.Request(
+                f"{base}/realtime/session?session_id={d.session_id}",
+                data=b"", method="POST"), timeout=20).read()
+            # NOT deduplicated. A road that looks the same for a stretch
+            # produces the same sentence, and that is the observer working —
+            # dropping repeats made this collect one line off a motorway and
+            # call it a thin sample.
+            lines = []
+            deadline = time.time() + 60
+            while len(lines) < n and time.time() < deadline:
+                time.sleep(1.6)
+                st = _json.load(urllib.request.urlopen(
+                    f"{base}/realtime/status", timeout=10))
+                sess = (st.get("observer") or {}).get("sessions", {})
+                mine = sess.get(d.session_id) or {}
+                if not mine.get("has_record"):
+                    continue
+                r = _json.load(urllib.request.urlopen(urllib.request.Request(
+                    f"{base}/realtime/tool?session_id={d.session_id}",
+                    data=_json.dumps({"name": "look",
+                                      "arguments": {"question": "what do you see"},
+                                      "spoken": "what do you see"}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"), timeout=30))
+                line = (r.get("answer") or "").strip()
+                if line:
+                    lines.append((line, r.get("path"), r.get("speak_directly")))
+    except Exception as e:
+        ok(False, f"could not collect observations ({type(e).__name__}: "
+                  f"{str(e)[:90]})")
+        return
+
+    ok(len(lines) >= 3, f"collected {len(lines)} observations off a live drive")
+    distinct = len({l for l, _, _ in lines})
+    print(f"      ({distinct} distinct of {len(lines)})")
+    good = 0
+    for line, path, direct in lines:
+        faults = persona.lint(line)
+        mark = "speaks" if direct else "composed"
+        print(f"      [{mark:8}] {line!r}"
+              + (f"  <- {faults}" if faults else ""))
+        if not faults:
+            good += 1
+    if lines:
+        ok(good >= max(1, int(0.6 * len(lines))),
+           f"{good}/{len(lines)} came out in her voice and could be spoken "
+           "without a model rewriting them")
+        ok(all((p == "observer_direct") == bool(d) for _, p, d in lines),
+           "and the path each one reports matches whether it was offered for "
+           "direct speech")
 
 
 async def run_other_transport():
@@ -943,6 +1077,7 @@ def main() -> int:
     run_chunker()
     run_tags()
     run_scene_gate()
+    run_persona()
     run_firewall()
     run_clips()
     if args.live:
@@ -954,6 +1089,8 @@ def main() -> int:
         asyncio.run(run_no_seat())
     if args.server:
         run_relay(args.server.rstrip("/"))
+        if args.live:
+            run_observer_voice(args.server.rstrip("/"))
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)

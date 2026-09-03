@@ -26,7 +26,34 @@ Re-version this file whenever the bible is updated.
 # the co-pilot about? If not, say so and stop.
 # ---------------------------------------------------------------------------
 
-OBSERVER_PROMPT = """Look at this image. In one short sentence of 8 words or fewer, describe what you literally see. Be factual and specific. Reply with one sentence only."""
+# WHAT THIS WRITES IS SPOKEN, AS HER.
+#
+# It used to be a caption for RIO to read and rephrase. It is not any more: a
+# general question about the road is answered from the running observation
+# DIRECTLY, with no conversational model between this sentence and the driver,
+# because the model pass cost about half a second to turn one good sentence
+# into another one.
+#
+# So this prompt is a voice brief, not a captioning instruction, and the output
+# is checked against persona.lint() before it is allowed anywhere near a
+# speaker. A line that fails goes back to being composed by her — the slow
+# path still exists and is still correct, it is just no longer the only one.
+import persona   # noqa: E402  (the banned-word list, and the lint that enforces it)
+
+OBSERVER_PROMPT = """You are the eyes of RIO, an in-car assistant, and what you write is SPOKEN ALOUD to the driver as her own words. Write the one sentence she would say if the driver asked what's out there.
+
+One short sentence. Twelve words at most. No full stop needed.
+
+She is looking through a windscreen, not describing a photograph. Never write "I see", "I notice", "the image", "there is", "appears to be", or anything about a picture, a camera or a frame.
+
+Name what is actually there and what matters about it — the road, the traffic, the light, the land. Specific beats general, and a dash between two halves is her rhythm:
+
+  Open freeway, light traffic — dry hills both sides
+  Two lanes into town, wet road, brake lights ahead
+  Quiet street, parked cars both sides, nobody about
+  Motorway opening out, sun low behind the ridge
+
+No greeting, no offer, no question, no commentary. If the road is unremarkable, say that plainly and stop. One sentence only."""
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +111,7 @@ Never "that car" if you can name it.
 
 # Banned words
 
-"Captain", "Agent 507", "buddy", "champ", "boss", "Joshua", "sir",
-"roger", "copy that", "be advised",
-"no problem", "happy to help", "I think", "I see", "I notice",
-"as your AI", "let me know if", "is there anything else",
-"I'm here to help", "great question", "I can help with that",
-"absolutely", "certainly".
+__BANNED_WORDS__
 
 # Your four tonal modes
 
@@ -388,3 +410,10 @@ Just the question. Nothing else."""
 
 PROMPT_VERSION = "bible_v1.1"
 PROMPT_BUILT_AT = "2026-07-29"
+
+
+# The banned list the model is TOLD about is the list persona.lint() ENFORCES.
+# Typed twice, they drift; rendered once, a word added to the check is a word
+# the model is warned off in the same commit.
+RIO_SYSTEM_PROMPT = RIO_SYSTEM_PROMPT.replace(
+    "__BANNED_WORDS__", persona.banned_words_block())

@@ -801,6 +801,15 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
                                where=where, spoken=body.get("spoken"))
     logged = {"tool": name, "ok": bool(result.get("ok")),
               "took_ms": result.get("took_ms")}
+    # WHICH PATH a visual answer took, in the drive's own record. The three are
+    # a hundredfold apart in cost — 4 ms from the running observation, a local
+    # forward pass, or the full remote turn — and which one a question got is
+    # the first question to ask when the camera feels slow.
+    if result.get("path"):
+        logged["path"] = result["path"]
+        logged["spoke_directly"] = bool(result.get("speak_directly"))
+        if result.get("lint"):
+            logged["lint"] = result["lint"]
     if isinstance(args, dict):
         logged["question"] = str(args.get("question") or "")[:400]
         # A place search is worth reviewing afterwards: what was asked, where it

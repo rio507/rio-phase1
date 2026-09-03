@@ -1261,24 +1261,53 @@ def look(question: str, session_key: str = "default",
                 hit = observer.observe_now(session_key)
             if hit:
                 took = round((time.time() - t0) * 1000, 1)
-                return {
+                base = {
                     "ok": True,
                     "answer": hit["text"],
                     "took_ms": took,
                     "fast_path": True,
                     "on_demand": bool(hit.get("on_demand")),
                     "seen_s_ago": hit["age_s"],
-                    "rules": (
-                        "This is what the camera is seeing right now — "
-                        f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
-                        "words, in ONE short sentence, as the road in front of "
-                        "you. Do not read it out as a caption and do not add "
-                        "anything it does not contain. If the driver wants "
-                        "detail about one particular thing, ask this tool again "
-                        "about that thing and it will look properly. This is a "
-                        "passing scene, so do not offer to say more about it."
-                    ),
                 }
+                # THE SECOND MODEL PASS, AND WHEN IT IS NOT WORTH ITS PRICE.
+                #
+                # Measured: composing this sentence into another sentence cost
+                # ~450 ms of remote model plus the round trip either side of
+                # it, on an answer the camera had ready in four milliseconds.
+                # For a general question about the road that is most of the
+                # wait, and it buys a rephrasing of a line that is already one
+                # short sentence.
+                #
+                # So the observer writes in her register now (see
+                # rio_prompts.OBSERVER_PROMPT) and this line is spoken as it
+                # stands — but ONLY if it passes persona.lint(), which is what
+                # makes "never a raw caption" a check rather than a hope. A
+                # line that fails goes back to being composed by her, which is
+                # slower and still correct.
+                if hit.get("speakable"):
+                    base["speak_directly"] = True
+                    base["speech"] = hit["text"]
+                    base["path"] = "observer_direct"
+                    base["rules"] = (
+                        "This has ALREADY BEEN SAID to the driver, out loud, "
+                        "in your voice. Do not say it again and do not "
+                        "acknowledge it. It is here so you know what they just "
+                        "heard."
+                    )
+                    return base
+                base["path"] = "observer_composed"
+                base["lint"] = hit.get("faults") or []
+                base["rules"] = (
+                    "This is what the camera is seeing right now — "
+                    f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
+                    "words, in ONE short sentence, as the road in front of "
+                    "you. Do not read it out as a caption and do not add "
+                    "anything it does not contain. If the driver wants "
+                    "detail about one particular thing, ask this tool again "
+                    "about that thing and it will look properly. This is a "
+                    "passing scene, so do not offer to say more about it."
+                )
+                return base
 
         route = request_router.classify(
             q,
@@ -1317,6 +1346,12 @@ def look(question: str, session_key: str = "default",
         return {"ok": False, "note": "nothing to see", "took_ms": took}
     return {
         "ok": True, "answer": text, "took_ms": took,
+        # Which of the three ways this answer was reached. Logged per call, so
+        # "the camera got slow again" is answerable from a drive rather than
+        # from a re-measurement: a run that used to be mostly observer_direct
+        # and is now mostly full_visual has a different problem from one that
+        # is slow at every stage.
+        "path": "full_visual",
         "meta": getattr(va, "meta", None),
         "rules": (
             "FIRST ANSWER, AND IT IS SHORT: one or two sentences, in your own "

@@ -484,6 +484,17 @@ class _Utterance:
         # both sides is what makes "finished" mean finished.
         self.flushes = 0
         self.finals = 0
+        # A CONTEXT IS A RESOURCE, and the socket allows five at once.
+        #
+        # The multi-context transport opens one per utterance and it has to be
+        # closed exactly once, on EVERY way out — finished, cancelled, or moved
+        # onto the fallback. The fallback was the one that did not: `end()`
+        # skipped the close for an utterance already on flash, so five slow
+        # lines in a drive left five contexts open and the service closed the
+        # connection with "Maximum simultaneous contexts per WebSocket
+        # connection exceeded (5)". Which then looked like a socket fault.
+        self.opened = False
+        self.closed = False
         self.cancelled = False
         self.on_flash = False     # this one is finishing on the fallback model
         self.tags_dropped = []
@@ -809,6 +820,20 @@ class DialogueSession:
                 await self._maybe_done(utt)
             return
 
+    async def _close_wire(self, utt: "_Utterance"):
+        """Give this utterance's context back, exactly once.
+
+        A no-op on the dialogue transport, which has no contexts — the dialect
+        returns no messages and this costs a loop over an empty list. That is
+        the point of it living here rather than at three call sites that each
+        remember whether the transport in use has contexts at all.
+        """
+        if not utt.opened or utt.closed:
+            return
+        utt.closed = True
+        for msg in self.wire.finish(utt.rid):
+            await self._send(msg)
+
     async def _maybe_done(self, utt: "_Utterance"):
         """Is this utterance over? Said once, when both halves agree.
 
@@ -843,9 +868,11 @@ class DialogueSession:
         carry the wrong sentence.
         """
         stale = False
+        previous = None
         async with self._lock:
             if self._utt and not self._utt.done:
                 self._utt.cancelled = True
+                previous = self._utt
                 stale = True
             self._utt = _Utterance(rid)
             self._utt.on_flash = self.force_flash
@@ -856,11 +883,14 @@ class DialogueSession:
         if stale and self._ws is not None and self.wire.recycle_on_cancel:
             await self._reconnect("superseded")
         elif self._ws is not None:
-            if stale:
-                for msg in self.wire.abandon(rid):
-                    await self._send(msg)
+            if stale and previous is not None:
+                await self._close_wire(previous)
+            opened = True
             for msg in self.wire.begin(rid):
-                await self._send(msg)
+                if not await self._send(msg):
+                    opened = False
+                    break
+            self._utt.opened = opened
 
     async def delta(self, rid: str, text: str):
         """More of the answer. Speak whatever this completes."""
@@ -893,12 +923,10 @@ class DialogueSession:
             # leaves the counters permanently one apart, and an utterance that
             # can never report itself finished is a mouth never handed back.
             #
-            # What the dialect may still need is a way to say the turn is OVER,
-            # which is what produces the per-context final on the
-            # multi-context socket.
-            if not utt.on_flash:
-                for msg in self.wire.finish(utt.rid):
-                    await self._send(msg)
+            # The CLOSE is not conditional on any of that. It gives back a
+            # context, and a context has to be returned whether the line was
+            # spoken here or finished on the fallback.
+            await self._close_wire(utt)
             await self._maybe_done(utt)
 
     async def cancel(self, rid: str):
@@ -926,11 +954,10 @@ class DialogueSession:
             return
         if self.wire.recycle_on_cancel:
             await self._reconnect("cancelled")
-        else:
+        elif utt is not None:
             # Close the context and drop anything still arriving for it by
             # name. No reconnect, so a barge-in costs nothing but a message.
-            for msg in self.wire.abandon(rid):
-                await self._send(msg)
+            await self._close_wire(utt)
 
     # -- speaking, and not being able to ------------------------------------
     async def _speak(self, utt: "_Utterance", phrase: str):
@@ -972,6 +999,9 @@ class DialogueSession:
         if utt.cancelled or utt.on_flash:
             return
         utt.on_flash = True
+        # The socket is not going to finish this one. Hand its context back now
+        # rather than at end(), which for a fallback used to never come.
+        await self._close_wire(utt)
         self._note_fallback(cause)
         remainder = (utt.sent[utt.voiced:] + extra
                      + utt.chunker.pending() + "".join(utt.chunker.drain()))
