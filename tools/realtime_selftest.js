@@ -1613,6 +1613,289 @@ async function liveRouting(base) {
   await post('/session/end?session_id=' + encodeURIComponent(sessionId), {});
 }
 
+// ---------------------------------------------------------------------------
+section('text mode — she writes, and something else speaks');
+// ---------------------------------------------------------------------------
+/* Under VOICE_BACKEND=elevenlabs the session produces WORDS and a sink turns
+   them into sound. Everything that was hard to get right about interruption is
+   supposed to be unchanged; what these check is that "unchanged" is true of
+   the parts that now have a different source of truth.
+
+   Three of them, and each one is a different bug if it is wrong:
+
+     the mouth is held until the LISTENER is done, not until the model is.
+     Handing it back at response.done lets the next queued thing talk over the
+     second half of her sentence.
+
+     a cancel STOPS audio, rather than muting it. Muting is what a barge-in
+     does before anyone knows whether a person spoke, and it has to stay
+     undoable; a cancel is a fade and a flush and must not be.
+
+     a resume carries what was HEARD. The model finishes an answer seconds
+     before the synthesiser does, so resuming from the model's text makes RIO
+     skip every word the interruption actually cost. */
+{
+  const eleven = require(path.join(__dirname, '..', 'static', 'rio_voice_eleven.js'));
+  const H = require(path.join(__dirname, 'voice_sink_harness.js'));
+
+  function textHarness(opts) {
+    opts = opts || {};
+    const arbiter = speech.makeArbiter();
+    const sent = [];
+    const events = [];
+    const rig = H.openSink(eleven, {});
+    const controller = rt.createController({
+      arbiter: arbiter,
+      send: (o) => sent.push(o),
+      tool: () => Promise.resolve({ ok: true }),
+      audio: { mute: () => rig.sink.mute(), unmute: () => rig.sink.unmute() },
+      voice: rig.sink,
+      cedarVoice: 'cedar',
+      onEvent: (ev) => events.push(ev),
+      bargeSustainMs: opts.bargeSustainMs === undefined ? 4 : opts.bargeSustainMs,
+      bargeConfirmMs: opts.bargeConfirmMs === undefined ? 8 : opts.bargeConfirmMs,
+      resumeInstruction: 'RESUME>>',
+    });
+    return { arbiter, sent, events, controller, rig,
+             types: () => sent.map((e) => e.type),
+             resumeSent: () => sent.filter(
+               (e) => e.type === 'response.create' && e.response &&
+                      /^RESUME>>/.test(e.response.instructions || '')) };
+  }
+
+  // --- the one piece of signal processing in the file ----------------------
+  {
+    /* Everything else the sink does is bookkeeping; this is the part that
+       turns bytes into sound, and it is wrong in a way that is hard to hear
+       and easy to write: a byte-order slip makes speech into noise, and a
+       scale slip makes it quiet or clipped. Both are checked against samples
+       whose values are known. */
+    const audio = H.fakeAudio();
+    const wire = H.fakeTransport();
+    const sink = eleven.createSink({ transport: wire, context: audio.ctx,
+                                     sampleRate: 24000 });
+    const opened = sink.open();
+    wire.deliver({ op: 'ready', open: true, sample_rate: 24000 });
+    // Four 16-bit little-endian samples: 0, +full scale, -full scale, +half.
+    const raw = Buffer.from([0x00, 0x00, 0xff, 0x7f, 0x00, 0x80, 0x00, 0x40]);
+    wire.deliver({ op: 'audio', rid: 'x1', text: 'hi',
+                   pcm: raw.toString('base64') });
+    // begin() first, or the chunk belongs to no utterance and is dropped.
+    sink.begin('x1');
+    wire.deliver({ op: 'audio', rid: 'x1', text: 'hi',
+                   pcm: raw.toString('base64') });
+    const src = audio.state.sources.slice(-1)[0];
+    ok(!!src && src.buffer && src.buffer.length === 4,
+       'four bytes-pairs of PCM become four samples, not eight or two — the ' +
+       'byte order is read as little-endian, which is what the socket sends');
+    const ch = src.buffer ? src.buffer.getChannelData(0) : [];
+    ok(Math.abs(ch[1] - 1.0) < 0.001 && Math.abs(ch[2] + 1.0) < 0.001,
+       'full scale in both directions maps to ±1.0, so nothing clips and ' +
+       'nothing is quiet');
+    ok(Math.abs(ch[3] - 0.5) < 0.001, 'and half scale to 0.5');
+    ok(Math.abs(src.buffer.duration - 4 / 24000) < 1e-9,
+       'the buffer is as long as the samples say at the rate the server named');
+    sink.close();
+    await opened.catch(() => {});
+  }
+
+  // --- the words go to the sink, not into the void ------------------------
+  {
+    const h = textHarness();
+    h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r1', delta: 'Traffic is thinning ' });
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r1', delta: 'out ahead.' });
+    const deltas = h.rig.wire.ops('delta');
+    ok(h.rig.wire.ops('begin').length === 1,
+       'a new response opens one utterance on the relay');
+    ok(deltas.length === 2 &&
+       deltas.map((d) => d.text).join('') === 'Traffic is thinning out ahead.',
+       'and every text delta is forwarded verbatim — no phrasing decided in ' +
+       'the browser, because phrasing is testable on a server and is not ' +
+       'testable in a car');
+    ok(h.types().indexOf('response.cancel') < 0,
+       'and nothing is cancelled just because the words arrived as text');
+  }
+
+  // --- the mouth is held until the LISTENER is done ------------------------
+  {
+    const h = textHarness();
+    let released = false;
+    h.arbiter.onEvent((ev) => {
+      if (ev.type === 'end' && ev.item && /^live:/.test(ev.item.id)) released = true;
+    });
+    h.controller.handle({ type: 'response.created', response: { id: 'r2' } });
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r2', delta: 'Two seconds of speech.' });
+    h.rig.say('r2', 'Two seconds of speech.', 2.0);
+    h.controller.handle({ type: 'response.done',
+                          response: { id: 'r2', status: 'completed' } });
+    await settle();
+    ok(!released,
+       'the model finishing is NOT the mouth coming free — two seconds of ' +
+       'her sentence are still unplayed');
+    h.rig.done('r2');
+    h.rig.audio.advance(2.5);
+    await new Promise((r) => setTimeout(r, 160));
+    ok(released,
+       'it comes free when the audio actually runs out, which is the moment ' +
+       'the next thing may start talking');
+  }
+
+  // --- how far she got is what came out of the speaker ---------------------
+  {
+    const h = textHarness();
+    h.controller.handle({ type: 'response.created', response: { id: 'r3' } });
+    // The model writes the whole answer in one breath...
+    h.controller.handle({
+      type: 'response.output_text.delta', response_id: 'r3',
+      delta: 'The exit is about two miles out and the traffic clears after it.' });
+    // ...and the synthesiser is four words into it.
+    h.rig.say('r3', 'The exit is about two miles out ', 2.0);
+    h.rig.audio.advance(1.0);
+    const heard = h.controller.state().said_so_far;
+    ok(heard.length > 0 && heard.length < 20,
+       'half-way through the first phrase, "how far did she get" is about ' +
+       'half of that phrase (' + JSON.stringify(heard) + ')');
+    ok(h.controller.state().generated.length > heard.length + 20,
+       'and it is much shorter than what the MODEL wrote — resuming from the ' +
+       'model would skip everything the driver never heard');
+  }
+
+  // --- a cancel stops audio; a mute does not -------------------------------
+  {
+    const h = textHarness();
+    h.controller.handle({ type: 'response.created', response: { id: 'r4' } });
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r4', delta: 'A long answer, going on.' });
+    h.rig.say('r4', 'A long answer, going on.', 3.0);
+    h.rig.audio.advance(0.5);
+
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    ok(h.rig.audio.state.stops === 0,
+       'the instant a barge-in fires, nothing is stopped — she is muted, and ' +
+       'a mute can be taken back when the noise turns out to be a cough');
+    const ramp = h.rig.audio.state.ramps.slice(-1)[0];
+    ok(ramp && ramp.to === 0 &&
+       Math.abs(ramp.overS - eleven.FADE_MS / 1000) < 1e-6,
+       'she is faded out over ' + eleven.FADE_MS + ' ms rather than cut, ' +
+       'because a hard stop on a voice is a click and a click reads as a fault');
+
+    await settle();                      // past the sustain gate
+    ok(h.types().indexOf('response.cancel') >= 0,
+       'past the gate the model is told to stop writing');
+    ok(h.rig.wire.ops('cancel').length === 1,
+       '...and the sink is told to throw away what it had queued — cancelling ' +
+       'generation alone leaves the audio already made to play out from ' +
+       'under whatever interrupted her');
+    await new Promise((r) => setTimeout(r, 60));
+    ok(h.rig.audio.state.stops > 0,
+       'and the scheduled buffers really are stopped, after the fade');
+  }
+
+  // --- a tool follow-up lands while the holding line is still playing ------
+  {
+    /* The routine collision in text mode, and the one that cost an answer:
+       RIO says "let me check", the model finishes WRITING that in a few
+       hundred milliseconds, the tool comes back, and the follow-up response is
+       created while the holding line is still coming out of the speaker. */
+    const h = textHarness();
+    h.controller.handle({ type: 'response.created', response: { id: 'r7' } });
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r7', delta: 'Let me check.' });
+    h.rig.say('r7', 'Let me check.', 2.0);
+    h.controller.handle({ type: 'response.done',
+                          response: { id: 'r7', status: 'completed' } });
+    h.rig.done('r7');
+    h.rig.audio.advance(0.3);            // 1.7 s of "let me check" still to go
+
+    h.controller.handle({ type: 'response.created', response: { id: 'r8' } });
+    ok(h.rig.wire.ops('begin').length === 2,
+       'the follow-up opens its own utterance rather than being swallowed by ' +
+       'a response that is only waiting on its tail');
+    h.controller.handle({ type: 'response.output_text.delta',
+                          response_id: 'r8', delta: 'It opens at nine.' });
+    const forwarded = h.rig.wire.ops('delta').slice(-1)[0];
+    ok(forwarded && forwarded.rid === 'r8',
+       'and the answer\'s words reach the synthesiser under the new response');
+    ok(h.controller.state().response_id === 'r8',
+       'the mouth is held by the new answer');
+
+    const before = h.rig.sink.state().next_at;
+    h.rig.say('r8', 'It opens at nine.', 1.0);
+    ok(h.rig.sink.state().next_at > before + 0.9,
+       'and its audio is queued BEHIND the holding line rather than on top of ' +
+       'it — "let me check" then the answer, which is the order anyway');
+  }
+
+  // --- a false barge-in resumes from what was HEARD ------------------------
+  {
+    const h = textHarness();
+    h.controller.handle({ type: 'response.created', response: { id: 'r5' } });
+    h.controller.handle({
+      type: 'response.output_text.delta', response_id: 'r5',
+      delta: 'The exit is about two miles out and the traffic clears after it.' });
+    h.rig.say('r5', 'The exit is about two miles out ', 2.0);
+    h.rig.audio.advance(1.0);
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    await settle();
+    h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+    h.controller.handle({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: '' });
+    await settle();
+    const resume = h.resumeSent()[0];
+    ok(!!resume, 'a door thunk with no words behind it still resumes the answer');
+    const carried = resume ? resume.response.instructions.replace('RESUME>>', '') : '';
+    ok(carried.length > 0 && carried.length < 25,
+       'carrying the part she had SPOKEN (' + JSON.stringify(carried.trim()) + ')');
+    ok(resume && resume.response.output_modalities[0] === 'text',
+       'and the continuation is asked for as text, so the same mouth finishes ' +
+       'the sentence it started');
+  }
+
+  // --- a warning does not wait on a dictation that cannot happen -----------
+  {
+    const h = textHarness();
+    let rejected = null;
+    await h.controller.speak('Watch your distance.').catch((e) => { rejected = e; });
+    ok(rejected && /text_mode/.test(rejected.message),
+       'dictation is refused at once in text mode, so rio_speak falls through ' +
+       'to the synthesiser instead of spending a warning\'s budget waiting');
+    ok(h.types().indexOf('response.create') < 0,
+       'and nothing was asked of the session at all');
+  }
+
+  // --- ElevenLabs goes away entirely, and RIO takes her voice back ---------
+  {
+    const h = textHarness();
+    ok(h.controller.state().voice_backend === 'elevenlabs',
+       'the drive starts on ElevenLabs');
+    ok(h.controller.useCedar('service_down') === true,
+       'and can be handed back to the session mid-drive');
+    const update = h.sent.filter((e) => e.type === 'session.update').pop();
+    ok(update && update.session.output_modalities[0] === 'audio',
+       'the session is asked for audio from here on');
+    ok(update && update.session.audio.output.voice === 'cedar',
+       'in the voice it was configured with, named now because a session that ' +
+       'has produced no audio can still be told whose voice to use');
+    ok(h.controller.state().voice_backend === 'openai_realtime',
+       'and the drive reports the voice it is actually using');
+    ok(h.controller.useCedar('again') === false,
+       'once, and only once — a voice that flickers because the network is ' +
+       'flickering is worse than either voice');
+
+    // ...and after the switch it behaves exactly like the cedar path did.
+    h.controller.handle({ type: 'response.created', response: { id: 'r6' } });
+    h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                          response_id: 'r6', delta: 'Back in my own voice.' });
+    ok(h.controller.state().said_so_far === 'Back in my own voice.',
+       'reading how far she got from her own transcript again');
+  }
+}
+
 const serverArg = process.argv.indexOf('--server');
 if (serverArg >= 0) {
   const base = (process.argv[serverArg + 1] || '').indexOf('http') === 0

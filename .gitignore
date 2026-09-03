@@ -18,3 +18,8 @@ weights/
 # repo, so it survives a container rebuild and git cannot stage it. This line
 # only guards against a stray copy ever landing inside the worktree.
 .git-credentials
+
+# The spoken question tools/voice_latency.py feeds to the detector. Synthesised
+# once and cached so every run measures against the same recording; it is a
+# derived artifact, not a fixture, and re-makes itself on a fresh checkout.
+tools/_driver_question.pcm

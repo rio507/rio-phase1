@@ -3,6 +3,15 @@
 **Status:** implemented and desk-verified against the real models. The audio
 half has not been driven in a car yet; see *What is unproven* at the end.
 
+> **Superseded in part by `docs/voice_elevenlabs.md`.** RIO's voice is now
+> ElevenLabs by default (`VOICE_BACKEND=elevenlabs`): the live session is put
+> in TEXT mode and its words are synthesised on `eleven_v3_conversational`.
+> Everything in this document about her EARS — the detector, the transcription,
+> the tools, the escalation, the barge-in policy and the arbiter — is
+> unchanged and still current. Everything about her MOUTH describes the
+> `openai_realtime` backend, which is kept whole, is what a tier-2 fallback
+> returns to, and is one config value away.
+
 ---
 
 ## What changed
@@ -320,12 +329,16 @@ warning is still P1 and still cuts RIO off mid-sentence; it now does so in her
 own voice, and the conversation is cancelled *before* the dictation starts,
 because both share one audio stream.
 
-**ElevenLabs is dormant, complete, and reachable.** `VOICE_BACKEND` is now
-`realtime`; `VOICE_FALLBACK_BACKEND` is `elevenlabs`. The server's TTS
-endpoints are the fallback path by definition — the browser only calls them
-when the live voice could not say the line — and `voice.synthesize_stream`
-refuses to pretend it can produce the live voice rather than silently
-substituting the other one.
+**ElevenLabs is dormant, complete, and reachable** — under this backend. With
+`VOICE_BACKEND=openai_realtime` the server's TTS endpoints are the fallback
+path by definition (the browser only calls them when the live voice could not
+say the line), and `voice.synthesize_stream` refuses to pretend it can produce
+the live voice rather than silently substituting the other one.
+
+Under the default backend it is the other way round: those same endpoints are
+THE path for everything deterministic, on the same voice id RIO converses in,
+and dictation is switched off because it has nothing left to fix. See
+`docs/voice_elevenlabs.md`.
 
 ## Whisper, still
 
@@ -346,7 +359,10 @@ reverts to it for the rest of the drive.
 ```
 OPENAI_REALTIME_MODEL=gpt-realtime-2.1     # env override, default in config.py
 OPENAI_REASONING_MODEL=gpt-5.6-sol
-OPENAI_REALTIME_VOICE=cedar                # cedar | marin
+OPENAI_REALTIME_VOICE=cedar                # cedar | marin — her voice under
+                                           # VOICE_BACKEND=openai_realtime, and
+                                           # what tier 2 falls back to otherwise
+VOICE_BACKEND=elevenlabs                   # elevenlabs | openai_realtime
 ```
 
 Neither model id appears anywhere but `config.py`, which the tests assert by

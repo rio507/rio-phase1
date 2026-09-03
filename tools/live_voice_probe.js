@@ -1,6 +1,7 @@
 /* live_voice_probe.js — ten turns of a live conversation, and why each one ended.
  *
  *   node tools/live_voice_probe.js
+ *   node tools/live_voice_probe.js --voice elevenlabs
  *   node tools/live_voice_probe.js --post http://127.0.0.1:8888
  *
  * The complaint this exists for is "her voice keeps cutting out and I have to
@@ -24,6 +25,16 @@
  * --post sends each event to a running server exactly as the panel does, so the
  * reporting path (/realtime/cutoff -> /realtime/cutoffs) is exercised over HTTP
  * rather than assumed.
+ *
+ * --voice elevenlabs runs the SAME ten turns with RIO's voice coming out of the
+ * dialogue sink instead of out of the session. That is the version of this
+ * question that matters now, and it is a genuinely different one: in text mode
+ * the model finishes an answer seconds before the driver hears the end of it,
+ * so "how far did she get" comes from a speaker's clock rather than from a
+ * transcript, the mouth is held past `response.done`, and a cancel has audio to
+ * throw away rather than only a generation to stop. Every one of those is a new
+ * way for a recoverable answer to be lost, and the number at the bottom of this
+ * report is the one that says whether any of them is.
  */
 'use strict';
 
@@ -44,6 +55,13 @@ const args = process.argv.slice(2);
 const postTo = (() => {
   const i = args.indexOf('--post');
   return i >= 0 ? args[i + 1] : null;
+})();
+/* Which mouth. `elevenlabs` runs the same ten turns with the real dialogue
+   sink between the controller and the speaker; anything else is the session
+   speaking for itself, which is what this script measured before. */
+const voiceArg = (() => {
+  const i = args.indexOf('--voice');
+  return i >= 0 ? (args[i + 1] || '') : null;
 })();
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -77,25 +95,49 @@ function makeSession(opts) {
   const sent = [];
   const events = [];
   const audio = { muted: false };
+  /* The ElevenLabs mouth, over a fake wire and a clock this script turns by
+     hand. Real sink, real bookkeeping — the only stubs are the socket and the
+     speaker, because those are the two things a node process does not have. */
+  let rig = null;
+  if (opts.eleven) {
+    const eleven = require(path.join(__dirname, '..', 'static', 'rio_voice_eleven.js'));
+    const H = require(path.join(__dirname, 'voice_sink_harness.js'));
+    rig = H.openSink(eleven, {});
+  }
   const controller = rt.createController({
     arbiter,
     send: (o) => sent.push(o),
     tool: () => Promise.resolve({ ok: true }),
-    audio: { mute: () => { audio.muted = true; }, unmute: () => { audio.muted = false; } },
+    audio: rig
+      ? { mute: () => { audio.muted = true; rig.sink.mute(); },
+          unmute: () => { audio.muted = false; rig.sink.unmute(); } }
+      : { mute: () => { audio.muted = true; }, unmute: () => { audio.muted = false; } },
+    voice: rig ? rig.sink : null,
+    cedarVoice: 'cedar',
     onEvent: (ev) => events.push(ev),
     bargeSustainMs: opts.sustain,
     bargeConfirmMs: opts.confirm,
     resumeInstruction: 'RESUME>>',
   });
-  return { arbiter, sent, events, audio, controller };
+  return { arbiter, sent, events, audio, controller, rig };
 }
 
 async function runTurn(s, turn, n) {
   const rid = 'r' + n;
   const said = 'This is answer number ' + n + ' and it was going somewhere';
   s.controller.handle({ type: 'response.created', response: { id: rid } });
-  s.controller.handle({ type: 'response.output_audio_transcript.delta',
-                        response_id: rid, delta: said });
+  if (s.rig) {
+    /* Text mode. The model writes the whole answer at once, the synthesiser
+       is part-way through it, and the gap between those two is the thing
+       every check below is really about. */
+    s.controller.handle({ type: 'response.output_text.delta',
+                          response_id: rid, delta: said });
+    s.rig.say(rid, said, 2.0);
+    s.rig.audio.advance(1.0);            // she is half-way through saying it
+  } else {
+    s.controller.handle({ type: 'response.output_audio_transcript.delta',
+                          response_id: rid, delta: said });
+  }
   await sleep(2);
 
   switch (turn.kind) {
@@ -168,12 +210,21 @@ async function runTurn(s, turn, n) {
                     status_details: { reason: 'max_output_tokens' } } });
       break;
   }
-  // Long enough for both gates plus the arbiter's next-tick handoff.
-  await sleep(140);
+  if (s.rig) {
+    // The rest of the audio plays out. Without this the mouth is never handed
+    // back on a clean turn -- which is correct behaviour and would deadlock a
+    // script that never lets the speaker finish.
+    s.rig.done(rid);
+    s.rig.audio.advance(5.0);
+  }
+  // Long enough for both gates plus the arbiter's next-tick handoff, and for
+  // the drain poll behind a text-mode response.
+  await sleep(240);
 }
 
 async function drive(opts) {
   const s = makeSession(opts);
+  if (s.rig) await s.rig.opened;
   for (let i = 0; i < TURNS.length; i++) await runTurn(s, TURNS[i], i + 1);
   s.controller.stop();
   const st = s.controller.state();
@@ -287,12 +338,16 @@ async function main() {
   console.log('=========================================================');
   console.log(' live voice probe — %d scripted turns through the real', TURNS.length);
   console.log(' controller and the real arbiter');
+  console.log(' voice: %s', voiceArg === 'elevenlabs'
+    ? 'elevenlabs (text mode, through the dialogue sink)'
+    : 'openai_realtime (the session speaks for itself)');
   console.log('=========================================================');
   RECOVERABLE = TURNS.filter(t => t.recoverable).length;
   TURNS.forEach((t, i) => console.log('  %d. %-52s %s', i + 1, t.name,
                                       t.recoverable ? '(should survive)' : ''));
 
-  const r = await drive({ sustain: 4, confirm: 40 });
+  const r = await drive({ sustain: 4, confirm: 40,
+                          eleven: voiceArg === 'elevenlabs' });
   const summary = await report(r);
 
   if (postTo && summary) {

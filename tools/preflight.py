@@ -200,6 +200,82 @@ def check_weights():
           f"or go silent: {missing}",
           "python -m tools.render_alerts")
 
+    # ...and WHOSE clips they are. Five files present is not the same claim as
+    # five files in the voice RIO is currently speaking in, and the second one
+    # is the one that stops being true silently: change the voice id, restart,
+    # and the most important sentence in the system is said by the previous
+    # occupant with nothing anywhere to say so.
+    try:
+        from tools import render_alerts as _ra
+
+        want = _ra.voice_signature()
+        doc = _ra.manifest()
+        rendered = doc.get("clips", {})
+        stale = sorted(
+            line for line in expected
+            if (rendered.get(line, {}).get("voice") != want["voice"]
+                or rendered.get(line, {}).get("backend") != want["backend"]))
+        check(not stale,
+              f"...and rendered in the configured voice "
+              f"({want['backend']}/{want['voice'] or '<unset>'})",
+              f"these clips were made by a different voice or have no record "
+              f"of who made them, so the lines that matter most sound like "
+              f"somebody else: {stale}",
+              "python -m tools.render_alerts --force")
+    except Exception as e:
+        check(False, "clip voice manifest",
+              f"cannot tell which voice the clips are in ({type(e).__name__})",
+              "python -m tools.render_alerts --force")
+
+
+def check_voice():
+    head("voice (config.VOICE_BACKEND)")
+    import config as _cfg
+
+    backend = _cfg.VOICE_BACKEND
+    check(backend in ("elevenlabs", "openai_realtime"),
+          f"VOICE_BACKEND={backend}",
+          "the backend name is not one this build knows; RIO starts with no "
+          "voice at all.",
+          "VOICE_BACKEND=elevenlabs|openai_realtime in .env")
+
+    if backend != "elevenlabs":
+        print("  (cedar backend — ElevenLabs is the fallback only)")
+        return
+
+    # The key is never printed. What is checked is that it EXISTS and that it
+    # is clean: a key pasted out of a browser carries a leading non-breaking
+    # space, every call then fails with "Invalid API key", and nothing in that
+    # message mentions whitespace. That failure looked exactly like a revoked
+    # key and cost an afternoon.
+    raw = os.environ.get("ELEVENLABS_API_KEY", "")
+    check(bool(raw.strip()), "ELEVENLABS_API_KEY set",
+          "RIO has no voice: conversation, warnings and turns are all silent.",
+          "add it to .env")
+    check(raw == raw.strip() and raw.startswith("sk_"),
+          "...and free of stray whitespace",
+          "the key has leading or trailing whitespace (a non-breaking space "
+          "survives a copy-paste) and every call will fail as 'Invalid API "
+          "key', which reads as a wrong key and is not one.",
+          "re-paste the value in .env with no spaces around it")
+    check(bool(_cfg.ELEVENLABS_VOICE_ID), 
+          f"ELEVENLABS_VOICE_ID={_cfg.ELEVENLABS_VOICE_ID or '<unset>'}",
+          "no voice id: every synthesis call is refused.",
+          "add it to .env")
+
+    for mod in ("websockets", "httpx"):
+        try:
+            __import__(mod)
+            ok_mod = True
+        except Exception:
+            ok_mod = False
+        check(ok_mod, mod,
+              "the dialogue socket cannot be opened: RIO falls straight back "
+              "to cedar for every drive." if mod == "websockets" else
+              "the per-utterance fallback cannot run, so a slow v3 line is a "
+              "silent line.",
+              "pip install -r requirements.txt")
+
 
 def check_persistent():
     head("persistent volume")
@@ -301,6 +377,7 @@ def main():
     check_apt()
     check_core_packages()
     check_torch()
+    check_voice()
     check_detector()
     check_weights()
     check_persistent()

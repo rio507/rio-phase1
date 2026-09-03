@@ -8,7 +8,18 @@ python-multipart
 # nav.py talks to the Google Routes/Geocoding/Places APIs. It arrives with the
 # openai client anyway; pinned here because navigation depends on it directly
 # and should not break if that transitive dependency ever changes.
+#
+# It is also the per-utterance voice fallback: when the v3 dialogue socket is
+# slow or errors, voice_dialogue.py finishes that line on flash over HTTP.
 httpx
+
+# RIO's voice under VOICE_BACKEND=elevenlabs. The Text-to-Dialogue socket is a
+# raw WebSocket — the ElevenLabs SDK covers the request-shaped endpoints, and
+# the whole point of the socket is that a request cannot start until the
+# sentence is finished. It arrives with uvicorn[standard] as well; named here
+# because voice_dialogue.py imports it directly and a missing one is a car
+# that starts every drive in the fallback voice.
+websockets
 
 # --- ML stack (Qwen3-VL-8B observer) ---
 # Torch is NOT on PyPI in its CUDA build. Install the three torch packages from

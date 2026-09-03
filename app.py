@@ -1,5 +1,6 @@
 
 
+import base64
 import json
 import math
 import re
@@ -16,7 +17,8 @@ from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
-from fastapi import FastAPI, UploadFile, Query, Body, Form, Header, Request
+from fastapi import (FastAPI, UploadFile, Query, Body, Form, Header, Request,
+                     WebSocket, WebSocketDisconnect)
 from fastapi.responses import (StreamingResponse, HTMLResponse, FileResponse,
                                JSONResponse)
 from fastapi.staticfiles import StaticFiles
@@ -28,6 +30,8 @@ import llm_interface
 import vision
 import perceive
 import realtime
+import voice_dialogue
+import voice_tags
 from navigation import events as navevents
 from navigation import service as navservice
 from navigation import speech as navspeech
@@ -625,6 +629,145 @@ def realtime_cutoffs_reset_endpoint():
     """Start a measured run from zero."""
     realtime.reset_cutoffs()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# RIO'S MOUTH — the dialogue relay
+# ---------------------------------------------------------------------------
+# Under VOICE_BACKEND=elevenlabs the live session is in TEXT mode, so the words
+# it produces arrive in the BROWSER and the synthesiser lives HERE. This socket
+# is the join, and it exists for one reason: the ElevenLabs key.
+#
+# Everything else on this page follows the same discipline — routing, geocoding
+# and TTS all go through the server, and the one key a browser ever sees is the
+# Maps render key, which can only draw a map. A dialogue socket opened from the
+# page would put a full-privilege synthesis key in a devtools console, and no
+# amount of convenience is worth that.
+#
+# The relay is deliberately thin in one direction and not the other. The
+# browser forwards text deltas the instant they arrive and knows nothing about
+# phrases, tags, flushes or fallbacks; all of that is decided here, once,
+# where it can be tested without a microphone. What the browser owns is
+# PLAYBACK — scheduling the samples, fading them out in 30 ms when a warning
+# takes the mouth, and knowing how far RIO actually got — because those are
+# facts about a speaker and cannot be known from this end.
+_voice_sessions = {}
+_voice_lock = threading.Lock()
+
+
+@app.websocket("/voice/dialogue")
+async def voice_dialogue_socket(ws: WebSocket, session_id: str = Query(default=None)):
+    """One live session's voice. One socket in, one dialogue session behind it.
+
+    The pairing is one-to-one on purpose: the docs are explicit that a
+    connection IS a dialogue session, and holding two for one drive would give
+    RIO two prosody contexts and the account two seats out of a pool that is
+    counted separately from ordinary synthesis.
+    """
+    await ws.accept()
+    key = session_id or f"anon-{uuid.uuid4().hex[:8]}"
+    seq = {"n": 0}
+
+    async def on_audio(rid, pcm, text):
+        seq["n"] += 1
+        await ws.send_text(json.dumps({
+            "op": "audio", "rid": rid, "seq": seq["n"],
+            # The words this audio is for. The browser needs them to answer
+            # "how far did she get" when a warning cuts her off — a question
+            # about what came out of the speaker, which only the speaker knows.
+            "text": text,
+            "pcm": base64.b64encode(pcm).decode("ascii"),
+        }))
+
+    async def on_event(kind, detail):
+        # A fallback is logged in the drive's own record, not only in the
+        # server's stdout: "she sounded different for a minute" is a sentence
+        # about a drive, and it should be answerable from the drive.
+        if kind == "fallback":
+            sessions.log_live(session_id, "voice_fallback", detail)
+        await ws.send_text(json.dumps({"op": "event", "kind": kind,
+                                       "detail": detail}))
+
+    session = voice_dialogue.DialogueSession(on_audio=on_audio, on_event=on_event)
+    with _voice_lock:
+        old = _voice_sessions.pop(key, None)
+        _voice_sessions[key] = session
+    if old:
+        # A page reloaded mid-drive. The old socket is closed rather than left
+        # to time out, so the account never holds two dialogue seats for one
+        # car because somebody pressed refresh.
+        try:
+            await old.close()
+        except Exception:
+            pass
+
+    opened = await session.start()
+    await ws.send_text(json.dumps({
+        "op": "ready", "open": opened,
+        "voice_id": session.voice, "model": session.model,
+        "sample_rate": config.ELEVENLABS_SAMPLE_RATE,
+        "output_format": session.fmt,
+        # If the socket would not open at all there is nothing to fall back
+        # from — the page is told now, and starts the drive on cedar.
+        "degraded": session.degraded,
+    }))
+    sessions.log_live(session_id, "voice_dialogue_open",
+                      {"open": opened, "model": session.model,
+                       "voice_id": session.voice})
+
+    try:
+        while True:
+            msg = json.loads(await ws.receive_text())
+            op = msg.get("op")
+            rid = msg.get("rid") or ""
+            if op == "begin":
+                await session.begin(rid)
+            elif op == "delta":
+                await session.delta(rid, msg.get("text") or "")
+            elif op == "end":
+                await session.end(rid)
+            elif op == "cancel":
+                await session.cancel(rid)
+            elif op == "ping":
+                await ws.send_text(json.dumps({"op": "pong"}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[voice] relay error: {type(e).__name__}: {e}", flush=True)
+    finally:
+        await session.close()
+        with _voice_lock:
+            if _voice_sessions.get(key) is session:
+                _voice_sessions.pop(key, None)
+        sessions.log_live(session_id, "voice_dialogue_close", session.status())
+
+
+@app.get("/voice/status")
+def voice_status_endpoint():
+    """Which voice RIO is using, and what it has cost her.
+
+    Read this after a drive. The interesting rows are `fallbacks` — every one
+    of them is an utterance that did not come out the way it was meant to, with
+    the cause attached — and the two first-audio percentiles, which are the
+    number the whole text-mode design is for.
+    """
+    with _voice_lock:
+        live = [{"session": k, **v.status()} for k, v in _voice_sessions.items()]
+    return {
+        "backend": config.VOICE_BACKEND,
+        "voice_id": voice_dialogue.voice_id(),
+        "configured": voice_dialogue.configured(),
+        "conversation_model": config.ELEVENLABS_DIALOGUE_MODEL,
+        "deterministic_model": config.ELEVENLABS_DETERMINISTIC_MODEL,
+        "cedar_voice": config.OPENAI_REALTIME_VOICE,
+        "first_byte_budget_ms": config.ELEVENLABS_FIRST_BYTE_BUDGET_MS,
+        "chunk": {"min_tokens": config.ELEVENLABS_CHUNK_MIN_TOKENS,
+                  "max_wait_ms": config.ELEVENLABS_CHUNK_MAX_WAIT_MS},
+        "tags": {"enabled": config.AUDIO_TAGS_ENABLED,
+                 "allowed": list(voice_tags.allowed_tags()),
+                 "max_per_utterance": config.AUDIO_TAGS_MAX_PER_UTTERANCE},
+        "sessions": live,
+    }
 
 
 @app.post("/realtime/tool")

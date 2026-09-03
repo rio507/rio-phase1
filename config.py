@@ -1,4 +1,14 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Read here rather than only in app.py. Everything in this file that comes from
+# the environment is read AT IMPORT, so a tool that imports config without
+# having loaded .env first got an empty voice id and a default model — which
+# looks exactly like a misconfiguration and is not one. Idempotent: app.py
+# still calls it, and the first call wins.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # RIO prompts now sourced from rio_prompts.py (compiled from behavior bible v1)
 from rio_prompts import RIO_SYSTEM_PROMPT
@@ -161,28 +171,132 @@ OPENAI_MAX_TOKENS = 300
 # spoken reply and the empty-reply failure cannot recur. "low" if RIO needs more.
 OPENAI_REASONING_EFFORT = "none"
 
-# ElevenLabs: RIO's fallback voice, and nothing else now.
+# ---------------------------------------------------------------------------
+# WHOSE VOICE
+# ---------------------------------------------------------------------------
+# Two backends, one at a time, chosen by VOICE_BACKEND and read at startup:
 #
-# One voice everywhere was the goal, and two voices is what you get if the
-# warnings keep their own synthesiser: conversation in one, alerts in another,
-# with the alerts — the lines that matter most — sounding like a different
-# system. So deterministic speech is DICTATED to the live session, word for
-# word, and the pre-rendered clips are rendered in the same voice.
+#   "elevenlabs"       RIO's voice is ElevenLabs. The live session still hears
+#                      the driver and still does the thinking, but it is put in
+#                      TEXT mode and its words are synthesised — streamed into
+#                      a Text-to-Dialogue socket phrase by phrase, so the first
+#                      audio starts before the model has finished the sentence.
+#   "openai_realtime"  RIO's voice is the live session's own (cedar). The path
+#                      this file described for the last three months, kept
+#                      whole rather than deleted, because it is what speaks
+#                      when ElevenLabs is not there at all.
 #
-# ElevenLabs stays wired up, complete, and off the active path. It is what
-# speaks when the live session is not there: no session open and one cannot be
-# started, the dictation timing out, the model refusing. That is not a
-# hypothetical — a car drives through tunnels — and it is the reason this is a
-# fallback rather than a deletion.
-# RIO's ACTIVE voice: the live session. Deterministic lines are dictated to it
-# and the pre-rendered clips are rendered in it.
-VOICE_BACKEND = "realtime"
-# ...and the voice that speaks when the live one cannot. Every server-side TTS
-# endpoint (/nav/voice, /headway_voice, /vehicle/health/voice) is now, by
-# definition, the fallback path: the browser only reaches for it when dictation
-# was not possible or did not start in time.
+# The choice is config plus a restart, not a runtime toggle, and deliberately:
+# the two paths differ in what the live session is even asked to PRODUCE, and a
+# session that changed its mind about that halfway through a drive would be a
+# third path nobody had tested. The per-utterance fallbacks below are what
+# handles trouble inside a drive; this decides which mouth a drive starts with.
+VOICE_BACKEND = os.getenv("VOICE_BACKEND", "elevenlabs")
+# "realtime" was what this setting called the live voice before ElevenLabs came
+# back. Old .env files and old shell exports still say it, and a car that comes
+# up mute because a value was renamed is a bad trade for a tidier vocabulary.
+if VOICE_BACKEND == "realtime":
+    VOICE_BACKEND = "openai_realtime"
+
+# The one thing that does not vary. Every path below — the dialogue socket, the
+# deterministic lines, the pre-rendered clips, both fallback tiers — names THIS
+# voice, which is what makes "one voice everywhere" a property of the config
+# rather than a thing to check.
+ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
+
+# RIO's conversation, when ElevenLabs is her voice. v3 conversational is the
+# model with the audio tags and the prosody that carries a shrug; it streams
+# only over the Text-to-Dialogue socket, which is why voice_dialogue.py exists.
+ELEVENLABS_DIALOGUE_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3_conversational")
+
+# Everything deterministic, and every fallback. Flash is the fastest thing
+# ElevenLabs has to first byte, and a warning is exactly the line where that is
+# the only property worth optimising: a turn instruction does not need prosody,
+# it needs to arrive. Same voice id, so the driver hears one person.
+ELEVENLABS_DETERMINISTIC_MODEL = "eleven_flash_v2_5"
+
+# Back-compatible alias. voice.synthesize_stream() and the tests reached for
+# this name when there was only one ElevenLabs model in the system.
+ELEVENLABS_MODEL = ELEVENLABS_DETERMINISTIC_MODEL
+
+# PCM rather than MP3, and this is not a preference. The browser schedules
+# RIO's audio itself so it can fade her out in 30 ms when a warning arrives,
+# and scheduling means decoding: a raw 24 kHz frame is decodable the instant it
+# lands, where an MP3 chunk out of the middle of a stream is not decodable at
+# all without the frames around it. 24 kHz mono is 48 KB/s over a loopback
+# socket, which costs nothing and buys the cancel path.
+ELEVENLABS_OUTPUT_FORMAT = "pcm_24000"
+ELEVENLABS_SAMPLE_RATE = 24000
+
+# --- when a phrase is worth speaking -----------------------------------------
+# The whole point of text mode is that RIO starts talking before she has
+# finished thinking. That only works if something decides, mid-stream, that
+# enough words have arrived to be worth synthesising — too eager and she speaks
+# in fragments with a seam in the prosody at every one; too patient and the
+# text path is slower than the audio path it replaced.
+#
+# A phrase is sent when it reaches a clause boundary AND has at least this many
+# words behind it...
+ELEVENLABS_CHUNK_MIN_TOKENS = 5
+# ...or when this long has passed since the first unsent word arrived, whatever
+# the model is doing. The second rule is what covers an answer that opens with
+# a long subordinate clause, and what stops "Yeah." waiting forever for a
+# boundary that has already been and gone.
+ELEVENLABS_CHUNK_MAX_WAIT_MS = 250
+
+# The socket closes itself after 20 seconds without a client message. A car
+# spends most of a drive inside that window, so a keep-alive goes out at half
+# the interval — comfortably inside it, and cheap: the message performs no
+# synthesis and costs no characters.
+ELEVENLABS_KEEPALIVE_MS = 9000
+ELEVENLABS_IDLE_TIMEOUT_MS = 20000
+
+# --- the two fallbacks, and what separates them ------------------------------
+# TIER 1, per utterance: v3 conversational was slow or errored on THIS line.
+# The line is re-synthesised on flash, same voice, and the drive carries on with
+# the dialogue socket for the next one. A conversational reply that arrives a
+# beat late in a slightly flatter reading is a much smaller thing than a reply
+# that does not arrive.
+ELEVENLABS_FIRST_BYTE_BUDGET_MS = 1500
+
+# TIER 2, per session: ElevenLabs is not answering at all — the socket will not
+# open and flash will not stream either. Then RIO's voice goes back to the live
+# session's own, mid-drive, by switching that session to audio output. Sticky
+# for the rest of the drive: a voice that flickers between two people because
+# the network is flickering is worse than either voice.
+#
+# How many consecutive per-utterance failures before concluding it is the
+# service and not the line. Two, because one is an utterance and three is a
+# conversation the driver has already noticed.
+ELEVENLABS_FAILURES_BEFORE_CEDAR = 2
+
+# --- audio tags (v3) ---------------------------------------------------------
+# v3 can be told how to say something: [laughs], [sighs], [whispers]. Used
+# sparingly this is the difference between a voice and a reading. Used the way
+# a model will use it if you let it, it is exactly the "performative" register
+# the bible bans in as many words (§ "NOT loud, polished, corporate, robotic,
+# or performative").
+#
+# So the tags are allowed in ONE place — conversation — from a short list, one
+# per utterance, and a tag is never the whole utterance. Everywhere else they
+# are stripped before synthesis, because the alternative is a navigation
+# instruction in which the model has written the word "sighs" and the driver
+# hears it read out at a junction.
+#
+# The list is short on purpose. Every tag on it is something a friend in the
+# passenger seat actually does; nothing on it is a performance.
+AUDIO_TAGS_ENABLED = True
+AUDIO_TAGS_ALLOWED = ("laughs", "sighs", "whispers", "exhales")
+AUDIO_TAGS_MAX_PER_UTTERANCE = 1
+
+# --- the old shape, still true ----------------------------------------------
+# The server's TTS endpoints (/nav/voice, /headway_voice,
+# /vehicle/health/voice) synthesise with this. Under VOICE_BACKEND=elevenlabs
+# they are not the fallback path any more — they are THE path for everything
+# deterministic, which is what requirement 6 means by one voice everywhere:
+# nav, health and the calm headway tier all come out of flash on the same voice
+# id RIO converses in.
 VOICE_FALLBACK_BACKEND = "elevenlabs"
-ELEVENLABS_MODEL = "eleven_flash_v2_5"
 
 SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
 

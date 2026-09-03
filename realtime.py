@@ -51,6 +51,7 @@ from typing import Optional
 from openai import OpenAI
 
 import config
+import voice_tags
 # Place search lives in its own module for the same reason visual_qa does: it is
 # a pipeline with a bill and a licence attached, not a branch of this file.
 import places
@@ -784,8 +785,21 @@ def client() -> OpenAI:
 
 
 def instructions() -> str:
-    """RIO's personality, plus what is only true when she is being heard."""
-    return (config.SYSTEM_PROMPT or "").rstrip() + "\n\n" + LIVE_ADDENDUM.strip()
+    """RIO's personality, plus what is only true when she is being heard.
+
+    The audio-tag paragraph is generated from the same config the VALIDATOR
+    enforces (voice_tags.instruction), and only when tags are actually
+    reachable — which under the cedar backend they are not. A model told it may
+    do something the gate will undo is a model that keeps trying, and the
+    instruction and the enforcement being two expressions of one list is what
+    stops them drifting.
+    """
+    parts = [(config.SYSTEM_PROMPT or "").rstrip(), LIVE_ADDENDUM.strip()]
+    if config.VOICE_BACKEND == "elevenlabs":
+        tags = voice_tags.instruction()
+        if tags:
+            parts.append(tags.strip())
+    return "\n\n".join(p for p in parts if p)
 
 
 def session_config() -> dict:
@@ -817,11 +831,26 @@ def session_config() -> dict:
     /last_talk and every review of a drive do, and having them come from a
     different model than every other transcript in the JSONL would be a quiet
     way to make two records that disagree.
+
+    WHAT THE SESSION PRODUCES depends on whose voice RIO has, and it is the
+    ONLY thing that does. Under the ElevenLabs backend the output is text and
+    something else speaks it; under the cedar backend the output is audio and
+    she speaks for herself. The INPUT half is identical either way — she is
+    still listening to the cabin, still transcribing with the same Whisper,
+    still deciding for herself when the driver has stopped talking — because
+    the change is about her mouth and nothing about her ears.
+
+    The voice is named even in text mode. It costs nothing, produces nothing
+    while the modality is text, and means the cedar fallback is a modality
+    switch rather than a modality switch plus a configuration the session has
+    to be told for the first time mid-drive.
     """
+    text_out = config.VOICE_BACKEND == "elevenlabs"
     return {
         "type": "realtime",
         "model": config.OPENAI_REALTIME_MODEL,
         "instructions": instructions(),
+        "output_modalities": ["text"] if text_out else ["audio"],
         "audio": {
             "input": {
                 "transcription": {"model": config.OPENAI_STT_MODEL},
@@ -874,6 +903,14 @@ def mint_client_secret() -> dict:
         # copy of the verbatim instruction that could drift from this one. What
         # RIO is told to read a warning as is decided here, once.
         "verbatim_instruction": VERBATIM_INSTRUCTION,
+        # WHOSE VOICE, and everything the page needs to build the mouth for it.
+        # Sent with the session for the same reason the dictation and resume
+        # policies are: the browser holds no second copy of a decision made in
+        # config.py, so there is nothing to drift.
+        "voice_backend": config.VOICE_BACKEND,
+        "cedar_voice": config.OPENAI_REALTIME_VOICE,
+        "voice_sample_rate": int(config.ELEVENLABS_SAMPLE_RATE),
+        "output_modalities": cfg["output_modalities"],
         # ...and so does the resume policy, for the same reason: one place
         # decides what she says and how long she waits before deciding nobody
         # spoke. See rio_realtime.js createController.
@@ -881,7 +918,16 @@ def mint_client_secret() -> dict:
         "barge_sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS),
         "barge_confirm_ms": int(config.REALTIME_BARGE_CONFIRM_MS),
         "max_resumes": int(config.REALTIME_MAX_RESUMES),
-        "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED),
+        # DICTATION IS A PROPERTY OF THE CEDAR BACKEND.
+        #
+        # It exists so a warning comes out of the same mouth as a conversation,
+        # and under ElevenLabs it already does: /nav/voice, /headway_voice and
+        # /vehicle/health/voice synthesise on the SAME voice id, on the model
+        # that is fastest to first byte. Dictating to a text-mode session would
+        # produce a warning as text, spoken by the conversational model through
+        # a socket built for prosody — slower, out of band, and for nothing.
+        "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED
+                               and config.VOICE_BACKEND != "elevenlabs"),
         "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
         "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),
     }

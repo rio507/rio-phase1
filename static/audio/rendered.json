@@ -1,0 +1,49 @@
+{
+  "clips": {
+    "back_off": {
+      "at": 1788467708.1,
+      "backend": "elevenlabs",
+      "bytes": 45602,
+      "model": "eleven_v3_conversational",
+      "sha1": "e5b7038f131a",
+      "voice": "weA4Q36twV5kwSaTEL0Q"
+    },
+    "tire_critical": {
+      "at": 1788467708.1,
+      "backend": "elevenlabs",
+      "bytes": 102862,
+      "model": "eleven_v3_conversational",
+      "sha1": "788b03fe41ef",
+      "voice": "weA4Q36twV5kwSaTEL0Q"
+    },
+    "tire_sensor_lost": {
+      "at": 1788467708.1,
+      "backend": "elevenlabs",
+      "bytes": 89070,
+      "model": "eleven_v3_conversational",
+      "sha1": "054ec8f7786a",
+      "voice": "weA4Q36twV5kwSaTEL0Q"
+    },
+    "too_close": {
+      "at": 1788467708.1,
+      "backend": "elevenlabs",
+      "bytes": 26376,
+      "model": "eleven_v3_conversational",
+      "sha1": "42545ad28c9a",
+      "voice": "weA4Q36twV5kwSaTEL0Q"
+    },
+    "watch_distance": {
+      "at": 1788467708.1,
+      "backend": "elevenlabs",
+      "bytes": 25122,
+      "model": "eleven_v3_conversational",
+      "sha1": "5add5b3bf5e9",
+      "voice": "weA4Q36twV5kwSaTEL0Q"
+    }
+  },
+  "voice": {
+    "backend": "elevenlabs",
+    "model": "eleven_v3_conversational",
+    "voice": "weA4Q36twV5kwSaTEL0Q"
+  }
+}

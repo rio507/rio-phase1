@@ -419,9 +419,26 @@
        arbiter,                      RIO.speech
        send(obj),                    put an event on the data channel
        tool(name, args) -> Promise,  run one tool call server-side
-       audio: { mute(), unmute() },  the element RIO's voice comes out of
+       audio: { mute(), unmute() },  whatever RIO's voice comes out of
+       voice,                        the ElevenLabs sink, or absent for cedar
        onEvent(ev)                   observability
      }
+
+     TWO BACKENDS, ONE HANDLER
+     -------------------------
+     Which voice RIO has changes what the session PRODUCES — audio, or text
+     that something else speaks — and almost nothing else. Interruption,
+     resumption, arbitration, the tool bridge and every counter below are the
+     same code either way, and deliberately: they are the parts that were hard
+     to get right, and a second copy of them for a second voice is a second set
+     of bugs.
+
+     `voice` is what makes the difference. Absent, the session speaks for
+     itself and this file mutes an element. Present, the session writes and the
+     sink speaks — so the text deltas are forwarded to it, the mouth is held
+     until the SINK has finished rather than until the model has, and "how far
+     did she get" is answered by what came out of a speaker instead of by what
+     the model said it was saying.
      --------------------------------------------------------------------- */
   function createController(cfg) {
     cfg = cfg || {};
@@ -429,6 +446,10 @@
     var send = cfg.send || function () {};
     var runTool = cfg.tool || function () { return Promise.resolve({ ok: false }); };
     var audio = cfg.audio || { mute: function () {}, unmute: function () {} };
+    /* RIO's mouth, when it is not the model's own. Nullable, and null is the
+       cedar path — every `if (sink)` below reads as "unless she is speaking
+       for herself", which is what it means. */
+    var sink = cfg.voice || null;
     var listeners = [];
     if (typeof cfg.onEvent === 'function') listeners.push(cfg.onEvent);
 
@@ -443,7 +464,10 @@
                      // The single most useful number here -- every one of
                      // these used to be a lost answer.
                      blips_absorbed: 0,
-                     resumed: 0, resume_skipped: 0, resume_failures: 0 };
+                     resumed: 0, resume_skipped: 0, resume_failures: 0,
+                     // Utterances the sink could not speak in the voice it was
+                     // meant to, and the one time a drive gave up on it.
+                     voice_fallbacks: 0, voice_backend_changed: 0 };
 
     /* WHY EVERY ANSWER STOPPED. One counter per cause, because "she cuts out"
        is four different faults wearing one coat and they have four different
@@ -474,6 +498,13 @@
        starts the answer again -- which is the thing the driver was already
        doing by hand. */
     var partial = '';
+    /* ...and what the MODEL has written, which in text mode is a different and
+       much longer string. The model finishes an answer in a few hundred
+       milliseconds; the driver is four seconds behind it. Resuming from what
+       was written rather than from what was heard would have RIO skip
+       everything the synthesiser had not reached, which is most of the answer
+       and exactly the words the interruption cost. */
+    var generated = '';
     var pendingBarge = null;    // { responseId, cancelled, timer, confirm, said }
     var pendingResume = null;   // { cause, said }
     var resumeChain = 0;        // resumes spent on THIS answer
@@ -504,6 +535,18 @@
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
     var speakTimeoutMs = cfg.speakTimeoutMs || 700;
 
+    /* How far the DRIVER got to hear. The only version of this question worth
+       asking, and the two backends answer it from different places: the model's
+       own transcript when she speaks for herself, the speaker's clock when
+       something else is speaking for her. */
+    function saidSoFar() {
+      if (sink && speaking) {
+        try { return sink.spokenPrefix(speaking.responseId) || ''; }
+        catch (e) { return partial; }
+      }
+      return partial;
+    }
+
     function emit(type, payload) {
       var ev = payload || {};
       ev.type = type;
@@ -532,6 +575,14 @@
     function cancelGeneration() {
       try { send({ type: 'response.cancel' }); } catch (e) {}
       try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+      /* The same two things, on the other side of the mouth: stop the words
+         being produced, and throw away the sound already made from them. In
+         text mode the second one is the sink's — the model's output buffer is
+         empty because the model was never making audio, and everything queued
+         is queued here. */
+      if (sink && speaking) {
+        try { sink.cancel(speaking.responseId); } catch (e) {}
+      }
     }
 
     function clearBarge() {
@@ -580,7 +631,11 @@
         send({
           type: 'response.create',
           response: {
-            output_modalities: ['audio'],
+            // What the session is asked to PRODUCE is the one thing the two
+            // backends disagree about. Everything else on this payload — that
+            // it is in the conversation rather than out of band, and what she
+            // is told — is the same sentence either way.
+            output_modalities: sink ? ['text'] : ['audio'],
             // In the conversation, not out of band: the truncated half is
             // already in the history and leaving the other half out would make
             // the next question land against an answer that stops mid-sentence.
@@ -623,11 +678,34 @@
         dictation.responseId = responseId;
         return;
       }
-      if (speaking) return;
+      /* A NEW ANSWER WHILE THE LAST ONE IS STILL BEING HEARD.
+       *
+       * Only reachable in text mode, and reachable there routinely: RIO says
+       * "let me check", the model finishes writing that in a few hundred
+       * milliseconds, the tool comes back, and the follow-up response is
+       * created while the holding line is still coming out of the speaker.
+       *
+       * `speaking` is still set at that instant -- deliberately, because the
+       * mouth belongs to the listener and the listener is not finished -- and
+       * the old early return meant the new response never claimed the mouth,
+       * never opened an utterance, and was silent. The answer to the question
+       * simply never got said.
+       *
+       * So a response that is only waiting on its tail yields to a new one.
+       * The tail is NOT cut off: the sink queues the new utterance behind
+       * whatever is still scheduled, which is the right order anyway -- "let
+       * me check" and then the answer. What is still refused is a second
+       * response over a live one, which is a real overlap. */
+      if (speaking) {
+        if (!speaking.finishing || speaking.responseId === responseId) return;
+        endResponse(speaking.responseId);
+      }
       var entry = { responseId: responseId, resolve: null, cancelled: false };
       speaking = entry;
       counters.responses++;
       partial = '';
+      generated = '';
+      if (sink) { try { sink.begin(responseId); } catch (e) {} }
       audio.unmute();
       arbiter.say({
         priority: arbiter.P.CONVO,
@@ -648,7 +726,7 @@
            warning and reappear halfway through a sentence. */
         stop: function () {
           entry.cancelled = true;
-          entry.said = partial;         // captured before the deltas stop
+          entry.said = saidSoFar();     // captured before the deltas stop
           audio.mute();
           cancelGeneration();
         },
@@ -664,7 +742,7 @@
           } else {
             counters.interrupted++;
             audio.mute();
-            var said = entry.said || partial;
+            var said = entry.said || saidSoFar();
             if (reason === 'preempted') {
               /* Something that matters more took the mouth mid-sentence. That
                  is correct and stays correct -- but the answer underneath it
@@ -700,6 +778,34 @@
         },
       });
       emit('LIVE_RESPONSE_START', { response_id: responseId });
+    }
+
+    /* The model has stopped writing. That is not the same moment as the driver
+       having heard the end of it, and the mouth belongs to the second one.
+     *
+     * When RIO speaks for herself the two are the same event and this is a
+     * pass-through. When something else speaks for her they are seconds apart:
+     * the model finishes an answer in a few hundred milliseconds and the
+     * synthesiser is still four seconds from the end of it. Handing the mouth
+     * back at `response.done` would let the next queued thing start talking
+     * over the second half of her sentence -- which is not a warning
+     * pre-empting her, it is two voices at once. */
+    function finishResponse(responseId) {
+      if (!sink || !speaking) { endResponse(responseId); return; }
+      if (responseId && speaking.responseId && speaking.responseId !== responseId) {
+        endResponse(responseId);
+        return;
+      }
+      var entry = speaking;
+      // Written down rather than inferred: from here the answer is finished
+      // being WRITTEN and is only waiting to finish being HEARD, and a new
+      // response arriving in that window is allowed to take the mouth.
+      entry.finishing = true;
+      var release = function () {
+        if (speaking === entry) endResponse(responseId);
+      };
+      try { sink.end(responseId).then(release, release); }
+      catch (e) { release(); }
     }
 
     function endResponse(responseId) {
@@ -766,7 +872,7 @@
         if (!pendingBarge) return;
         pendingBarge.timer = null;
         pendingBarge.cancelled = true;
-        pendingBarge.said = partial;
+        pendingBarge.said = saidSoFar();
         // Sustained past the gate: stop generating and hand back the mouth.
         cancelGeneration();
         endResponse(rid);
@@ -852,16 +958,17 @@
       }
       if (!pendingBarge) return;
       var rid = pendingBarge.responseId;
-      var said = pendingBarge.said || partial;
+      var said = pendingBarge.said || saidSoFar();
       var wasCancelled = pendingBarge.cancelled;
       clearBarge();
       if (!wasCancelled) {
         // Words arrived before the gate even closed. Real, and early: cancel
         // now rather than waiting out a timer that is about to agree.
         if (real && speaking && speaking.responseId === rid) {
+          var heard = saidSoFar();
           cancelGeneration();
           endResponse(rid);
-          noteCutoff('barge_in', { response_id: rid, said: partial });
+          noteCutoff('barge_in', { response_id: rid, said: heard });
         }
         return;
       }
@@ -996,7 +1103,22 @@
                                      reason: 'response_failed' });
               }
             }
-            endResponse((ev.response && ev.response.id) || ev.response_id);
+            finishResponse((ev.response && ev.response.id) || ev.response_id);
+            break;
+          /* TEXT MODE. The words, as they are written, forwarded to whatever
+             is speaking them. Nothing is buffered here and no phrasing is
+             decided here: the relay chunks at clause boundaries because that
+             decision is testable on a server and is not testable in a car. */
+          case 'response.output_text.delta':
+            if (sink && (!dictation || dictation.responseId !== ev.response_id)) {
+              generated += (ev.delta || '');
+              try { sink.delta(ev.response_id, ev.delta || ''); } catch (e) {}
+            }
+            break;
+          case 'response.output_text.done':
+            // What the model says it wrote. Kept for the log and for the
+            // panel; the resume still carries what was HEARD, not this.
+            if (sink && ev.text) generated = ev.text;
             break;
           case 'response.output_audio_transcript.delta':
             // What she is saying, as she says it. The only record of how far
@@ -1070,6 +1192,15 @@
         opts = opts || {};
         var line = (text || '').trim();
         if (stopped || !line) return Promise.reject(new Error('no session'));
+        /* Not in text mode, and not as a limitation. Dictation exists so a
+           warning comes out of the same mouth as the conversation; when that
+           mouth is ElevenLabs, /nav/voice and /headway_voice ARE that mouth —
+           same voice id, on the model that is fastest to first byte — so the
+           line goes there directly. Rejecting immediately is what makes it go:
+           rio_speak's fallback is one `catch` away and costs nothing, where
+           waiting out the dictation budget would cost a warning most of a
+           second for no reason at all. */
+        if (sink) return Promise.reject(new Error('text_mode'));
         if (dictation) return Promise.reject(new Error('busy'));
         return new Promise(function (resolve, reject) {
           dictation = {
@@ -1096,6 +1227,47 @@
             finishDictation('send_failed');
           }
         });
+      },
+
+      /* TIER 2: ElevenLabs is not answering at all, and RIO takes her own
+         voice back mid-drive.
+       *
+       * One-way and sticky. A voice that alternates between two people because
+       * the network is alternating is worse than either of them, and the
+       * driver has no way to interpret it -- so this happens once, is logged
+       * once, and the drive finishes in cedar.
+       *
+       * The session is asked for audio from here on. It has produced none so
+       * far, which is the only reason the voice can be named this late: a
+       * realtime session's voice is fixed once it has spoken. */
+      useCedar: function (why) {
+        if (!sink || stopped) return false;
+        var gone = sink;
+        sink = null;
+        counters.voice_backend_changed++;
+        try { gone.close(); } catch (e) {}
+        try {
+          send({
+            type: 'session.update',
+            session: {
+              type: 'realtime',
+              output_modalities: ['audio'],
+              audio: { output: { voice: cfg.cedarVoice || 'cedar' } },
+            },
+          });
+        } catch (e) {}
+        emit('LIVE_VOICE_BACKEND', {
+          backend: 'openai_realtime', voice: cfg.cedarVoice || 'cedar',
+          why: why || 'elevenlabs_unavailable' });
+        return true;
+      },
+
+      /* One utterance did not come out the way it was meant to. Counted here
+         rather than only in the relay, so a drive's own tally says how often
+         RIO's voice was not quite her voice. */
+      noteVoiceFallback: function (detail) {
+        counters.voice_fallbacks++;
+        emit('LIVE_VOICE_FALLBACK', detail || {});
       },
 
       /* The wire went away mid-sentence -- the data channel closed, or ICE
@@ -1126,12 +1298,20 @@
         pendingResume = null;
         if (dictation) finishDictation('session_stopped');
         if (speaking) endResponse(speaking.responseId);
+        // The dialogue socket is one per live session and dies with it. Left
+        // open it would hold a seat in a pool that is counted separately from
+        // ordinary synthesis, for a drive that is over.
+        if (sink) { try { sink.close(); } catch (e) {} sink = null; }
       },
 
       state: function () {
         return {
           speaking: !!speaking,
           dictating: !!dictation,
+          // Which mouth this session is using, and what the sink is doing.
+          voice_backend: sink ? 'elevenlabs' : 'openai_realtime',
+          voice: sink && sink.state ? sink.state() : null,
+          generated: generated,
           response_id: speaking ? speaking.responseId : null,
           stopped: stopped,
           last_transcript: lastTranscript,
@@ -1142,7 +1322,7 @@
           cutoffs: cutoffs,
           pending_barge: !!pendingBarge,
           pending_resume: pendingResume ? pendingResume.cause : null,
-          said_so_far: partial,
+          said_so_far: saidSoFar(),
           policy: { barge_sustain_ms: bargeSustainMs,
                     barge_confirm_ms: bargeConfirmMs,
                     max_resumes: maxResumes },
@@ -1190,6 +1370,41 @@
           if (p && p.catch) p.catch(function () {});
         };
 
+        /* WHICH MOUTH, AND HOW IT CAN CHANGE MID-DRIVE
+         *
+         * The element is where the session's own voice comes out; the sink is
+         * where ElevenLabs comes out. The controller talks to neither
+         * directly, because it has to be possible to swap them at the moment
+         * ElevenLabs stops answering -- and the controller must not have to
+         * know that happened in order to keep muting the right thing.
+         *
+         * The element stays muted for the whole drive under the ElevenLabs
+         * backend. It is carrying no audio (a text-mode session produces
+         * none), and a muted element is the honest expression of that rather
+         * than a track everybody assumes is silent. */
+        var elementMouth = {
+          mute: function () { element.muted = true; },
+          unmute: function () { element.muted = false; },
+        };
+        var sink = null;
+        if (session.voice_backend === 'elevenlabs' && root.RIO
+            && root.RIO.voiceEleven) {
+          var proto = (root.location && root.location.protocol === 'https:')
+            ? 'wss://' : 'ws://';
+          var host = (root.location && root.location.host) || '';
+          sink = root.RIO.voiceEleven.createSink({
+            wsUrl: proto + host + url('/voice/dialogue'),
+            sampleRate: session.voice_sample_rate,
+            onEvent: opts.onEvent,
+          });
+          element.muted = true;
+        }
+        var mouth = { at: sink || elementMouth };
+        var audioFacade = {
+          mute: function () { mouth.at.mute(); },
+          unmute: function () { mouth.at.unmute(); },
+        };
+
         var controller = createController({
           arbiter: arbiter,
           // Dictation policy comes from the server with the session, so the
@@ -1224,12 +1439,12 @@
                                      where: currentFix() }),
             }).then(function (r) { return r.json(); });
           },
-          // Muting the ELEMENT rather than pausing it: the track is live, and a
-          // paused element resumes into stale audio.
-          audio: {
-            mute: function () { element.muted = true; },
-            unmute: function () { element.muted = false; },
-          },
+          // Muting rather than pausing: a track is live and a paused element
+          // resumes into stale audio, and the sink's fade is undoable for the
+          // same reason -- the sustain gate has to be able to change its mind.
+          audio: audioFacade,
+          voice: sink,
+          cedarVoice: session.cedar_voice || session.voice,
           onEvent: opts.onEvent,
         });
 
@@ -1238,6 +1453,48 @@
           try { ev = JSON.parse(e.data); } catch (err) { return; }
           controller.handle(ev);
         };
+
+        /* Anything that has to be SAID to the session has to wait for a
+           channel to say it on. The one that matters is the cedar fallback:
+           the relay can refuse before the data channel has finished opening,
+           and a session.update sent into a channel that is not open yet is not
+           a fallback, it is a drive with no voice at all. */
+        var channelOpen = false;
+        var whenOpen = [];
+        function onChannelOpen(fn) {
+          if (channelOpen) { try { fn(); } catch (e) {} return; }
+          whenOpen.push(fn);
+        }
+        channel.onopen = function () {
+          channelOpen = true;
+          var pending = whenOpen.splice(0, whenOpen.length);
+          for (var i = 0; i < pending.length; i++) {
+            try { pending[i](); } catch (e) {}
+          }
+        };
+
+        /* The sink's own bad news. A per-utterance fallback is counted and the
+           drive carries on; a cedar fallback changes what the session is asked
+           to produce, and the mouth moves back to the element in the same
+           breath so the very next response is audible. */
+        if (sink) {
+          sink.onEvent(function (ev) {
+            if (!ev) return;
+            if (ev.type === 'VOICE_FALLBACK') {
+              if (ev.tier === 'cedar') {
+                mouth.at = elementMouth;
+                onChannelOpen(function () {
+                  controller.useCedar(ev.cause || 'elevenlabs_unavailable');
+                });
+              } else {
+                controller.noteVoiceFallback(ev);
+              }
+            } else if (ev.type === 'VOICE_TRANSPORT_LOST') {
+              mouth.at = elementMouth;
+              onChannelOpen(function () { controller.useCedar('voice_relay_lost'); });
+            }
+          });
+        }
 
         /* A session that dies mid-answer looks exactly like an answer that
            stopped, and the driver reports the same symptom for both. These are
@@ -1252,7 +1509,22 @@
           }
         };
 
-        return pc.createOffer()
+        /* The relay and the model are opened together rather than in a line.
+           Both are a round trip the driver is waiting through, and they have
+           nothing to say to each other until the first word is spoken. */
+        var voiceReady = Promise.resolve(null);
+        if (sink) {
+          voiceReady = sink.open().catch(function () {
+            mouth.at = elementMouth;
+            onChannelOpen(function () {
+              controller.useCedar('voice_relay_unavailable');
+            });
+            return null;
+          });
+        }
+
+        return voiceReady
+          .then(function () { return pc.createOffer(); })
           .then(function (offer) { return pc.setLocalDescription(offer).then(function () { return offer; }); })
           .then(function (offer) {
             return fetch(CALLS_URL + '?model=' + encodeURIComponent(session.model), {
@@ -1286,8 +1558,16 @@
                 var chans = session.speech_channels || {};
                 return chans[channel] !== false;
               },
+              /* Which voice this drive is actually using, for the panel and
+                 for the tests. Read from the controller rather than from the
+                 session payload: the payload says what was INTENDED, and after
+                 a cedar fallback those are two different answers. */
+              voiceBackend: function () {
+                return controller.state().voice_backend;
+              },
               stop: function () {
                 controller.stop();
+                if (sink) { try { sink.close(); } catch (e) {} }
                 try { channel.close(); } catch (e) {}
                 try { pc.close(); } catch (e) {}
                 mic.getTracks().forEach(function (t) { t.stop(); });

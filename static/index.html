@@ -4178,8 +4178,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
 <!-- ---- Navigation. Loaded last, and in this order:
        rio_speech.js    the arbiter — must exist before anything asks to speak
-       rio_realtime.js  RIO's live speech-to-speech session — no DOM in the
-                        half that decides anything, so node can test it
+       rio_voice_eleven.js  RIO's mouth under VOICE_BACKEND=elevenlabs: the
+                        dialogue relay socket and the Web Audio queue it plays
+                        into. Before rio_realtime.js, which asks for it by name
+                        when the session says that is the backend
+       rio_realtime.js  RIO's live session — no DOM in the half that decides
+                        anything, so node can test it
        rio_speak.js     one voice for deterministic lines: dictate, else
                         synthesise, else play the clip
        rio_navcore.js   the route tracker — no DOM, node-testable
@@ -4195,6 +4199,7 @@ document.addEventListener('DOMContentLoaded', () => {
   window.RIO_MAPS_KEY = "__GOOGLE_MAPS_API_KEY__";
 </script>
 <script src="/static/rio_speech.js"></script>
+<script src="/static/rio_voice_eleven.js"></script>
 <script src="/static/rio_realtime.js"></script>
 <script src="/static/rio_speak.js"></script>
 <script src="/static/rio_navcore.js"></script>

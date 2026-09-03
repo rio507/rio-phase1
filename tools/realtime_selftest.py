@@ -385,11 +385,21 @@ def run_firewall():
     # `observer` and `re` arrived with the fast path for visual questions: the
     # observer is a read that runs Qwen over frames already in the ring, and it
     # is checked below like places is.
+    # `voice_tags` is the newest name on this list and the one that needs its
+    # own sentence. It is a regex over a string and a read of a config tuple —
+    # it cannot synthesise, cannot reach a policy and cannot start a sentence.
+    # It is imported here because the paragraph telling the model which audio
+    # tags it may use is GENERATED from the same list the validator enforces,
+    # and two hand-written copies of that list is how a model ends up being
+    # told it may do something that is silently undone.
     ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
                         "openai", "config", "visual_qa", "router",
                         "vehicle_health", "places", "observer",
-                        "base64", "io", "wave"},
+                        "base64", "io", "wave", "voice_tags"},
        f"and imports only read-side code and stdlib ({sorted(live_imports)})")
+    tag_imports = _imports_of(os.path.join(REPO, "voice_tags.py"))
+    ok(tag_imports <= {"re", "config"},
+       f"...and voice_tags itself is a regex and a config read ({sorted(tag_imports)})")
 
     observer_imports = _imports_of("observer.py")
     hits = sorted(observer_imports & unreachable)
@@ -588,13 +598,31 @@ def run_dictation():
         ok(phrase in r["instructions"],
            f"and an instruction that says {phrase!r}")
 
-    ok(config.VOICE_BACKEND == "realtime",
-       f"RIO's active voice is the live session ({config.VOICE_BACKEND})")
+    # WHOSE VOICE, and what dictation means under each backend.
+    #
+    # Dictation exists so a warning comes out of the same mouth as a
+    # conversation. Under the cedar backend that means dictating INTO the live
+    # session; under ElevenLabs it is already true without dictating anything,
+    # because /nav/voice and friends synthesise on the same voice id — so the
+    # mechanism above is kept whole and switched off rather than removed, and
+    # this checks the switch rather than assuming a backend.
+    ok(config.VOICE_BACKEND in ("elevenlabs", "openai_realtime"),
+       f"RIO's voice is a named backend ({config.VOICE_BACKEND})")
+    if config.VOICE_BACKEND == "elevenlabs":
+        ok(config.ELEVENLABS_VOICE_ID and
+           config.ELEVENLABS_DETERMINISTIC_MODEL == "eleven_flash_v2_5",
+           "deterministic lines synthesise on the conversation's own voice id, "
+           f"on {config.ELEVENLABS_DETERMINISTIC_MODEL} — which is what makes "
+           "dictation unnecessary rather than missing")
+    else:
+        ok(config.REALTIME_SPEECH_ENABLED,
+           "with cedar as the voice, deterministic lines are dictated into the "
+           "live session so a warning and a conversation are one person")
     ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
-       "with ElevenLabs kept as the fallback, complete and off the active path")
+       "and the server's TTS endpoints synthesise with ElevenLabs")
 
     import voice
-    gen = voice.synthesize_stream("anything", backend="realtime")
+    gen = voice.synthesize_stream("anything", backend="openai_realtime")
     try:
         next(gen)
         ok(False, "this process must not pretend it can produce the live voice")
@@ -1153,8 +1181,16 @@ def _ask_live(conn, question, tool_handler, timeout_s=120.0):
                 "output": json.dumps(result)})
             need_followup = True
         elif event.type == "response.output_audio_transcript.done":
+            # What she said, when she said it herself.
             if event.transcript:
                 said.append(event.transcript.strip())
+        elif event.type == "response.output_text.done":
+            # ...and what she wrote, when something else is going to say it.
+            # Both are collected rather than one being selected on the config:
+            # this function is meant to work against whichever backend the
+            # session was minted with, and only one of the two ever fires.
+            if getattr(event, "text", ""):
+                said.append(event.text.strip())
         elif event.type == "response.created":
             started += 1
             active += 1
