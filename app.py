@@ -709,10 +709,29 @@ import sessions
 
 @app.post("/observe")
 async def observe(image: UploadFile = File(...), session_id: str = Query(default=None)):
+    """One frame -> one sentence. RIO's cheapest look at the road.
+
+    In a threadpool for the same reason /perceive and /headway_frame are: the
+    work is a blocking Qwen generate, and run directly in this coroutine it
+    holds the event loop for its whole duration while every other request --
+    the 4 fps frame stream included -- waits behind it.
+
+    Measured on this pod, four runs each, a headway loop pushing frames for the
+    length of one observe: on the loop, exactly ONE frame completed per observe
+    and it took 208-366 ms, which is that frame sitting out the generate. Off
+    it, three to six frames complete inside the same window at ~95 ms each.
+    Observe itself gets slower (360-410 ms to 560-770 ms) because it now shares
+    the card instead of owning it, which is the trade and the right way round:
+    a caption may wait, a following-distance warning may not.
+
+    The numbers here are smaller than /perceive's because OBSERVER_MAX_SIDE_PX
+    keeps this generate short. That is a property of the current prompt and not
+    a reason to leave it on the loop.
+    """
     import time as _t
     _t0 = _t.time()
     image_bytes = await image.read()
-    observation = vision.observe(image_bytes)
+    observation = await run_in_threadpool(vision.observe, image_bytes)
     sessions.log_observe(session_id, len(image_bytes), observation, (_t.time() - _t0) * 1000)
     return {"observation": observation}
 
