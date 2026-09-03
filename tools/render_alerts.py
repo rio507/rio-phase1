@@ -216,7 +216,7 @@ def _render_elevenlabs_once(text: str, tmp: Path) -> int:
     with tmp.open("wb") as fh:
         for chunk in voice.synthesize_stream(
                 text, backend="elevenlabs",
-                model=config.ELEVENLABS_DIALOGUE_MODEL):
+                model=config.ELEVENLABS_CONVERSATION_MODEL):
             fh.write(chunk)
             n += len(chunk)
     if n == 0:
@@ -232,7 +232,7 @@ def voice_signature(backend: str = None) -> dict:
     if backend == "elevenlabs":
         return {"backend": "elevenlabs",
                 "voice": config.ELEVENLABS_VOICE_ID,
-                "model": config.ELEVENLABS_DIALOGUE_MODEL}
+                "model": config.ELEVENLABS_CONVERSATION_MODEL}
     return {"backend": "openai_realtime",
             "voice": config.OPENAI_REALTIME_VOICE,
             "model": config.OPENAI_REALTIME_MODEL}
@@ -330,7 +330,7 @@ def main() -> int:
 
     if backend == "elevenlabs":
         print(f"  voice: elevenlabs {config.ELEVENLABS_VOICE_ID} "
-              f"on {config.ELEVENLABS_DIALOGUE_MODEL}")
+              f"on {config.ELEVENLABS_CONVERSATION_MODEL}")
     else:
         print(f"  voice: openai_realtime ({config.OPENAI_REALTIME_VOICE})")
     for line, path, n, what in render(force=args.force, backend=backend):

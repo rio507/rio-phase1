@@ -66,7 +66,14 @@ import config
 import voice_tags
 
 WS_URL = "wss://api.elevenlabs.io/v1/text-to-dialogue/stream-input"
+MULTI_URL = "wss://api.elevenlabs.io/v1/text-to-speech/{voice}/multi-stream-input"
 FLASH_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice}/stream"
+
+# How long the service holds a quiet socket open. The text-to-speech socket
+# lets this be asked for (up to 180 s); the dialogue socket does not and is
+# fixed at 20. Both are kept alive from here anyway — this only decides how
+# much slack there is if a keep-alive is ever late.
+MULTI_INACTIVITY_S = 180
 
 # Causes, named once. These are what /voice/status counts and what the log
 # lines say, and having them in one place is what stops "error" becoming the
@@ -227,6 +234,178 @@ class PhraseChunker:
 
 
 # ---------------------------------------------------------------------------
+# TWO SOCKETS, ONE CONVERSATION
+# ---------------------------------------------------------------------------
+# ElevenLabs streams over two different websockets and which one a voice needs
+# is decided by the MODEL, not by anything about the car:
+#
+#   text-to-dialogue/stream-input        eleven_v3 models, and only those
+#   text-to-speech/{voice}/multi-stream-input   everything else
+#
+# Everything above and below this section is the same either way — the phrase
+# chunker, the tag gate, both fallback tiers, the keep-alive, the capacity
+# parking, the character accounting a resume depends on. What differs is the
+# shape of four messages and the name of three fields, and that is exactly what
+# a dialect is for: the difference is written down once, here, instead of
+# spreading `if v3` through the session.
+#
+# The multi-context socket is the better-behaved of the two, and it is worth
+# saying why rather than treating it as a detail. Every audio frame it sends
+# carries the CONTEXT it belongs to, so a cancelled utterance's audio can be
+# dropped by name. The dialogue socket sends audio with nothing on it that says
+# which turn it came from, so the only safe way to abandon a turn there is to
+# throw the whole connection away and open another. One of those is a design;
+# the other is a workaround for a missing field.
+class _Dialect:
+    """The wire, and nothing else. No policy lives in here."""
+
+    #: Does a cancelled utterance need the connection thrown away?
+    recycle_on_cancel = True
+
+    def __init__(self, voice: str, model: str, fmt: str):
+        self.voice, self.model, self.fmt = voice, model, fmt
+
+    def url(self) -> str:
+        raise NotImplementedError
+
+    def hello(self) -> list:
+        """Messages to send the moment the socket opens."""
+        raise NotImplementedError
+
+    def begin(self, rid: str) -> list:
+        return []
+
+    def speak(self, rid: str, phrase: str, first: bool) -> list:
+        raise NotImplementedError
+
+    def finish(self, rid: str) -> list:
+        """The model has stopped writing. Say the rest and end the turn."""
+        return []
+
+    def abandon(self, rid: str) -> list:
+        """Give up on this utterance without ending the session."""
+        return []
+
+    def keepalive(self) -> dict:
+        raise NotImplementedError
+
+    def goodbye(self) -> dict:
+        return {"close_socket": True}
+
+    def read(self, m: dict) -> dict:
+        """One wire message -> {kind, rid, pcm, text} in one vocabulary."""
+        raise NotImplementedError
+
+
+class _DialogueDialect(_Dialect):
+    """eleven_v3, over text-to-dialogue/stream-input.
+
+    One turn per utterance, `flush` per phrase, and an end-of-turn marker per
+    flush rather than per turn — which is why the session counts both. Audio
+    arrives unlabelled, so a cancel recycles the connection.
+    """
+
+    recycle_on_cancel = True
+
+    def url(self):
+        return (f"{WS_URL}?model_id={self.model}&output_format={self.fmt}"
+                "&sync_alignment=true")
+
+    def hello(self):
+        return [{"voices": [self.voice]}]
+
+    def speak(self, rid, phrase, first):
+        return [{"inputs": [{"text": phrase, "voice_id": self.voice,
+                             "new_turn": first}]},
+                {"flush": True}]
+
+    def keepalive(self):
+        return {"keep_alive": True}
+
+    def read(self, m):
+        if m.get("error"):
+            return {"kind": "error", "code": m.get("error"),
+                    "message": m.get("message")}
+        if m.get("audio"):
+            chars = ((m.get("alignment") or {}).get("chars")) or []
+            return {"kind": "audio", "rid": None,
+                    "pcm": base64.b64decode(m["audio"]), "text": "".join(chars)}
+        if m.get("is_final_audio_for_turn"):
+            return {"kind": "flushed", "rid": None}
+        return {"kind": "other"}
+
+
+class _MultiContextDialect(_Dialect):
+    """Everything else, over text-to-speech/{voice}/multi-stream-input.
+
+    One CONTEXT per utterance, named for the response it belongs to. Audio
+    comes back labelled with it and `isFinal` arrives per context, so an
+    utterance can be finished or abandoned by name and the socket carries on —
+    no counting, no recycling.
+
+    `chunk_length_schedule` opens low on purpose. The service buffers text to
+    improve quality before generating, and the first number is how long it
+    waits for the FIRST piece — which is the one the driver is sitting in
+    silence for. Every phrase is flushed explicitly anyway, so the schedule
+    only decides what happens if a flush is ever late.
+    """
+
+    recycle_on_cancel = False
+
+    def url(self):
+        return (MULTI_URL.format(voice=self.voice)
+                + f"?model_id={self.model}&output_format={self.fmt}"
+                + f"&sync_alignment=true&inactivity_timeout={MULTI_INACTIVITY_S}")
+
+    def hello(self):
+        return []          # a context carries its own settings; see begin()
+
+    def _settings(self):
+        return {
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75,
+                               "use_speaker_boost": True},
+            "generation_config": {"chunk_length_schedule": [50, 120, 160, 250]},
+        }
+
+    def begin(self, rid):
+        return [dict({"text": " ", "context_id": rid}, **self._settings())]
+
+    def speak(self, rid, phrase, first):
+        return [{"text": phrase, "context_id": rid, "flush": True}]
+
+    def finish(self, rid):
+        return [{"context_id": rid, "close_context": True}]
+
+    def abandon(self, rid):
+        # Ends the context so nothing more is generated for it. Audio already
+        # committed still arrives, and is dropped by name on the way in.
+        return [{"context_id": rid, "close_context": True}]
+
+    def keepalive(self):
+        # No context, so it cannot disturb an utterance in flight.
+        return {"text": " "}
+
+    def read(self, m):
+        if m.get("error"):
+            return {"kind": "error", "code": m.get("error"),
+                    "message": m.get("message")}
+        rid = m.get("contextId")
+        if m.get("audio"):
+            chars = ((m.get("alignment") or {}).get("chars")) or []
+            return {"kind": "audio", "rid": rid,
+                    "pcm": base64.b64decode(m["audio"]), "text": "".join(chars)}
+        if m.get("isFinal"):
+            return {"kind": "done", "rid": rid}
+        return {"kind": "other"}
+
+
+def dialect_for(voice: str, model: str, fmt: str) -> _Dialect:
+    cls = (_DialogueDialect if config.uses_dialogue_socket(model)
+           else _MultiContextDialect)
+    return cls(voice, model, fmt)
+
+
+# ---------------------------------------------------------------------------
 # One utterance
 # ---------------------------------------------------------------------------
 class _Utterance:
@@ -288,8 +467,9 @@ class DialogueSession:
         self.on_audio = on_audio
         self.on_event = on_event or (lambda *a, **k: _noop())
         self.voice = voice or voice_id()
-        self.model = model or config.ELEVENLABS_DIALOGUE_MODEL
+        self.model = model or config.ELEVENLABS_CONVERSATION_MODEL
         self.fmt = fmt or config.ELEVENLABS_OUTPUT_FORMAT
+        self.wire = dialect_for(self.voice, self.model, self.fmt)
 
         self._ws = None
         self._reader = None
@@ -309,10 +489,6 @@ class DialogueSession:
                       "first_audio_ms": [], "tags_dropped": 0}
 
     # -- lifecycle ---------------------------------------------------------
-    def _url(self) -> str:
-        return (f"{WS_URL}?model_id={self.model}&output_format={self.fmt}"
-                "&sync_alignment=true")
-
     async def _open(self) -> bool:
         """Open the socket and register the voice. False if it would not.
 
@@ -327,13 +503,14 @@ class DialogueSession:
             return False
         try:
             self._ws = await websockets.connect(
-                self._url(), additional_headers={"xi-api-key": api_key()},
+                self.wire.url(), additional_headers={"xi-api-key": api_key()},
                 max_size=None, open_timeout=10)
-            await self._ws.send(json.dumps({"voices": [self.voice]}))
+            for msg in self.wire.hello():
+                await self._ws.send(json.dumps(msg))
             self._last_send = time.time()
             return True
         except Exception as e:
-            print(f"[voice] dialogue socket would not open: "
+            print(f"[voice] {self.model} socket would not open: "
                   f"{type(e).__name__}: {str(e)[:160]}", flush=True)
             self._ws = None
             return False
@@ -341,6 +518,18 @@ class DialogueSession:
     def _parked(self) -> bool:
         """Is the dialogue socket parked because the pool was full?"""
         return time.time() < self._no_seat_until
+
+    def _pool_name(self) -> str:
+        """Which pool ran out — they are different pools, and different sizes.
+
+        The dialogue socket draws on a dedicated pool (measured at 21 on this
+        account). Every other model streams over the text-to-speech socket and
+        draws on ORDINARY concurrency, which on the same account is a single
+        digit. Naming the right one is the difference between a log line
+        somebody can act on and one that sends them to the wrong dashboard.
+        """
+        return ("dialogue session" if self.wire.recycle_on_cancel
+                else f"concurrent {self.model} request")
 
     async def _note_no_seat(self, where: str):
         """Park the socket, and say so ONCE.
@@ -368,12 +557,13 @@ class DialogueSession:
         if not first:
             return
         self._note_fallback(NO_SEAT)
-        print(f"[voice] every dialogue seat in the workspace is in use "
+        print(f"[voice] every {self._pool_name()} in the workspace is in use "
               f"({where}); this drive runs on "
               f"{config.ELEVENLABS_DETERMINISTIC_MODEL} for the next "
               f"{config.ELEVENLABS_CAPACITY_BACKOFF_S:.0f}s", flush=True)
         await self._emit("fallback", {
             "tier": "flash", "cause": NO_SEAT, "rid": None,
+            "pool": self._pool_name(),
             "model": config.ELEVENLABS_DETERMINISTIC_MODEL,
             "retry_in_s": config.ELEVENLABS_CAPACITY_BACKOFF_S})
 
@@ -403,7 +593,7 @@ class DialogueSession:
         ws, self._ws = self._ws, None
         if ws:
             try:
-                await ws.send(json.dumps({"close_socket": True}))
+                await ws.send(json.dumps(self.wire.goodbye()))
             except Exception:
                 pass
             try:
@@ -438,7 +628,7 @@ class DialogueSession:
         if await self._open():
             self._reader = asyncio.create_task(self._read_loop())
             self.stats["reconnects"] += 1
-            print(f"[voice] dialogue socket reconnected ({why})", flush=True)
+            print(f"[voice] {self.model} socket reconnected ({why})", flush=True)
             await self._emit("reconnected", {"why": why})
 
     # -- the wire ----------------------------------------------------------
@@ -451,7 +641,8 @@ class DialogueSession:
             self._last_send = time.time()
             return True
         except Exception as e:
-            print(f"[voice] dialogue send failed: {type(e).__name__}", flush=True)
+            print(f"[voice] send failed on the {self.model} socket: "
+                  f"{type(e).__name__}", flush=True)
             self._ws = None
             return False
 
@@ -492,7 +683,7 @@ class DialogueSession:
                 why = NO_SEAT
                 await self._note_no_seat("closed by the service")
             else:
-                print(f"[voice] dialogue socket dropped: {why}: {str(e)[:120]}",
+                print(f"[voice] {self.model} socket dropped: {why}: {str(e)[:120]}",
                       flush=True)
         if self._closed or self._ws is not ws:
             return          # a deliberate close, or already replaced
@@ -506,31 +697,41 @@ class DialogueSession:
             return
         await self._reconnect(why)
 
-    async def _on_message(self, m: dict):
-        if m.get("error"):
-            capacity = _is_capacity(m.get("error")) or _is_capacity(m.get("message"))
+    async def _on_message(self, raw: dict):
+        """One wire message, read through the dialect and acted on once.
+
+        Everything below is about the CAR: whose utterance this belongs to,
+        whether it has been abandoned, how much of it the driver has heard.
+        None of it knows which socket it came from, which is the point.
+        """
+        m = self.wire.read(raw)
+        kind = m.get("kind")
+
+        if kind == "error":
+            capacity = _is_capacity(m.get("code")) or _is_capacity(m.get("message"))
             if capacity:
                 await self._note_no_seat("refused on the socket")
             else:
-                print(f"[voice] dialogue error: {str(m.get('message'))[:160]}",
+                print(f"[voice] {self.model} error: {str(m.get('message'))[:160]}",
                       flush=True)
             utt = self._utt
             if utt and not utt.done and not utt.cancelled:
                 await self._fall_back(utt, NO_SEAT if capacity else SOCKET_ERROR)
             return
 
-        audio_b64 = m.get("audio")
-        if audio_b64:
+        if kind == "audio":
             utt = self._utt
             # Audio for something that has been abandoned — cancelled by a
             # barge-in, or moved onto flash — is dropped rather than played.
-            # This is the whole reason an utterance carries a flag instead of
-            # the code simply stopping: the bytes are already in flight.
+            # `rid` is the strong version of that test and is available on the
+            # multi-context socket; the dialogue socket sends nothing that says
+            # which turn its audio is for, which is why a cancel there has to
+            # throw the connection away instead.
             if utt is None or utt.cancelled or utt.on_flash:
                 return
-            pcm = base64.b64decode(audio_b64)
-            chars = ((m.get("alignment") or {}).get("chars")) or []
-            text = "".join(chars)
+            if m.get("rid") and m["rid"] != utt.rid:
+                return
+            pcm, text = m["pcm"], m.get("text") or ""
             utt.voiced += len(text)
             utt.chunks += 1
             if utt.first_audio is None and utt.flushed_at:
@@ -542,11 +743,23 @@ class DialogueSession:
             await self._deliver(utt.rid, pcm, text)
             return
 
-        if m.get("is_final_audio_for_turn"):
+        if kind == "flushed":
+            # The dialogue socket answers per FLUSH, not per utterance. See
+            # _Utterance for why both sides are counted.
             utt = self._utt
             if utt:
                 utt.finals += 1
                 await self._maybe_done(utt)
+            return
+
+        if kind == "done":
+            # The multi-context socket answers per CONTEXT, which is per
+            # utterance, so there is nothing to count.
+            utt = self._utt
+            if utt and (not m.get("rid") or m["rid"] == utt.rid):
+                utt.finals = utt.flushes
+                await self._maybe_done(utt)
+            return
 
     async def _maybe_done(self, utt: "_Utterance"):
         """Is this utterance over? Said once, when both halves agree.
@@ -589,8 +802,17 @@ class DialogueSession:
             self._utt = _Utterance(rid)
             self._utt.on_flash = self.force_flash
             self.stats["utterances"] += 1
-        if stale and self._ws is not None:
+        # A stale turn only forces a new connection where audio is unlabelled.
+        # With a context per utterance the old one is closed by name and the
+        # socket carries on, which is a reconnect a drive does not have to pay.
+        if stale and self._ws is not None and self.wire.recycle_on_cancel:
             await self._reconnect("superseded")
+        elif self._ws is not None:
+            if stale:
+                for msg in self.wire.abandon(rid):
+                    await self._send(msg)
+            for msg in self.wire.begin(rid):
+                await self._send(msg)
 
     async def delta(self, rid: str, text: str):
         """More of the answer. Speak whatever this completes."""
@@ -617,12 +839,18 @@ class DialogueSession:
             for phrase in utt.chunker.drain():
                 await self._speak(utt, phrase)
             utt.ended = True
-            # NO EXTRA FLUSH HERE. Every phrase is flushed as it is sent, so by
-            # this point there is nothing buffered — and a flush over an empty
-            # buffer generates no audio and returns no end-of-turn marker. One
-            # sent anyway leaves the counters permanently one apart, and an
-            # utterance that can never report itself finished is a mouth that
-            # is never handed back.
+            # NO EXTRA FLUSH. Every phrase is flushed as it is sent, so there
+            # is nothing buffered — and a flush over an empty buffer generates
+            # no audio and returns no end-of-turn marker. One sent anyway
+            # leaves the counters permanently one apart, and an utterance that
+            # can never report itself finished is a mouth never handed back.
+            #
+            # What the dialect may still need is a way to say the turn is OVER,
+            # which is what produces the per-context final on the
+            # multi-context socket.
+            if not utt.on_flash:
+                for msg in self.wire.finish(utt.rid):
+                    await self._send(msg)
             await self._maybe_done(utt)
 
     async def cancel(self, rid: str):
@@ -646,8 +874,15 @@ class DialogueSession:
         if utt and utt.rid == rid:
             utt.cancelled = True
             utt.done = True
-        if self._ws is not None:
+        if self._ws is None:
+            return
+        if self.wire.recycle_on_cancel:
             await self._reconnect("cancelled")
+        else:
+            # Close the context and drop anything still arriving for it by
+            # name. No reconnect, so a barge-in costs nothing but a message.
+            for msg in self.wire.abandon(rid):
+                await self._send(msg)
 
     # -- speaking, and not being able to ------------------------------------
     async def _speak(self, utt: "_Utterance", phrase: str):
@@ -664,12 +899,13 @@ class DialogueSession:
             await self._flash(utt, phrase)
             return
         first = not utt.sent
-        ok = await self._send({"inputs": [{
-            "text": phrase, "voice_id": self.voice, "new_turn": first}]})
+        ok = True
+        for msg in self.wire.speak(utt.rid, phrase, first):
+            ok = await self._send(msg)
+            if not ok:
+                break
         if ok:
-            ok = await self._send({"flush": True})
-            if ok:
-                utt.flushes += 1
+            utt.flushes += 1
         if not ok:
             await self._fall_back(utt, SOCKET_ERROR, phrase)
             return
@@ -812,7 +1048,7 @@ class DialogueSession:
         if (self._ws is not None
                 and (now - self._last_send) * 1000.0
                 > config.ELEVENLABS_KEEPALIVE_MS):
-            if await self._send({"keep_alive": True}):
+            if await self._send(self.wire.keepalive()):
                 self.stats["keepalives"] += 1
 
         # The back-off has run out and there is no socket. Try for a seat
@@ -840,6 +1076,8 @@ class DialogueSession:
             "open": self._ws is not None,
             "degraded": self.degraded,
             "model": self.model,
+            "transport": ("text_to_dialogue" if self.wire.recycle_on_cancel
+                          else "multi_context_tts"),
             "voice_id": self.voice,
             "output_format": self.fmt,
             # Parked on flash because the workspace's dialogue pool was full.

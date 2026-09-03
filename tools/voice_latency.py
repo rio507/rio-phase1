@@ -30,15 +30,28 @@ and the whole measurement hangs off that event.
 The same question, the same instructions and the same VAD settings across all
 three paths, so the only thing varying is the mouth.
 
-THE THREE PATHS
----------------
+THE PATHS
+---------
   cedar             the live session speaks for itself. One model, one hop.
-  elevenlabs_v3     text mode, phrase-chunked into the Text-to-Dialogue socket.
-                    The path this measurement exists to justify.
-  elevenlabs_flash  text mode, straight to flash over HTTP. This is what a
+  elevenlabs_v2     text mode, phrase-chunked into the multi-context
+                    text-to-speech socket. The current conversation path.
+  elevenlabs_v3     the same, over the Text-to-Dialogue socket. A different
+                    model AND a different transport, which is why it is worth
+                    keeping a column rather than a memory of one.
+  elevenlabs_flash  text mode, straight to flash over HTTP. What a
                     per-utterance fallback sounds like, and having its number
-                    next to the other two is what makes "fall back to flash" a
+                    next to the others is what makes "fall back to flash" a
                     decision rather than a hope.
+
+AND THE OTHER QUESTION
+----------------------
+`--deterministic` measures the OTHER path — the one warnings, turns and health
+announcements take, which is an ordinary HTTP stream and not a socket. It is a
+different question with a different answer: nothing there is phrase-chunked,
+nothing streams into a conversation, and the only number that matters is time
+to first byte. It exists to answer "could the deterministic path use the
+conversation model too", which is a question about one voice everywhere and is
+worth re-asking whenever the conversation model changes.
 """
 import argparse
 import asyncio
@@ -146,6 +159,11 @@ async def _run_turn(path: str) -> dict:
     from openai import AsyncOpenAI
 
     text_out = path != "cedar"
+    model_for = {
+        "elevenlabs_v2": config.ELEVENLABS_CONVERSATION_MODEL,
+        "elevenlabs_v3": "eleven_v3_conversational",
+        "elevenlabs_flash": config.ELEVENLABS_DETERMINISTIC_MODEL,
+    }
     result = {"path": path, "ms": None, "note": None, "first_text_ms": None}
     marks = {"stopped": None, "first_text": None, "first_audio": None}
     sink_done = asyncio.Event()
@@ -165,8 +183,7 @@ async def _run_turn(path: str) -> dict:
         # dialogue socket's budget unreachable rather than by calling a
         # different function: what is measured is the code that actually runs
         # in a car when v3 is slow, including the moment spent waiting for it.
-        model = (config.ELEVENLABS_DIALOGUE_MODEL if path == "elevenlabs_v3"
-                 else config.ELEVENLABS_DETERMINISTIC_MODEL)
+        model = model_for.get(path, config.ELEVENLABS_CONVERSATION_MODEL)
         # `force_flash` is straight to the fallback model with no dialogue
         # socket in the path at all — the tier-1 destination, timed on its own
         # rather than timed through a failure.
@@ -304,11 +321,74 @@ def report(results: dict):
           "with no network in\n  the path, in this same voice.")
 
 
+# ---------------------------------------------------------------------------
+# The deterministic path: a table lookup, an HTTP stream, and a first byte
+# ---------------------------------------------------------------------------
+DETERMINISTIC_LINES = [
+    "Take the next left onto Lincoln Boulevard.",
+    "Watch your distance.",
+    "Your rear left tire is losing pressure.",
+]
+
+
+def report_deterministic(turns: int) -> int:
+    """Time to first byte for one warning, per model, on the same voice.
+
+    Not the same measurement as the conversation path and not comparable with
+    it. There is no model writing, no chunker and no socket here — the line is
+    already known, in full, before anything is called. What is being asked is
+    the narrow question the warning path actually cares about: how long after
+    the decision to speak does sound start.
+    """
+    import statistics
+
+    import voice
+
+    print("  the deterministic path — /nav/voice, /headway_voice, "
+          "/vehicle/health/voice")
+    print(f"  voice: {voice.voice_id()}\n")
+    out = {}
+    for model in (config.ELEVENLABS_DETERMINISTIC_MODEL,
+                  config.ELEVENLABS_CONVERSATION_MODEL,
+                  "eleven_turbo_v2_5"):
+        got = []
+        for i in range(turns):
+            line = DETERMINISTIC_LINES[i % len(DETERMINISTIC_LINES)]
+            t0 = time.time()
+            try:
+                stream = voice.synthesize_stream(line, model=model)
+                next(iter(stream))
+                got.append((time.time() - t0) * 1000)
+            except Exception as e:
+                print(f"    {model}: {type(e).__name__}: {str(e)[:90]}")
+                break
+            time.sleep(0.3)
+        out[model] = got
+        if got:
+            print(f"    {model:26} p50 {_pct(got, 50):6.0f} ms   "
+                  f"p95 {_pct(got, 95):6.0f} ms   {[round(x) for x in got]}")
+
+    fast = out.get(config.ELEVENLABS_DETERMINISTIC_MODEL) or []
+    conv = out.get(config.ELEVENLABS_CONVERSATION_MODEL) or []
+    print()
+    if fast and conv:
+        d = _pct(conv, 50) - _pct(fast, 50)
+        print(f"  the conversation model costs {d:+.0f} ms against "
+              f"{config.ELEVENLABS_DETERMINISTIC_MODEL} on a warning.")
+        print("  What that has to buy: a driver cannot hear the difference "
+              "between two\n  readings of \"Take the next left\", and can "
+              "certainly hear it arrive late.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--turns", type=int, default=5)
     ap.add_argument("--only", default=None,
-                    help="cedar | elevenlabs_v3 | elevenlabs_flash")
+                    help="cedar | elevenlabs_v2 | elevenlabs_v3 | elevenlabs_flash")
+    ap.add_argument("--deterministic", action="store_true",
+                    help="measure the WARNING path instead: time to first byte "
+                         "over HTTP, per model, on the same voice")
     args = ap.parse_args()
 
     if not os.getenv("OPENAI_API_KEY"):
@@ -319,13 +399,17 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    if args.deterministic:
+        return report_deterministic(args.turns)
     paths = ([args.only] if args.only
-             else ["cedar", "elevenlabs_v3", "elevenlabs_flash"])
+             else ["cedar", "elevenlabs_v2", "elevenlabs_v3",
+                   "elevenlabs_flash"])
     print(f"  question : {QUESTION!r}")
     print(f"  voice    : {voice_dialogue.voice_id()}")
     print(f"  models   : {config.OPENAI_REALTIME_MODEL} / "
-          f"{config.ELEVENLABS_DIALOGUE_MODEL} / "
+          f"{config.ELEVENLABS_CONVERSATION_MODEL} / "
           f"{config.ELEVENLABS_DETERMINISTIC_MODEL}")
+    print(f"  transport: {type(voice_dialogue.dialect_for('v', config.ELEVENLABS_CONVERSATION_MODEL, 'pcm_24000')).__name__}")
     print(f"  chunker  : >={config.ELEVENLABS_CHUNK_MIN_TOKENS} words at a "
           f"clause boundary, or {config.ELEVENLABS_CHUNK_MAX_WAIT_MS} ms")
     results = asyncio.run(run(paths, args.turns))

@@ -121,6 +121,24 @@ def run_dictation_policy():
            "warning goes to the synthesiser directly instead of waiting out a "
            "dictation budget it is never going to meet")
 
+    # WHICH SOCKET, decided by the model and by nothing else.
+    conv = config.ELEVENLABS_CONVERSATION_MODEL
+    wire = vd.dialect_for("v", conv, "pcm_24000")
+    ok(config.uses_dialogue_socket(conv) == conv.startswith("eleven_v3"),
+       f"the transport follows the model: {conv} -> "
+       f"{type(wire).__name__}")
+    ok(isinstance(wire, (vd._DialogueDialect, vd._MultiContextDialect)),
+       "and it is one of the two dialects, not a third path")
+    v3 = vd.dialect_for("v", "eleven_v3_conversational", "pcm_24000")
+    ok(isinstance(v3, vd._DialogueDialect) and v3.recycle_on_cancel,
+       "v3 still routes to the dialogue socket, which recycles on a cancel "
+       "because its audio carries nothing that says which turn it is for")
+    v2 = vd.dialect_for("v", "eleven_multilingual_v2", "pcm_24000")
+    ok(isinstance(v2, vd._MultiContextDialect) and not v2.recycle_on_cancel,
+       "and v2 to the multi-context socket, which does not — a context can be "
+       "closed by name, so a barge-in costs one message rather than a "
+       "connection")
+
     ok(config.ELEVENLABS_DETERMINISTIC_MODEL == "eleven_flash_v2_5",
        f"deterministic speech uses {config.ELEVENLABS_DETERMINISTIC_MODEL}, "
        "the fastest thing to first byte")
@@ -367,8 +385,48 @@ async def _drive(session, text, rid="r1", wait=20.0, events=None):
     return heard
 
 
+def run_voice_support():
+    """Does this voice actually support the models we point at it?
+
+    THE CHECK THAT WOULD HAVE CAUGHT THE LAST ONE. RIO's voice is a
+    professional clone, and a clone is trained against a set of base models —
+    ask for one outside that set and the service does not refuse, it
+    synthesises an approximation. The result is a voice that is recognisably
+    not the one that was cloned, arriving with no error anywhere, which is a
+    thing you can only find by listening.
+
+    The set is published per voice as `high_quality_base_model_ids`, so it is a
+    question with an answer rather than a matter of taste. This voice lists the
+    v2 family and no v3 model at all, which is precisely why the conversation
+    path moved off v3.
+    """
+    section("B2. the voice supports the models we point at it")
+
+    import urllib.request
+
+    try:
+        v = json.load(urllib.request.urlopen(urllib.request.Request(
+            f"https://api.elevenlabs.io/v1/voices/{vd.voice_id()}",
+            headers={"xi-api-key": vd.api_key()}), timeout=25))
+    except Exception as e:
+        ok(False, f"could not read the voice ({type(e).__name__})")
+        return
+    supported = set(v.get("high_quality_base_model_ids") or [])
+    ok(bool(supported), f"{v.get('name')!r} lists {len(supported)} base models")
+    for label, model in (("conversation", config.ELEVENLABS_CONVERSATION_MODEL),
+                         ("deterministic", config.ELEVENLABS_DETERMINISTIC_MODEL)):
+        ok(model in supported,
+           f"the {label} model ({model}) is one this voice was cloned against"
+           + ("" if model in supported else
+              f" — it is NOT, and the service will approximate rather than "
+              f"refuse. Supported: {sorted(supported)}"))
+
+
 async def run_live():
-    section("G. the real socket — opening, staying open, coming back")
+    wire = vd.dialect_for(vd.voice_id(), config.ELEVENLABS_CONVERSATION_MODEL,
+                          config.ELEVENLABS_OUTPUT_FORMAT)
+    section(f"G. the real socket ({type(wire).__name__}) — opening, staying "
+            "open, coming back")
 
     events = []
 
@@ -378,7 +436,7 @@ async def run_live():
     s = vd.DialogueSession(on_audio=lambda *a: asyncio.sleep(0),
                            on_event=on_event)
     opened = await s.start()
-    ok(opened, "the dialogue socket opens")
+    ok(opened, f"the socket for {config.ELEVENLABS_CONVERSATION_MODEL} opens")
     if not opened:
         await s.close()
         return
@@ -431,6 +489,75 @@ async def run_live():
                          rid="r3", events=events)
     ok(again["pcm"] > 0, "and the next thing she says comes out normally")
 
+    # A CANCEL, and what it costs. This is the behaviour that differs between
+    # the two transports and the reason the multi-context one is preferred: a
+    # context can be closed by name, so a barge-in is one message rather than a
+    # connection thrown away and rebuilt.
+    reconnects_before = s.stats["reconnects"]
+    await s.begin("r4")
+    await s.delta("r4", "This one is going to be interrupted part way ")
+    await asyncio.sleep(0.6)
+    await s.cancel("r4")
+    await asyncio.sleep(1.5)
+    if s.wire.recycle_on_cancel:
+        ok(s.stats["reconnects"] > reconnects_before,
+           "on the dialogue socket a cancel recycles the connection, because "
+           "its audio carries nothing that says which turn it belongs to")
+    else:
+        ok(s.stats["reconnects"] == reconnects_before,
+           "a cancel closes the context and leaves the connection alone — no "
+           "reconnect on the barge-in path at all")
+        ok(s._ws is not None, "...and the socket is still open")
+    dropped = {"n": 0}
+
+    async def count(rid, pcm, text):
+        dropped["n"] += len(pcm)
+
+    s.on_audio = count
+    await asyncio.sleep(1.5)
+    ok(dropped["n"] == 0,
+       "and nothing more from the cancelled utterance reaches the page, so a "
+       "warning is not spoken over by the sentence it interrupted")
+
+    after_cancel = await _drive(s, "And she carries straight on.", rid="r5",
+                                events=events)
+    ok(after_cancel["pcm"] > 0, "the next answer speaks normally afterwards")
+
+    await s.close()
+
+
+async def run_other_transport():
+    """The transport this build is NOT configured for, exercised anyway.
+
+    Both dialects are shipped and either is one config value away, so the one
+    that is switched off is the one that rots. This runs a real session over
+    whichever socket the conversation model does not use, so a refactor that
+    breaks it fails here rather than on the day somebody switches back.
+    """
+    other = ("eleven_v3_conversational"
+             if not config.uses_dialogue_socket()
+             else "eleven_multilingual_v2")
+    section(f"G2. the other transport, kept alive ({other})")
+
+    events = []
+
+    async def on_event(kind, detail):
+        events.append((kind, detail))
+
+    s = vd.DialogueSession(on_audio=lambda *a: asyncio.sleep(0),
+                           on_event=on_event, model=other)
+    opened = await s.start()
+    ok(opened, f"a session on {other} opens")
+    if not opened:
+        await s.close()
+        return
+    ok(config.uses_dialogue_socket(other) == s.wire.recycle_on_cancel,
+       f"over {type(s.wire).__name__}, which is the dialect its model needs")
+    heard = await _drive(s, "The other socket still works.", rid="o1",
+                         events=events)
+    ok(heard["pcm"] > 0, f"and it speaks ({heard['pcm']} bytes)")
+    ok(heard["done"], "and reports the utterance finished, so a mouth held on "
+                      "this transport still comes back")
     await s.close()
 
 
@@ -518,11 +645,15 @@ async def run_fallbacks():
 async def run_no_seat():
     """The workspace's dialogue pool, filled for real, and what RIO does then.
 
-    MEASURED first, then asserted: this account (Starter) holds 21 concurrent
-    dialogue sessions — a separate and much larger pool than the standard
-    concurrency limit — and the seat is taken LAZILY. A connection costs
-    nothing; the refusal arrives the first time a session tries to synthesise,
-    as a 1008 close carrying `too_many_concurrent_requests`.
+    THE DIALOGUE POOL SPECIFICALLY, which means this runs against a v3 session
+    whatever the conversation model happens to be. The two transports have two
+    different capacity stories and this is the one with a hard, reachable
+    limit: measured at 21 on this account (Starter), against 20+ simultaneous
+    on the text-to-speech socket without a refusal.
+
+    MEASURED first, then asserted. The seat is taken LAZILY — a connection
+    costs nothing; the refusal arrives the first time a session tries to
+    synthesise, as a 1008 close carrying `too_many_concurrent_requests`.
 
     That shape is the reason this test exists. From inside a car it looks
     exactly like a dropped socket, and the reflex that is right for a dropped
@@ -534,7 +665,8 @@ async def run_no_seat():
 
     import websockets
 
-    url = (vd.WS_URL + f"?model_id={config.ELEVENLABS_DIALOGUE_MODEL}"
+    v3 = "eleven_v3_conversational"
+    url = (vd.WS_URL + f"?model_id={v3}"
            f"&output_format={config.ELEVENLABS_OUTPUT_FORMAT}")
     hdr = {"xi-api-key": vd.api_key()}
     hogs = []
@@ -566,7 +698,7 @@ async def run_no_seat():
         ok(len(hogs) >= 2, f"held {len(hogs)} dialogue sessions to fill the pool")
 
         s = vd.DialogueSession(on_audio=lambda *a: asyncio.sleep(0),
-                               on_event=on_event)
+                               on_event=on_event, model=v3)
         opened = await s.start()
         ok(opened, "a car still CONNECTS with the pool full — a connection "
                    "costs no seat, so nothing fails until she speaks")
@@ -580,6 +712,9 @@ async def run_no_seat():
         ok(heard["pcm"] > 0,
            f"the driver still hears the line ({heard['pcm']} bytes), in the "
            "same voice on the fast model")
+        ok(s.status()["transport"] == "text_to_dialogue",
+           "the session under test is on the dialogue socket, which is the "
+           "transport this pool belongs to")
         ok(s.status()["no_seat"] is True,
            "the dialogue socket is PARKED rather than reconnected — going back "
            "for a refusal once per sentence is the failure this avoids")
@@ -622,7 +757,7 @@ def run_relay(base: str):
        f"/voice/status reports the backend ({st.get('backend')})")
     ok(st.get("voice_id") == config.ELEVENLABS_VOICE_ID,
        f"and the voice id ({st.get('voice_id')})")
-    ok(st.get("conversation_model") == config.ELEVENLABS_DIALOGUE_MODEL
+    ok(st.get("conversation_model") == config.ELEVENLABS_CONVERSATION_MODEL
        and st.get("deterministic_model") == config.ELEVENLABS_DETERMINISTIC_MODEL,
        f"both models: {st.get('conversation_model')} for conversation, "
        f"{st.get('deterministic_model')} for everything deterministic")
@@ -714,7 +849,9 @@ def main() -> int:
     run_firewall()
     run_clips()
     if args.live:
+        run_voice_support()
         asyncio.run(run_live())
+        asyncio.run(run_other_transport())
         asyncio.run(run_fallbacks())
     if args.pool:
         asyncio.run(run_no_seat())

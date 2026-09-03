@@ -1,4 +1,4 @@
-# RIO's voice — ElevenLabs v3, with GPT-Realtime still doing the thinking
+# RIO's voice — ElevenLabs, with GPT-Realtime still doing the thinking
 
 **Status:** implemented, measured against the real models and the real service.
 The playback half runs in a browser and has not been driven in a car yet; see
@@ -12,9 +12,19 @@ The playback half runs in a browser and has not been driven in a car yet; see
 |---|---|---|
 | hearing | the live session, continuously | **unchanged** |
 | thinking | `gpt-realtime-2.1` | **unchanged** |
-| speaking | the same session, in `cedar` | ElevenLabs `eleven_v3_conversational`, voice `weA4Q36twV5kwSaTEL0Q` |
+| speaking | the same session, in `cedar` | ElevenLabs `eleven_multilingual_v2`, voice `weA4Q36twV5kwSaTEL0Q` |
 | deterministic lines | dictated into the live session | ElevenLabs `eleven_flash_v2_5`, **same voice id** |
-| pre-rendered clips | rendered in `cedar` | re-rendered on v3, **same voice id** |
+| pre-rendered clips | rendered in `cedar` | re-rendered on `eleven_multilingual_v2`, **same voice id** |
+
+> **The conversation model was v3 first, and v3 was wrong.** The voice is a
+> professional clone, and a clone is trained against a set of base models. This
+> one publishes eight of them — the whole v2 family, `eleven_multilingual_v2`
+> and `eleven_flash_v2_5` among them — and **no v3 model at all**. Asked for one
+> outside that set the service does not refuse; it synthesises an
+> approximation, so the driver hears a voice that is recognisably not the one
+> that was cloned, with no error anywhere. That is only findable by listening,
+> which is how it was found. `voice_selftest --live` now asks the question
+> directly, against the voice's own `high_quality_base_model_ids`.
 
 The live session is put in **text mode**. Its audio input, its voice-activity
 detector, its transcription, its tools and its instructions are untouched — it
@@ -44,8 +54,9 @@ lines still play local files with no network in the path.
                                         voice_dialogue.PhraseChunker
                                         voice_tags.sanitize
                                                        │
-                                    wss://api.elevenlabs.io/v1/
-                                      text-to-dialogue/stream-input
+                                    wss://api.elevenlabs.io/v1/text-to-speech/
+                                      {voice}/multi-stream-input
+                                          (v3 would use text-to-dialogue)
                                                        │
                                              pcm_24000 + alignment
                                                        │
@@ -82,6 +93,36 @@ than approximately true: without it the server waits for ~40 characters of its
 own accord, which is a second sentence's worth of delay sitting inside the
 mechanism that exists to remove delay.
 
+### Two sockets, and the model picks
+
+ElevenLabs streams over two different websockets, and which one a voice needs
+is decided by the model:
+
+| model | socket |
+|---|---|
+| `eleven_v3*` | `text-to-dialogue/stream-input` |
+| everything else | `text-to-speech/{voice}/multi-stream-input` |
+
+`voice_dialogue.py` speaks both. Everything around them is shared — the phrase
+chunker, the tag gate, both fallback tiers, the keep-alive, the capacity
+parking, the character accounting a resume depends on — and the difference is
+four message shapes and three field names, written down once as a dialect.
+
+**The multi-context socket is the better-behaved of the two**, and it is worth
+saying why rather than filing it as a detail. Every audio frame it sends
+carries the `contextId` it belongs to, and `isFinal` arrives per context. So an
+utterance can be finished or abandoned **by name**: a barge-in closes one
+context and the connection carries on. The dialogue socket sends audio with
+nothing on it saying which turn it came from, so the only safe way to abandon a
+turn there is to throw the connection away and open another — a reconnect per
+barge-in, and an end-of-turn marker per *flush* that has to be counted against
+flushes sent. One of those is a design; the other is a workaround for a missing
+field.
+
+Both are tested live on every `--live` run, including the one this build is not
+configured for, because the transport that is switched off is the one that
+rots.
+
 ---
 
 ## Measured
@@ -95,24 +136,29 @@ instructions, same VAD settings on every row; only the mouth varies.
 python -m tools.voice_latency --turns 10
 ```
 
-10 turns per path, 2026-09-03:
+8 turns per path, 2026-09-03:
 
-| path | p50 | p95 | model's first word (p50) | synthesis p50 / p95 |
+| path | p50 | p95 | model's first word (p50) | **synthesis** p50 / p95 |
 |---|---|---|---|---|
-| `cedar` (the session speaks for itself) | 634 ms | 1004 ms | — (inside the model) | — |
-| `elevenlabs_v3` (text mode → dialogue socket) | 717 ms | 1183 ms | 293 ms | 402 / 444 ms |
-| `elevenlabs_flash` (the per-utterance fallback) | 633 ms | 872 ms | 316 ms | 325 / 369 ms |
+| `cedar` (the session speaks for itself) | 594 ms | 733 ms | — (inside the model) | — |
+| **`elevenlabs_v2`** (multi-context socket) | **699 ms** | 879 ms | 278 ms | **491 / 536 ms** |
+| `elevenlabs_v3` (dialogue socket) | 912 ms | 1286 ms | 547 ms | 366 / 433 ms |
+| `elevenlabs_flash` (the per-utterance fallback) | 599 ms | 885 ms | 296 ms | 336 / 353 ms |
 | pre-rendered clip | 0 ms | 0 ms | — | — |
 
-**v3 conversational costs +83 ms against cedar at the median.** The p95 column
-is mostly the MODEL: a turn where GPT takes a second to write its first word is
-a second late in every voice, which is why the synthesis column is reported
-separately — that is the part this change owns, and it is a much tighter
-distribution than the end-to-end number suggests (402 ms p50, 444 ms p95).
+**v2 costs +105 ms against cedar at the median.**
 
-Flash is level with cedar end to end and has the tightest p95 of the three,
-which is the reason it is the per-utterance fallback and the reason every
-deterministic line uses it.
+**Read the synthesis column, not the end-to-end one, when comparing the three
+ElevenLabs rows.** They ran against the same GPT and got different luck from
+it: v3's end-to-end p50 is 912 ms mostly because GPT took 547 ms to write its
+first word in that batch against 278 ms in v2's. Subtracting the model leaves
+the part this system owns, and there v2 is the slowest of the three —
+**491 ms against v3's 366 and flash's 336**. That is the price of the clone
+being reproduced properly, and it is ~125 ms.
+
+v2 also returns audio in **fewer, larger chunks** than v3 (2 against 8 on the
+same sentence). Playback still starts before the sentence is finished, which is
+the whole point, but there is less of a head start than v3 gave.
 
 ---
 
@@ -122,10 +168,34 @@ Every path names `config.ELEVENLABS_VOICE_ID`:
 
 | what | model | why that model |
 |---|---|---|
-| conversation | `eleven_v3_conversational` | prosody and audio tags; a socket, so it can stream |
-| nav / health / calm headway | `eleven_flash_v2_5` | fastest to first byte, and a turn instruction is a line where that is the only property that matters |
+| conversation | `eleven_multilingual_v2` | the clone is reproduced properly, and it streams over the multi-context socket |
+| nav / health / calm headway | `eleven_flash_v2_5` | **measured**: 168 ms to first byte against v2's 917 ms on the same line and the same voice |
 | per-utterance fallback | `eleven_flash_v2_5` | same reason, plus it is already the fast path |
-| pre-rendered clips | `eleven_v3_conversational` | rendered offline, so there is no first byte to wait for |
+| pre-rendered clips | `eleven_multilingual_v2` | rendered offline, so there is no first byte to wait for — and matching the conversation exactly is the only thing left to optimise |
+
+### Could the deterministic path use the conversation model too?
+
+No, and it is not close. Measured on the same voice, same lines, time to first
+byte over HTTP — which is the only property that path cares about, because the
+sentence is already known in full before anything is called:
+
+```
+python -m tools.voice_latency --deterministic --turns 5
+
+eleven_flash_v2_5          p50    168 ms   p95    253 ms
+eleven_multilingual_v2     p50    917 ms   p95    952 ms
+eleven_turbo_v2_5          p50    210 ms   p95    497 ms
+```
+
+**The conversation model costs +749 ms on a warning.** For reference, the
+dictation budget this system already treats as too long to wait is 900 ms. A
+driver cannot hear the difference between two readings of "Take the next left";
+they can certainly hear it arrive late.
+
+`eleven_turbo_v2_5` is the interesting third column — +42 ms over flash, and in
+the same v2 family as the conversation model, so if flash ever turns out to
+render the clone less faithfully than v2 does, that is the trade to look at
+before giving up the latency. Both are on the voice's supported list.
 
 **Dictation is switched off, not removed.** It exists so a warning comes out of
 the same mouth as a conversation; under this backend that is already true
@@ -271,12 +341,19 @@ to prove it.
 ## Configuration
 
 ```
-VOICE_BACKEND=elevenlabs                   # elevenlabs | openai_realtime
+VOICE_BACKEND=elevenlabs                          # elevenlabs | openai_realtime
 ELEVENLABS_VOICE_ID=weA4Q36twV5kwSaTEL0Q
-ELEVENLABS_MODEL=eleven_v3_conversational
-ELEVENLABS_API_KEY=sk_...                  # never leaves the server
-OPENAI_REALTIME_VOICE=cedar                # what tier 2 falls back to
+ELEVENLABS_MODEL_CONVERSATION=eleven_multilingual_v2
+ELEVENLABS_API_KEY=sk_...                         # never leaves the server
+OPENAI_REALTIME_VOICE=cedar                       # what tier 2 falls back to
 ```
+
+The conversation model is the only setting that chooses a transport: name an
+`eleven_v3*` model and the dialogue socket is used, name anything else and the
+multi-context text-to-speech socket is. `ELEVENLABS_MODEL` is still read as a
+fallback for the older name. The deterministic model is not an environment
+variable — it is `eleven_flash_v2_5` in `config.py`, for the measured reason
+above.
 
 The backend is **config plus a restart**, not a runtime toggle: the two paths
 differ in what the live session is asked to produce, and a session that changed
@@ -306,12 +383,13 @@ the dialogue pool full.
 
 ```
 python -m tools.voice_selftest                       # config, chunker, tags, firewall, clips
-python -m tools.voice_selftest --live                # + the real socket and both fallback tiers
+python -m tools.voice_selftest --live                # + both real sockets and both fallback tiers
 python -m tools.voice_selftest --server http://127.0.0.1:8888   # + the relay
 python -m tools.voice_selftest --pool                # + a genuinely full dialogue pool
 node tools/realtime_selftest.js                      # + the text-mode controller section
 node tools/live_voice_probe.js --voice elevenlabs    # the ten turns, through the sink
-python -m tools.voice_latency --turns 10             # the three voices, side by side
+python -m tools.voice_latency --turns 10             # the four voices, side by side
+python -m tools.voice_latency --deterministic        # ...and the warning path, per model
 python -m tools.render_alerts --force                # re-render the clips + manifest
 python -m tools.preflight                            # is this pod configured for that voice
 ```
@@ -338,9 +416,12 @@ be about how fast the machine running them is.
 * **Playback in a real browser.** Every decision in the sink is tested against
   a stub context; the Web Audio scheduling itself, and the iOS gesture-unlock
   path around it, have not been run on a device.
-* **How v3 sounds in a moving car** at road-noise levels, against flash. The
-  latency difference is measured; the quality difference is a judgement nobody
-  has made yet with the engine running.
+* **How v2 sounds in a moving car** at road-noise levels, against flash. The
+  latency difference is measured and the clone is now reproduced by a model the
+  voice actually supports; whether flash — which is also on that list, and
+  which every warning uses — holds the likeness as well as v2 does is a
+  judgement nobody has made yet with the engine running. It is the same class
+  of thing that made v3 wrong, and the only way to settle it is to listen.
 * **How often the tag gate fires in practice.** The rules are tested; the
   *rate* at which a real conversation reaches for a tag it does not get is a
   property of the model and the prompt, and wants a drive's worth of
@@ -353,23 +434,36 @@ be about how fast the machine running them is.
 
 ## Concurrency — measured, because it is not published
 
-Dialogue sessions draw from a pool separate from ordinary synthesis, and
-ElevenLabs documents that fact without publishing the numbers: the per-tier
-table on the models page covers multilingual, flash, STT, realtime STT and
-music, and says nothing about dialogue. The subscription API does not expose it
-either. So it was measured, by opening sessions against this account until the
-service refused.
+**Which pool depends on the transport, and they are different pools.** Under
+`eleven_multilingual_v2` the conversation runs on the text-to-speech socket,
+not the dialogue socket, so the 21-seat dialogue pool below no longer governs
+the conversation path — it governs the v3 path, which is still shipped and one
+config value away.
 
-**Starter holds 21 concurrent dialogue sessions.** The service says so itself:
+**On the text-to-speech socket: at least 20 simultaneous, and no refusal.**
+Twenty multi-context requests generating *at the same time* on this account all
+succeeded. That is notably not the 3 the published table gives multilingual v2
+on Starter, which suggests websocket sessions are metered separately from HTTP
+there too. The ceiling was not probed further: 20 already answers the only
+question that matters, since a car needs one.
+
+> A first attempt at this measured nothing and looked like a pass. It opened
+> sockets one at a time and generated a short phrase on each, so no two
+> requests were ever concurrent. The number only means something when the
+> generations overlap, which is the easy mistake to make here and the reason
+> the probe now opens every socket first and starts them together.
+
+**On the dialogue socket, Starter holds 21 concurrent sessions.** The service
+says so itself:
 
 ```
 too_many_concurrent_requests: Too many concurrent requests. Your current
 subscription is associated with a maximum of 21 concurrent requests
 ```
 
-For scale, this tier's *standard* concurrency is 3 on multilingual v2 and 6 on
-flash — so the dialogue pool really is sized differently, and 21 cars talking
-at once is not a limit this product is going to reach soon.
+For scale, this tier's *published* standard concurrency is 3 on multilingual v2
+and 6 on flash — so the dialogue pool really is sized differently. Either way,
+neither number is one this product is going to reach: a car needs one seat.
 
 **The seat is taken lazily, and that is the part worth knowing.** Two probes
 disagreed before this was understood: thirty idle connections were all

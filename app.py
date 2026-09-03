@@ -757,7 +757,7 @@ def voice_status_endpoint():
         "backend": config.VOICE_BACKEND,
         "voice_id": voice_dialogue.voice_id(),
         "configured": voice_dialogue.configured(),
-        "conversation_model": config.ELEVENLABS_DIALOGUE_MODEL,
+        "conversation_model": config.ELEVENLABS_CONVERSATION_MODEL,
         "deterministic_model": config.ELEVENLABS_DETERMINISTIC_MODEL,
         "cedar_voice": config.OPENAI_REALTIME_VOICE,
         "first_byte_budget_ms": config.ELEVENLABS_FIRST_BYTE_BUDGET_MS,

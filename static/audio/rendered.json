@@ -1,49 +1,49 @@
 {
   "clips": {
     "back_off": {
-      "at": 1788467708.1,
+      "at": 1788474432.4,
       "backend": "elevenlabs",
-      "bytes": 45602,
-      "model": "eleven_v3_conversational",
-      "sha1": "e5b7038f131a",
+      "bytes": 28884,
+      "model": "eleven_multilingual_v2",
+      "sha1": "be72f25f983e",
       "voice": "weA4Q36twV5kwSaTEL0Q"
     },
     "tire_critical": {
-      "at": 1788467708.1,
+      "at": 1788474432.4,
       "backend": "elevenlabs",
-      "bytes": 102862,
-      "model": "eleven_v3_conversational",
-      "sha1": "788b03fe41ef",
+      "bytes": 103280,
+      "model": "eleven_multilingual_v2",
+      "sha1": "cc9939a1491f",
       "voice": "weA4Q36twV5kwSaTEL0Q"
     },
     "tire_sensor_lost": {
-      "at": 1788467708.1,
+      "at": 1788474432.4,
       "backend": "elevenlabs",
-      "bytes": 89070,
-      "model": "eleven_v3_conversational",
-      "sha1": "054ec8f7786a",
+      "bytes": 125432,
+      "model": "eleven_multilingual_v2",
+      "sha1": "a9c120581ad5",
       "voice": "weA4Q36twV5kwSaTEL0Q"
     },
     "too_close": {
-      "at": 1788467708.1,
+      "at": 1788474432.4,
       "backend": "elevenlabs",
-      "bytes": 26376,
-      "model": "eleven_v3_conversational",
-      "sha1": "42545ad28c9a",
+      "bytes": 25958,
+      "model": "eleven_multilingual_v2",
+      "sha1": "d47a87480ea9",
       "voice": "weA4Q36twV5kwSaTEL0Q"
     },
     "watch_distance": {
-      "at": 1788467708.1,
+      "at": 1788474432.4,
       "backend": "elevenlabs",
-      "bytes": 25122,
-      "model": "eleven_v3_conversational",
-      "sha1": "5add5b3bf5e9",
+      "bytes": 27212,
+      "model": "eleven_multilingual_v2",
+      "sha1": "03e16312641b",
       "voice": "weA4Q36twV5kwSaTEL0Q"
     }
   },
   "voice": {
     "backend": "elevenlabs",
-    "model": "eleven_v3_conversational",
+    "model": "eleven_multilingual_v2",
     "voice": "weA4Q36twV5kwSaTEL0Q"
   }
 }

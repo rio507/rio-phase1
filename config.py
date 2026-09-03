@@ -204,10 +204,33 @@ if VOICE_BACKEND == "realtime":
 # rather than a thing to check.
 ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
 
-# RIO's conversation, when ElevenLabs is her voice. v3 conversational is the
-# model with the audio tags and the prosody that carries a shrug; it streams
-# only over the Text-to-Dialogue socket, which is why voice_dialogue.py exists.
-ELEVENLABS_DIALOGUE_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3_conversational")
+# RIO's conversation, when ElevenLabs is her voice.
+#
+# eleven_multilingual_v2, because this is a PROFESSIONAL VOICE CLONE and v3
+# does not reproduce it. v3 has the audio tags and the prosody that carries a
+# shrug, and none of that is worth a voice that is recognisably not the one
+# that was cloned — the whole argument for one voice everywhere is that the
+# driver hears one person, and a conversational model that renders her as
+# somebody else breaks it more thoroughly than two models ever could.
+#
+# THE MODEL DECIDES THE TRANSPORT, which is why this is not a one-word change.
+# The Text-to-Dialogue socket takes eleven_v3 models and nothing else; every
+# other model streams over the text-to-speech socket. voice_dialogue.py speaks
+# both dialects and picks by the name here, so switching back to v3 is still
+# this one setting.
+ELEVENLABS_CONVERSATION_MODEL = os.getenv(
+    "ELEVENLABS_MODEL_CONVERSATION",
+    os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"))
+
+# Which socket that model needs. Named as a question about the model rather
+# than as a second setting, so the two can never disagree.
+def uses_dialogue_socket(model: str = None) -> bool:
+    """Is this a Text-to-Dialogue model? Only the v3 family is."""
+    return str(model or ELEVENLABS_CONVERSATION_MODEL).startswith("eleven_v3")
+
+
+# The old name for the setting above, kept because tools and docs use it.
+ELEVENLABS_DIALOGUE_MODEL = ELEVENLABS_CONVERSATION_MODEL
 
 # Everything deterministic, and every fallback. Flash is the fastest thing
 # ElevenLabs has to first byte, and a warning is exactly the line where that is
