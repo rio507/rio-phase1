@@ -1494,19 +1494,46 @@ function installBrowser(base, sessionId, origin) {
                                                    accuracy: 8 } }),
     },
   };
-  global.RIO = {
-    sessionId: sessionId,
-    url: (p) => base + p + (p.indexOf('?') >= 0 ? '&' : '?') +
-                'session_id=' + encodeURIComponent(sessionId),
-    headway: { startWatch: () => {}, onPosition: (fn) => { gps.sink = fn; } },
-    speak: { provider: () => ({ play: () => Promise.resolve(), stop: () => {} }) },
-  };
+  /* EXTEND the page's namespace, never REPLACE it.
+   *
+   * Every panel file registers itself on `window.RIO` from an IIFE that runs
+   * once, at load. In node that load is a `require`, and `require` is CACHED —
+   * so a module this file already pulled in at the top (rio_speech,
+   * rio_navcore, rio_realtime) will NOT run its registration again no matter
+   * how many times it is required here.
+   *
+   * Assigning a fresh object to global.RIO therefore does not reset the page,
+   * it DELETES those modules for the rest of the process. `attach()` then
+   * calls RIO.navcore.create on undefined, setRoute catches it like any other
+   * routing failure, and eight checks report that a route would not build —
+   * naming the provider, the server and the tool, none of which were involved.
+   * The server was answering with sixteen maneuvers throughout.
+   *
+   * So the harness adds its four stubs to whatever is already there. */
+  const RIO = global.RIO || (global.RIO = {});
+  RIO.sessionId = sessionId;
+  RIO.url = (p) => base + p + (p.indexOf('?') >= 0 ? '&' : '?') +
+                   'session_id=' + encodeURIComponent(sessionId);
+  RIO.headway = { startWatch: () => {}, onPosition: (fn) => { gps.sink = fn; } };
+  RIO.speak = { provider: () => ({ play: () => Promise.resolve(), stop: () => {} }) };
 
   require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
   require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
   require(path.join(__dirname, '..', 'static', 'rio_navplan.js'));
   require(path.join(__dirname, '..', 'static', 'rio_nav.js'));
   (docHandlers.DOMContentLoaded || []).forEach((f) => f());
+
+  /* ...and say so HERE if one of them is missing anyway.
+   *
+   * This is the check the afternoon above was spent not having. A panel with
+   * no tracker module fails at the first route it is asked to build, several
+   * layers down, wearing the costume of a provider error — and the one thing
+   * that would have named it is the question this asks. */
+  const missing = ['speech', 'navcore', 'navplan', 'nav']
+    .filter((k) => !RIO[k]);
+  ok(missing.length === 0,
+     'the panel has every module it needs before anything asks it to route'
+     + (missing.length ? ' (missing: ' + missing.join(', ') + ')' : ''));
   return gps;
 }
 
