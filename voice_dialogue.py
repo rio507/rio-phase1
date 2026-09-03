@@ -147,13 +147,31 @@ _BOUNDARY = re.compile(r"[.!?…](?=\s|$)|[,;:—–](?=\s)")
 class PhraseChunker:
     """A character stream in, speakable phrases out."""
 
-    def __init__(self, min_tokens=None, max_wait_ms=None):
-        self.min_tokens = int(config.ELEVENLABS_CHUNK_MIN_TOKENS
-                              if min_tokens is None else min_tokens)
-        self.max_wait_ms = float(config.ELEVENLABS_CHUNK_MAX_WAIT_MS
-                                 if max_wait_ms is None else max_wait_ms)
+    def __init__(self, min_tokens=None, max_wait_ms=None,
+                 first_min_tokens=None, first_max_wait_ms=None):
+        self._min_tokens = int(config.ELEVENLABS_CHUNK_MIN_TOKENS
+                               if min_tokens is None else min_tokens)
+        self._max_wait_ms = float(config.ELEVENLABS_CHUNK_MAX_WAIT_MS
+                                  if max_wait_ms is None else max_wait_ms)
+        # The first phrase of an answer is the only one with nothing playing
+        # behind it, so it gets a lower bar. See config.
+        self._first_min_tokens = int(
+            config.ELEVENLABS_FIRST_CHUNK_MIN_TOKENS
+            if first_min_tokens is None else first_min_tokens)
+        self._first_max_wait_ms = float(
+            config.ELEVENLABS_FIRST_CHUNK_MAX_WAIT_MS
+            if first_max_wait_ms is None else first_max_wait_ms)
+        self.spoke = False       # has anything gone out for this utterance?
         self.buf = ""
         self.since = None        # when the oldest unsent character arrived
+
+    @property
+    def min_tokens(self):
+        return self._first_min_tokens if not self.spoke else self._min_tokens
+
+    @property
+    def max_wait_ms(self):
+        return self._first_max_wait_ms if not self.spoke else self._max_wait_ms
 
     def _tokens(self, s: str) -> int:
         return len(s.split())
@@ -186,6 +204,7 @@ class PhraseChunker:
                 break
             out.append(self.buf[:cut])
             self.buf = self.buf[cut:]
+            self.spoke = True
             self.since = now if self.buf.strip() else None
         return out
 
@@ -220,6 +239,7 @@ class PhraseChunker:
             # it is the only thing that produces speakable audio.
             return []
         phrase, self.buf = self.buf[:cut], self.buf[cut:]
+        self.spoke = True
         self.since = now if self.buf.strip() else None
         return [phrase]
 
@@ -227,7 +247,10 @@ class PhraseChunker:
         """Everything left, because the model has stopped writing."""
         left = self.buf
         self.buf, self.since = "", None
-        return [left] if left.strip() else []
+        if left.strip():
+            self.spoke = True
+            return [left]
+        return []
 
     def pending(self) -> str:
         return self.buf
@@ -352,13 +375,34 @@ class _MultiContextDialect(_Dialect):
 
     recycle_on_cancel = False
 
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        # ONCE PER CONNECTION, NOT ONCE PER UTTERANCE.
+        #
+        # The service is strict about this and says so plainly: "voice_settings
+        # field must be provided in the first message and then either be not
+        # provided or not change." Sending it again on the second context does
+        # not warn — it closes the socket with a 1008.
+        #
+        # Which is exactly what it did. Every utterance after the first killed
+        # the connection, fell back to flash for that line, and reconnected;
+        # the drive kept speaking, in the wrong model, reconnecting once per
+        # sentence. The tests did not catch it because a fallback that still
+        # produces audio still passes "she said something" — see the check
+        # added for it in voice_selftest.
+        self._greeted = False
+
     def url(self):
         return (MULTI_URL.format(voice=self.voice)
                 + f"?model_id={self.model}&output_format={self.fmt}"
                 + f"&sync_alignment=true&inactivity_timeout={MULTI_INACTIVITY_S}")
 
     def hello(self):
-        return []          # a context carries its own settings; see begin()
+        # A fresh connection has said nothing yet, and the settings ride on the
+        # first context rather than on their own message so that opening a
+        # socket costs no synthesis.
+        self._greeted = False
+        return []
 
     def _settings(self):
         return {
@@ -368,7 +412,11 @@ class _MultiContextDialect(_Dialect):
         }
 
     def begin(self, rid):
-        return [dict({"text": " ", "context_id": rid}, **self._settings())]
+        msg = {"text": " ", "context_id": rid}
+        if not self._greeted:
+            self._greeted = True
+            msg.update(self._settings())
+        return [msg]
 
     def speak(self, rid, phrase, first):
         return [{"text": phrase, "context_id": rid, "flush": True}]

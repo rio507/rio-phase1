@@ -432,6 +432,103 @@ be about how fast the machine running them is.
 
 ---
 
+## "What do you see?" — where the time goes
+
+The visual turn got slower when the voice changed, and the shape of it is not
+what the change made obvious. Measured end to end on the current path
+(`python -m tools.visual_latency --live --session auto`), with a seam at every
+stage, before and after the fixes below:
+
+| stage | before (p50/p95) | after (p50/p95) | whose time |
+|---|---|---|---|
+| turn end → `look()` called | 716 / 2178 ms | 704 / 1233 ms | the model |
+| `look()` → tool result | 4 / 5996 ms | **4 / 3421 ms** | ours |
+| tool result → first text token | 385 / 1697 ms | 607 / 766 ms | the model |
+| first token → first phrase out | 101 ms | **67 ms** | ours |
+| first phrase → FIRST AUDIO | 422 ms | 293 ms | the synthesiser |
+| **turn end → first audio, scene questions** | ~1629 ms | **~1480 ms** | |
+| turn end → first audio, all questions | 2464 / 5426 ms | 1898 / 4900 ms | |
+| observer cache hits | 4/8 | **7/10** | |
+| answer length | 23 / 44 words | 19 / 32 words | |
+
+**The observer was never the problem.** It ran throughout — 304 observations
+over a ten-question run, `has_record` true — and every cache hit came back in
+**3–4 ms**. What was wrong was which questions reached it.
+
+### The gate was judging the wrong sentence
+
+`look()` decides whether a question can be answered from the running
+observation by matching it against a list of scene phrasings. Those phrasings
+are things *drivers* say. What arrives at the tool is what the *model* passed,
+and the model paraphrases: "what's around us right now" arrives as "describe
+the current scene", misses the list, and pays 2.3–6.0 s for a full remote
+visual turn to produce a sentence that was already sitting in memory.
+
+Two changes, and the second matters more than the first:
+
+* **The driver's own transcript now travels with the tool call.** The panel is
+  where Whisper's output lands, so it is the only thing that can send it, and
+  the gate judges it first. A paraphrase is now the fallback rather than the
+  authority.
+* **The rule is the right way round.** It was a whitelist of phrasings that
+  might be scene questions — a losing game, where every phrasing nobody thought
+  of costs two seconds. What actually disqualifies a caption from answering is
+  small, closed and already written down: the question asks about a *particular
+  thing*. So a short question with no object reference in it is a scene
+  question, and the whitelist survives only as the fast yes.
+
+Three of eight scene questions were taking the full path. Now the only
+questions that take it are the ones that should: "what's that car ahead",
+"what's on the left", "what colour is the car in front".
+
+### Two smaller things the numbers also named
+
+* **She was told to say "let me look" before calling the camera.** Those words
+  are composed *before* the call goes out, so the driver waits through them —
+  in front of a tool that usually answers in four milliseconds. She calls
+  first and speaks after now. The research tool, which really does take
+  seconds, keeps its holding line.
+* **Camera answers ran to 23 words at the median and 44 at p95**, against
+  instructions asking for one short sentence. Instructions are guidance; the
+  follow-up response after a `look` now carries
+  `REALTIME_LOOK_ANSWER_MAX_TOKENS` as an actual ceiling. 19 / 32 words after.
+
+### What did not turn out to be true
+
+Two reasonable suspicions, both cleared by measurement rather than argument:
+
+* **The observer is not gated on the old audio session.** It starts when the
+  session is minted, which text mode still does.
+* **v2's coarser chunking is not what delays the first word.** The first phrase
+  reaches the socket 67 ms after the model's first token. It was worth taking
+  to its floor anyway — the first phrase of an answer has nothing playing
+  behind it, so it now goes at three words or 120 ms rather than five or 250 —
+  but this stage was never the problem, and saying so is worth more than the
+  40 ms.
+
+### It is still above the target, and this is why
+
+The goal was ~1.2 s to first audio on a scene question. It is ~1.48 s, and the
+budget says where the rest is:
+
+```
+  ~700 ms   the model hearing the question and deciding to call the camera
+     4 ms   the camera answering
+  ~450 ms   the model composing a sentence from the answer
+    67 ms   the chunker deciding it is worth speaking
+  ~330 ms   v2 synthesising it
+```
+
+**About a second of that is two round trips to a remote model**, and roughly
+0.4 s is this system's. Getting under 1.2 s means removing one of the two model
+passes — speaking the observation with less of RIO's own composition on top of
+it — and that is a deliberate trade against the rule this codebase has held
+throughout: *she phrases it, the pipeline does not.* It is a decision about
+what RIO is, not a tuning parameter, so it is written down here rather than
+taken.
+
+---
+
 ## Concurrency — measured, because it is not published
 
 **Which pool depends on the transport, and they are different pools.** Under

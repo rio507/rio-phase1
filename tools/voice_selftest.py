@@ -279,6 +279,86 @@ def _imports_of(path):
     return names
 
 
+def run_scene_gate():
+    """Which visual questions get the 4 ms answer, and which pay for a model.
+
+    MEASURED, then fixed: three of eight scene questions took the full remote
+    visual turn (2.3-6.0 s) instead of reading the running observation (3 ms),
+    and none of them was an object question. The gate was a whitelist of
+    phrasings people say, judged against the paraphrase the MODEL passes to the
+    tool — so "what's around us right now" arrived as "describe the current
+    scene", missed the list, and cost six seconds.
+    """
+    section("B3. the camera's fast path — what it will and will not shortcut")
+
+    scene = [
+        "what do you see", "describe what you see", "what's ahead",
+        "describe the current scene", "what's the scene ahead",
+        "describe what's around us", "what does the road look like ahead",
+        "what's around us right now", "anything I should know about ahead",
+    ]
+    for q in scene:
+        ok(realtime.is_generic_scene_question(q),
+           f"scene question answered from the observation: {q!r}")
+
+    # ...and the questions a one-sentence caption CANNOT answer. This is the
+    # half that has to keep working: the fast path is now an allow-by-default,
+    # so this list is the whole of what protects it.
+    objects = [
+        "what's that car ahead", "what does that sign say",
+        "what colour is the car in front", "how far is the car ahead",
+        "what's on the left", "which one is the black one",
+        "what's the make of that one", "how many cars are ahead",
+    ]
+    for q in objects:
+        ok(not realtime.is_generic_scene_question(q),
+           f"object question still looks properly: {q!r}")
+
+    ok(not realtime.is_generic_scene_question(
+        "is there anything ahead that would make it unsafe to change lane now"),
+       "and a long conditional question is not a caption either")
+
+    # THE DRIVER'S WORDS OUTRANK THE PARAPHRASE, in both directions.
+    ok(realtime.is_generic_scene_question("describe the current scene",
+                                          "what do you see"),
+       "a paraphrase the list has never seen is still fast when the driver "
+       "asked a scene question")
+    ok(not realtime.is_generic_scene_question("what do you see",
+                                              "what colour is that car"),
+       "...and a generic-looking paraphrase does NOT shortcut a question the "
+       "driver asked about one particular thing")
+
+    # The transcript has to actually travel, or the above is theatre.
+    js = Path(REPO / "static/rio_realtime.js").read_text()
+    ok("spoken: controllerTranscript()" in js,
+       "the panel sends the driver's own last transcript with every tool call")
+    app = Path(REPO / "app.py").read_text()
+    ok("spoken=body.get(\"spoken\")" in app,
+       "the server passes it through to the tool")
+    ok("def look(question: str, session_key: str = \"default\",\n         spoken" in
+       Path(REPO / "realtime.py").read_text(),
+       "and look() takes it")
+
+    # A camera answer has a ceiling, at the API rather than in the prompt.
+    ok(config.REALTIME_LOOK_ANSWER_MAX_TOKENS
+       and config.REALTIME_LOOK_ANSWER_MAX_TOKENS <= 120,
+       f"a camera answer is capped at {config.REALTIME_LOOK_ANSWER_MAX_TOKENS} "
+       "tokens — measured at 23 words median and 44 at p95 against "
+       "instructions asking for one sentence")
+    ok("max_output_tokens: lookAnswerMaxTokens" in js,
+       "and the cap is applied to the follow-up response, where the answer is "
+       "actually composed")
+
+    # No holding line in front of a 4 ms answer.
+    inst = realtime.instructions()
+    ok("CALL IT FIRST AND SAY NOTHING IN FRONT OF IT" in inst,
+       "she is told to call the camera before speaking, not after — words "
+       "composed before the call are words the driver waits through")
+    ok("Say a holding line first" in inst,
+       "...while the research tool, which really does take seconds, keeps its "
+       "holding line")
+
+
 def run_firewall():
     section("E. firewall — the synthesiser cannot decide to speak")
 
@@ -478,6 +558,22 @@ async def run_live():
     after = await _drive(s, "Still here, still listening.", rid="r2",
                          events=events)
     ok(after["pcm"] > 0, "and the socket is still usable afterwards")
+
+    # ...IN THE MODEL IT WAS MEANT TO USE. "She said something" is not the same
+    # claim as "she said it in her own voice", and the difference is exactly
+    # what a per-utterance fallback hides: a socket that dies on every line
+    # after the first still produces audio, still reports the utterance done,
+    # and still passes every check above.
+    #
+    # It happened. `voice_settings` may appear only in the FIRST message on a
+    # connection; sending it again with the second context closed the socket
+    # with a 1008, and the drive spent itself falling back to flash and
+    # reconnecting once per sentence with nothing failing.
+    ok(not [d for k, d in events if k == "fallback"],
+       "and no utterance fell back — three lines on one connection is the "
+       "shape that catches a per-connection rule applied per utterance")
+    ok(s.stats["reconnects"] == 0,
+       "and nothing reconnected: a healthy socket speaks a whole drive")
 
     # RECONNECT. Kill the wire under it and check the next line still speaks.
     before = s.stats["reconnects"]
@@ -846,6 +942,7 @@ def main() -> int:
     run_dictation_policy()
     run_chunker()
     run_tags()
+    run_scene_gate()
     run_firewall()
     run_clips()
     if args.live:

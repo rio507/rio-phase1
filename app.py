@@ -793,8 +793,12 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
     # The visual tool needs the session's own frame ring — the same key the
     # hold-to-talk path uses, so a live question and a recorded one look at the
     # same few seconds of road.
+    # The driver's own last words, attached by the panel alongside `where` and
+    # for the same reason: Whisper's output lands in the browser, and the
+    # visual fast path is a judgement about what was ASKED rather than about
+    # the paraphrase the model relayed it as.
     result = realtime.run_tool(name, args, session_key=_visual_key(session_id),
-                               where=where)
+                               where=where, spoken=body.get("spoken"))
     logged = {"tool": name, "ok": bool(result.get("ok")),
               "took_ms": result.get("took_ms")}
     if isinstance(args, dict):

@@ -22,4 +22,4 @@ weights/
 # The spoken question tools/voice_latency.py feeds to the detector. Synthesised
 # once and cached so every run measures against the same recording; it is a
 # derived artifact, not a fixture, and re-makes itself on a fresh checkout.
-tools/_driver_question.pcm
+tools/_driver_*.pcm

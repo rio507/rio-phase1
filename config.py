@@ -121,6 +121,23 @@ DEEP_ANSWER_MAX_TOKENS = 320
 # is meant to be unreachable in ordinary conversation rather than typical.
 REALTIME_MAX_RESPONSE_TOKENS = 200
 
+# What a spoken answer to "what do you see" may run to.
+#
+# MEASURED: on the current path those answers came back at 23 words at the
+# median and 44 at p95, against instructions that ask for ONE short sentence.
+# Instructions are guidance; this is a limit, which is the same argument
+# REALTIME_MAX_RESPONSE_TOKENS already makes for answers in general.
+#
+# It matters more here than it did with the old voice. The whole answer is
+# synthesised, so its length is time the driver spends listening to a caption
+# being elaborated — and a scene answer is the one kind that has nothing to
+# elaborate: the road looks how it looks, and the useful version is the
+# sentence a passenger would say without being asked twice.
+#
+# ~60 tokens is two short sentences. Small enough to be a real ceiling, large
+# enough that an ordinary one-sentence answer never touches it.
+REALTIME_LOOK_ANSWER_MAX_TOKENS = 60
+
 # --- when RIO should stop talking, and when she should not ------------------
 # The complaint these exist for: her answers cut out mid-sentence and the
 # driver had to ask again. Three of the four causes were one cause — the voice
@@ -266,6 +283,23 @@ ELEVENLABS_CHUNK_MIN_TOKENS = 5
 # a long subordinate clause, and what stops "Yeah." waiting forever for a
 # boundary that has already been and gone.
 ELEVENLABS_CHUNK_MAX_WAIT_MS = 250
+
+# ...and a lower bar for the FIRST phrase of an answer, because it is the only
+# one anybody is waiting on.
+#
+# Every later phrase is spoken over audio that is already playing, so its
+# threshold is about prosody: a seam in the middle of a sentence is audible and
+# a longer piece reads better. The first one has nothing playing behind it, and
+# every millisecond it waits is silence the driver is sitting in.
+#
+# MEASURED at 74 ms p50 on a visual answer under the ordinary rule, which is
+# small — this is the last stage of the budget that belongs to this system
+# rather than to a model, and it is worth having at its floor rather than
+# nearly there. Not lower than three words: two words is not enough for the
+# synthesiser to pitch a sentence, and a first chunk that arrives fast and
+# sounds wrong is a worse trade than 40 ms.
+ELEVENLABS_FIRST_CHUNK_MIN_TOKENS = 3
+ELEVENLABS_FIRST_CHUNK_MAX_WAIT_MS = 120
 
 # The socket closes itself after 20 seconds without a client message. A car
 # spends most of a drive inside that window, so a keep-alive goes out at half

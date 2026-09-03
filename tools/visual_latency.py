@@ -33,9 +33,12 @@ is what --live is for, and it is honest about which part is which -- the
 down, so the difference between them IS the round trip.
 """
 import argparse
+import asyncio
+import contextlib
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -321,135 +324,392 @@ class HttpDrive:
         self.client.close()
 
 
-def run_live(base, n, session_id=None):
-    """Ten visual questions through a real session, timed as the driver feels it.
+# ---------------------------------------------------------------------------
+# THE LIVE PATH, AS IT IS NOW
+# ---------------------------------------------------------------------------
+# The old version of this measured a session it configured itself with
+# `output_modalities: ["audio"]`, which stopped being the path the car uses the
+# day the voice moved to ElevenLabs. It reported honest numbers about a
+# configuration nobody was running.
+#
+# This one takes the session exactly as realtime.session_config() builds it —
+# text mode, ElevenLabs behind it — feeds a real spoken question in at real
+# time so the server's own detector ends the turn, drives frames into the
+# SERVER's ring over HTTP at the rate the panel does, and calls the tool over
+# HTTP the way the panel does. Everything in the path is the thing itself.
+#
+# The stages, and why each one is worth its own column:
+#
+#   turn end -> look()      the model deciding this is a visual question and
+#                           asking for the camera. Nothing local can make this
+#                           faster; a big number here is the model.
+#   look() -> tool result   the server answering. FAST means the running
+#                           observer had a sentence ready; a miss means a Qwen
+#                           pass, or worse, the full remote visual turn.
+#   result -> first token   the model composing the spoken answer from it.
+#   token -> first phrase   the chunker deciding enough has arrived to speak.
+#   phrase -> first audio   the synthesiser.
+#
+# The last three are the ones this system owns, and they are the three that
+# changed when the voice did.
+VISUAL_STAGES = [
+    ("turn_end_to_look", "turn end -> look() called"),
+    ("look_to_result", "look() -> tool result"),
+    ("result_to_token", "tool result -> first text token"),
+    ("token_to_phrase", "first token -> first phrase out"),
+    ("phrase_to_audio", "first phrase -> FIRST AUDIO"),
+    ("felt", "turn end -> FIRST AUDIO (felt)"),
+]
 
-    Reports which tools were called -- deep_dive on a visual question is a
-    misroute and doubles the wait -- and the gap between the question landing
-    and the first audio delta, which is the felt latency.
-    """
+
+def observer_state(base, session_id):
+    """What /realtime/status says the observer is doing for this session."""
     import httpx
-    from openai import OpenAI
 
-    from tools.realtime_selftest import _rate_limit_wait as rate_limit_wait
+    try:
+        st = httpx.get(f"{base}/realtime/status", timeout=10).json()
+        obs = (st.get("observer") or {})
+        return obs.get("sessions", {}).get(session_id or "default", {}), obs
+    except Exception as e:
+        return {"error": f"{type(e).__name__}"}, {}
+
+
+async def _one_visual_turn(conn, sink, http, base, session_id, question_pcm,
+                           marks, tool_url, params):
+    """One spoken question, answered, with a timestamp at every seam."""
+    import json as _json
+
+    rid = {"id": None}
+    feeder = asyncio.create_task(_feed_audio(conn, question_pcm))
+    async for event in conn:
+        t = event.type
+        if t == "input_audio_buffer.speech_stopped":
+            marks["turn_end"] = time.perf_counter()
+        elif t == "response.created":
+            rid["id"] = event.response.id
+            if sink:
+                await sink.begin(rid["id"])
+        elif t == "response.function_call_arguments.done":
+            marks.setdefault("look", time.perf_counter())
+            marks["tool"] = event.name
+            marks["asked"] = (_json.loads(event.arguments or "{}")
+                              .get("question") or "")
+            r = await http.post(tool_url, params=params, json={
+                "name": event.name,
+                "arguments": _json.loads(event.arguments or "{}"),
+                "where": {"lat": 34.0195, "lng": -118.4912, "age_s": 2},
+            })
+            res = r.json()
+            marks["result"] = time.perf_counter()
+            # From here, sound belongs to the ANSWER. Anything before it was
+            # the holding line, which the driver hears quickly and which is not
+            # what this is measuring.
+            marks["phrase_mark"]["armed"] = True
+            marks["fast_path"] = bool(res.get("fast_path"))
+            marks["on_demand"] = bool(res.get("on_demand"))
+            marks["server_ms"] = res.get("took_ms")
+            marks["seen_s_ago"] = res.get("seen_s_ago")
+            await conn.conversation.item.create(item={
+                "type": "function_call_output",
+                "call_id": event.call_id, "output": _json.dumps(res)})
+            await conn.response.create()
+        elif t == "response.output_text.delta":
+            # Only AFTER the tool result: the text before it is the holding
+            # line ("let me look"), which the driver hears quickly and which is
+            # not the answer. Counting it as one is how a slow turn measures
+            # fast.
+            if marks.get("result") and "first_token" not in marks:
+                marks["first_token"] = time.perf_counter()
+            marks["answer"] = marks.get("answer", "") + (event.delta or "")
+            if sink:
+                await sink.delta(rid["id"], event.delta or "")
+        elif t == "response.done":
+            # The account's per-minute token cap arrives as an ordinary
+            # `response.done` with no output. Unhandled it looks exactly like a
+            # model that decided to say nothing, and the turn then sits until
+            # the timeout — which is what two rows of the first run were.
+            pause = _rate_limit_pause(event)
+            if pause:
+                # The account's per-minute cap. Waiting it out and carrying on
+                # would fold the wait into whichever stage is open, so the turn
+                # is marked and thrown away instead.
+                marks["capped"] = True
+                await asyncio.sleep(pause)
+                if marks.get("result"):
+                    await conn.response.create()
+                    continue
+                break
+            if marks.get("result") and marks.get("first_token"):
+                if sink:
+                    await sink.end(rid["id"])
+                    # The model finishing is not the driver hearing anything.
+                    # Breaking here — which the first version did — ends the
+                    # turn before the synthesiser has answered, and reports the
+                    # one stage this whole exercise is about as missing.
+                    pm = marks["phrase_mark"]
+                    deadline = time.perf_counter() + 8
+                    while ("first_audio" not in pm
+                           and time.perf_counter() < deadline):
+                        await asyncio.sleep(0.02)
+                break
+        elif t == "error":
+            marks["error"] = str(getattr(event, "error", ""))[:120]
+            break
+        if time.perf_counter() - marks["t0"] > 60:
+            marks["error"] = "timeout"
+            break
+    feeder.cancel()
+    return marks
+
+
+def _rate_limit_pause(event):
+    """Seconds to wait, if this response failed on the realtime token cap."""
+    details = getattr(getattr(event, "response", None), "status_details", None)
+    if details is None or "rate_limit" not in str(details):
+        return None
+    m = re.search(r"try again in ([0-9.]+)\s*s", str(details))
+    return min(30.0, float(m.group(1)) + 1.0) if m else 5.0
+
+
+async def _feed_audio(conn, pcm):
+    """The driver asking, at the speed a driver asks."""
+    import base64 as _b64
+
+    rate, frame_ms = 24000, 20
+    payload = pcm + b"\x00\x00" * int(rate * (int(config.REALTIME_VAD_SILENCE_MS) + 400) / 1000)
+    step = int(rate * frame_ms / 1000) * 2
+    for i in range(0, len(payload), step):
+        await conn.input_audio_buffer.append(
+            audio=_b64.b64encode(payload[i:i + step]).decode("ascii"))
+        await asyncio.sleep(frame_ms / 1000.0)
+
+
+async def run_live_async(base, n, session_id, drive=None, gap=1.5,
+                         reset_every=4):
+    import httpx
+    from openai import AsyncOpenAI
+
+    import voice_dialogue as vd
 
     print("\n" + "=" * 78)
-    print("LIVE — a real session, visual questions, felt latency")
+    print("LIVE — the current path, end to end, with a seam at every stage")
     print("=" * 78)
 
-    client = OpenAI()
     cfg = realtime.session_config()
-    rows = []
+    text_mode = cfg["output_modalities"] == ["text"]
+    print(f"  session modality : {cfg['output_modalities']}")
+    print(f"  conversation     : "
+          + (f"{config.ELEVENLABS_CONVERSATION_MODEL} "
+             f"({type(vd.dialect_for('v', config.ELEVENLABS_CONVERSATION_MODEL, 'p')).__name__})"
+             if text_mode else f"cedar ({config.OPENAI_REALTIME_VOICE})"))
+
+    http = httpx.AsyncClient(timeout=90.0)
     tool_url = f"{base}/realtime/tool"
     params = {"session_id": session_id} if session_id else None
-    with client.realtime.connect(model=config.OPENAI_REALTIME_MODEL) as conn:
-        conn.session.update(session={
-            "type": "realtime",
-            "instructions": cfg["instructions"],
-            "tools": cfg["tools"],
-            "output_modalities": ["audio"],
-            "audio": {"output": {"voice": config.OPENAI_REALTIME_VOICE,
-                                 "format": {"type": "audio/pcm", "rate": 24000}}},
-        })
-        for i in range(n):
-            q = QUESTIONS[i % len(QUESTIONS)]
-            conn.conversation.item.create(item={
-                "type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": q}]})
-            conn.response.create()
-            t_ask = time.perf_counter()
-            row = {"q": q, "tools": [], "tool_ms": None, "first_audio_ms": None,
-                   "answer_audio_ms": None, "took_ms": None}
-            need_followup, active, started, waited = False, 0, 0, 0
-            # Audio arriving BEFORE the tool result is the holding line -- "let
-            # me look" -- which is not the answer and must not be counted as
-            # one. The driver hears it quickly and then waits, and it is that
-            # second wait this whole exercise is about.
-            tool_done = False
-            for event in conn:
-                if time.perf_counter() - t_ask > 90:
-                    break
-                if event.type == "response.function_call_arguments.done":
-                    row["tools"].append(event.name)
-                    t_tool = time.perf_counter()
-                    r = httpx.post(tool_url, timeout=90, params=params, json={
-                        "name": event.name,
-                        "arguments": json.loads(event.arguments or "{}"),
-                        "where": {"lat": 34.0195, "lng": -118.4912, "age_s": 2},
-                    }).json()
-                    row["fast"] = bool(r.get("fast_path"))
-                    row["tool_ms"] = (time.perf_counter() - t_tool) * 1000
-                    row["took_ms"] = r.get("took_ms")
-                    conn.conversation.item.create(item={
-                        "type": "function_call_output",
-                        "call_id": event.call_id, "output": json.dumps(r)})
-                    need_followup = True
-                    tool_done = True
-                elif event.type == "response.output_audio.delta":
-                    now = (time.perf_counter() - t_ask) * 1000
-                    if row["first_audio_ms"] is None:
-                        row["first_audio_ms"] = now
-                    if tool_done and row["answer_audio_ms"] is None:
-                        row["answer_audio_ms"] = now
-                elif event.type == "response.created":
-                    started += 1
-                    active += 1
-                elif event.type == "response.done":
-                    active -= 1
-                    # The realtime token cap. Without this the response comes
-                    # back empty, the loop breaks, and every LATER question
-                    # returns instantly with nothing because there is an unread
-                    # `done` sitting in the stream -- which is exactly what the
-                    # first version of this file measured: two answers and eight
-                    # blanks. tools/realtime_selftest.py hit the same wall and
-                    # this is its handling, imported rather than re-derived.
-                    pause = rate_limit_wait(event)
-                    if pause is not None and waited < 4:
-                        waited += 1
-                        print(f"    (token cap — waiting {pause:.0f}s)")
-                        time.sleep(pause)
-                        conn.response.create()
-                        continue
-                    if need_followup:
-                        need_followup = False
-                        conn.response.create()
-                        continue
-                    if started and active <= 0:
-                        break
-                elif event.type == "error":
-                    row["error"] = str(getattr(event, "error", ""))
-                    break
-            rows.append(row)
-            print(f"  {i + 1:2d}. {q:30s} {'FAST' if row.get('fast') else '    '} "
-                  f"{','.join(row['tools']) or '-':<12s} "
-                  f"tool_rt {row['tool_ms'] or 0:6.0f}  "
-                  f"server {row['took_ms'] or 0:6.0f}  "
-                  f"holding {row['first_audio_ms'] or 0:6.0f}  "
-                  f"ANSWER {row['answer_audio_ms'] or 0:7.0f} ms")
 
-    # THE number: ask -> the first word of the ANSWER, past any holding line.
-    felt = [r["answer_audio_ms"] for r in rows if r["answer_audio_ms"]]
-    fast_felt = [r["answer_audio_ms"] for r in rows
-                 if r.get("fast") and r["answer_audio_ms"]]
-    slow_felt = [r["answer_audio_ms"] for r in rows
-                 if not r.get("fast") and r["answer_audio_ms"]]
-    holding = [r["first_audio_ms"] for r in rows if r["first_audio_ms"]]
-    rt = [r["tool_ms"] for r in rows if r["tool_ms"]]
-    srv = [r["took_ms"] for r in rows if r["took_ms"]]
-    deep = sum(1 for r in rows if realtime.TOOL_NAME in r["tools"])
-    looked = sum(1 for r in rows if realtime.LOOK_TOOL_NAME in r["tools"])
-    print(f"\n    {'felt (ask -> ANSWER)':22s} {fmt(felt)}")
-    print(f"    {'  ...served from cache':22s} {fmt(fast_felt)}")
-    print(f"    {'  ...full turn':22s} {fmt(slow_felt)}")
-    print(f"    {'first sound at all':22s} {fmt(holding)}   "
-          f"(the holding line, not the answer)")
-    print(f"    {'tool round trip':22s} {fmt(rt)}")
-    print(f"    {'of which server':22s} {fmt(srv)}")
-    print(f"\n    look called on {looked}/{len(rows)} visual questions")
-    print(f"    deep_dive called on {deep}/{len(rows)} — "
-          + ("MISROUTE: a visual question must never go there" if deep
-             else "none, which is correct"))
+    # The question, spoken. One recording per question, so the detector sees
+    # the same thing every turn and the turn-end mark means the same thing
+    # every turn.
+    from tools.voice_latency import driver_audio_for
+
+    rows = []
+    # The synthesiser, instrumented. `first phrase out` is the moment the
+    # chunker decided a piece of the answer was worth speaking, which is the
+    # stage between the model and the sound and the one nothing else can see.
+    phrase_mark = {}
+
+    async def on_audio(rid, pcm, text):
+        if phrase_mark.get("armed"):
+            phrase_mark.setdefault("first_audio", time.perf_counter())
+
+    sink = None
+    if text_mode:
+        sink = vd.DialogueSession(on_audio=on_audio,
+                                  on_event=lambda k, d: asyncio.sleep(0))
+        real_speak = sink._speak
+
+        async def timed_speak(utt, phrase):
+            if phrase_mark.get("armed"):
+                phrase_mark.setdefault("first_phrase", time.perf_counter())
+            return await real_speak(utt, phrase)
+
+        sink._speak = timed_speak
+        await sink.start()
+
+    # The observer only starts when a live session is minted, which is what
+    # the panel does — so the probe does it too, rather than relying on look()
+    # to start one cold on the first question.
+    minted = await http.post(f"{base}/realtime/session", params=params)
+    print(f"  minted           : {minted.status_code} "
+          f"(this is what starts the observer)")
+    await asyncio.sleep(3)              # let the ring fill and the loop tick
+
+    # ONE CONNECTION FOR THE WHOLE DRIVE, which is both what a car does and
+    # what the account can afford. A session per question re-sends the
+    # instructions and the whole tool list every time, and eight of those walk
+    # straight into the realtime token cap — after which every stage timing is
+    # really a measurement of a rate limiter. That is what the first run of
+    # this measured, at 12 s a stage, and it is why cap-hit turns are now
+    # DISCARDED rather than reported: a number that is mostly somebody else's
+    # queue is worse than no number.
+    # ONE CONNECTION, BUT NOT FOREVER. History accumulates on a realtime
+    # connection and every later turn re-sends all of it, so a long probe walks
+    # into the per-minute token cap by growing rather than by asking. Recycling
+    # every few turns keeps each turn's context the size a real question has,
+    # and `gap` paces the run so the cap is not reached by speed either.
+    #
+    # Neither is a property of the car — a driver does not ask ten scene
+    # questions in ninety seconds — they are what it costs to measure one.
+    client = AsyncOpenAI()
+    conn_mgr = None
+    conn = None
+    for i in range(n):
+        if conn is None or (reset_every and i and i % reset_every == 0):
+            if conn_mgr is not None:
+                await conn_mgr.__aexit__(None, None, None)
+            conn_mgr = client.realtime.connect(
+                model=config.OPENAI_REALTIME_MODEL)
+            conn = await conn_mgr.__aenter__()
+            await conn.session.update(session=cfg)
+        if True:
+            q = QUESTIONS[i % len(QUESTIONS)]
+            pcm = driver_audio_for(q)
+            phrase_mark.clear()
+            marks = {"t0": time.perf_counter(), "q": q,
+                     "phrase_mark": phrase_mark}
+            try:
+                await asyncio.wait_for(
+                    _one_visual_turn(conn, sink, http, base, session_id,
+                                     pcm, marks, tool_url, params),
+                    timeout=90)
+            except asyncio.TimeoutError:
+                marks["error"] = "turn timed out"
+            except Exception as e:
+                marks["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+
+            obs, _ = observer_state(base, session_id)
+            row = _stage_row(marks, phrase_mark, obs)
+            rows.append(row)
+            _print_row(i + 1, row)
+            await asyncio.sleep(gap)
+    if conn_mgr is not None:
+        await conn_mgr.__aexit__(None, None, None)
+
+    if sink:
+        await sink.close()
+    await http.aclose()
+    _report_stages(rows, base, session_id, drive)
     return rows
+
+
+def _stage_row(marks, phrase_mark, obs):
+    def gap(a, b):
+        if marks.get(a) and marks.get(b):
+            return (marks[b] - marks[a]) * 1000
+        return None
+
+    fa = phrase_mark.get("first_audio")
+    fp = phrase_mark.get("first_phrase")
+    row = {
+        "q": marks["q"], "tool": marks.get("tool"),
+        "fast_path": marks.get("fast_path"), "on_demand": marks.get("on_demand"),
+        "server_ms": marks.get("server_ms"), "seen_s_ago": marks.get("seen_s_ago"),
+        "answer": (marks.get("answer") or "").strip(),
+        "asked": marks.get("asked"),
+        "error": marks.get("error"),
+        "capped": bool(marks.get("capped")),
+        "observations": obs.get("observations"),
+        "turn_end_to_look": gap("turn_end", "look"),
+        "look_to_result": gap("look", "result"),
+        "result_to_token": gap("result", "first_token"),
+    }
+    row["answer_words"] = len(row["answer"].split())
+    if fp and marks.get("first_token"):
+        row["token_to_phrase"] = (fp - marks["first_token"]) * 1000
+    if fa and fp:
+        row["phrase_to_audio"] = (fa - fp) * 1000
+    if fa and marks.get("turn_end"):
+        row["felt"] = (fa - marks["turn_end"]) * 1000
+    return row
+
+
+def _print_row(i, r):
+    def ms(k):
+        v = r.get(k)
+        return f"{v:6.0f}" if v is not None else "     -"
+
+    flag = ("CACHE" if r.get("fast_path") and not r.get("on_demand")
+            else "qwen " if r.get("fast_path") else "FULL ")
+    asked = (r.get("asked") or "")
+    rewrite = ""
+    if asked and asked.strip().lower() != r["q"].strip().lower():
+        rewrite = f"  model asked: {asked[:44]!r}"
+    if r.get("capped"):
+        flag = "CAP  "
+    print(f"  {i:2d}. {r['q'][:26]:26s} {flag} "
+          f"look {ms('turn_end_to_look')} "
+          f"tool {ms('look_to_result')} "
+          f"tok {ms('result_to_token')} "
+          f"phr {ms('token_to_phrase')} "
+          f"aud {ms('phrase_to_audio')} "
+          f"= {ms('felt')} ms  {r['answer_words']}w"
+          + (f"  [{r['error']}]" if r.get("error") else "") + rewrite)
+
+
+def _report_stages(rows, base, session_id, drive=None):
+    print("\n  " + "-" * 74)
+    capped = [r for r in rows if r.get("capped")]
+    rows = [r for r in rows if not r.get("capped")]
+    if capped:
+        print(f"    ({len(capped)} turn(s) discarded: the realtime token cap "
+              "fired, and a stage that contains somebody else's queue is not a "
+              "measurement)")
+    for key, label in VISUAL_STAGES:
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        if not vals:
+            print(f"    {label:32s} —")
+            continue
+        mark = "  <<<" if key == "felt" else ""
+        print(f"    {label:32s} p50 {pct(vals, 0.5):6.0f}  "
+              f"p95 {pct(vals, 0.95):6.0f} ms   n={len(vals)}{mark}")
+
+    # THE TARGET IS ABOUT SCENE QUESTIONS. An object question — "what colour
+    # is the car in front" — crops a frame and asks a multimodal model, and it
+    # is supposed to take seconds; averaging it in hides the number that is
+    # being aimed at behind one that is not.
+    scene = [r["felt"] for r in rows
+             if r.get("fast_path") and r.get("felt") is not None]
+    obj = [r["felt"] for r in rows
+           if r.get("tool") and not r.get("fast_path") and r.get("felt") is not None]
+    if scene:
+        print(f"\n    {'SCENE questions only':32s} p50 {pct(scene, 0.5):6.0f}  "
+              f"p95 {pct(scene, 0.95):6.0f} ms   n={len(scene)}")
+    if obj:
+        print(f"    {'object questions (full turn)':32s} p50 {pct(obj, 0.5):6.0f}  "
+              f"p95 {pct(obj, 0.95):6.0f} ms   n={len(obj)}   "
+              "— these are meant to be slow")
+
+    cache = sum(1 for r in rows if r.get("fast_path") and not r.get("on_demand"))
+    demand = sum(1 for r in rows if r.get("on_demand"))
+    full = sum(1 for r in rows if r.get("tool") and not r.get("fast_path"))
+    words = [r["answer_words"] for r in rows if r["answer_words"]]
+    print(f"\n    observer cache hits   {cache}/{len(rows)}")
+    print(f"    on-demand qwen passes {demand}/{len(rows)}   "
+          "(fast path, but a forward pass — the loop was behind)")
+    print(f"    full visual turns     {full}/{len(rows)}   "
+          "(the remote multimodal path)")
+    if words:
+        print(f"    answer length         p50 {pct(words, 0.5)} words, "
+              f"p95 {pct(words, 0.95)}")
+    obs, whole = observer_state(base, session_id)
+    print(f"    observer for this session: {obs or 'NOT RUNNING'}")
+    if drive is not None:
+        print(f"    frames posted: {drive.n} ({drive.rejected} refused)")
+
+
+def run_live(base, n, session_id=None, drive=None, gap=1.5, reset_every=4):
+    return asyncio.run(run_live_async(base, n, session_id, drive, gap,
+                                      reset_every))
 
 
 def main():
@@ -466,6 +726,13 @@ def main():
     ap.add_argument("--session", default=None,
                     help="feed this session id with frames over HTTP during the "
                          "live run, and ask the questions against it")
+    ap.add_argument("--gap", type=float, default=1.5,
+                    help="seconds between questions. Raise it when the "
+                         "realtime token cap starts discarding turns — a "
+                         "drive does not ask ten questions in a minute.")
+    ap.add_argument("--reset-every", type=int, default=4,
+                    help="recycle the realtime connection every N turns, so "
+                         "accumulated history does not grow each turn's cost")
     ap.add_argument("--out", default=None, help="write the rows as JSON")
     args = ap.parse_args()
 
@@ -477,10 +744,12 @@ def main():
             with HttpDrive(args.base, args.session, args.video, args.dt) as drive:
                 print(f"  drive session {drive.session_id[:8]} — "
                       f"{drive.n} frames in, {drive.rejected} refused")
-                out["live"] = run_live(args.base, args.n, drive.session_id)
+                out["live"] = run_live(args.base, args.n, drive.session_id,
+                                       drive, args.gap, args.reset_every)
                 print(f"    ({drive.n} frames accepted, {drive.rejected} refused)")
         else:
-            out["live"] = run_live(args.base, args.n)
+            out["live"] = run_live(args.base, args.n, None, None, args.gap,
+                                   args.reset_every)
     if args.out:
         with open(args.out, "w") as fh:
             json.dump(out, fh, indent=2, default=str)

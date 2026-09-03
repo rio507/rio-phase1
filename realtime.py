@@ -156,7 +156,11 @@ LOOK_SCHEMA = {
         "car', 'what does that sign say', 'what colour is the one on the left', "
         "'what do you see'. You cannot see anything without calling this: if a "
         "question is about the world outside the car, call it rather than "
-        "guessing. It takes a couple of seconds."
+        "guessing.\n"
+        "Call it straight away, with nothing said in front of it. A general "
+        "question about the road comes back instantly — the camera is already "
+        "being watched — and only a question about one particular thing takes "
+        "a couple of seconds."
     ),
     "parameters": {
         "type": "object",
@@ -433,14 +437,23 @@ you offered — then use the research tool. Say a holding line first, because
 that one does take a few seconds. Keep the answer to three or four sentences
 and offer to go on rather than going on.
 
-Say something first — "let me look" — because it can take a couple of seconds.
-Often it will not: a plain "what do you see" comes back immediately, because
-the camera is already being watched and the answer was ready before you asked.
-When it comes back that fast, just answer — a holding line in front of an
-instant answer is the only slow part left. What comes back is short factual background: describe it in
-your own words, as you would anything else. Answer with what it gives you and
-nothing more; if it says it cannot see, or asks which one the driver meant, say
-that, in your own words.
+CALL IT FIRST AND SAY NOTHING IN FRONT OF IT. Not "let me look", not "one
+second" — call the tool, wait, then answer. A plain "what do you see" comes
+back in about four milliseconds, because the camera is already being watched
+and the answer was ready before the driver finished asking; a holding line in
+front of that is not politeness, it is the only slow part of the turn. Every
+word you say before the call is a word you compose before the camera has even
+been asked, and the driver waits through all of it.
+
+The rare slow one — a question about a particular thing, which has to crop the
+frame and look properly — takes a couple of seconds, and a couple of seconds of
+silence is what a passenger does when they turn their head to look. Silence is
+a tone here, not a gap to fill.
+
+What comes back is short factual background: describe it in your own words, as
+you would anything else. Answer with what it gives you and nothing more; if it
+says it cannot see, or asks which one the driver meant, say that, in your own
+words.
 
 WHEN THE DRIVER ASKS TO GO SOMEWHERE
 
@@ -928,6 +941,10 @@ def mint_client_secret() -> dict:
         # a socket built for prosody — slower, out of band, and for nothing.
         "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED
                                and config.VOICE_BACKEND != "elevenlabs"),
+        # How long an answer to a camera question may be. Carried with the
+        # session like every other policy the page enforces, so the number
+        # lives in config.py and the browser holds no copy of it.
+        "look_answer_max_tokens": int(config.REALTIME_LOOK_ANSWER_MAX_TOKENS),
         "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
         "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),
     }
@@ -1129,15 +1146,61 @@ _NEEDS_SPECIFICS = re.compile(
     re.IGNORECASE)
 
 
-def is_generic_scene_question(q: str) -> bool:
-    """May this question be answered from the running observation?"""
-    q = (q or "").strip()
-    if not q or _NEEDS_SPECIFICS.search(q):
+# How many words a question can run to and still be "what is out there".
+# A scene question is short because there is nothing to qualify; anything long
+# enough to carry a clause is usually carrying a condition with it, and a
+# caption cannot answer a condition.
+_SCENE_MAX_WORDS = 12
+
+
+def is_generic_scene_question(q: str, spoken: str = None) -> bool:
+    """May this question be answered from the running observation?
+
+    TWO INPUTS, AND THE FIRST ONE IS THE DRIVER'S.
+    ---------------------------------------------
+    `q` is what the MODEL passed to the tool, and the model paraphrases: a
+    driver who said "what's around us right now" produces a call carrying
+    "describe the current scene". The list below was written for the things
+    people say, so judging a paraphrase against it fails questions the driver
+    asked perfectly well — measured at three of eight, each one costing the
+    full remote visual turn (2.3-6.0 s) instead of a 4 ms cache read.
+
+    So `spoken` — the driver's own transcript, which the panel already has and
+    now sends — is judged first when it is there, and the paraphrase is the
+    fallback rather than the authority.
+
+    AND THE RULE IS NOW THE RIGHT WAY ROUND.
+    ----------------------------------------
+    It used to be "does this match a list of scene phrasings". That is a
+    whitelist, and a whitelist of things people might say is a losing game —
+    every phrasing nobody thought of costs two seconds.
+
+    What actually disqualifies a question from being answered by a caption is
+    knowable and small: it asks about a PARTICULAR THING. "the black one", "the
+    sign", "how far", "what colour". That list is short, closed, and already
+    written (_NEEDS_SPECIFICS), and it is what the whitelist was really
+    protecting.
+
+    Calling `look` at all is the model asserting the question is visual. Given
+    that, a short question with no object reference in it is a scene question,
+    and the whitelist survives only as the fast yes for the phrasings it
+    already knows.
+    """
+    for candidate in ((spoken or "").strip(), (q or "").strip()):
+        if not candidate:
+            continue
+        if _NEEDS_SPECIFICS.search(candidate):
+            return False
+        if _GENERIC_SCENE.search(candidate):
+            return True
+        if len(candidate.split()) <= _SCENE_MAX_WORDS:
+            return True
         return False
-    return bool(_GENERIC_SCENE.search(q))
+    return False
 
 
-def look(question: str, session_key: str = "default") -> dict:
+def look(question: str, session_key: str = "default",
+         spoken: str = None) -> dict:
     """RIO's eyes: the existing visual pipeline, called from a live session.
 
     Nothing new is built here. `visual_qa.answer()` is the same path the
@@ -1186,7 +1249,7 @@ def look(question: str, session_key: str = "default") -> dict:
         # This turn is a look. deep_dive refuses a visual question asked within
         # DEPTH_COLD_S of one -- see depth_allowed().
         note_look(session_key, q)
-        if (is_generic_scene_question(q)
+        if (is_generic_scene_question(q, spoken)
                 and session.pending_clarification() is None):
             hit = observer.fresh(session_key)
             if not hit:
@@ -1305,7 +1368,7 @@ def vehicle_status() -> dict:
 
 
 def run_tool(name: str, arguments, session_key: str = "default",
-             where=None) -> dict:
+             where=None, spoken: str = None) -> dict:
     """Dispatch one tool call from the live session.
 
     An unknown tool name is answered, not raised: the session is a model and a
@@ -1316,6 +1379,11 @@ def run_tool(name: str, arguments, session_key: str = "default",
     Only find_places reads it, and only as a location bias -- the browser is the
     one that knows where the car is, for the same reason nav_status is answered
     there.
+
+    `spoken` is the driver's own last transcript, attached the same way and for
+    the same kind of reason: the panel is where Whisper's output lands, and the
+    visual fast path is a judgement about what was ASKED rather than about how
+    the model chose to relay it.
     """
     if name == VEHICLE_TOOL_NAME:
         return vehicle_status()
@@ -1349,7 +1417,12 @@ def run_tool(name: str, arguments, session_key: str = "default",
     if not isinstance(arguments, dict):
         return {"ok": False, "note": "unreadable arguments"}
     if name == LOOK_TOOL_NAME:
-        return look(str(arguments.get("question") or ""), session_key)
+        # `spoken` is the driver's own last transcript, attached by the panel.
+        # The model paraphrases what it was asked, and the fast path is a
+        # judgement about the QUESTION, so it is judged on the words that were
+        # actually said wherever they are available. See look().
+        return look(str(arguments.get("question") or ""), session_key,
+                    spoken=str(spoken or "") or None)
     if name == PLACES_TOOL_NAME:
         return places.find_places(
             query=str(arguments.get("query") or ""),

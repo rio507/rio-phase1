@@ -83,28 +83,39 @@ RATE = 24000
 FRAME_MS = 20
 
 
-def driver_audio() -> bytes:
-    """The question, as raw PCM, synthesised once and cached on disk.
+def driver_audio_for(question: str) -> bytes:
+    """One spoken question, as raw PCM, synthesised once and cached on disk.
 
-    Cached because it is the CONSTANT in this experiment. Re-synthesising it
-    per run would put a different recording in front of the detector each time
-    and quietly make the three columns incomparable.
+    Cached because the recording is the CONSTANT in every experiment that uses
+    it. Re-synthesising per run puts a different waveform in front of the
+    detector each time, which moves the turn-end mark every measurement hangs
+    off and quietly makes two runs incomparable.
+
+    Shared with tools/visual_latency.py, which asks its own questions and needs
+    them to behave the same way.
     """
+    import hashlib
+
     import httpx
 
-    cache = Path(__file__).resolve().parent / "_driver_question.pcm"
+    slug = hashlib.sha1(question.encode()).hexdigest()[:12]
+    cache = Path(__file__).resolve().parent / f"_driver_{slug}.pcm"
     if cache.exists() and cache.stat().st_size > 1000:
         return cache.read_bytes()
     r = httpx.post(
         voice_dialogue.FLASH_URL.format(voice=voice_dialogue.voice_id()),
         params={"output_format": f"pcm_{RATE}"},
         headers={"xi-api-key": voice_dialogue.api_key()},
-        json={"text": QUESTION,
+        json={"text": question,
               "model_id": config.ELEVENLABS_DETERMINISTIC_MODEL},
         timeout=60.0)
     r.raise_for_status()
     cache.write_bytes(r.content)
     return r.content
+
+
+def driver_audio() -> bytes:
+    return driver_audio_for(QUESTION)
 
 
 def _silence(ms: int) -> bytes:

@@ -534,6 +534,9 @@
       'Read the text below out loud, exactly as written, word for word. ' +
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
     var speakTimeoutMs = cfg.speakTimeoutMs || 700;
+    // The ceiling on a camera answer, from config.py by way of the session
+    // payload. Null leaves the session's own limit in charge.
+    var lookAnswerMaxTokens = cfg.lookAnswerMaxTokens || null;
 
     /* How far the DRIVER got to hear. The only version of this question worth
        asking, and the two backends answer it from different places: the model's
@@ -1043,9 +1046,24 @@
               output: JSON.stringify(result),
             },
           });
-          // Ask for the spoken answer. Without this the model has the result
-          // and no reason to say anything about it.
-          send({ type: 'response.create' });
+          /* Ask for the spoken answer. Without this the model has the result
+             and no reason to say anything about it.
+           *
+           * A CAMERA ANSWER GETS A CEILING. The observation it is composing
+           * from is one sentence about the road, and the instructions ask for
+           * one sentence back — but instructions are guidance, and measured on
+           * this path the answers came back at 23 words median and 44 at p95.
+           * Every one of those words is synthesised and played, so on a voice
+           * that speaks the whole answer it is time the driver spends being
+           * read a caption twice.
+           *
+           * Only for `look`, and only as a cap: an ordinary answer is a
+           * fraction of it. Everything else keeps the session's own limit. */
+          var ask = { type: 'response.create' };
+          if (name === 'look' && lookAnswerMaxTokens) {
+            ask.response = { max_output_tokens: lookAnswerMaxTokens };
+          }
+          send(ask);
           emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
                                      ok: !!result.ok, took_ms: result.took_ms || null,
                                      note: result.note || null });
@@ -1405,6 +1423,16 @@
           unmute: function () { mouth.at.unmute(); },
         };
 
+        /* The driver's last words, read back off the controller.
+         *
+         * Safe to reference before `controller` is assigned: this is only ever
+         * CALLED from a tool call, which cannot happen until the session is up
+         * and the controller has been built. */
+        function controllerTranscript() {
+          try { return controller.state().last_transcript || ''; }
+          catch (e) { return ''; }
+        }
+
         var controller = createController({
           arbiter: arbiter,
           // Dictation policy comes from the server with the session, so the
@@ -1412,6 +1440,7 @@
           // from the one the tests check.
           verbatimInstruction: session.verbatim_instruction,
           speakTimeoutMs: session.speak_timeout_ms,
+          lookAnswerMaxTokens: session.look_answer_max_tokens,
           // Interruption policy, decided in config.py and carried here with
           // the session exactly as the dictation policy is. The browser holds
           // no numbers of its own to drift from the ones the tests check.
@@ -1435,8 +1464,17 @@
               // `where` is the car's own fix. Only find_places reads it, but it
               // is attached to every call rather than to one, so a tool that
               // needs it later does not have to re-plumb this.
+              //
+              // `spoken` is the DRIVER'S OWN LAST WORDS, and it is here for a
+              // measured reason. The model paraphrases what it was asked --
+              // "what's around us right now" reaches the tool as "describe the
+              // current scene" -- and the camera's fast path is a judgement
+              // about the question, so it has to be able to see the question
+              // rather than the relay. This page is where Whisper's transcript
+              // lands, so this is the only place that can send it.
               body: JSON.stringify({ name: name, arguments: args,
-                                     where: currentFix() }),
+                                     where: currentFix(),
+                                     spoken: controllerTranscript() }),
             }).then(function (r) { return r.json(); });
           },
           // Muting rather than pausing: a track is live and a paused element
