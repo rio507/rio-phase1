@@ -376,8 +376,126 @@
     });
   }
 
+  /* stop_navigation — "I know the way from here."
+   *
+   * The panel again, and for the reason start_navigation is: a server-side
+   * version could decide a route should end but could not end it, because the
+   * route, the tracker and the queue of things about to be said all live here.
+   *
+   * Nothing about stopping is written here either. RIO.nav.stopRoute is what
+   * the Clear button on the dashboard calls — the same teardown, the same
+   * emptied queue, the same generation going dead so that an announcement
+   * already in flight fails its own validity check instead of being spoken
+   * over a driver who has just said they do not need it.
+   */
+  function stopNavigation() {
+    var nav = root.RIO && root.RIO.nav;
+    if (!nav || typeof nav.stopRoute !== 'function') {
+      return { ok: false, note: 'no navigation on this page' };
+    }
+    var out = nav.stopRoute('voice') || {};
+    if (!out.was_navigating) {
+      return {
+        ok: true, was_navigating: false,
+        rules: 'There was no route running, so nothing was stopped. Say ' +
+               'that in one short line. Do not apologise for it and do not ' +
+               'offer to start one.',
+      };
+    }
+    return {
+      ok: true, was_navigating: true, destination: out.destination || null,
+      rules: 'The route is off and the turn-by-turn is silent. Confirm it ' +
+             'once, briefly — "Okay, navigation off." Do not ask whether ' +
+             'they are sure, do not offer to start it again, and do not ' +
+             'read out where they were going.',
+    };
+  }
+
+  /* reroute — "find another way", "avoid the freeway".
+   *
+   * A COMMAND, and kept separate from the reroute the tracker does on its own
+   * when the car leaves the route. That one is a correction and announces
+   * nothing; this one was asked for and is answered.
+   *
+   * The destination is not re-resolved: RIO.nav.reroute goes back to the same
+   * destination OBJECT, so "find another way" cannot quietly land on a
+   * different branch of the same chain. What can change is how the route is
+   * allowed to get there, and only in the ways the map itself supports —
+   * anything else comes back named in `avoid_unsupported`, to be said out
+   * loud rather than silently ignored.
+   */
+  function rerouteNavigation(args) {
+    var nav = root.RIO && root.RIO.nav;
+    if (!nav || typeof nav.reroute !== 'function') {
+      return Promise.resolve({ ok: false, note: 'no navigation on this page' });
+    }
+    var wanted = [];
+    var list = (args && args.avoid) || [];
+    for (var i = 0; i < list.length; i++) {
+      var a = String(list[i] || '').trim().toLowerCase();
+      if (a) wanted.push(a);
+    }
+    // Anything the driver asked for that the schema has no word for. It is
+    // carried as far as the answer and no further: it changes no route, and
+    // exists so RIO can say "I can't pick the scenic one" instead of
+    // rerouting and letting the driver assume she did.
+    var other = String((args && args.other_preference) || '').trim();
+
+    return Promise.resolve(nav.reroute({ avoid: wanted })).then(function (out) {
+      out = out || {};
+      if (out.status === 'no_route') {
+        return {
+          ok: true, status: 'no_route',
+          rules: 'Nothing is being navigated, so there is no route to ' +
+                 'change. Say that in one line and offer to set one.',
+        };
+      }
+      if (out.status === 'busy') {
+        return {
+          ok: true, status: 'busy',
+          rules: 'A route is already being worked out right now. Say you are ' +
+                 'on it, in one line, and say nothing else about it.',
+        };
+      }
+      if (out.status !== 'rerouted') {
+        return {
+          ok: false, status: 'failed', note: out.error || 'reroute failed',
+          rules: 'The reroute did not happen and the route they were already ' +
+                 'on is still running — say both, in one line. Do not tell ' +
+                 'them to do it themselves on the screen.',
+        };
+      }
+      var route = out.route || {};
+      var dest = route.destination || {};
+      var unsupported = (route.avoid_unsupported || []).slice();
+      if (other) unsupported.push(other);
+      return {
+        ok: true, status: 'rerouted',
+        destination: dest.display_name || dest.formatted_address || null,
+        minutes: route.duration_s
+          ? Math.max(1, Math.round(route.duration_s / 60)) : null,
+        distance_km: route.total_distance_m
+          ? Math.round(route.total_distance_m / 100) / 10 : null,
+        eta_epoch: route.eta_epoch || null,
+        generation_id: route.generation_id || null,
+        avoid_applied: route.avoid_applied || [],
+        avoid_unsupported: unsupported,
+        rules: 'The new route is live and the car is already on it. One ' +
+               'line: what changed and roughly how long it is now — ' +
+               '"Rerouting — about twenty minutes." If avoid_unsupported ' +
+               'has anything in it, say plainly that you cannot do that one ' +
+               'and that you have rerouted anyway; never say you avoided ' +
+               'something that is not in avoid_applied. Do not read the ' +
+               'turns out, and do not call them — the navigation system ' +
+               'still does that itself.',
+      };
+    });
+  }
+
   var LOCAL_TOOLS = { nav_status: navStatus, nav_directions: navDirections,
-                      start_navigation: startNavigation };
+                      start_navigation: startNavigation,
+                      stop_navigation: stopNavigation,
+                      reroute: rerouteNavigation };
 
   /* ---------------------------------------------------------------------
      Where the car is, for the tools that run on the SERVER.
@@ -452,6 +570,36 @@
     var sink = cfg.voice || null;
     var listeners = [];
     if (typeof cfg.onEvent === 'function') listeners.push(cfg.onEvent);
+
+    /* TOOLS THAT WAIT FOR A REASON TO EXIST.
+     *
+     * Every tool schema is input on every response for the whole drive. Two
+     * of them -- stop_navigation and reroute -- cannot be called at all until
+     * a route exists, and a route exists for a minority of most drives; the
+     * session was paying about 350 tokens a response, twice that on a tool
+     * turn, to offer the model two things it could only fail at.
+     *
+     * So a condition is named, the server says which tools ride on it, and
+     * this sends ONE session.update when the answer changes. Not on every
+     * route event: a session.update per GPS-triggered reroute would spend
+     * more than it saves and would reset the tool list mid-turn.
+     *
+     * The list is replaced whole because that is what the API does with
+     * `tools` -- which is why the base schemas ride along in the session
+     * payload rather than being reconstructed here. Nothing about a tool is
+     * decided in this file; it holds the server's words and picks which of
+     * them are true right now. */
+    var baseTools = cfg.toolSchemas || [];
+    var conditionalTools = cfg.conditionalTools || {};
+    var conditionsOn = {};
+
+    function toolsForNow() {
+      var out = baseTools.slice();
+      for (var name in conditionalTools) {
+        if (conditionsOn[name]) out = out.concat(conditionalTools[name] || []);
+      }
+      return out;
+    }
 
     var speaking = null;      // { responseId, resolve, cancelled }
     var stopped = false;
@@ -1540,6 +1688,66 @@
         return true;
       },
 
+      /* THE PRECONDITIONS, WATCHED, so that attaching them is not something
+       * every embedder has to remember.
+       *
+       * The panel wires this from connect(); the recording harness builds a
+       * controller directly and needs the same behaviour, and the drive where
+       * it did not have it is the reason this is a method rather than six
+       * lines in one caller: asked to avoid the freeway with no `reroute`
+       * attached, the model reached for the research tool and narrated a
+       * reroute it had not done.
+       *
+       * `defer` exists for the browser, where a session.update sent before
+       * the data channel finishes opening is silently nothing. */
+      watchToolConditions: function (bus, defer) {
+        if (!bus || !bus.on) return false;
+        var self = this;
+        var when = defer || function (fn) { fn(); };
+        bus.on('*', function (ev) {
+          var on = ev.type === 'NAV_ROUTE_ATTACHED' ? true
+                 : (ev.type === 'NAV_STOPPED' ? false : null);
+          if (on === null) return;
+          when(function () { self.setToolCondition('routing', on); });
+        });
+        // A route that was already live when the session opened — she can be
+        // started mid-drive, and the tools have to arrive with the session
+        // rather than at the next route event, which may never come.
+        if (root.RIO && root.RIO.nav && root.RIO.nav.route) {
+          when(function () { self.setToolCondition('routing', true); });
+        }
+        return true;
+      },
+
+      /* A PRECONDITION CHANGED, so the tool list does.
+       *
+       * Returns whether anything was actually sent, and sends nothing when
+       * the answer has not changed: route events arrive several times a drive
+       * — every automatic reroute attaches a route — and a session.update per
+       * event would spend more than the tools cost and would replace the tool
+       * list in the middle of a turn that is using it.
+       *
+       * `tools` is sent alone. A session.update carrying the whole session
+       * would re-send the instructions and the turn detection with it, and
+       * setting turn detection again mid-drive resets the detector. */
+      setToolCondition: function (name, on) {
+        if (!conditionalTools[name]) return false;
+        if (!baseTools.length) return false;   // nothing to replace it with
+        on = !!on;
+        if (!!conditionsOn[name] === on) return false;
+        conditionsOn[name] = on;
+        var tools = toolsForNow();
+        try {
+          send({ type: 'session.update',
+                 session: { type: 'realtime', tools: tools } });
+        } catch (e) { return false; }
+        emit('LIVE_TOOLS_CHANGED', {
+          condition: name, on: on,
+          tools: tools.map(function (t) { return t.name; }),
+        });
+        return true;
+      },
+
       /* One utterance did not come out the way it was meant to. Counted here
          rather than only in the relay, so a drive's own tally says how often
          RIO's voice was not quite her voice. */
@@ -1608,6 +1816,13 @@
           policy: { barge_sustain_ms: bargeSustainMs,
                     barge_confirm_ms: bargeConfirmMs,
                     max_resumes: maxResumes },
+          // Which tools the session is carrying right now, and why. `null`
+          // rather than `[]` when the session did not hand the schemas over:
+          // "this controller was never told" and "this session has no tools"
+          // are different answers and an empty list reads as the second.
+          tools: baseTools.length
+            ? toolsForNow().map(function (t) { return t.name; }) : null,
+          tool_conditions: conditionsOn,
         };
       },
     };
@@ -1747,6 +1962,10 @@
           audio: audioFacade,
           voice: sink,
           cedarVoice: session.cedar_voice || session.voice,
+          // The tool list, and the part of it that waits for a precondition.
+          // Both come from the server; see mint_client_secret.
+          toolSchemas: session.tool_schemas,
+          conditionalTools: session.conditional_tools,
           onEvent: opts.onEvent,
         });
 
@@ -1774,6 +1993,21 @@
             try { pending[i](); } catch (e) {}
           }
         };
+
+        /* WHEN THE PRECONDITION BECOMES TRUE, AND WHEN IT STOPS.
+         *
+         * On the bus rather than by calling into rio_nav.js, because the
+         * condition is a fact about the drive and not a favour between two
+         * files: anything that attaches a route says so there, including the
+         * automatic reroute, and this asks one question of each event rather
+         * than knowing who sent it.
+         *
+         * Sent through the same wait-for-the-channel gate the cedar fallback
+         * uses. A route set before the data channel finishes opening is
+         * ordinary — the driver can ask for one in the first second — and a
+         * session.update into a channel that is not open yet is silently
+         * nothing. */
+        controller.watchToolConditions(root.RIO && root.RIO.bus, onChannelOpen);
 
         /* The sink's own bad news. A per-utterance fallback is counted and the
            drive carries on; a cedar fallback changes what the session is asked

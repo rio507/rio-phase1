@@ -203,10 +203,29 @@ def latest_route() -> Optional[M.CanonicalRoute]:
     return next(reversed(_ROUTES.values()))
 
 
+def split_preferences(avoid) -> tuple:
+    """(what this provider will honour, what it cannot), preserving order.
+
+    The second half is the point. A driver who says "avoid the freeway and the
+    traffic" has asked for one thing this map does and one thing it does not,
+    and the only honest reply names the second — so it is carried out of here
+    as data rather than dropped where nobody can see it.
+    """
+    supported = tuple(getattr(get_provider(), "AVOID_SUPPORTED", ()) or ())
+    wanted, unsupported = [], []
+    for a in (avoid or []):
+        key = str(a or "").strip().lower()
+        if not key:
+            continue
+        (wanted if key in supported else unsupported).append(key)
+    return wanted, unsupported
+
+
 def build_route(origin_lat: float, origin_lng: float,
                 destination: M.CanonicalDestination,
                 previous: Optional[M.CanonicalRoute] = None,
-                with_landmarks: bool = True) -> M.CanonicalRoute:
+                with_landmarks: bool = True,
+                avoid=None, heading=None) -> M.CanonicalRoute:
     """Provider route -> a complete, speakable, anchored route generation.
 
     Order matters. Speech is built before landmarks so that every maneuver has
@@ -214,7 +233,8 @@ def build_route(origin_lat: float, origin_lng: float,
     §27 expressed as control flow rather than as a promise.
     """
     provider = get_provider()
-    route = provider.route(origin_lat, origin_lng, destination)
+    route = provider.route(origin_lat, origin_lng, destination,
+                           avoid=avoid or [], heading=heading)
 
     if previous is not None:
         route.journey_id = previous.journey_id
@@ -230,9 +250,13 @@ def build_route(origin_lat: float, origin_lng: float,
         with _lock:
             _JOURNEYS[route.journey_id] = {"generation": 1, "reroutes": 0}
 
+    # AFTER the generation is decided, never before: the phrasing set is
+    # indexed off journey and generation, so building the speech table first
+    # would draw every route's lines at the same place in the set.
     for man in route.maneuvers:
         man.speech = speech_mod.build(man, route.destination.display_name,
-                                      route.arrival.side)
+                                      route.arrival.side,
+                                      variant=speech_mod.variant_for(route, man))
 
     stats = {"state": "not_requested", "lookups": 0, "candidates": 0}
     if with_landmarks:

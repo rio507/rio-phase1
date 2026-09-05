@@ -197,7 +197,10 @@ def candidates_for(route: M.CanonicalRoute, maneuver: M.CanonicalManeuver,
         rel = relation_for(route, maneuver, p)
         if not rel:
             continue
-        text = speech_mod.contextual_text(maneuver, spoken, rel["relation"])
+        # The SAME index the maneuver's early line was drawn at, so one turn
+        # is phrased out of one half of the register rather than two.
+        text = speech_mod.contextual_text(maneuver, spoken, rel["relation"],
+                                          speech_mod.variant_for(route, maneuver))
         if not text:
             continue
         scored.append(dict(rel, brand=brand_key, place_id=p.get("place_id", ""),

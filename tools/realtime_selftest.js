@@ -21,6 +21,15 @@
 'use strict';
 
 const path = require('path');
+
+/* THE BROWSER GLOBAL THE SINK DECODES WITH, which node 12 has not got. It is
+   installed before anything is required, because rio_voice_eleven reaches for
+   it the moment a chunk of speech arrives and the failure is a thrown
+   ReferenceError in the middle of a test rather than a red check. */
+if (typeof global.atob !== 'function') {
+  global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
+}
+
 const rt = require(path.join(__dirname, '..', 'static', 'rio_realtime.js'));
 const speech = require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
 // The real tracker, so the directions a test reads are computed the way the
@@ -34,6 +43,21 @@ function ok(cond, what) {
   else console.log('  ok    ' + what);
 }
 function section(name) { console.log('\n=== ' + name + ' ==='); }
+
+/* ONE PAGE'S DOMContentLoaded HANDLERS, SHARED BY EVERY HARNESS IN THIS FILE.
+ *
+ * The same cached-require problem installBrowser explains at length, one step
+ * further on. A panel module registers its init exactly once, against
+ * whichever `document` existed when it was first required — so the SECOND
+ * harness to build a page gets an empty handler list of its own and a
+ * rio_nav.js still wired to the first harness's stubs. That reads as "the
+ * panel is not subscribed to the position watch" in a section that has
+ * nothing to do with whatever ran before it.
+ *
+ * So the registry is the file's, not the harness's: a new page re-runs the
+ * handlers the modules actually registered, against the globals that are
+ * current now. */
+const pageInit = {};
 const tick = () => new Promise(r => setTimeout(r, 0));
 // Long enough for both barge-in timers in the harness (4 ms + 8 ms) to run.
 const settle = () => new Promise(r => setTimeout(r, 40));
@@ -64,6 +88,8 @@ function harness(opts) {
     bargeConfirmMs: opts.bargeConfirmMs === undefined ? 8 : opts.bargeConfirmMs,
     maxResumes: opts.maxResumes,
     resumeInstruction: 'RESUME>>',
+    toolSchemas: opts.toolSchemas,
+    conditionalTools: opts.conditionalTools,
   });
   return { arbiter, sent, events, audio, controller,
            types: () => sent.map(e => e.type),
@@ -1516,6 +1542,463 @@ function panelTools() {
 }
 
 // ---------------------------------------------------------------------------
+section('tools that wait for a reason to exist');
+// ---------------------------------------------------------------------------
+/* A tool schema is input on EVERY response for the whole drive, and two of
+   them cannot be called until a route exists. The session therefore ships the
+   seven that are always true and attaches the other two when they become
+   callable — which is worth about 350 tokens a response out of a minute that
+   holds 40,000, and matters most on exactly the turns that spend two of them.
+
+   What is checked here is the SENDING, because the cost of getting it wrong is
+   not a wasted token: a session.update per route event would replace the tool
+   list in the middle of a turn that is using it. */
+{
+  const BASE = [{ type: 'function', name: 'look' },
+                { type: 'function', name: 'start_navigation' }];
+  const EXTRA = { routing: [{ type: 'function', name: 'stop_navigation' },
+                            { type: 'function', name: 'reroute' }] };
+  const h = harness({ toolSchemas: BASE, conditionalTools: EXTRA });
+
+  const updates = () => h.sent.filter((e) => e.type === 'session.update');
+  ok(updates().length === 0,
+     'a session that has not been told anything sends no update — the seven '
+     + 'it opened with are the seven it has');
+  ok(h.controller.state().tools.join(',') === 'look,start_navigation',
+     'and it says so: ' + h.controller.state().tools.join(','));
+
+  ok(h.controller.setToolCondition('routing', true) === true,
+     'a route attaching attaches the tools that need one');
+  ok(updates().length === 1, 'in exactly one session.update');
+  const namesSent = updates()[0].session.tools.map((t) => t.name);
+  ok(namesSent.join(',') === 'look,start_navigation,stop_navigation,reroute',
+     'carrying the whole list, base first — the API replaces `tools`, it does '
+     + 'not add to it (' + namesSent.join(',') + ')');
+  ok(Object.keys(updates()[0].session).join(',') === 'type,tools',
+     'and nothing else: an update that re-sent turn detection would reset the '
+     + 'detector mid-drive (' + Object.keys(updates()[0].session).join(',') + ')');
+  ok(h.events.some((e) => e.type === 'LIVE_TOOLS_CHANGED' && e.on === true),
+     'the drive log says when the toolset changed and why');
+
+  ok(h.controller.setToolCondition('routing', true) === false,
+     'a second route attaching changes nothing, so nothing is sent — every '
+     + 'automatic reroute attaches a route, and each one would otherwise cost '
+     + 'an update');
+  ok(updates().length === 1, 'still one update, not two');
+
+  ok(h.controller.setToolCondition('routing', false) === true &&
+     updates().length === 2,
+     'the route ending takes them away again');
+  ok(updates()[1].session.tools.map((t) => t.name).join(',')
+     === 'look,start_navigation',
+     'leaving the session carrying only what is always true');
+
+  ok(h.controller.setToolCondition('nonsense', true) === false &&
+     updates().length === 2,
+     'a condition the server never declared is not a tool list the browser '
+     + 'may invent');
+
+  // A session minted before this existed, or by a server that declares none:
+  // nothing to attach, and nothing sent trying.
+  const bare = harness({});
+  ok(bare.controller.setToolCondition('routing', true) === false,
+     'a session with no conditional tools declared sends no update at all');
+
+  /* WATCHING THE ROUTE EVENTS IS THE CONTROLLER'S JOB, not the caller's.
+   *
+   * This is a method because leaving it to each embedder cost a live drive:
+   * the recording harness builds a controller directly, nobody had wired the
+   * route events into it, and asked to avoid the freeway with no `reroute`
+   * attached the model reached for the research tool and narrated a reroute
+   * it had not performed. */
+  const w = harness({ toolSchemas: BASE, conditionalTools: EXTRA });
+  const bus = (function () {
+    const subs = [];
+    return { on: (t, fn) => subs.push(fn),
+             emit: (type, p) => subs.forEach(
+               (fn) => fn(Object.assign({ type: type }, p || {}))) };
+  })();
+  ok(w.controller.watchToolConditions(bus) === true,
+     'the controller subscribes to the drive\'s own route events');
+  bus.emit('NAV_ROUTE_ATTACHED', { route_id: 'r1' });
+  const wUpdates = () => w.sent.filter((e) => e.type === 'session.update');
+  ok(wUpdates().length === 1 &&
+     wUpdates()[0].session.tools.map((t) => t.name).indexOf('reroute') >= 0,
+     'a route attaching brings the route tools with it');
+  bus.emit('NAV_ROUTE_ATTACHED', { route_id: 'r2' });
+  ok(wUpdates().length === 1,
+     'and the automatic reroute that follows changes nothing');
+  bus.emit('NAV_PROGRESS', {});
+  ok(wUpdates().length === 1, 'nor does any other navigation event');
+  bus.emit('NAV_STOPPED', { route_id: 'r2' });
+  ok(wUpdates().length === 2 &&
+     wUpdates()[1].session.tools.map((t) => t.name).indexOf('reroute') < 0,
+     'stopping takes them away again');
+  ok(w.controller.watchToolConditions(null) === false,
+     'and a page with no bus at all is not an error — it is a controller with '
+     + 'nothing to watch');
+}
+
+// ---------------------------------------------------------------------------
+section('navigation by voice — stopping, rerouting, and who the tracker '
+        + 'thinks started the route');
+// ---------------------------------------------------------------------------
+/* The real static/rio_nav.js, against a route server made of a function.
+ *
+ * A fake route rather than a fake nav: everything under test here — the
+ * teardown, the generation, the queue, the tracker — is the panel's own, and
+ * the only thing replaced is the HTTP call that hands it a route. That is what
+ * lets a whole simulated drive run in a few milliseconds and still measure the
+ * timing a car would have seen: the simulator advances its clock one second
+ * per tick whatever the wall clock does.
+ */
+{
+  const ROUTE_LAT = 34.0430, ROUTE_LNG = -118.2673;
+
+  function fakeRoute(gen, avoid) {
+    const mLat = 111320, mLng = 111320 * Math.cos(ROUTE_LAT * Math.PI / 180);
+    const pts = [];
+    const push = (x, y) => pts.push([ROUTE_LAT + y / mLat, ROUTE_LNG + x / mLng]);
+    for (let d = 0; d <= 1200; d += 10) push(d, 0);
+    for (let d = 10; d <= 900; d += 10) push(1200, d);
+    const iTurn = 120, iEnd = pts.length - 1;
+    return {
+      route_id: 'r' + gen, journey_id: 'j1', generation_id: gen,
+      provider: 'fake', created_at: 0, eta_epoch: 0,
+      origin: { lat: pts[0][0], lng: pts[0][1] },
+      destination: { display_name: 'Test Destination',
+                     formatted_address: 'Test Destination, Los Angeles, CA',
+                     lat: pts[iEnd][0], lng: pts[iEnd][1] },
+      total_distance_m: 2100, duration_s: 190, route_length_m: 2100,
+      arrival: { side: 'RIGHT' }, landmarks_state: 'not_requested',
+      geometry: pts,
+      timing: {
+        gps_stale_timeout_s: 5, gps_accuracy_limit_m: 30, gps_degraded_bias_s: 2,
+        off_route_distance_m: 45, off_route_persistence: 3, reroute_debounce_s: 12,
+        progress_rewind_tolerance_m: 30, maneuver_passed_eps_m: 8,
+        arrive_radius_m: 25, projection_back_m: 80, projection_fwd_m: 400,
+        heading_min_displacement_m: 8, heading_max_sample_age_s: 3,
+        heading_min_speed_ms: 1.5, stationary_speed_ms: 0.7,
+        early_guidance_s: 25, anchor_acquisition_s: 11, context_call_s: 6,
+        near_turn_s: 2.5, min_call_distance_m: 20, max_call_distance_m: 400,
+        early_max_distance_m: 900, speed_floor_ms: 3, speed_nominal_ms: 11,
+        duplicate_instruction_cooldown_s: 8, anchor_valid_for_s: 6,
+        speech_ttl_s: { early: 8, primary: 5, imminent: 2.5, arrival: 8 },
+        vision_enabled: false,
+      },
+      avoid_applied: avoid || [],
+      avoid_unsupported: [],
+      maneuvers: [
+        { id: 'm0', sequence: 0, type: 'TURN', direction: 'LEFT',
+          road_name: 'Lincoln Boulevard',
+          instruction: 'Turn left onto Lincoln Boulevard',
+          lat: pts[iTurn][0], lng: pts[iTurn][1],
+          route_distance_position: 1200, polyline_index: iTurn, anchors: [],
+          speech: { early: 'Left turn coming up onto Lincoln Boulevard.',
+                    primary: 'Take the next left onto Lincoln Boulevard.',
+                    imminent: 'Left here.' } },
+        { id: 'm1', sequence: 1, type: 'ARRIVE', direction: 'RIGHT',
+          road_name: '', instruction: 'Arrive at Test Destination',
+          lat: pts[iEnd][0], lng: pts[iEnd][1],
+          route_distance_position: 2100, polyline_index: iEnd, anchors: [],
+          speech: { early: 'Almost there.',
+                    primary: 'Your destination is on the right.',
+                    arrival: 'Your destination is on the right.' } },
+      ],
+    };
+  }
+
+  // The route server: one generation per call, and it remembers what it was
+  // asked for so the preference and the heading can be asserted rather than
+  // assumed.
+  const served = { calls: [], gen: 0 };
+  global.fetch = function (url, opts) {
+    const body = JSON.parse((opts && opts.body) || '{}');
+    if (String(url).indexOf('/nav/route') >= 0) {
+      served.calls.push(body);
+      served.gen += 1;
+      const r = fakeRoute(served.gen, body.avoid || []);
+      r.avoid_unsupported = [];
+      return Promise.resolve({ ok: true, status: 200,
+                               json: () => Promise.resolve(r) });
+    }
+    if (String(url).indexOf('/nav/destination') >= 0) {
+      // Resolution is not what this section tests; it is the step before it.
+      // One place, unambiguously, so the interesting half of routeToQuery is
+      // the half that runs.
+      return Promise.resolve({ ok: true, status: 200, json: () =>
+        Promise.resolve({ status: 'resolved', destination: {
+          display_name: 'Test Destination',
+          formatted_address: 'Test Destination, Los Angeles, CA',
+          provider_place_id: 'p_test' } }) });
+    }
+    // Everything else the panel might reach for (the drive log) is accepted
+    // and ignored: none of it is what this section is about.
+    return Promise.resolve({ ok: true, status: 200,
+                             json: () => Promise.resolve({}) });
+  };
+
+  global.window = global;
+  const stubNode = () => ({
+    style: {}, textContent: '', innerHTML: '', appendChild: () => {},
+    querySelector: () => stubNode(), addEventListener: () => {},
+    setAttribute: () => {},
+  });
+  global.document = {
+    addEventListener: (t, f) => { (pageInit[t] = pageInit[t] || []).push(f); },
+    getElementById: () => null, createElement: stubNode,
+    createTextNode: () => ({}), head: { appendChild: () => {} },
+  };
+  global.Audio = function () {
+    return { preload: '', muted: false, currentTime: 0,
+             play: () => Promise.resolve(), pause: () => {} };
+  };
+  global.navigator = { geolocation: { getCurrentPosition: (okc) => okc({
+    coords: { latitude: ROUTE_LAT, longitude: ROUTE_LNG, accuracy: 8 } }) } };
+
+  global.RIO = global.RIO || {};
+  global.RIO.sessionId = 'sel';
+  global.RIO.url = (p2) => 'http://127.0.0.1:0' + p2;
+  const watch = { sink: null };
+  global.RIO.headway = { startWatch: () => {},
+                         onPosition: (fn) => { watch.sink = fn; } };
+
+  // Every line RIO would have said about the route, in the order she would
+  // have said it. `hold` makes one line refuse to finish, which is the only
+  // way to have something QUEUED rather than already spoken.
+  const heard = [];
+  const holding = { on: false, resolve: null };
+  global.RIO.speak = {
+    provider: function (o) {
+      return {
+        play: function () {
+          heard.push(o.text);
+          if (holding.on) {
+            return new Promise((res) => { holding.resolve = res; });
+          }
+          return Promise.resolve();
+        },
+        stop: function () {},
+      };
+    },
+  };
+
+  require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_navplan.js'));
+  require(path.join(__dirname, '..', 'static', 'rio_nav.js'));
+  (pageInit.DOMContentLoaded || []).forEach((f) => f());
+  const nav = global.RIO.nav;
+
+  const calls = [];
+  global.RIO.bus.on('*', (ev) => {
+    if (/NAV_(EARLY_GUIDANCE|CONTEXTUAL_CALL|NEAR_TURN|PRIMARY|ARRIVAL|SPEECH_SPOKEN)/
+        .test(ev.type)) calls.push(ev);
+  });
+
+  // Where the car is, said out loud rather than inherited. attach() seeds a
+  // new tracker from the last fix it has, which after a simulated drive is
+  // the far end of the last route; a second route started from there is
+  // arrived at before it starts.
+  function parkAtStart() {
+    if (!watch.sink) return;
+    watch.sink({ coords: { latitude: ROUTE_LAT, longitude: ROUTE_LNG,
+                           speed: 0, heading: null, accuracy: 6 } });
+  }
+
+  ok(!!watch.sink,
+     'the panel subscribed to the position watch, the way it does in a car');
+  ok(!!nav && typeof nav.stopRoute === 'function' &&
+     typeof nav.reroute === 'function',
+     'the panel exposes stopping and rerouting by name, which is how the '
+     + 'voice path reaches the same code the buttons do');
+
+  /* One simulated drive, run to the end. The clock inside it is the
+     simulator's, so this measures the timing of a real drive at the speed of
+     a test. */
+  function driveToEnd(tag) {
+    const before = calls.length;
+    heard.length = 0;
+    nav.simulate({ tickMs: 1, mph: 30 });
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const poll = setInterval(() => {
+        const st = nav.state();
+        if (!st || st.arrived || Date.now() - started > 8000) {
+          clearInterval(poll);
+          nav.stopSimulation();
+          resolve({ calls: calls.slice(before), spoken: heard.slice() });
+        }
+      }, 5);
+    });
+  }
+
+  const sequence = (r) => r.calls
+    .filter((e) => e.call_type)
+    .map((e) => e.maneuver_id + ':' + e.call_type);
+
+  // --- STARTED BY VOICE, then STARTED BY THE BOX, and compared -------------
+  await (async () => {
+    parkAtStart();
+    const byVoice = await rt.localTools.start_navigation(
+      { destination: 'Test Destination' });
+    ok(byVoice.ok === true && byVoice.routing === true,
+       'a spoken destination routes (' + byVoice.destination + ')');
+    const voiceDrive = await driveToEnd('voice');
+    const voiceSeq = sequence(voiceDrive);
+    ok(voiceSeq.length > 0,
+       'and driving it calls the turns: ' + voiceSeq.join(' → '));
+    ok(voiceDrive.spoken.some((t) => /Lincoln Boulevard/.test(t)),
+       'in her own words, with the road in them — '
+       + JSON.stringify(voiceDrive.spoken));
+
+    nav.stopRoute('test');
+    parkAtStart();
+    const byBox = await nav.routeToQuery('Test Destination');
+    ok(byBox.status === 'routed', 'the destination box routes the same place');
+    const boxDrive = await driveToEnd('box');
+    const boxSeq = sequence(boxDrive);
+
+    // THE CLAIM, checked rather than assumed: the tracker does not know or
+    // care who asked for the route. Both drives are the same geometry at the
+    // same speed, so any difference here is the entry point leaking into the
+    // guidance — which is exactly the bug this section exists to catch.
+    ok(voiceSeq.join(' → ') === boxSeq.join(' → '),
+       'a route started by voice calls its turns in the same sequence as one '
+       + 'started on the dashboard\n        voice: ' + voiceSeq.join(' → ')
+       + '\n        box:   ' + boxSeq.join(' → '));
+    ok(voiceSeq.some((s) => /:early$/.test(s))
+       && voiceSeq.some((s) => /:primary$/.test(s)),
+       'and the sequence is the real one — an early call and an instruction, '
+       + 'not one lonely event');
+  })();
+
+  // --- STOP: the route ends, and nothing queued survives it ----------------
+  await (async () => {
+    parkAtStart();
+    const started = await rt.localTools.start_navigation(
+      { destination: 'Test Destination' });
+    ok(started.ok === true, 'a route to stop');
+
+    /* Something is being said, and something else is waiting behind it. The
+       first line is held open on purpose: an arbiter with nothing queued
+       cannot demonstrate that a stop empties the queue, because there is
+       nothing in it to lose. */
+    holding.on = true;
+    const dropped = [];
+    global.RIO.speech.say({
+      priority: 30, group: 'nav:m0', id: 'nav:m0:early', text: 'held line',
+      play: () => new Promise(() => {}), stop: () => {},
+      onDone: (why) => dropped.push(['held', why]),
+    });
+    global.RIO.speech.say({
+      priority: 30, group: 'nav:m1', id: 'nav:m1:primary', text: 'queued line',
+      play: () => Promise.resolve(), stop: () => {},
+      onDone: (why) => dropped.push(['queued', why]),
+    });
+    ok(global.RIO.speech.state().queued.length >= 1,
+       'one nav line is playing and another is queued behind it');
+
+    const out = rt.localTools.stop_navigation();
+    ok(out.ok === true && out.was_navigating === true,
+       'stop_navigation reports that it stopped something real');
+    ok(/navigation off/i.test(out.rules),
+       'and tells her to confirm it in one line');
+    ok(nav.route === null && rt.navStatus().routing === false,
+       'the route is gone and nav_status says so — nothing to answer from');
+    ok(dropped.some((d) => d[0] === 'queued' && d[1] === 'cleared'),
+       'the queued line was discarded rather than left to play over a driver '
+       + 'who has just said they know the way (' + JSON.stringify(dropped) + ')');
+    ok(dropped.some((d) => d[0] === 'held'),
+       'and the one already in flight was stopped too');
+    holding.on = false;
+
+    const again = rt.localTools.stop_navigation();
+    ok(again.ok === true && again.was_navigating === false,
+       'stopping when nothing is running is not an error — it is a sentence');
+  })();
+
+  // --- REROUTE: a new generation, and the old one goes quiet ---------------
+  await (async () => {
+    parkAtStart();
+    const started = await rt.localTools.start_navigation(
+      { destination: 'Test Destination' });
+    const genBefore = nav.route.generation_id;
+    const routeIdBefore = nav.route.route_id;
+    ok(started.ok === true && genBefore >= 1, 'a route to reroute');
+
+    /* A line about the plan that is about to be replaced, still waiting its
+       turn behind one that is playing. Held open on purpose: a line the
+       arbiter has already spoken proves nothing about what a reroute does to
+       the queue. */
+    holding.on = true;
+    const fate = [];
+    global.RIO.speech.say({
+      priority: 30, group: 'nav:m0', id: 'nav:m0:early', text: 'held line',
+      play: () => new Promise(() => {}), stop: () => {},
+      onDone: (why) => fate.push(['playing', why]),
+    });
+    // A DIFFERENT MANEUVER, deliberately: same group means the newer line
+    // replaces the older one, which is ordinary turn-taking and would leave
+    // nothing in the queue to lose.
+    global.RIO.speech.say({
+      priority: 30, group: 'nav:m1', id: 'nav:m1:primary', text: 'old plan',
+      play: () => Promise.resolve(), stop: () => {},
+      valid: () => !!nav.route && nav.route.generation_id === genBefore,
+      onDone: (why) => fate.push(['queued', why]),
+    });
+    ok(global.RIO.speech.state().queued.length >= 1,
+       'a line about the old plan is queued when the reroute is asked for');
+
+    const out = await rt.localTools.reroute(
+      { avoid: ['highways'], other_preference: 'the scenic way' });
+    ok(out.ok === true && out.status === 'rerouted',
+       'reroute comes back with a live route');
+    ok(nav.route.route_id !== routeIdBefore &&
+       nav.route.generation_id === genBefore + 1,
+       'a different route, one generation on — replaced, never patched ('
+       + routeIdBefore + ' gen ' + genBefore + ' → ' + nav.route.route_id
+       + ' gen ' + nav.route.generation_id + ')');
+    ok(rt.navStatus().routing === true,
+       'and the car is being navigated the whole time — a reroute is a '
+       + 'replacement, not a gap');
+
+    const asked = served.calls[served.calls.length - 1];
+    ok(asked.reroute_of === routeIdBefore && asked.reason === 'driver_request',
+       'the server was told which route this replaces and that a person '
+       + 'asked for it, not the tracker');
+    ok(JSON.stringify(asked.avoid) === JSON.stringify(['highways']),
+       'with the preference the driver actually named');
+    ok(out.avoid_unsupported.indexOf('the scenic way') >= 0,
+       'and what the map cannot do comes back to be said out loud rather '
+       + 'than dropped: ' + JSON.stringify(out.avoid_unsupported));
+    ok(/never say you avoided something that is not in avoid_applied/
+       .test(out.rules), 'the result forbids claiming a preference it did '
+       + 'not get');
+
+    // NOTHING ABOUT THE OLD PLAN SURVIVES THE REPLACEMENT. Two mechanisms
+    // agree here and both are meant to: the queue is emptied of 'nav:' when
+    // the new route attaches, and any line that got past the queue answers
+    // its own validity question at dequeue, where the generation it was
+    // written for no longer exists. (tools/nav_selftest.js drives that second
+    // one on its own, against the planner.)
+    await new Promise((r) => setTimeout(r, 5));
+    ok(fate.some((f) => f[0] === 'queued' && f[1] !== 'spoken'),
+       'the queued line about the old plan never reached the speaker ('
+       + JSON.stringify(fate) + ')');
+    ok(fate.some((f) => f[0] === 'playing'),
+       'and the one mid-sentence about it was stopped, not talked over');
+    holding.on = false;
+
+    const off = rt.localTools.stop_navigation();
+    ok(off.was_navigating === true, 'and the drive can still be stopped after '
+       + 'a reroute — the teardown follows the new route, not the old one');
+  })();
+
+  delete global.fetch;
+}
+
+// ---------------------------------------------------------------------------
 // LIVE — the real panel, the real server, over HTTP.
 //
 //   node tools/realtime_selftest.js --server [http://127.0.0.1:8888]
@@ -1570,9 +2053,8 @@ function installBrowser(base, sessionId, origin) {
     querySelector: () => stubNode(), addEventListener: () => {},
     setAttribute: () => {},
   });
-  const docHandlers = {};
   global.document = {
-    addEventListener: (t, f) => { (docHandlers[t] = docHandlers[t] || []).push(f); },
+    addEventListener: (t, f) => { (pageInit[t] = pageInit[t] || []).push(f); },
     getElementById: noElement,
     createElement: stubNode,
     createTextNode: () => ({}),
@@ -1620,7 +2102,7 @@ function installBrowser(base, sessionId, origin) {
   require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
   require(path.join(__dirname, '..', 'static', 'rio_navplan.js'));
   require(path.join(__dirname, '..', 'static', 'rio_nav.js'));
-  (docHandlers.DOMContentLoaded || []).forEach((f) => f());
+  (pageInit.DOMContentLoaded || []).forEach((f) => f());
 
   /* ...and say so HERE if one of them is missing anyway.
    *
@@ -1723,6 +2205,54 @@ async function liveRouting(base) {
        'the provider read "LAX" as ' + amb.status + ' — no ambiguity to '
        + 'exercise against this provider today');
   }
+
+  // --- THE SESSION'S OWN ACCOUNT OF WHAT SHE CAN REACH FOR ----------------
+  const minted = await post('/realtime/session?session_id='
+                            + encodeURIComponent(sessionId), {});
+  ok((minted.tools || []).indexOf('stop_navigation') < 0,
+     'the session the browser is handed carries no route tools: ' +
+     (minted.tools || []).join(', '));
+  ok(((minted.conditional_tools || {}).routing || [])
+     .map((t) => t.name).join(',') === 'stop_navigation,reroute',
+     'they arrive as a condition the browser turns on when a route exists');
+  ok((minted.tool_schemas || []).length === (minted.tools || []).length,
+     'with the base schemas alongside, because a session.update replaces the '
+     + 'whole tool list and the browser must not write one of its own');
+
+  // --- REROUTING, AGAINST THE REAL MAP ------------------------------------
+  const beforeReroute = global.RIO.nav.route;
+  const rr = await rt.localTools.reroute({ avoid: ['highways'],
+                                           other_preference: 'the scenic way' });
+  ok(rr.ok === true && rr.status === 'rerouted',
+     'asked for another way, the provider computed one: ' +
+     JSON.stringify({ minutes: rr.minutes, km: rr.distance_km }));
+  ok(global.RIO.nav.route.route_id !== beforeReroute.route_id &&
+     global.RIO.nav.route.generation_id === beforeReroute.generation_id + 1,
+     'it replaced the route and moved the journey on one generation ('
+     + beforeReroute.generation_id + ' -> '
+     + global.RIO.nav.route.generation_id + ')');
+  ok(global.RIO.nav.route.destination.display_name ===
+     beforeReroute.destination.display_name,
+     'to the same place, resolved once and never looked up again ('
+     + global.RIO.nav.route.destination.display_name + ')');
+  ok((rr.avoid_applied || []).indexOf('highways') >= 0,
+     'with the preference the map actually honoured: '
+     + JSON.stringify(rr.avoid_applied));
+  ok((rr.avoid_unsupported || []).indexOf('the scenic way') >= 0,
+     'and the one it cannot, named so she can say so rather than pretend');
+  ok(rt.navStatus().routing === true,
+     'and the car is still being navigated — a reroute is a replacement, not '
+     + 'a gap');
+
+  // --- STOPPING -----------------------------------------------------------
+  const stopped = rt.localTools.stop_navigation();
+  ok(stopped.ok === true && stopped.was_navigating === true,
+     'and "stop navigation" stops it: ' + stopped.destination);
+  ok(global.RIO.nav.route === null && rt.navStatus().routing === false,
+     'the route is gone from the panel, and nav_status answers from nothing');
+  ok(global.RIO.speech.state().queued.length === 0 &&
+     !global.RIO.speech.state().speaking,
+     'with nothing left queued to be said about it');
 
   // The drive log should say a human voice set this, not the box.
   await new Promise((r) => setTimeout(r, 400));

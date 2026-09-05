@@ -146,7 +146,16 @@ class FixtureProvider(NavigationProvider):
             self.sessions_seen.append(("destination", session))
         return self._route.destination
 
-    def route(self, origin_lat, origin_lng, destination):
+    # The same three the real map honours, so the offline suites exercise the
+    # honoured path and the refused one rather than only the refused one.
+    AVOID_SUPPORTED = ("highways", "tolls", "ferries")
+
+    def route(self, origin_lat, origin_lng, destination,
+              avoid=None, heading=None):
+        # Recorded so a selftest can assert what was ASKED for, which is the
+        # only part of a preference this provider can honour.
+        self.last_avoid = list(avoid or [])
+        self.last_heading = heading
         self.route_calls += 1
         if self._fail_with:
             raise NavError(self._fail_with)

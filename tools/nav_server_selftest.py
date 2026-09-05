@@ -141,7 +141,14 @@ def run_provider():
         def destination(self, query="", place_id="", label="", session=None):
             return fixtures.city_route().destination
 
-        def route(self, origin_lat, origin_lng, destination):
+        # THE MINIMUM CONTRACT, and it now includes taking the two arguments
+        # this provider cannot do anything with. `avoid` arrives already
+        # filtered against AVOID_SUPPORTED — which is empty here — so it is
+        # always the empty list; `heading` is a hint a provider is free to
+        # ignore. Accepting and dropping them is what a map with no such
+        # controls is supposed to do.
+        def route(self, origin_lat, origin_lng, destination,
+                  avoid=None, heading=None):
             r = fixtures.city_route()
             r.origin_lat, r.origin_lng = origin_lat, origin_lng
             return r
@@ -307,9 +314,11 @@ def run_candidates():
        "an unbranded local business is not — there is no reliable sign to see")
     ok(all(a["speech"] for a in m0.anchors),
        "every candidate arrives with its sentence already written")
-    ok(m0.anchors[0]["speech"] == "Turn left by the Shell station.",
-       'the best candidate\'s line is "Turn left by the Shell station." — got "'
-       + m0.anchors[0]["speech"] + '"')
+    line = m0.anchors[0]["speech"]
+    ok("left" in line.lower() and "the Shell station" in line
+       and "Lincoln Boulevard" in line,
+       "the best candidate's line names the turn, the landmark and the road, "
+       "whichever phrasing it was drawn at — got " + repr(line))
     ok(m0.anchors[0]["salience"] >= m0.anchors[-1]["salience"],
        "candidates are ordered with the most recognisable sign first")
 
@@ -545,7 +554,14 @@ def run_speech():
     r = service.build_route(route.geometry[0][0], route.geometry[0][1], route.destination)
 
     m0, m1, arrive = r.maneuvers
-    ok(m0.speech["early"] == "Left turn coming up.", "the early line prepares, with no distance")
+    ok(m0.speech["early"] in [t.format(dir="left", Dir="Left",
+                                       road=" onto Lincoln Boulevard",
+                                       road_this="Lincoln Boulevard")
+                              for t in speech_mod._EARLY_TURN],
+       "the early line is one of the phrasings and nothing else — got "
+       + repr(m0.speech["early"]))
+    ok(not any(ch.isdigit() for ch in m0.speech["early"]),
+       "and still carries no distance, whichever one it drew")
     ok(m0.speech["primary"] == "Take the next left onto Lincoln Boulevard.",
        "the canonical instruction is a complete sentence on its own")
     ok(m0.speech["imminent"] == "Left here.", "the imminent backup is two words")
@@ -561,15 +577,20 @@ def run_speech():
     ok(speech_mod.arrival_text("The Getty", M.UNKNOWN) == "You've arrived at The Getty.",
        "an UNKNOWN arrival side is omitted, never guessed")
 
-    ok(m0.anchors[0]["speech"] == "Turn left by the Shell station.",
-       "the contextual line is prepared at route load, not composed while driving")
+    ok(m0.anchors[0]["speech"] in [
+        t.format(dir="left", Dir="Left", label="the Shell station",
+                 road=" onto Lincoln Boulevard")
+        for t in speech_mod._CONTEXTUAL["NEAR"]],
+       "the contextual line is prepared at route load, not composed while "
+       "driving — and is one of the NEAR phrasings")
 
     # Every sentence is addressable, and only by id.
     ok(speech_mod.text_for(r, "m0", "primary") == m0.speech["primary"],
        "/nav/voice resolves (route, maneuver, call) to the stored line")
     ok(speech_mod.text_for(r, "m0", "primary", m0.anchors[0]["anchor_id"]) ==
-       "Turn left by the Shell station.",
-       "...and (route, maneuver, call, anchor) to the contextual one")
+       m0.anchors[0]["speech"],
+       "...and (route, maneuver, call, anchor) to the contextual one, the "
+       "same string that was stored — the choice was made once, at build")
     ok(speech_mod.text_for(r, "m0", "primary", "not_a_real_anchor") is None,
        "an anchor that is not on this route is not a sentence RIO can say")
     ok(speech_mod.text_for(r, "m99", "primary") is None,
@@ -590,6 +611,115 @@ def run_speech():
         hits = [b for b in banned if b in src]
         ok(not hits, f"{mod.__name__} cannot reach a model or the network "
                      + (f"(found {hits})" if hits else ""))
+
+
+# ---------------------------------------------------------------------------
+# G2. Varied phrasing, and the preferences a driver can ask for
+# ---------------------------------------------------------------------------
+def run_variation():
+    section("G2. phrasing — varied in wording, fixed in content")
+    import persona
+    route = fixtures.city_route()
+    service.set_provider(fixtures.FixtureProvider(route, []))
+    service.reset()
+    r = service.build_route(route.geometry[0][0], route.geometry[0][1],
+                            route.destination)
+    turns = [m for m in r.maneuvers if m.type == M.TURN]
+
+    # THE CONTENT, which is the half that may not vary. A phrasing that drops
+    # the direction is a phrasing that leaves the driver guessing, and one
+    # that drops the road name is worse than the template it replaced.
+    for m in turns:
+        word = "left" if m.direction == M.LEFT else "right"
+        early = m.speech.get("early", "")
+        ok(word in early.lower(),
+           f"{m.id}'s early line says which way to turn ({early!r})")
+        ok(m.road_name in early,
+           f"...and which road it goes onto ({m.road_name!r} in {early!r})")
+        ok(not persona.lint(early),
+           f"...and is in her register: {persona.lint(early) or 'clean'}")
+
+    # THE WORDING, which is the half that must. Two consecutive turns drawing
+    # the same phrasing is the sound this change exists to remove.
+    ok(turns[0].speech["early"] != turns[1].speech["early"],
+       "consecutive turns are not phrased identically ("
+       + " / ".join(repr(m.speech["early"]) for m in turns) + ")")
+
+    # THE IMMINENT CALL, which is neither: one template per maneuver type, the
+    # same bytes every time, whatever the route or the generation.
+    for v in range(len(speech_mod._EARLY_TURN) + 3):
+        ok(speech_mod.imminent_text(turns[0]) == "Left here.",
+           "the imminent call is byte-identical whatever else varies"
+           if v == 0 else None)
+        break
+    imminents = set()
+    for gen in range(1, 6):
+        alt = speech_mod.build(turns[0], "", M.UNKNOWN, variant=gen)
+        imminents.add(alt["imminent"])
+    ok(imminents == {"Left here."},
+       "and stays one string across every variant index — " + repr(imminents))
+
+    # REPRODUCIBLE FROM WHAT IS LOGGED, which is the property a bug report
+    # needs and a weaker one than "always the same words". Two separate drives
+    # to the same place are two journeys and may well phrase a turn
+    # differently — that is the point of it, for anyone who makes the same
+    # commute daily. What must never happen is a line nobody can account for
+    # afterwards: (journey, generation, sequence) is written to the drive log,
+    # and those three reproduce the sentence exactly.
+    for m in turns:
+        ok(speech_mod.build(m, "", M.UNKNOWN,
+                            variant=speech_mod.variant_for(r, m)) == m.speech,
+           f"{m.id}'s stored lines are what its journey, generation and "
+           "position redraw — nothing decided at drive time")
+    ok(speech_mod.early_text(turns[0], 2) == speech_mod.early_text(turns[0], 2),
+       "and the draw itself is a function of its index, not of the clock")
+
+    # ...and a REROUTE is a new generation, which is allowed to sound
+    # different: the plan changed, and repeating the abandoned one verbatim is
+    # the one place this would sound like a recording.
+    offsets = {speech_mod.route_offset("j-abc", g) for g in (1, 2, 3)}
+    ok(len(offsets) == 3,
+       "each generation of a journey starts at its own place in the set")
+
+
+def run_preferences():
+    section("G3. preferences — what the map can keep off a route, and what it cannot")
+    route = fixtures.city_route()
+    prov = fixtures.FixtureProvider(route, [])
+    service.set_provider(prov)
+    service.reset()
+
+    wanted, unsupported = service.split_preferences(
+        ["highways", "the scenic way", "TOLLS", ""])
+    ok(wanted == ["highways", "tolls"],
+       "what the provider advertises is honoured, case and blanks aside")
+    ok(unsupported == ["the scenic way"],
+       "and what it does not is carried OUT as data rather than dropped — "
+       "the driver gets told, instead of assuming it was done")
+
+    r = service.build_route(route.geometry[0][0], route.geometry[0][1],
+                            route.destination, avoid=wanted, heading=91.5)
+    ok(prov.last_avoid == ["highways", "tolls"],
+       "the preferences reach the provider that has to honour them")
+    ok(prov.last_heading == 91.5,
+       "and so does the heading, so a reroute does not open with a U-turn")
+    ok(r.generation_id == 1, "an ordinary route is still generation 1")
+
+    # A provider with no such controls is not asked for them, and says so by
+    # advertising nothing rather than by failing a call.
+    class NoPrefs(fixtures.FixtureProvider):
+        AVOID_SUPPORTED = ()
+    service.set_provider(NoPrefs(route, []))
+    wanted2, unsupported2 = service.split_preferences(["highways"])
+    ok(wanted2 == [] and unsupported2 == ["highways"],
+       "against a map with no preference controls, everything asked for is "
+       "reported back as something it cannot do")
+
+    # The real provider's own table, checked rather than assumed: these are
+    # the three the Routes API has modifiers for.
+    from navigation.providers.google import GoogleProvider
+    ok(set(GoogleProvider.AVOID_SUPPORTED) == {"highways", "tolls", "ferries"},
+       "and the production provider advertises exactly what it can modify")
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1086,8 @@ def main():
     run_gates()
     run_verification()
     run_speech()
+    run_variation()
+    run_preferences()
     run_spoken()
     run_observer()
     run_autocomplete()

@@ -1186,11 +1186,21 @@ def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=N
     except (TypeError, ValueError):
         return {"error": "need a current position (lat, lng) to route from"}
 
+    reason = str(body.get("reason") or "") or None
+    # A DRIVER ASKING IS NOT A JOURNEY OSCILLATING. The anti-flap limit exists
+    # because a fix bouncing between two lanes can order routes forever; a
+    # person saying "find another way" twice is two decisions, and refusing the
+    # second because a counter is high would be RIO declining an instruction on
+    # the strength of the tracker's bookkeeping. It still COUNTS — the limit
+    # keeps protecting the automatic path — it just does not gate this one.
+    driver_asked = reason == "driver_request"
+
     previous = None
     reroute_of = body.get("reroute_of")
     if reroute_of:
         previous = navservice.get_route(str(reroute_of))
-        if previous is not None and not navservice.reroute_allowed(previous.journey_id):
+        if (previous is not None and not driver_asked
+                and not navservice.reroute_allowed(previous.journey_id)):
             # Anti-flap. A journey rerouting this often is not being rerouted,
             # it is oscillating, and each attempt costs a routing call.
             sessions.log_nav(session_id, navevents.REROUTE_FAILED, {
@@ -1222,13 +1232,23 @@ def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=N
                          {"destination": query or label, "error": "unresolved destination"})
         return {"error": "could not find that place"}
 
+    # What the driver asked to keep off the route, split into what this map
+    # can actually do and what it cannot, so the reply can say which is which.
+    avoid, unsupported = navservice.split_preferences(body.get("avoid"))
+    try:
+        heading = float(body.get("heading"))
+    except (TypeError, ValueError):
+        heading = None
+
     if previous is not None:
         sessions.log_nav(session_id, navevents.REROUTE_STARTED, {
             "route_id": previous.route_id, "journey_id": previous.journey_id,
             "generation_id": previous.generation_id,
-            "reason": str(body.get("reason") or "off_route")})
+            "avoid": avoid, "avoid_unsupported": unsupported,
+            "reason": reason or "off_route"})
     try:
-        route = navservice.build_route(lat, lng, destination, previous=previous)
+        route = navservice.build_route(lat, lng, destination, previous=previous,
+                                       avoid=avoid, heading=heading)
     except navservice.NavError as e:
         sessions.log_nav(session_id, navevents.ROUTE_FAILED,
                          {"destination": destination.display_name, "error": str(e)})
@@ -1241,7 +1261,13 @@ def nav_route_endpoint(body: dict = Body(...), session_id: str = Query(default=N
                      navevents.REROUTE_COMPLETE if previous is not None
                      else navevents.ROUTE_STARTED,
                      navservice.summary(route))
-    return navservice.wire(route)
+    out = navservice.wire(route)
+    # Rides back with the route rather than being inferred from it: a route
+    # built with avoidHighways looks like any other route, and "did she
+    # actually do what I asked" is not a question the geometry answers.
+    out["avoid_applied"] = avoid
+    out["avoid_unsupported"] = unsupported
+    return out
 
 
 @app.get("/nav/voice")

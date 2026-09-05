@@ -21,9 +21,39 @@ Every sentence RIO can say about a maneuver is enumerable before the drive
 starts: a direction, a road name, and at most one landmark from a list fetched
 at route load. Enumerating them costs a dictionary lookup and removes latency,
 hallucination, a validation layer, a test surface and an entire class of
-failure state. A model may later vary the phrasing of the EARLY line, which is
-the one line that is never time-critical. The imminent call stays a template
-permanently.
+failure state.
+
+VARIED, WITHOUT A MODEL AND WITHOUT A DICE ROLL
+-----------------------------------------------
+A car that says "Left turn coming up." nine times in twenty minutes stops
+sounding like someone in the passenger seat and starts sounding like a GPS,
+which is the one thing RIO is defined against. So the EARLY line and the
+CONTEXTUAL line — the two that are never time-critical — are drawn from a SET
+of phrasings in her register rather than from a single template.
+
+The set is fixed, and so is the choice. `_variant` indexes it by the
+maneuver's position in the route plus a per-generation offset, which buys the
+three things a random draw does not:
+
+  a drive never repeats itself     consecutive maneuvers step through the set
+                                   rather than landing on the same line twice
+  a sentence is accountable        the offset is arithmetic on the journey id
+                                   and the generation, both of which are in
+                                   the drive log — so what she said on any
+                                   turn of any drive can be recomputed, which
+                                   a dice roll makes impossible. Two separate
+                                   drives to the same place are two journeys
+                                   and may phrase a turn differently, which is
+                                   the point for anyone who drives it daily.
+  /nav/voice stays a lookup        the text is chosen once, at route build,
+                                   and stored — nothing decides anything about
+                                   language while the car is moving
+
+What varies is the WORDING. What never varies is the CONTENT: every phrasing
+in every set carries the direction and, when the provider gave one, the road
+name — checked in the selftest rather than promised here. The IMMINENT call is
+excluded from all of it and stays one fixed template per maneuver type,
+permanently: at two seconds' notice "Right here." is not a phrasing choice.
 
 The text for every call of every maneuver is computed HERE, at route time, and
 stored on the route. Nothing generates language while the car is moving; the
@@ -58,17 +88,82 @@ def _road_phrase(maneuver: "M.CanonicalManeuver") -> str:
     return f" onto {name}" if name else ""
 
 
-def early_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
+# THE PHRASINGS, and the rule they all obey: the direction is in every one of
+# them, and `{road}` — which expands to " onto Lincoln Boulevard" or to nothing
+# at all — is in every one of them too. A set member that could drop either is
+# a set member that makes a call less useful than the template it replaced.
+#
+# Index 0 of each set is the line this file said before there were sets, so a
+# route that draws 0 everywhere is the old behaviour exactly.
+_EARLY_TURN = (
+    "{Dir} turn coming up{road}.",
+    "{Dir} coming up{road}.",
+    "Next one's a {dir}{road}.",
+    "Coming up on a {dir}{road}.",
+)
+_EARLY_UTURN = (
+    "U-turn coming up.",
+    "U-turn's next.",
+    "Coming up on a U-turn.",
+)
+_EARLY_ROUNDABOUT = (
+    "Roundabout coming up.",
+    "Roundabout's next.",
+    "Coming up on a roundabout.",
+)
+_EARLY_RAMP = (
+    "Exit coming up.",
+    "Exit's next.",
+    "Coming up on an exit.",
+)
+# THE ONE PLACE A CALL WAS ADDED RATHER THAN REPHRASED. A long leg with no
+# maneuver on it used to produce nothing at all, which is correct in the sense
+# that there is no turn to call and wrong in the sense that a passenger says
+# "stay on this" and a GPS says nothing. No distance, like every other early
+# line: the planner decides WHEN this is worth saying, and a leg length said
+# out loud here would be a second, worse answer to that question.
+_EARLY_KEEP = (
+    "Stay on {road_this}.",
+    "Stay on {road_this} for now.",
+    "We're on {road_this} for a while.",
+)
+
+
+def _variant(options, index: int) -> str:
+    """One phrasing out of a set, chosen by position rather than by chance.
+
+    `index` is the maneuver's sequence plus the route generation's offset, so
+    consecutive maneuvers walk the set instead of repeating, and the same route
+    built twice says the same words both times.
+    """
+    return options[index % len(options)]
+
+
+def _fill(template: str, maneuver: "M.CanonicalManeuver") -> str:
+    d = _DIR_WORD.get(maneuver.direction) or ""
+    name = (maneuver.road_name or "").strip()
+    return template.format(
+        dir=d, Dir=d.capitalize(),
+        road=_road_phrase(maneuver),
+        # A leg is described by the road it is ON, a turn by the road it goes
+        # ONTO — and a leg whose road the provider did not name is "this",
+        # which is what a passenger says when they mean the one we are on.
+        road_this=name or "this")
+
+
+def early_text(maneuver: "M.CanonicalManeuver", variant: int = 0) -> Optional[str]:
     """The optional preparation line. No distance, no camera, no urgency."""
     d = _DIR_WORD.get(maneuver.direction)
     if maneuver.type == M.TURN and d:
-        return f"{d.capitalize()} turn coming up."
+        return _fill(_variant(_EARLY_TURN, variant), maneuver)
     if maneuver.type == M.UTURN:
-        return "U-turn coming up."
+        return _variant(_EARLY_UTURN, variant)
     if maneuver.type == M.ROUNDABOUT:
-        return "Roundabout coming up."
-    if maneuver.type in (M.RAMP, M.FORK, M.MERGE, M.KEEP):
-        return "Exit coming up." if maneuver.type == M.RAMP else None
+        return _variant(_EARLY_ROUNDABOUT, variant)
+    if maneuver.type == M.RAMP:
+        return _variant(_EARLY_RAMP, variant)
+    if maneuver.type in (M.KEEP, M.STRAIGHT):
+        return _fill(_variant(_EARLY_KEEP, variant), maneuver)
     return None
 
 
@@ -95,8 +190,31 @@ def primary_text(maneuver: "M.CanonicalManeuver") -> str:
     return f"Continue{_road_phrase(maneuver)}."
 
 
+# The contextual sets, one per relation. Same rule as the early sets — every
+# phrasing carries the direction, the road name when there is one, and the
+# landmark, because a contextual line that drops the road is a landmark
+# description rather than an instruction.
+_CONTEXTUAL = {
+    "NEAR": (
+        "Turn {dir} by {label}{road}.",
+        "{Dir}{road}, by {label}.",
+        "{Dir} at {label}{road}.",
+    ),
+    "JUST_AFTER": (
+        "Turn {dir} just after {label}{road}.",
+        "{Dir}{road}, just past {label}.",
+        "Just past {label}, {dir}{road}.",
+    ),
+    "JUST_BEFORE": (
+        "Turn {dir} just before {label}{road}.",
+        "{Dir}{road}, just before {label}.",
+        "Before {label}, {dir}{road}.",
+    ),
+}
+
+
 def contextual_text(maneuver: "M.CanonicalManeuver", spoken_label: str,
-                    relation: str) -> Optional[str]:
+                    relation: str, variant: int = 0) -> Optional[str]:
     """The differentiated line: the same turn, described by what is out there.
 
     Only for the maneuver families a landmark can actually describe. "Merge
@@ -106,13 +224,12 @@ def contextual_text(maneuver: "M.CanonicalManeuver", spoken_label: str,
     d = _DIR_WORD.get(maneuver.direction)
     if maneuver.type != M.TURN or not d or not spoken_label:
         return None
-    if relation == "NEAR":
-        return f"Turn {d} by {spoken_label}."
-    if relation == "JUST_AFTER":
-        return f"Turn {d} just after {spoken_label}."
-    if relation == "JUST_BEFORE":
-        return f"Turn {d} just before {spoken_label}."
-    return None
+    options = _CONTEXTUAL.get(relation)
+    if not options:
+        return None
+    return _variant(options, variant).format(
+        dir=d, Dir=d.capitalize(), label=spoken_label,
+        road=_road_phrase(maneuver))
 
 
 def imminent_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
@@ -146,8 +263,30 @@ def arrival_text(destination_name: str, side: str) -> str:
     return f"You've arrived at {name}." if name else "You've arrived."
 
 
+def route_offset(journey_id: str, generation_id: int) -> int:
+    """Where in each phrasing set this route generation starts.
+
+    Per GENERATION rather than per journey, so the same turn is not guaranteed
+    the same words after a reroute — the drive has changed, and a line repeated
+    verbatim from the plan that was just abandoned is the one place this would
+    sound like a recording. Arithmetic on the id rather than a random seed:
+    reproducible, and no state to carry.
+    """
+    return sum(ord(c) for c in (journey_id or "")) + int(generation_id or 0)
+
+
+def variant_for(route: "M.CanonicalRoute",
+                maneuver: "M.CanonicalManeuver") -> int:
+    """The index this maneuver's phrasings are drawn at. One definition, two
+    callers: the speech table here and the anchor lines in landmarks.py, which
+    must agree or one turn's early call and contextual call come out of
+    different halves of the register."""
+    return route_offset(getattr(route, "journey_id", ""),
+                        getattr(route, "generation_id", 0)) + maneuver.sequence
+
+
 def build(maneuver: "M.CanonicalManeuver", destination_name: str = "",
-          arrival_side: str = M.UNKNOWN) -> dict:
+          arrival_side: str = M.UNKNOWN, variant: int = 0) -> dict:
     """Every line this maneuver can produce, ahead of time.
 
     `anchors` is filled in separately by the landmark stage, which adds one
@@ -161,9 +300,12 @@ def build(maneuver: "M.CanonicalManeuver", destination_name: str = "",
             ARRIVAL: arrival_text(destination_name, arrival_side),
         }
     out = {PRIMARY: primary_text(maneuver)}
-    e = early_text(maneuver)
+    e = early_text(maneuver, variant)
     if e:
         out[EARLY] = e
+    # NOT varied, and this is the line that must not be. Two seconds from a
+    # junction the driver is listening for a word, not a sentence, and every
+    # millisecond of novelty is a millisecond of parsing.
     i = imminent_text(maneuver)
     if i:
         out[IMMINENT] = i

@@ -470,6 +470,13 @@
       // A fix already in hand starts tracking immediately rather than at the
       // next GPS tick, so a route set 200 m from a turn announces it now.
       if (lastFix && !sim.timer) tracker.position(lastFix);
+      // A SIMULATED DRIVE CARRIES ON, FROM THE START OF WHAT IT IS NOW ON.
+      // The simulator's position is a distance along the route, and a route
+      // that has just been attached begins where the car is — so keeping the
+      // old distance would teleport the car a mile up a road it has not
+      // driven. Real GPS needs none of this; it reports where the car is and
+      // the projection follows.
+      if (sim.timer) sim.s = 0;
     }
 
     /* ---------------------------------------------------------------------
@@ -519,15 +526,29 @@
       if (routing) return Promise.resolve({ ok: false, error: 'already routing' });
       routing = true;
       if (!opts.reroute_of) lastRequest = opts;
-      status(opts.reroute_of ? 'Off route · rerouting…' : 'Routing…');
+      status(!opts.reroute_of ? 'Routing…'
+             : (opts.reason === 'driver_request' ? 'Rerouting…'
+                                                 : 'Off route · rerouting…'));
       return currentOrigin().then(function (origin) {
         return fetch(RIO.url('/nav/route'), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             lat: origin.lat, lng: origin.lng,
+            // WHICH WAY THE CAR IS POINTING, when the watch has told us. A
+            // reroute computed without it is free to begin with a U-turn the
+            // driver did not ask for and cannot make; with it the provider
+            // routes from the lane we are actually in. Omitted rather than
+            // guessed when there is no fix — a heading of 0 is due north, not
+            // "unknown".
+            heading: (lastFix && typeof lastFix.heading === 'number')
+              ? lastFix.heading : null,
             destination: opts.destination || '', place_id: opts.place_id || '',
             label: opts.label || '', reroute_of: opts.reroute_of || null,
             reason: opts.reason || null, session: opts.session || null,
+            // What the driver asked to keep off: 'highways', 'tolls',
+            // 'ferries'. The server sends only what the provider actually
+            // supports and says what it dropped.
+            avoid: opts.avoid || [],
           }),
         });
       }).then(function (r) { return r.json(); })
@@ -619,6 +640,82 @@
       clearMap();
       paintRoute();
       status(reason || 'No Route Set');
+    }
+
+    /* STOPPING, on purpose. The one path, whoever asked: the Clear button on
+       the panel and `stop_navigation` in RIO's voice both arrive here.
+
+       clearRoute already does everything that matters — the tracker and the
+       planner are stopped, the queue is emptied of anything addressed 'nav:',
+       and `route` going null takes activeGeneration() to -1, so an
+       announcement that was already past the queue and in flight fails its own
+       validity check at dequeue rather than playing over a driver who has just
+       said they know the way. This adds the one thing a spoken stop needs that
+       a button press does not: what was stopped, so the confirmation can name
+       it, and a line in the drive's log saying who ended the route. */
+    function stopRoute(reason) {
+      var was = route;
+      if (!was) return { ok: true, was_navigating: false };
+      var dest = was.destination || {};
+      clearRoute('Navigation off');
+      RIO.bus.emit('NAV_STOPPED', {
+        route_id: was.route_id, journey_id: was.journey_id,
+        generation_id: was.generation_id,
+        destination: dest.display_name || dest.formatted_address || '',
+        reason: reason || 'driver',
+      });
+      return { ok: true, was_navigating: true,
+               destination: dest.display_name || dest.formatted_address || '' };
+    }
+
+    /* REROUTING BECAUSE THE DRIVER ASKED, which is a different event from
+       rerouting because the car left the route, and is deliberately not the
+       same function.
+
+       Off-route rerouting is the tracker noticing and the debounce protecting
+       a flapping fix from a routing bill. This is a command: it runs on the
+       word, to the SAME destination object (never a re-resolution of its
+       label), and it may carry preferences the automatic path never has.
+
+       ATOMIC, and that is the whole shape of it. The old tracker keeps running
+       while the provider is asked — it is still the truth until something
+       replaces it — and is stopped only once attach() has put a new route,
+       tracker and planner in place. A reroute that fails leaves the car
+       navigating the route it was already on, rather than navigating nothing
+       because it asked a question and got an error. */
+    function rerouteNow(opts) {
+      opts = opts || {};
+      if (!route) return Promise.resolve({ status: 'no_route' });
+      if (routing) return Promise.resolve({ status: 'busy' });
+      var prev = route;
+      var oldTracker = tracker, oldPlanner = planner;
+      lastRerouteAt = clockS;      // shares the anti-flap clock with off-route
+      return setRoute({
+        destination: (lastRequest && lastRequest.destination) || '',
+        place_id: (lastRequest && lastRequest.place_id) || '',
+        label: (lastRequest && lastRequest.label) || '',
+        reroute_of: prev.route_id, reason: 'driver_request',
+        avoid: opts.avoid || [],
+      }).then(function (res) {
+        if (!res || !res.ok) {
+          return { status: 'failed', error: (res && res.error) || 'reroute failed',
+                   destination: prev.destination };
+        }
+        // The replacement has happened. Now, and only now, the old plan is
+        // torn down and anything it queued is dropped: the new generation is
+        // live, so nothing addressed to the old one can be true any more.
+        if (oldPlanner) oldPlanner.stop();
+        if (oldTracker) oldTracker.stop();
+        RIO.speech.clear('nav:');
+        RIO.bus.emit('NAV_REROUTED', {
+          route_id: res.route.route_id, journey_id: res.route.journey_id,
+          from_route_id: prev.route_id,
+          from_generation_id: prev.generation_id,
+          generation_id: res.route.generation_id,
+          avoid: opts.avoid || [], reason: 'driver_request',
+        });
+        return { status: 'rerouted', route: res.route };
+      });
     }
 
     /* Reroute: the provider is asked for a new route from where we actually
@@ -757,7 +854,7 @@
         if (elDest && elDest.value.trim()) routeToQuery(elDest.value.trim());
       });
     }
-    if (elClear) elClear.addEventListener('click', function () { clearRoute(); });
+    if (elClear) elClear.addEventListener('click', function () { stopRoute('panel'); });
 
     /* ---------------------------------------------------------------------
        Simulate drive — the desk mode.
@@ -766,11 +863,21 @@
        tracking, the planner, the arbiter or the logging knows the difference,
        which is the point: what you hear at the desk is what you get in the car.
        --------------------------------------------------------------------- */
-    function startSim() {
+    /* `opts.tickMs` is the desk-test knob, and it is safe for one reason
+       worth stating: the simulated clock advances ONE SECOND PER TICK
+       whatever the wall clock is doing, so every time-based decision
+       downstream — the duplicate cooldown, the gap the imminent call needs
+       after the primary, a line's TTL — sees exactly the drive it would have
+       seen at 1 Hz. A suite can therefore run a whole route in a second and
+       still be measuring the real timing. The button passes nothing and gets
+       a second a second, which is the only setting a car ever uses. */
+    function startSim(opts) {
       if (!tracker || !route) { status('Set a route first'); return; }
       unlock();
       stopSim(true);
-      var mph = parseFloat(elSimSpeed && elSimSpeed.value) || 30;
+      var tickMs = Math.max(1, (opts && opts.tickMs) || 1000);
+      var mph = (opts && opts.mph) ||
+                parseFloat(elSimSpeed && elSimSpeed.value) || 30;
       sim.ms = Math.max(1, mph * MPH_TO_MS);
       sim.s = 0;
       clockS = 0;
@@ -786,7 +893,7 @@
                      accuracy: 5, t: clockS });
         if (p.done) { stopSim(); return; }
         sim.s += sim.ms;   // one second of travel per tick
-      }, 1000);
+      }, tickMs);
     }
 
     function stopSim(quiet) {
@@ -821,6 +928,8 @@
       routeToQuery: routeToQuery,
       offerDestinations: offerDestinations,
       clearRoute: clearRoute,
+      stopRoute: stopRoute,
+      reroute: rerouteNow,
       simulate: startSim,
       stopSimulation: stopSim,
       unlock: unlock,

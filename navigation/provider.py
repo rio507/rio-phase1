@@ -98,14 +98,26 @@ class NavigationProvider(abc.ABC):
 
     @abc.abstractmethod
     def route(self, origin_lat: float, origin_lng: float,
-              destination: CanonicalDestination) -> CanonicalRoute:
+              destination: CanonicalDestination,
+              avoid=None, heading=None) -> CanonicalRoute:
         """The route. Raises NavError if there is not one to be had.
 
         The returned route carries no journey identity — `route_id`,
         `journey_id` and `generation_id` are assigned by the service, because
         a reroute's relationship to the route it replaces is RIO's bookkeeping
         and not the provider's.
+
+        `avoid` is what the driver asked to keep off the route, as the keys of
+        AVOID_SUPPORTED; a provider that cannot honour one of them is not
+        asked to (the caller filters first), so anything arriving here is
+        something this provider said it could do. `heading` is the car's course
+        in degrees, or None when nothing has a fix on it.
         """
+
+    # What this provider can be asked to keep off a route. The empty default
+    # is the honest answer for a provider with no such controls: the caller
+    # tells the driver it cannot be done rather than routing as if it had.
+    AVOID_SUPPORTED = ()
 
     def landmarks_near(self, lat: float, lng: float, radius_m: float,
                        types: tuple) -> List[dict]:

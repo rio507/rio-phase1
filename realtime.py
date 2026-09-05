@@ -109,6 +109,24 @@ VEHICLE_TOOL_NAME = "vehicle_status"
 # the browser, where the route and the tracker live.
 NAVIGATE_TOOL_NAME = "start_navigation"
 
+# ...and the other two halves of the same job. A driver who can be taken
+# somewhere by voice and then has to reach for the screen to stop it, or to ask
+# for a different way round, has been given half a feature: the hands stayed on
+# the wheel for the easy part and came off it for the correction. Both are
+# answered in the browser for the same reason start_navigation is — the route
+# and the tracker are there — and both go down the path the dashboard's own
+# controls already use.
+STOP_TOOL_NAME = "stop_navigation"
+REROUTE_TOOL_NAME = "reroute"
+
+# WHAT EVERY SESSION CARRIES, and what waits for a reason to exist. See the
+# `conditional_tools` note in mint_client_secret: the second list is attached
+# by session.update when its condition holds, and removed when it stops.
+def _base_tools():
+    return [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
+            PLACES_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA]
+
+
 TOOL_SCHEMA = {
     "type": "function",
     "name": TOOL_NAME,
@@ -331,6 +349,58 @@ NAVIGATE_SCHEMA = {
     },
 }
 
+
+STOP_SCHEMA = {
+    "type": "function",
+    "name": STOP_TOOL_NAME,
+    "description": (
+        "Stop navigating: 'stop navigation', 'cancel the route', 'I know the "
+        "way from here'. Ends the route and silences the turn-by-turn — the "
+        "panel's own Clear button. Call it when they ask; do not check "
+        "whether they mean it."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+REROUTE_SCHEMA = {
+    "type": "function",
+    "name": REROUTE_TOOL_NAME,
+    "description": (
+        "A different way to the SAME place, from where the car is now: "
+        "'reroute', 'find another way', 'avoid the freeway', 'take surface "
+        "streets'. The destination never changes. The new route is live "
+        "before you speak, so confirm it rather than proposing it.\n"
+        "For when they ASK. The car reroutes itself when it leaves the route, "
+        "and that one is not yours to announce."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "avoid": {
+                "type": "array",
+                "items": {"type": "string",
+                          "enum": ["highways", "tolls", "ferries"]},
+                "description": (
+                    "What to keep off it. 'The freeway', 'the motorway' and "
+                    "'surface streets' are all highways. Omit for a plain "
+                    "'find another way'."
+                ),
+            },
+            "other_preference": {
+                "type": "string",
+                "description": (
+                    "Anything they asked for that is not one of those three "
+                    "— 'the scenic way', 'avoid the traffic' — in their "
+                    "words. It changes no route; it comes back so you can "
+                    "say you cannot do it."
+                ),
+            },
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
 # Appended to RIO's own personality prompt. Only the things that are true of a
 # LIVE session and not of the text path: how to be interrupted, how long to
 # talk for, and when to reach for the tool.
@@ -443,12 +513,31 @@ turn", "read me the directions", "is everything okay with the car".
 Unasked, you say nothing about any of it.
 
 Reading the directions when the driver asks for them is ANSWERING. The rule is
-about CALLING a turn — saying "left here" at the junction, over the driver,
-because a tool result mentioned it. That call belongs to the navigation system.
+about CALLING a turn — "left here" at the junction, over the driver, because a
+tool result mentioned it. That belongs to the navigation system.
 
 Being asked to DO something is the other half of the same rule. "Take me to
 the Getty" is an instruction, and carrying it out is answering. So you start
-routes. What you still never do is call the turns along the way.
+routes, you stop them, and you change the way to a place they are already
+going. What you still never do is call the turns along the way.
+
+The turns are called in your voice and are not yours to time or to write: the
+system picks the turn, the moment and the words, from lines chosen when the
+route loaded. Nobody asks you at the junction, so never answer as though they
+had.
+
+WHEN THE DRIVER WANTS TO STOP, OR TO GO A DIFFERENT WAY
+
+"Stop navigation." "I know the way from here." That is stop_navigation, on the
+word, then one line: "Okay, navigation off."
+
+"Find another way." "Avoid the freeway." That is reroute — same place,
+different way — then one line with the new time. The map can keep off
+highways, tolls and ferries and nothing else; asked for anything else, reroute
+anyway and say plainly you cannot do that part. Never say you avoided
+something you did not.
+
+Neither is something you raise yourself.
 
 WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
 
@@ -471,9 +560,8 @@ you offered — then use the research tool. Say a holding line first, because
 that one does take a few seconds. Keep the answer to three or four sentences
 and offer to go on rather than going on.
 
-Never use the research tool for anything you can see: it has no picture, and
-it will refuse a first look anyway and tell you to answer from what you
-already have.
+Never use the research tool for anything you can see — it has no picture, and
+refuses a first look anyway.
 
 Answer with what the tool gives you and nothing more. If it says it cannot
 see, or asks which one the driver meant, say that, in your own words.
@@ -484,18 +572,13 @@ WHEN THE DRIVER ASKS TO GO SOMEWHERE
 away. Never tell the driver to type it in, to set it on the screen, or to do
 anything about it themselves.
 
-Then one short line confirming it, in your own words: "Getting you to the
-Getty — about eighteen minutes." Two rules and nothing else: use the
-destination name the tool hands back, spelled its way rather than the way you
-heard it — LAX and LAS are one letter apart — and say it once. The route comes
-back with it, so nothing else needs asking; do not read the turns out as part
-of the confirmation. If the driver then asks what they are, that is
-nav_directions and it is answering.
+Then one short line confirming it: "Getting you to the Getty — about eighteen
+minutes." Say it once and without the turns, and use the destination name the
+tool hands back, spelled its way rather than the way you heard it — LAX and
+LAS are one letter apart.
 
 Asked WHICH ONE, name them briefly and call start_navigation again with what
-they chose. Not found: say so and ask them to put it another way. Route
-failed: say that plainly. None of the three is a cue to hand the job back to
-the driver.
+they chose.
 
 WHEN THE DRIVER ASKS FOR THE DIRECTIONS
 
@@ -504,16 +587,13 @@ WHEN THE DRIVER ASKS FOR THE DIRECTIONS
 what it is for, and refusing to read a route you are driving is not a boundary,
 it is a gap.
 
-Say it the way a person gives directions, not the way a screen lists them. One
-flowing line or two: "First a right onto Lincoln in about half a mile, then
-left on Sunset, then it's straight for six miles." Round the distances —
-nobody says four hundred and twenty metres. Name the roads exactly as the tool
-spells them. Stop after the first few unless they asked for all of it, and
-offer the rest rather than reciting it.
+Say it the way a person gives directions, not the way a screen lists them: one
+flowing line or two. Round the distances — nobody says four hundred and twenty
+metres. Name the roads exactly as the tool spells them, and stop after the
+first few unless they asked for all of it.
 
-Some turns come back with a landmark. Say it as an EXPECTATION: "then a left
-onto Sunset — there should be a Shell on the corner." Never "there's a Shell",
-never "you'll see a Shell".
+A landmark is an EXPECTATION: "there should be a Shell on the corner." Never
+"there's a Shell".
 
 And it stays an answer, not a call: no "turn left here", no "get ready to
 turn", nothing that sounds like an instruction for right now.
@@ -560,10 +640,8 @@ question — and call it again with that area.
 WHEN THEY PICK ONE
 
 "Take me to the second one." "Let's go to the Blue Bottle." That is
-start_navigation, and the result you already have carries the place_id for
-every place you read out. Pass that id along with the name: it is the same
-place, already resolved, so there is no chance of landing on a different
-branch of the same chain three miles the other way.
+start_navigation, with the place_id the result you already have carries for
+every place you read out — the same place, already resolved.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
@@ -863,6 +941,14 @@ def turn_detection() -> dict:
     return td
 
 
+BASE_TOOLS = _base_tools()
+
+# The conditions, and what each one brings with it. One entry today; the shape
+# is what matters, because the next tool with a precondition belongs here
+# rather than in the session that is sent before the precondition is known.
+CONDITIONAL_TOOLS = {"routing": [STOP_SCHEMA, REROUTE_SCHEMA]}
+
+
 def session_config() -> dict:
     """The live session, as the API wants it.
 
@@ -919,8 +1005,7 @@ def session_config() -> dict:
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },
-        "tools": [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
-                  PLACES_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA],
+        "tools": list(BASE_TOOLS),
         "tool_choice": "auto",
         # A ceiling on any single spoken answer, at the API rather than in the
         # prompt. The instructions ask for brevity and mostly get it; this is
@@ -952,6 +1037,30 @@ def mint_client_secret() -> dict:
         "voice": config.OPENAI_REALTIME_VOICE,
         "tool": TOOL_NAME,
         "tools": [t["name"] for t in cfg["tools"]],
+        # The schemas themselves, because a session.update replaces the tool
+        # list whole: a browser that is going to add two tools has to be able
+        # to send back the seven that were already there. It holds them, it
+        # does not write them — every word still comes from here.
+        "tool_schemas": [dict(t) for t in cfg["tools"]],
+        # ...AND THE ONES THAT ARE NOT SENT YET.
+        #
+        # A tool schema is input on EVERY response for the whole drive, whether
+        # or not the driver ever needs it — and stop_navigation and reroute are
+        # unusable for most of a drive, because there is nothing to stop or to
+        # reroute until a route exists. Two tools nobody can call cost about
+        # 350 tokens a response, twice that on a tool turn, out of a minute
+        # that holds 40,000.
+        #
+        # So they are attached when their precondition holds and taken away
+        # when it stops holding, by a session.update the browser sends on the
+        # route attaching and on it ending. The condition is named rather than
+        # implied — `routing` — because this is the general shape and not a
+        # special case for navigation: a tool whose precondition is knowable
+        # rides with the precondition, not with the session.
+        "conditional_tools": {
+            name: [dict(t) for t in tools]
+            for name, tools in CONDITIONAL_TOOLS.items()
+        },
         # Dictation policy travels WITH the session, so the browser holds no
         # copy of the verbatim instruction that could drift from this one. What
         # RIO is told to read a warning as is decided here, once.
@@ -1571,6 +1680,12 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # in the page. A second implementation here could only resolve and
         # hope, which is the arrangement this tool exists to end.
         return {"ok": False, "note": "start_navigation is answered by the panel"}
+    if name in (STOP_TOOL_NAME, REROUTE_TOOL_NAME):
+        # Both for the same reason, one step past start_navigation's: stopping
+        # and replacing a route are not resolutions at all, they are teardown
+        # and atomic replacement of objects that only exist in the page — the
+        # tracker, the planner, and the queue of sentences waiting to be said.
+        return {"ok": False, "note": f"{name} is answered by the panel"}
     if name not in (TOOL_NAME, LOOK_TOOL_NAME, PLACES_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
@@ -1636,7 +1751,8 @@ def status() -> dict:
         "reasoning_model": config.OPENAI_REASONING_MODEL,
         "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME,
                   NAV_DIRECTIONS_TOOL_NAME, PLACES_TOOL_NAME,
-                  VEHICLE_TOOL_NAME, NAVIGATE_TOOL_NAME],
+                  VEHICLE_TOOL_NAME, NAVIGATE_TOOL_NAME,
+                  STOP_TOOL_NAME, REROUTE_TOOL_NAME],
         "web_search": bool(config.REALTIME_WEB_SEARCH),
         # What the running observer is doing, if anything. A live session that
         # feels slow on visual questions is either not observing or observing

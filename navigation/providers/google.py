@@ -337,8 +337,17 @@ class GoogleProvider(NavigationProvider):
         return self._geocode(address)
 
     # -- routing -------------------------------------------------------------
+    # What the Routes API will actually keep off a route, and nothing else.
+    # A preference this map does not have is refused by name upstream rather
+    # than silently dropped here, because "avoid the traffic" quietly ignored
+    # is RIO agreeing to something she did not do.
+    AVOID_MODIFIERS = {"highways": "avoidHighways", "tolls": "avoidTolls",
+                       "ferries": "avoidFerries"}
+    AVOID_SUPPORTED = tuple(AVOID_MODIFIERS)
+
     def route(self, origin_lat: float, origin_lng: float,
-              destination: M.CanonicalDestination) -> M.CanonicalRoute:
+              destination: M.CanonicalDestination,
+              avoid=None, heading=None) -> M.CanonicalRoute:
         # A place id in preference to coordinates even when both are known: a
         # business's coordinates are a rooftop or a centroid, and the provider
         # routes a place id to the entrance it knows about. "Arrive at the
@@ -354,9 +363,16 @@ class GoogleProvider(NavigationProvider):
         else:
             raise NavError("no destination given")
 
+        origin = {"location": {"latLng": {"latitude": origin_lat,
+                                          "longitude": origin_lng}}}
+        # THE LANE THE CAR IS IN, when the browser had a heading to give. The
+        # provider uses it to route out of where we are actually pointing
+        # instead of opening with a U-turn across the median.
+        if heading is not None:
+            origin["location"]["heading"] = int(round(float(heading))) % 360
+
         body = {
-            "origin": {"location": {"latLng": {"latitude": origin_lat,
-                                               "longitude": origin_lng}}},
+            "origin": origin,
             "destination": waypoint,
             "travelMode": "DRIVE",
             "routingPreference": "TRAFFIC_AWARE",
@@ -369,6 +385,10 @@ class GoogleProvider(NavigationProvider):
             "languageCode": "en-US",
             "units": "METRIC",
         }
+        mods = {self.AVOID_MODIFIERS[a]: True for a in (avoid or [])
+                if a in self.AVOID_MODIFIERS}
+        if mods:
+            body["routeModifiers"] = mods
         try:
             r = httpx.post(ROUTES_URL, json=body, timeout=HTTP_TIMEOUT_S, headers={
                 "Content-Type": "application/json",

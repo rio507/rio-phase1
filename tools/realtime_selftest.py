@@ -474,6 +474,33 @@ def run_session_cost():
        f"one response fits the budget: {floor:,} tokens against a ceiling of "
        f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare), "
        f"so {TPM // (floor * 2)} tool turns a minute fit in {TPM:,}")
+    # WHAT A ROUTE COSTS ON TOP, and why it is not paid for the whole drive.
+    #
+    # stop_navigation and reroute cannot be called until a route exists, so
+    # they are not in the session that is minted — the browser attaches them
+    # with one session.update when a route attaches and takes them away when
+    # it ends (realtime.CONDITIONAL_TOOLS, rio_realtime.js setToolCondition).
+    # What that buys is this difference, on every response of every drive that
+    # is not navigating, which is most of them.
+    extra = tokens(json.dumps([t for tools in realtime.CONDITIONAL_TOOLS.values()
+                               for t in tools]))
+    routing = floor + extra
+    conditional = [t["name"] for tools in realtime.CONDITIONAL_TOOLS.values()
+                   for t in tools]
+    print(f"      while a route is live: {routing:>6,} tokens   "
+          f"(+{extra:,}: {', '.join(conditional)})")
+    ok(extra > 0 and routing > floor,
+       f"the tools that need a route cost {extra:,} tokens and are not paid "
+       f"for until there is one")
+    # Three tool turns a minute while navigating, rather than four. A driver
+    # who is being taken somewhere asks fewer questions of everything else,
+    # and the alternative was cutting behaviour rules out of the prompt to buy
+    # a fourth. Stated here so that if it is ever the wrong trade, it is the
+    # wrong trade in writing rather than a silent ceiling.
+    ok(routing * 2 * 3 <= TPM,
+       f"and three tool turns a minute still fit while navigating: "
+       f"{routing * 2 * 3:,} of {TPM:,}")
+
     ok(floor * 2 * 4 <= TPM,
        f"...and four tool turns in a minute — the cadence of a driver asking "
        f"something every fifteen seconds — costs {floor * 2 * 4:,} of {TPM:,}")
@@ -1319,6 +1346,84 @@ def _invented_names(said: str, allowed_names) -> list:
             continue
         out.append(phrase)
     return sorted(set(out))
+
+
+def run_route_control():
+    """Stopping and rerouting: hers to do, and only while there is a route."""
+    section("J2. stopping and rerouting — the other half of taking someone "
+            "somewhere")
+    import inspect
+
+    by_name = {t["name"]: t for tools in realtime.CONDITIONAL_TOOLS.values()
+               for t in tools}
+    ok(set(by_name) == {realtime.STOP_TOOL_NAME, realtime.REROUTE_TOOL_NAME},
+       "both tools exist, and both are conditional — a driver with no route "
+       "is offered neither")
+    ok([t["name"] for t in realtime.session_config()["tools"]].count(
+        realtime.STOP_TOOL_NAME) == 0,
+       "so the minted session carries neither until a route says otherwise")
+    ok(realtime.CONDITIONAL_TOOLS.get("routing"),
+       "the condition is named 'routing' — the browser turns it on and off by "
+       "that name, from the route events it already emits")
+
+    stop, reroute = by_name["stop_navigation"], by_name["reroute"]
+    ok("stop navigation" in stop["description"].lower()
+       and "cancel the route" in stop["description"].lower()
+       and "i know the way from here" in stop["description"].lower(),
+       "stop_navigation is described by the words a driver actually uses")
+    ok("Clear button" in stop["description"],
+       "...and says it is the panel's own control, not a second way to do it")
+    ok(stop["parameters"]["properties"] == {},
+       "it takes no arguments: there is one route and it is the one running")
+
+    props = reroute["parameters"]["properties"]
+    ok(set(props["avoid"]["items"]["enum"]) == {"highways", "tolls", "ferries"},
+       "reroute offers exactly the three preferences the map can honour")
+    from navigation.providers.google import GoogleProvider
+    ok(set(props["avoid"]["items"]["enum"]) == set(GoogleProvider.AVOID_SUPPORTED),
+       "...which are the three the provider advertises — one list, not two "
+       "hand-typed copies that can drift")
+    ok("other_preference" in props,
+       "and anything outside them has somewhere to go, so 'the scenic way' is "
+       "answered rather than silently dropped")
+    ok(reroute["parameters"]["required"] == [],
+       "nothing is required: 'find another way' is a whole request")
+    ok("same place" in reroute["description"].lower()
+       and "reroutes itself" in reroute["description"],
+       "the description says the destination never changes, and that the "
+       "automatic reroute is not hers to announce")
+
+    # Neither is answered here, for the reason nav_status is not.
+    for name in (realtime.STOP_TOOL_NAME, realtime.REROUTE_TOOL_NAME):
+        out = realtime.run_tool(name, {})
+        ok(out.get("ok") is False and "panel" in str(out.get("note", "")),
+           f"{name} is answered by the panel, and the server says so plainly")
+
+    flat = re.sub(r"\s+", " ", realtime.session_config()["instructions"])
+    ok("WHEN THE DRIVER WANTS TO STOP, OR TO GO A DIFFERENT WAY" in
+       realtime.session_config()["instructions"],
+       "the instructions have a section for both")
+    for phrase in ("That is stop_navigation, on the word",
+                   "That is reroute — same place, different way",
+                   "highways, tolls and ferries and nothing else",
+                   "Never say you avoided something you did not",
+                   "Neither is something you raise yourself"):
+        ok(phrase in flat, f"and spell it out: {phrase!r}")
+    ok("are not yours to time or to write" in flat,
+       "and the turns stay the navigation system's, said where a new pair of "
+       "route tools is most likely to be read as promotion")
+
+    # The panel is still the only implementation of any of it.
+    src = inspect.getsource(realtime)
+    ok("conditional_tools" in src and "tool_schemas" in src,
+       "the session hands the browser the schemas and the condition, so the "
+       "browser writes no tool of its own")
+    js = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "static", "rio_realtime.js")).read()
+    ok("nav.stopRoute" in js and "nav.reroute" in js,
+       "and the tools call the panel's own stop and reroute entry points")
+    ok("setToolCondition" in js and "session.update" in js,
+       "which is also what turns the condition on and off")
 
 
 def run_live():
@@ -2882,6 +2987,7 @@ def main():
     run_dictation()
     run_awareness()
     run_routing()
+    run_route_control()
     run_places()
     run_fast_path()
     run_two_tier()
