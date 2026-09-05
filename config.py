@@ -116,10 +116,23 @@ DEEP_ANSWER_MAX_TOKENS = 320
 
 # --- brevity, out loud ------------------------------------------------------
 # The ceiling on any single spoken response, enforced at the API rather than
-# asked for in the prompt: instructions are guidance and this is a limit. ~200
-# tokens is roughly 25 seconds of speech, which is already long for a car and
+# asked for in the prompt: instructions are guidance and this is a limit. ~300
+# tokens is roughly 35 seconds of speech, which is already long for a car and
 # is meant to be unreachable in ordinary conversation rather than typical.
-REALTIME_MAX_RESPONSE_TOKENS = 200
+#
+# RAISED FROM 200 BECAUSE IT WAS BEING REACHED. A question about the car is the
+# one that runs long -- "how are my tires" is answered from a structure with
+# several issues in it, and the honest answer names more than one -- and those
+# came back at 156 and 184 output tokens in a straight measurement, with a live
+# drive hitting the cap and stopping her mid-sentence. A ceiling that ordinary
+# answers touch is not a ceiling, it is a length, and the driver hears it as
+# her trailing off rather than as a limit doing its job.
+#
+# It costs the token budget, and that is accounted for rather than ignored:
+# tools/realtime_selftest.py run_session_cost adds the cap to the per-response
+# input floor and asserts that three tool turns a minute still fit inside the
+# account's 40,000 even if every single answer runs the whole way to it.
+REALTIME_MAX_RESPONSE_TOKENS = 300
 
 # What a spoken answer to "what do you see" may run to.
 #

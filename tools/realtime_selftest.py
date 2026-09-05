@@ -412,9 +412,14 @@ def run_session_cost():
 
     ok(floor > 0, f"one response carries {floor:,} tokens of input before the "
                   f"driver has said anything")
+    cap = int(config.REALTIME_MAX_RESPONSE_TOKENS)
+    worst = floor + cap
+    print(f"      answer ceiling {cap:>6,} tokens   "
+          f"(a response at full length: {worst:,})")
     for tpm in (TPM, 200_000):
         print(f"      at {tpm:>7,} TPM: ~{tpm // floor} plain answers a "
-              f"minute, ~{tpm // (floor * 2)} tool answers")
+              f"minute, ~{tpm // (floor * 2)} tool answers "
+              f"(~{tpm // (worst * 2)} if every one ran to the ceiling)")
 
     # THE BUDGET, AS A TEST RATHER THAN AS A NOTE.
     #
@@ -438,6 +443,23 @@ def run_session_cost():
     ok(floor * 2 * 4 <= TPM,
        f"...and four tool turns in a minute — the cadence of a driver asking "
        f"something every fifteen seconds — costs {floor * 2 * 4:,} of {TPM:,}")
+
+    # WHAT SHE SAYS COSTS TOO, and the cap is the most anything can cost.
+    #
+    # The line above is the input floor, which is the part that is fixed and
+    # the part a growing prompt inflates. This one is the pessimistic reading
+    # of the whole thing: every response running the full length of
+    # REALTIME_MAX_RESPONSE_TOKENS, which ordinary answers are nowhere near
+    # (measured: 14 tokens for a holding line, 156 for a full answer about the
+    # car) but which the ceiling exists to permit.
+    #
+    # Three tool turns a minute rather than four, because raising the answer
+    # ceiling buys length and length is not free. That is the trade being made
+    # deliberately, and it is written down here so that raising it again is a
+    # decision rather than a surprise.
+    ok(worst * 2 * 3 <= TPM,
+       f"and three tool turns fit even if every answer runs the whole way to "
+       f"the ceiling: {worst * 2 * 3:,} of {TPM:,}")
 
 
 # ---------------------------------------------------------------------------
@@ -2630,8 +2652,16 @@ def run_two_tier():
     ok(cfg.get("max_output_tokens") == config.REALTIME_MAX_RESPONSE_TOKENS,
        f"the live session has a hard ceiling on any one answer "
        f"({config.REALTIME_MAX_RESPONSE_TOKENS} tokens)")
+    # Now sitting exactly on this bound, and deliberately: 300 tokens is about
+    # thirty-five seconds of speech, which is already a long time to hold a
+    # driver. Past it the ceiling stops being the point at which something has
+    # gone wrong and becomes a length she is allowed to reach, and the budget
+    # arithmetic in run_session_cost changes with it — so raising it again
+    # should fail here and be argued for rather than edited in.
     ok(config.REALTIME_MAX_RESPONSE_TOKENS <= 300,
-       "and it is short enough to be a limit rather than a formality")
+       f"and it is short enough to be a limit rather than a formality "
+       f"({config.REALTIME_MAX_RESPONSE_TOKENS} tokens, ~"
+       f"{config.REALTIME_MAX_RESPONSE_TOKENS // 8}s of speech)")
     ok(config.DEEP_ANSWER_MAX_TOKENS <= 400,
        f"a deep answer is capped for speech too ({config.DEEP_ANSWER_MAX_TOKENS})")
 
