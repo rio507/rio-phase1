@@ -993,6 +993,42 @@ _LOOKS_VISUAL = re.compile(
     re.IGNORECASE)
 
 
+# WHAT MAKES A QUESTION A FOLLOW-UP TO THE ONE THE CAMERA JUST ANSWERED.
+#
+# Two things, and neither of them is "it arrived within a minute".
+#
+# The gate below used to refuse EVERY deep_dive for DEPTH_COLD_S after any
+# look, on the reasoning that a look and an escalation seconds apart are one
+# turn. They usually are -- when they are about the same thing. In a drive the
+# driver asks about the road constantly, so a look was almost always recent,
+# and "why does a turbocharger need an intercooler" was being refused as a
+# first look at a building nobody had mentioned. The reasoning model was
+# effectively unreachable for the whole drive, and what the driver heard was
+# RIO answering from memory every time.
+#
+# `last_look_q` was already being recorded and never read. It is the thing that
+# says whether this is the same question: a shared subject word means the
+# driver is still on the building, and a bare back-reference means they are
+# still on SOMETHING and have not named a new one.
+_STOPWORDS = frozenset("""
+a about all am an and any anything are as at be been being but by can could
+do does doing done for from get give go going had has have how i if in into
+is it its just know like me more much my no not now of on one only or other
+our out over please said say see should so some something tell than that the
+their them then there these they thing things this those to told too us very
+was we well were what when where which while who why will with would you your
+""".split())
+
+_BACK_REFERENCE = re.compile(
+    r"\b(it|its|that|this|those|these|them|they|the\s+same)\b", re.IGNORECASE)
+
+
+def _subject_words(text: str) -> set:
+    """The words a question is ABOUT, near enough for one comparison."""
+    return {w for w in re.findall(r"[a-z']{3,}", (text or "").lower())
+            if w not in _STOPWORDS}
+
+
 def note_look(session_key: str, question: str) -> None:
     """A visual question was just answered from the camera."""
     with _turns_lock:
@@ -1035,10 +1071,19 @@ def depth_allowed(session_key: str, question: str, context: str = "") -> dict:
     if st.get("depth_until", 0) > now:
         return {"allowed": True, "reason": "depth_window_open"}
 
+    if _LOOKS_VISUAL.search(text):
+        return {"allowed": False, "reason": "visual_question"}
+
     looked_recently = (now - st.get("last_look_t", 0)) < float(config.DEPTH_COLD_S)
-    if looked_recently or _LOOKS_VISUAL.search(text):
-        return {"allowed": False,
-                "reason": "first_look" if looked_recently else "visual_question"}
+    if looked_recently:
+        # A look just happened. Whether THIS question belongs to it is the
+        # question, and the answer is not "yes, because of the clock" -- see
+        # _subject_words above for what that cost.
+        last_q = st.get("last_look_q") or ""
+        if (_subject_words(text) & _subject_words(last_q)
+                or _BACK_REFERENCE.search(text)):
+            return {"allowed": False, "reason": "first_look"}
+        return {"allowed": True, "reason": "different_question"}
     return {"allowed": True, "reason": "not_a_visual_question"}
 
 
@@ -1139,9 +1184,19 @@ _GENERIC_SCENE = re.compile(
 # `right(?!\s+now)`: "what's around us right now" is a scene question, and the
 # first version of this list read the "right" in it as a direction and sent the
 # most generic question there is down the slow path.
+#
+# `kind of|type of|sort of`: asking WHAT KIND of thing something is is asking
+# about a particular thing, and it was the one shape of that question the list
+# did not have. "What kind of car is in front of us" carries no "that", no
+# direction and no attribute word, so it was reaching the running observation
+# and being answered with the sentence about the road -- an answer to a
+# question nobody asked, delivered fast. The other phrasings of it ("what's
+# that car ahead", "what's the make of that one") were already caught, which is
+# why this went unnoticed.
 _NEEDS_SPECIFICS = re.compile(
     r"\b(left|right(?!\s+now)|behind|beside|next\s+to|that|those|this|these|sign|says?|"
     r"reads?|colou?r|make|model|plate|licen[cs]e|building|shop|store|logo|"
+    r"kind\s+of|type\s+of|sort\s+of|"
     r"how\s+far|how\s+many|which)\b",
     re.IGNORECASE)
 

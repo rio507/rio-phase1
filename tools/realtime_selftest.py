@@ -46,6 +46,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import config          # noqa: E402
 import places          # noqa: E402
 import realtime        # noqa: E402
+import voice_tags      # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -161,6 +162,187 @@ def run_session():
        "she is told outright that she has no eyes without the tool")
     ok(len(instr) > len(config.SYSTEM_PROMPT),
        "the addendum adds to the prompt rather than replacing it")
+
+
+def run_text_session():
+    """The session RIO gets when ElevenLabs has her voice — the WHOLE session.
+
+    This exists because of three live failures that shared one shape: plain
+    conversation worked and anything that needed a tool did not, and the first
+    suspicion was that the text-mode session was a smaller session — a tool
+    list or an instruction section lost when the modality changed.
+
+    It was not, and this is what says so, every run. The only thing the voice
+    backend is allowed to change is what the session PRODUCES; everything she
+    is told and everything she can reach is the same sentence either way, and
+    a diff of the two payloads is the cheapest possible statement of that.
+
+    Checked against the MINTED payload as well as the built one. The browser
+    never sees session_config() — it gets an ephemeral secret with the session
+    baked into it, and a field that the mint drops on the way through would be
+    invisible to a test that only looked at the dict.
+    """
+    section("A2. the text-mode session — the same session, in writing")
+
+    backend = config.VOICE_BACKEND
+    try:
+        config.VOICE_BACKEND = "elevenlabs"
+        text = realtime.session_config()
+        config.VOICE_BACKEND = "openai_realtime"
+        audio = realtime.session_config()
+    finally:
+        config.VOICE_BACKEND = backend
+
+    ok(text["output_modalities"] == ["text"],
+       "under ElevenLabs the session writes")
+    ok(audio["output_modalities"] == ["audio"],
+       "...and under cedar it speaks")
+
+    # THE WHOLE PAYLOAD, MINUS THE ONE FIELD THAT IS ALLOWED TO DIFFER.
+    a, b = dict(text), dict(audio)
+    a.pop("output_modalities"), b.pop("output_modalities")
+    a.pop("instructions"), b.pop("instructions")
+    ok(a == b,
+       "and nothing else about the session changes with the voice — same "
+       "model, same tools, same detector, same limits")
+
+    # The instructions differ by the audio-tag paragraph and nothing else,
+    # because tags are only reachable on the backend that can speak them.
+    tags = voice_tags.instruction().strip()
+    ok(text["instructions"].replace(tags, "").strip()
+       == audio["instructions"].strip() if tags else
+       text["instructions"] == audio["instructions"],
+       "the instructions differ by the audio-tag paragraph alone, which is "
+       "the one thing only one of the two mouths can do")
+
+    # --- ALL SEVEN TOOLS, BY NAME -----------------------------------------
+    # Named individually rather than counted: a count passes while a tool is
+    # quietly swapped for another, and the failure that started this was a
+    # suspicion about one tool in particular.
+    expected = [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
+                realtime.NAV_TOOL_NAME, realtime.NAV_DIRECTIONS_TOOL_NAME,
+                realtime.PLACES_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
+                realtime.NAVIGATE_TOOL_NAME]
+    names = [t["name"] for t in text["tools"]]
+    for want in expected:
+        ok(want in names, f"the text-mode session can call {want}")
+    ok(len(names) == len(expected) == 7 and set(names) == set(expected),
+       f"...and those seven and no others ({len(names)} tools)")
+
+    # --- THE WHOLE INSTRUCTION SET ----------------------------------------
+    instr = text["instructions"]
+    ok(config.SYSTEM_PROMPT.strip() in instr,
+       "the bible is carried whole, not summarised")
+    ok(realtime.LIVE_ADDENDUM.strip() in instr,
+       "and the live addendum whole after it")
+
+    # The sections, each by a phrase from its own body. Symptom 3 was RIO
+    # saying the car would read the directions -- the behaviour from before
+    # nav_directions existed -- so the section that ends that is named here.
+    for phrase, what in [
+            ("WHEN THE DRIVER ASKS FOR THE DIRECTIONS",
+             "the directions section is in the session"),
+            ("Call nav_directions and read what comes back",
+             "...and it says to call the tool rather than defer to the car"),
+            ("refusing to read a route you are driving is not a boundary",
+             "...and names the old behaviour as the gap it is"),
+            ("A first answer is\n  ALWAYS short",
+             "the two-tier visual policy: the first answer is short"),
+            ("depth is something they ask for",
+             "...and depth is the driver's to ask for"),
+            ("WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER",
+             "the deep_dive section"),
+            ("WHEN THE DRIVER ASKS ABOUT A PLACE",
+             "the places section"),
+            ("WHEN THE DRIVER ASKS ABOUT THE ROUTE, OR ABOUT THE CAR",
+             "the route-and-car section"),
+            ("YOU ANSWER. YOU DO NOT ANNOUNCE.",
+             "and the rule the whole live addendum is built around")]:
+        ok(phrase in instr, what)
+
+    if voice_tags.instruction().strip():
+        ok(voice_tags.instruction().strip() in instr,
+           "the tag policy is present, generated from the list the validator "
+           "enforces so the two cannot drift")
+        for tag in voice_tags.allowed_tags():
+            ok(f"[{tag}]" in instr, f"...naming [{tag}] as one she may use")
+
+    # --- AND THE SAME AGAIN, AFTER THE ROUND TRIP -------------------------
+    # Offline by default: this one costs a call.
+    if os.environ.get("RIO_SELFTEST_MINT"):
+        backend = config.VOICE_BACKEND
+        try:
+            config.VOICE_BACKEND = "elevenlabs"
+            minted = realtime.client().realtime.client_secrets.create(
+                session=realtime.session_config()).model_dump()
+        finally:
+            config.VOICE_BACKEND = backend
+        sess = minted.get("session") or {}
+        got = [t.get("name") for t in (sess.get("tools") or [])]
+        ok(set(got) == set(expected),
+           f"the ephemeral secret carries all seven tools through ({got})")
+        ok(sess.get("output_modalities") == ["text"],
+           "and comes back in text mode")
+        ok("WHEN THE DRIVER ASKS FOR THE DIRECTIONS"
+           in (sess.get("instructions") or ""),
+           "and with the directions section intact")
+
+
+def run_session_cost():
+    """What one response costs, against what a minute allows.
+
+    Not a pass/fail about correctness -- it is a budget, and it is here
+    because the budget is what the driver was actually hitting. Every response
+    re-sends the instruction set and the tool list as input, and a TOOL TURN
+    SPENDS TWO of them: one to call the tool, one to answer from the result.
+    So the questions that need the camera, the route or the reasoning model
+    cost double, and they are the ones that run a per-minute ceiling out while
+    "hello" carries on working.
+
+    The failure that produces is a response the API refuses outright, which
+    the browser used to file under `other` and say nothing about. It now
+    retries once and counts it -- see rio_realtime.js responseFailed -- but
+    the number below is the reason it has to.
+    """
+    section("A3. what a response costs, and what a minute allows")
+
+    backend = config.VOICE_BACKEND
+    try:
+        config.VOICE_BACKEND = "elevenlabs"
+        cfg = realtime.session_config()
+    finally:
+        config.VOICE_BACKEND = backend
+
+    def tokens(s):
+        try:
+            import tiktoken
+            return len(tiktoken.get_encoding("o200k_base").encode(s))
+        except Exception:
+            return len(s) // 4          # close enough to size a budget
+
+    instr = tokens(cfg["instructions"])
+    tools = tokens(json.dumps(cfg["tools"]))
+    floor = instr + tools
+
+    print(f"      instructions {instr:>6,} tokens")
+    print(f"      tool schemas {tools:>6,} tokens")
+    print(f"      ----------------------------")
+    print(f"      per response {floor:>6,} tokens   "
+          f"(a tool turn spends two: {floor * 2:,})")
+
+    ok(floor > 0, f"one response carries {floor:,} tokens of input before the "
+                  f"driver has said anything")
+    # A ceiling worth stating out loud. 40k tokens/min is the entry limit on
+    # the realtime model, and the arithmetic below is why a drive with three
+    # tool questions in a minute stops answering.
+    for tpm in (40_000, 200_000):
+        plain = tpm // floor
+        tool = tpm // (floor * 2)
+        print(f"      at {tpm:>7,} TPM: ~{plain} plain answers a minute, "
+              f"~{tool} tool answers")
+    ok(floor < 12_000,
+       f"and it is under twelve thousand ({floor:,}) — past that a 40k/min "
+       "account cannot finish three tool turns in a minute")
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1234,86 @@ def run_verbatim():
         same = spoken_norm(heard) == spoken_norm(line)
         ok(same, f"and Whisper hears the same words back"
                  + ("" if same else f" — heard {heard.strip()!r}"))
+
+
+def run_split_turn():
+    """A question broken in half by a hesitation still reaches the camera.
+
+    MEASURED, because it was reported as broken and was not. A recording opened
+    with "Hey, what do you see?", she answered "Hey. What's up.", and the probe
+    stopped listening — which read as the camera never being called.
+
+    What actually happens, with a deliberate 1.2 s pause after "Hey,": the
+    detector ends the turn on the pause, the greeting is answered, the rest of
+    the sentence arrives as its own turn, and the camera is called on it. The
+    question is late by the length of the greeting; it is not lost.
+
+    Pinned here so the next person asking gets an answer from the suite rather
+    than from an afternoon. Also pins the ordinary case — a natural "Hey," in
+    front of a question does not split the turn at all, because the pause a
+    speaker leaves there is 0-280 ms against a 700 ms window.
+    """
+    section("L. a hesitation mid-question — late, not lost")
+
+    import asyncio
+    import base64
+
+    from openai import AsyncOpenAI
+
+    from tools.voice_demo import RATE, say_as_driver, silence
+
+    async def drive(pcm, budget=45.0):
+        log = []
+        client = AsyncOpenAI()
+        async with client.realtime.connect(
+                model=config.OPENAI_REALTIME_MODEL) as conn:
+            await conn.session.update(session=realtime.session_config())
+
+            async def feed():
+                payload = pcm + silence(
+                    int(config.REALTIME_VAD_SILENCE_MS) + 600)
+                step = int(RATE * 20 / 1000) * 2
+                for i in range(0, len(payload), step):
+                    await conn.input_audio_buffer.append(
+                        audio=base64.b64encode(payload[i:i + step]).decode())
+                    await asyncio.sleep(0.02)
+
+            feeder = asyncio.create_task(feed())
+
+            async def read():
+                async for ev in conn:
+                    if ev.type == ("conversation.item.input_audio_"
+                                   "transcription.completed"):
+                        log.append(("heard", ev.transcript))
+                    elif ev.type == "response.function_call_arguments.done":
+                        log.append(("tool", ev.name))
+                        return
+                    elif ev.type == "response.output_text.done":
+                        log.append(("said", ev.text))
+            try:
+                await asyncio.wait_for(read(), timeout=budget)
+            except asyncio.TimeoutError:
+                pass
+            feeder.cancel()
+        return log
+
+    split = (say_as_driver("Hey,") + silence(1200)
+             + say_as_driver("what do you see?"))
+    log = asyncio.run(drive(split))
+    heard = [v for k, v in log if k == "heard"]
+    ok(any("hey" in h.lower() for h in heard) and len(heard) >= 2,
+       f"a 1.2 s pause after \"Hey,\" splits the turn in two: {heard}")
+    ok(any(k == "tool" and v == realtime.LOOK_TOOL_NAME for k, v in log),
+       "and the camera is still called on the second half — the question is "
+       "late by one greeting, not lost")
+
+    # ...and the ordinary case, where there is nothing to split.
+    natural = say_as_driver("Hey, what do you see?")
+    log2 = asyncio.run(drive(natural))
+    heard2 = [v for k, v in log2 if k == "heard"]
+    ok(any(k == "tool" and v == realtime.LOOK_TOOL_NAME for k, v in log2),
+       f"and a naturally-spoken \"Hey, what do you see?\" reaches the camera "
+       f"on the first turn: {heard2}")
 
 
 def run_latency():
@@ -2070,7 +2332,13 @@ def run_fast_path():
     specific = ["what's on the left", "what's that car ahead",
                 "what colour is the car in front", "what does that sign say",
                 "how far is the car ahead", "what's that building on the right",
-                "which one is closer", "read me that sign"]
+                "which one is closer", "read me that sign",
+                # No "that", no direction, no attribute -- and still a question
+                # about one particular vehicle. It was reaching the running
+                # observation and being answered with the sentence about the
+                # road, which is a wrong answer delivered quickly.
+                "what kind of car is in front of us",
+                "what type of truck is that up ahead"]
     for q in specific:
         ok(not realtime.is_generic_scene_question(q),
            f"needs a proper look: {q!r}")
@@ -2204,6 +2472,38 @@ def run_two_tier():
        f"a follow-up inside the window is allowed, even phrased as a visual "
        f"question ({g['reason']})")
 
+    # 3b. A LOOK DOES NOT CLOSE THE REASONING MODEL FOR A MINUTE.
+    #
+    # This is the hole the whole gate fell through in a real drive. A driver
+    # asks about the road constantly, so a look was always recent, and the
+    # clock alone was enough to refuse -- so "why does a turbocharger need an
+    # intercooler" came back as a first look at a building nobody had
+    # mentioned, and what the driver actually heard was RIO answering every
+    # question from memory. Symptom two of three.
+    #
+    # What makes a question a follow-up is its SUBJECT, not its timing.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "what do you see outside")
+    for q in ("why does a turbocharger need an intercooler",
+              "what is the speed limit on a California freeway",
+              "how does a wastegate work"):
+        g = realtime.depth_allowed(key, q)
+        ok(g["allowed"] and g["reason"] == "different_question",
+           f"seconds after a look, a question about something else still "
+           f"reaches the reasoning model: {q!r}")
+
+    # ...and the follow-ups it was written to catch still are caught, by both
+    # the routes that make one: naming the same thing, and pointing at it.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "what is that building")
+    for q, why in (("the architecture of the building", "names it again"),
+                   # Not "when was it built" -- that asks for depth outright
+                   # and is allowed on purpose, one rule earlier.
+                   ("is it open to the public", "points back at it")):
+        g = realtime.depth_allowed(key, q)
+        ok(not g["allowed"] and g["reason"] == "first_look",
+           f"a follow-up that {why} is still the same turn, and refused: {q!r}")
+
     # 4. A QUESTION THAT WAS NEVER VISUAL IS NEVER TOUCHED BY ANY OF THIS.
     realtime._visual_turns.pop(key, None)
     for q in ("how does regenerative braking work",
@@ -2269,6 +2569,8 @@ def main():
     args = ap.parse_args()
 
     run_session()
+    run_text_session()
+    run_session_cost()
     run_config()
     run_dispatch()
     run_failure()
@@ -2285,6 +2587,7 @@ def main():
         run_live()
         run_verbatim()
         run_latency()
+        run_split_turn()
     if args.chain:
         run_chain()
 

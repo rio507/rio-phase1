@@ -1773,7 +1773,7 @@ section('text mode — she writes, and something else speaks');
     const controller = rt.createController({
       arbiter: arbiter,
       send: (o) => sent.push(o),
-      tool: () => Promise.resolve({ ok: true }),
+      tool: opts.tool || (() => Promise.resolve({ ok: true })),
       audio: { mute: () => rig.sink.mute(), unmute: () => rig.sink.unmute() },
       voice: rig.sink,
       cedarVoice: 'cedar',
@@ -1954,6 +1954,292 @@ section('text mode — she writes, and something else speaks');
     ok(h.rig.sink.state().next_at > before + 0.9,
        'and its audio is queued BEHIND the holding line rather than on top of ' +
        'it — "let me check" then the answer, which is the order anyway');
+  }
+
+  // --- A WHOLE TOOL TURN, END TO END --------------------------------------
+  {
+    /* The turn the driver actually loses when this is wrong, driven as one
+       piece: the model calls a tool, the panel answers it, a second response
+       is created for the answer, and the words of that second response have
+       to reach the speaker.
+
+       Written as a turn rather than as its parts because the parts all passed
+       while the turn did not. What was missing was an ordering: the tool
+       result comes back on the panel's own clock, and `response.done` for the
+       response that called it comes back on the wire's, and nothing makes
+       those two agree. */
+    const turn = async (opts) => {
+      const h = textHarness({ tool: opts.tool });
+      h.controller.handle({ type: 'response.created', response: { id: 'q1' } });
+      if (opts.holding) {
+        h.controller.handle({ type: 'response.output_text.delta',
+                              response_id: 'q1', delta: opts.holding });
+        h.rig.say('q1', opts.holding, 1.2);
+      }
+      h.controller.handle({ type: 'response.function_call_arguments.done',
+                            name: opts.name, call_id: 'k1', arguments: '{}' });
+      const finish = () => {
+        h.controller.handle({ type: 'response.done',
+                              response: { id: 'q1', status: 'completed' } });
+        h.rig.done('q1');
+      };
+      if (opts.doneFirst) finish();
+      await settle();
+      if (!opts.doneFirst) { finish(); await settle(); }
+      const asked = h.sent.filter((e) => e.type === 'response.create').length;
+      if (asked) {
+        h.controller.handle({ type: 'response.created', response: { id: 'q2' } });
+        h.controller.handle({ type: 'response.output_text.delta',
+                              response_id: 'q2', delta: opts.answer });
+        await settle();
+      }
+      const opened = h.rig.wire.ops('begin').map((o) => o.rid);
+      const deltas = h.rig.wire.ops('delta');
+      return {
+        h, asked, opened, deltas,
+        // What the relay would actually SPEAK. Text sent under a rid it never
+        // opened an utterance for is dropped on the server (voice_dialogue.py
+        // delta(): `if utt.rid != rid: return`), so forwarding it is not the
+        // same as saying it, and only this second reading catches that.
+        heard: deltas.filter((d) => opened.indexOf(d.rid) >= 0)
+                     .map((d) => d.text).join(''),
+        orphans: deltas.filter((d) => opened.indexOf(d.rid) < 0).length,
+      };
+    };
+
+    // 1. The ordinary shape: a server tool, and the model answers from it.
+    {
+      const r = await turn({
+        name: 'nav_directions', doneFirst: true,
+        tool: () => Promise.resolve({ ok: true, steps: [] }),
+        answer: 'Right onto Lincoln, then left on Sunset.' });
+      ok(r.asked === 1,
+         'a tool result is followed by a request for the spoken answer — ' +
+         'without it the model has the result and no reason to say anything');
+      ok(r.heard === 'Right onto Lincoln, then left on Sunset.',
+         'and the words of that SECOND response reach the speaker, which is ' +
+         'the half of a tool turn the driver actually hears');
+      ok(r.orphans === 0,
+         'with nothing sent under a turn the relay had not opened');
+    }
+
+    // 2. ...and the same when the tool answers before the wire says done.
+    {
+      const r = await turn({
+        name: 'nav_directions', doneFirst: false,
+        tool: () => Promise.resolve({ ok: true, steps: [] }),
+        answer: 'Right onto Lincoln, then left on Sunset.' });
+      ok(r.heard === 'Right onto Lincoln, then left on Sunset.',
+         'a tool that answers in a microtask -- every tool the panel owns ' +
+         'does -- still gets its answer spoken');
+    }
+
+    // 3. THE CAMERA'S FAST PATH, WHICH IS THE ONE THAT WAS SILENT.
+    {
+      /* "What do you see outside" is answered from the running observation
+         with no model in the loop, and that is the whole point of it: the
+         sentence is already written and already checked against her register,
+         so it is spoken directly.
+
+         Directly means IMMEDIATELY -- under a millisecond of server work --
+         and that beats `response.done` for the function call coming back down
+         the data channel. The controller used to refuse the mouth to anything
+         while a response was still open, so the line never opened an
+         utterance, its text was dropped by the relay as belonging to a turn
+         that was over, and the driver got silence and no second chance.
+
+         Both orders are checked. Only one of them was ever broken, and it is
+         the fast one, which is to say the common one. */
+      const direct = () => Promise.resolve({
+        ok: true, speak_directly: true, path: 'observer_direct',
+        speech: 'Clear road, silver sedan a few lengths ahead.' });
+
+      for (const doneFirst of [true, false]) {
+        const r = await turn({ name: 'look', doneFirst: doneFirst,
+                               tool: direct, answer: '(never asked for)' });
+        const when = doneFirst ? 'after response.done' : 'BEFORE response.done';
+        ok(r.heard === 'Clear road, silver sedan a few lengths ahead.',
+           'the camera answering ' + when + ' is spoken either way — the ' +
+           'observation reaches the speaker instead of being dropped');
+        ok(r.opened.indexOf('direct:1') >= 0,
+           '...under an utterance of its own on the relay (' + when + '), so ' +
+           'the context is flushed and the line can report itself finished');
+        ok(r.orphans === 0,
+           '...with nothing left orphaned under the response it superseded');
+        ok(r.h.events.filter((e) => e.type === 'LIVE_DIRECT_ANSWER').length === 1,
+           '...and the drive records it as the fast path it was');
+        ok(r.asked === 0,
+           '...and no model is asked to rewrite a sentence that was already ' +
+           'hers');
+      }
+    }
+
+    // 4. ...and if the line cannot be spoken, the turn is still answered.
+    {
+      /* THE INVARIANT, checked where it is reachable: a tool result always
+         ends as either a spoken line or a request for one. Never as neither,
+         which is what the driver was getting.
+
+         A warning arriving first does NOT reach this -- the arbiter queues a
+         conversational line behind a safety one rather than refusing it, so
+         the fast path still happens, just after the warning. What does reach
+         it is the observation coming back with nothing sayable in it, and the
+         two things that must then be true are worth stating: the model is
+         asked for an answer, and the session is NOT told she said a line she
+         never said. That second one is why the assistant item is written
+         after the line is spoken rather than before -- a history claiming she
+         answered is how a driver asking again gets told she already did. */
+      const h = textHarness({ tool: () => Promise.resolve({
+        ok: true, speak_directly: true, path: 'observer_direct',
+        speech: '   ' }) });
+      h.controller.handle({ type: 'response.created', response: { id: 'w1' } });
+      h.controller.handle({ type: 'response.function_call_arguments.done',
+                            name: 'look', call_id: 'k9', arguments: '{}' });
+      await settle();
+      ok(h.controller.state().counters.direct_deferred === 1,
+         'a direct line that cannot be spoken is counted rather than ' +
+         'silently dropped');
+      ok(h.sent.filter((e) => e.type === 'response.create').length === 1,
+         '...and becomes an ordinary request for an answer, so the question ' +
+         'is answered late instead of never');
+      ok(h.sent.filter((e) => e.type === 'conversation.item.create' &&
+                       e.item && e.item.role === 'assistant').length === 0,
+         '...and the session is NOT told she said a line she never said');
+      ok(h.rig.wire.ops('delta').length === 0,
+         '...and nothing blank was sent to the synthesiser');
+    }
+  }
+
+  // --- the finished response does not cancel the one that replaced it -----
+  {
+    /* THE RACE THAT ATE THE DIRECTIONS.
+     *
+     * A response that only calls a tool finishes the instant the call is
+     * made: no text, so the sink's utterance completes with zero chunks and
+     * there is no audio to wait for. The mouth is handed back, and the
+     * server's follow-up response arrives in the same tick -- before the
+     * arbiter has pumped the finished item off its queue.
+     *
+     * The new answer claims the mouth, the arbiter sees a second `convo` item
+     * and supersedes the first, and the first one's `stop` callback runs.
+     * `response.cancel` names no response and cancels whatever is generating,
+     * which by then is the answer. Live, that came back
+     * `cancelled / client_cancelled` with nothing said: RIO called
+     * nav_directions, got the route, and read none of it. */
+    const h = textHarness({ tool: () => Promise.resolve({ ok: true, steps: [] }) });
+    h.controller.handle({ type: 'response.created', response: { id: 'd1' } });
+    h.controller.handle({ type: 'response.function_call_arguments.done',
+                          name: 'nav_directions', call_id: 'n1', arguments: '{}' });
+    // No text in it at all -- the whole response was the call.
+    h.controller.handle({ type: 'response.done',
+                          response: { id: 'd1', status: 'completed' } });
+    h.rig.done('d1');
+    await settle();
+    // ...and the answer, arriving before the arbiter has finished tidying up.
+    h.controller.handle({ type: 'response.created', response: { id: 'd2' } });
+    h.controller.handle({ type: 'response.output_text.delta', response_id: 'd2',
+                          delta: 'First a right onto Lincoln, then left on Sunset.' });
+    await settle();
+
+    ok(h.types().indexOf('response.cancel') < 0,
+       'the response that called the tool does not cancel the response that ' +
+       'answers it on its way out');
+    const opened = h.rig.wire.ops('begin').map((o) => o.rid);
+    const spoken = h.rig.wire.ops('delta')
+                    .filter((d) => opened.indexOf(d.rid) >= 0)
+                    .map((d) => d.text).join('');
+    ok(spoken === 'First a right onto Lincoln, then left on Sunset.',
+       '...so the directions reach the speaker');
+    ok(h.controller.state().response_id === 'd2',
+       '...and the mouth belongs to the answer, not to the call');
+  }
+
+  // --- the words a tool is judged on are THIS turn's ----------------------
+  {
+    /* The camera's fast path is a judgement about what the DRIVER asked, so
+       the panel sends the driver's transcript along with every tool call. The
+       transcript for a turn arrives on its own schedule and is regularly
+       later than the tool call it belongs to -- and what used to be sent then
+       was the PREVIOUS turn's.
+
+       Measured in a live drive: "what do you see outside" answered from the
+       running observation in 42 ms, then "what kind of car is in front of us"
+       answered in 5 ms with the same sentence about the road, because the
+       transcript the panel held was still the first question. The second
+       question never reached a camera. */
+    const h = textHarness();
+    h.controller.handle({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: 'what do you see outside' });
+    ok(h.controller.state().spoken_this_turn === 'what do you see outside',
+       'a tool called in the turn the driver just spoke is given their words');
+
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    ok(h.controller.state().spoken_this_turn === '',
+       '...and the moment they start a NEW sentence those words go stale, so ' +
+       'the previous question cannot judge this one');
+    ok(h.controller.state().last_transcript === 'what do you see outside',
+       '...while the transcript itself is kept, because classifying a ' +
+       'barge-in still needs whatever was said last');
+
+    h.controller.handle({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: 'what kind of car is in front of us' });
+    ok(h.controller.state().spoken_this_turn === 'what kind of car is in front of us',
+       '...and the new turn\'s words are sent as soon as they land');
+  }
+
+  // --- the API refuses a response outright ---------------------------------
+  {
+    /* Not a cut-off: nothing was said, so there is nothing to resume from and
+       `said` would be empty. It is almost always the per-minute token
+       ceiling, and it lands on tool turns first because a tool turn spends
+       two responses where an ordinary answer spends one -- which is exactly
+       the shape the driver reported: "hello" works, anything that needs a
+       tool does not. tools/realtime_selftest.py run_session_cost has the
+       arithmetic.
+
+       Silence used to be the whole behaviour. One retry, at the delay the API
+       itself names, is the difference between a late answer and none. */
+    const h = textHarness();
+    h.controller.handle({
+      type: 'conversation.item.input_audio_transcription.completed',
+      transcript: 'what are the directions' });
+    h.controller.handle({ type: 'response.created', response: { id: 'f1' } });
+    h.controller.handle({
+      type: 'response.done',
+      response: { id: 'f1', status: 'failed', status_details: { error: {
+        code: 'rate_limit_exceeded',
+        message: 'Rate limit reached ... Please try again in 0.05s.' } } } });
+    h.rig.done('f1');
+    const failed = h.events.filter((e) => e.type === 'LIVE_RESPONSE_FAILED')[0];
+    ok(failed && failed.code === 'rate_limit_exceeded',
+       'a refused response is reported with the reason the API gave, not as ' +
+       'the anonymous "other" every unnamed fault used to share');
+    ok(h.controller.state().counters.responses_failed === 1,
+       '...and counted, so a drive can say how often it happened');
+    // Past the floor the retry waits: the API's own "try again in 0.05s" is
+    // clamped up, because a retry that beats the ceiling it was refused by is
+    // a second refusal.
+    await new Promise((r) => setTimeout(r, 600));
+    ok(h.sent.filter((e) => e.type === 'response.create').length === 1,
+       '...and asked for again once, so the driver gets a late answer ' +
+       'rather than silence');
+
+    // ...once. A second refusal means the budget is genuinely gone.
+    h.controller.handle({ type: 'response.created', response: { id: 'f2' } });
+    h.controller.handle({
+      type: 'response.done',
+      response: { id: 'f2', status: 'failed', status_details: { error: {
+        code: 'rate_limit_exceeded',
+        message: 'Please try again in 0.05s.' } } } });
+    h.rig.done('f2');
+    await new Promise((r) => setTimeout(r, 600));
+    ok(h.sent.filter((e) => e.type === 'response.create').length === 1,
+       'and not again after that — asking a spent per-minute budget twice ' +
+       'only spends the next minute');
+    ok(h.controller.state().counters.responses_retried === 1,
+       'one retry, counted');
   }
 
   // --- a false barge-in resumes from what was HEARD ------------------------

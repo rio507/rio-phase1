@@ -470,7 +470,19 @@
                      voice_fallbacks: 0, voice_backend_changed: 0,
                      // Answers spoken straight from the running observation,
                      // with no model between the sentence and the speaker.
-                     spoken_directly: 0 };
+                     spoken_directly: 0,
+                     // ...and the ones that could not be, because the mouth
+                     // was still held when the camera answered. Not a lost
+                     // answer any more -- it becomes an ordinary request to
+                     // the model -- but it IS the fast path not being taken,
+                     // which is worth a number rather than a shrug.
+                     direct_deferred: 0,
+                     // Responses the API refused outright. Almost always the
+                     // token-per-minute ceiling, and a tool turn spends two
+                     // responses where a plain answer spends one, which is
+                     // why "she only fails when she uses a tool" is the shape
+                     // the driver sees. Retried once; counted either way.
+                     responses_failed: 0, responses_retried: 0 };
     var directs = 0;
 
     /* WHY EVERY ANSWER STOPPED. One counter per cause, because "she cuts out"
@@ -512,6 +524,32 @@
     var pendingBarge = null;    // { responseId, cancelled, timer, confirm, said }
     var pendingResume = null;   // { cause, said }
     var resumeChain = 0;        // resumes spent on THIS answer
+    /* One retry of a refused response per driver turn. See responseFailed:
+       the ceiling this exists for is per-minute, so a second attempt inside
+       one turn is asking the same question of the same empty budget. */
+    var retryArmed = true;
+    var turnSeq = 0;            // which driver turn is outstanding
+    /* IS THE LAST TRANSCRIPT ABOUT THE QUESTION BEING ASKED NOW?
+     *
+     * Only until the driver opens their mouth again. `lastTranscript` is kept
+     * for the whole drive because a barge-in has to be classified against
+     * whatever was said last, but a TOOL is a different question: the camera's
+     * fast path is a judgement about what the driver asked, and the transcript
+     * for the turn being asked about arrives on its own schedule -- often
+     * after the model has already called the tool.
+     *
+     * Sent stale, the previous question judges this one. Measured, in a real
+     * drive: "what do you see outside" (a scene question, answered from the
+     * running observation in 42 ms) followed by "what kind of car is in front
+     * of us" -- and the second one came back in 5 ms with the sentence about
+     * the road, because the transcript the panel had was still the first
+     * question. A wrong answer, delivered fast, to a question the driver had
+     * asked perfectly clearly.
+     *
+     * So it goes stale the moment new speech starts, and the tool falls back
+     * to the model's paraphrase, which is what it did before any of this
+     * existed and is honest about being second-best. */
+    var transcriptFresh = false;
     var lastArbiterStart = null;
 
     /* If the detector never says the speech ended, nothing will ever classify
@@ -708,9 +746,30 @@
        * The tail is NOT cut off: the sink queues the new utterance behind
        * whatever is still scheduled, which is the right order anyway -- "let
        * me check" and then the answer. What is still refused is a second
-       * response over a live one, which is a real overlap. */
+       * response over a live one, which is a real overlap.
+       *
+       * ...AND SO DOES THE RESPONSE A DIRECT LINE IS THE ANSWER TO, whether
+       * or not it has finished writing. That is a second case and it was the
+       * one that lost whole answers.
+       *
+       * Every other caller here is a `response.created` off the wire, and the
+       * server orders those: it does not open a second response until the
+       * first has reported done, so by the time one arrives the response
+       * before it is always `finishing` and the rule above is enough.
+       * speakDirect is the one caller with no server between it and the mouth
+       * -- it fires the instant the camera answers, which for a question the
+       * running observation already covers is under a millisecond. That beats
+       * `response.done` for the function call down the data channel, and the
+       * early return then meant the line never opened an utterance, its text
+       * was dropped by the relay as belonging to a turn that was over, and
+       * "what do you see outside" got silence.
+       *
+       * There is nothing to protect in the response being superseded: it
+       * produced a function call, not speech, and the line taking the mouth
+       * from it IS the answer to that call. */
       if (speaking) {
-        if (!speaking.finishing || speaking.responseId === responseId) return;
+        if (speaking.responseId === responseId) return;
+        if (!speaking.finishing && !opts.direct) return;
         endResponse(speaking.responseId);
       }
       var entry = { responseId: responseId, resolve: null, cancelled: false,
@@ -737,15 +796,36 @@
         /* The arbiter has given the mouth to something that matters more.
            Mute first — that is instant, and covers the audio already on its way
            — then tell the model to stop, so she does not carry on underneath a
-           warning and reappear halfway through a sentence. */
+           warning and reappear halfway through a sentence.
+
+           BOTH OF THOSE ONLY IF THIS IS STILL THE ANSWER BEING SPOKEN, and
+           that guard is the whole of a bug that ate tool answers.
+
+           `response.cancel` and a mute name nothing: they stop whatever is
+           generating and silence whatever is playing, which is right when this
+           entry IS that. It is exactly wrong when the entry is already over.
+           And it routinely is: the arbiter finishes an item on its own pump, a
+           tick after endResponse resolves it, while a response that called a
+           tool is a response the server finishes and replaces IMMEDIATELY --
+           there is no audio to wait for, so the utterance completes with zero
+           chunks and the follow-up arrives inside that tick.
+
+           The new answer then claims the mouth, the arbiter sees a second item
+           in the `convo` group and supersedes the first, the first one's
+           `stop` runs -- and cancels the answer that replaced it. Measured in
+           a live drive: "what are the directions", nav_directions called and
+           answered, and the response carrying the directions came back
+           `cancelled / client_cancelled` having said nothing. */
         stop: function () {
           entry.cancelled = true;
           entry.said = saidSoFar();     // captured before the deltas stop
+          if (speaking !== entry) return;
           audio.mute();
           cancelGeneration();
         },
         onDone: function (reason) {
-          if (speaking === entry) speaking = null;
+          var wasCurrent = (speaking === entry);
+          if (wasCurrent) speaking = null;
           if (reason === 'spoken') {
             /* NOT a signal that the answer finished. `spoken` is what the
                arbiter is told whenever the mouth is handed back cleanly, and a
@@ -755,7 +835,9 @@
                completed) and where the driver starts a turn of their own. */
           } else {
             counters.interrupted++;
-            audio.mute();
+            // Same reason as `stop` above: an entry that is no longer the one
+            // speaking must not silence the one that is.
+            if (wasCurrent) audio.mute();
             var said = entry.said || saidSoFar();
             if (reason === 'preempted') {
               /* Something that matters more took the mouth mid-sentence. That
@@ -798,6 +880,68 @@
         },
       });
       emit('LIVE_RESPONSE_START', { response_id: responseId });
+    }
+
+    /* THE API REFUSED THE RESPONSE OUTRIGHT.
+     *
+     * Not a cut-off: nothing was said and there is nothing to resume from. It
+     * used to be filed under `other` with everything else that has no name,
+     * and it is worth its own, because in a live drive it has one cause and a
+     * shape the driver can describe.
+     *
+     * The cause is the token-per-minute ceiling, and the shape is "she only
+     * fails when she has to use a tool". A tool turn spends TWO responses --
+     * the one that calls the tool and the one that answers from the result --
+     * where an ordinary reply spends one, and each carries the whole
+     * instruction set and tool list as input. So the questions that need a
+     * camera, a route or the reasoning model are the ones that run the budget
+     * out, and "hello" keeps working right through it. The measurement is in
+     * tools/realtime_selftest.py (run_session_cost).
+     *
+     * ONE RETRY, at the delay the API itself names. Not more: a second refusal
+     * means the budget is genuinely gone and asking again only spends the next
+     * minute's. Not sooner either -- an immediate retry is refused by the same
+     * ceiling and buys nothing.
+     *
+     * A retry is armed once per driver turn. The one thing worse than an
+     * answer arriving late is two of them arriving. */
+    function retryAfterS(error) {
+      var m = /try again in ([0-9.]+)\s*s/i.exec((error && error.message) || '');
+      var s = m ? parseFloat(m[1]) : 1.0;
+      if (!isFinite(s) || s < 0.4) s = 0.4;
+      return Math.min(s, 10);
+    }
+
+    function responseFailed(responseId, error) {
+      counters.responses_failed++;
+      var code = (error && error.code) || 'unknown';
+      emit('LIVE_RESPONSE_FAILED', { response_id: responseId, code: code,
+                                     message: (error && error.message) || null,
+                                     retrying: retryArmed });
+      if (!retryArmed || stopped || dictation) {
+        // Nothing more to try. Recorded as a cut-off so a drive's tally still
+        // accounts for the answer the driver never got.
+        noteCutoff('other', { response_id: responseId,
+                              reason: 'response_failed:' + code });
+        return;
+      }
+      retryArmed = false;
+      counters.responses_retried++;
+      var waitMs = Math.round(retryAfterS(error) * 1000);
+      /* WHICH TURN THIS BELONGS TO. The wait is seconds long and a driver
+         does not stop talking for it -- if they have asked something else by
+         the time it comes round, the answer to the old question is no longer
+         wanted and saying it would be RIO answering a question nobody is
+         still asking. */
+      var seq = turnSeq;
+      setTimeout(function () {
+        if (stopped || dictation || turnSeq !== seq) return;
+        // A response that is only waiting on its tail is not in the way; one
+        // still being written is.
+        if (speaking && !speaking.finishing) return;
+        try { send({ type: 'response.create' }); } catch (e) {}
+        emit('LIVE_RESPONSE_RETRY', { after_ms: waitMs, code: code });
+      }, waitMs);
     }
 
     /* The model has stopped writing. That is not the same moment as the driver
@@ -972,10 +1116,14 @@
     function transcriptArrived(text) {
       var real = !!(text && text.trim());
       if (real) {
+        transcriptFresh = true;
         // A new turn from the driver. Whatever was outstanding is theirs to
-        // have interrupted, and the resume budget starts again.
+        // have interrupted, and the resume budget starts again -- and so does
+        // the one retry a refused response gets.
         pendingResume = null;
         resumeChain = 0;
+        retryArmed = true;
+        turnSeq++;
       }
       if (!pendingBarge) return;
       var rid = pendingBarge.responseId;
@@ -1056,11 +1204,16 @@
      * not do is ask a model to say it. */
     function speakDirect(text, meta) {
       var line = (text || '').trim();
-      if (!sink || stopped || !line) return Promise.resolve(false);
+      if (!sink || stopped || !line) return false;
       var id = 'direct:' + (++directs);
       beginResponse(id, { direct: true });
       var entry = speaking;
-      if (!entry || entry.responseId !== id) return Promise.resolve(false);
+      /* COULD NOT TAKE THE MOUTH, AND SAYS SO. `false` rather than a promise
+         of `false`, because the caller has to know NOW: a line that is not
+         going to be spoken has to become a request to the model in the same
+         turn, and a driver's question is not something to discover was
+         dropped one microtask later. */
+      if (!entry || entry.responseId !== id) return false;
       counters.spoken_directly++;
       emit('LIVE_DIRECT_ANSWER', {
         text: line, path: (meta && meta.path) || 'observer_direct',
@@ -1126,19 +1279,33 @@
              happened rather than a gap. `output_text` is the only content type
              the API accepts for an assistant item — `text` is refused by
              name. */
+          /* SPOKEN FIRST, AND TOLD TO THE SESSION ONLY IF IT WAS SPOKEN.
+             The assistant item is a claim about what the driver heard, and
+             writing it before knowing whether the line reached a speaker is
+             how a turn ends with RIO silent and the history saying she
+             answered. If the mouth is not available the line is not lost --
+             the tool result is already in the conversation, so asking for a
+             response gets the same sentence composed by the model, a few
+             hundred milliseconds later instead of none at all. */
           if (name === 'look' && result.speak_directly && result.speech && sink) {
-            send({
-              type: 'conversation.item.create',
-              item: { type: 'message', role: 'assistant',
-                      content: [{ type: 'output_text', text: result.speech }] },
-            });
-            speakDirect(result.speech, { path: result.path,
-                                         seen_s_ago: result.seen_s_ago });
-            emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
-                                       ok: true, path: result.path,
-                                       took_ms: result.took_ms || null,
-                                       spoke_directly: true });
-            return result;
+            var spoken = speakDirect(result.speech, {
+              path: result.path, seen_s_ago: result.seen_s_ago });
+            if (spoken !== false) {
+              send({
+                type: 'conversation.item.create',
+                item: { type: 'message', role: 'assistant',
+                        content: [{ type: 'output_text', text: result.speech }] },
+              });
+              emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
+                                         ok: true, path: result.path,
+                                         took_ms: result.took_ms || null,
+                                         spoke_directly: true });
+              return result;
+            }
+            counters.direct_deferred++;
+            emit('LIVE_DIRECT_DEFERRED', { path: result.path,
+                                           response_id: speaking
+                                             ? speaking.responseId : null });
           }
           var ask = { type: 'response.create' };
           if (name === 'look' && lookAnswerMaxTokens) {
@@ -1200,8 +1367,7 @@
                 noteCutoff('token_cap', { response_id: ev.response.id,
                                          said: partial });
               } else if (ev.response.status === 'failed') {
-                noteCutoff('other', { response_id: ev.response.id,
-                                     reason: 'response_failed' });
+                responseFailed(ev.response.id, det.error || {});
               }
             }
             finishResponse((ev.response && ev.response.id) || ev.response_id);
@@ -1238,6 +1404,8 @@
             }
             break;
           case 'input_audio_buffer.speech_started':
+            // Whatever was last transcribed is about the turn before this one.
+            transcriptFresh = false;
             bargeIn();
             break;
           case 'input_audio_buffer.speech_stopped':
@@ -1276,7 +1444,11 @@
 
       /* Say one line as her, with no model between it and the speaker. Only
          the visual fast path uses this, and only for a line the server has
-         already checked against her register. */
+         already checked against her register.
+
+         Returns a promise while the line is being spoken, or `false` -- NOT a
+         promise of false -- when the mouth could not be had at all, so a
+         caller can turn the line into an ordinary request in the same turn. */
       speakDirect: speakDirect,
 
       /* Dictate one deterministic line — a warning, a turn, a health
@@ -1422,6 +1594,9 @@
           response_id: speaking ? speaking.responseId : null,
           stopped: stopped,
           last_transcript: lastTranscript,
+          // ...and the same words only while they are still THIS turn's.
+          // This is what a tool call is given; see transcriptFresh.
+          spoken_this_turn: transcriptFresh ? lastTranscript : '',
           counters: counters,
           // The answer to "why does she keep cutting out", as a tally rather
           // than as an impression. Read it from the console after a drive, or
@@ -1518,7 +1693,7 @@
          * CALLED from a tool call, which cannot happen until the session is up
          * and the controller has been built. */
         function controllerTranscript() {
-          try { return controller.state().last_transcript || ''; }
+          try { return controller.state().spoken_this_turn || ''; }
           catch (e) { return ''; }
         }
 

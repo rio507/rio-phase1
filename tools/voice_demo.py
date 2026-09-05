@@ -60,18 +60,22 @@ RATE = config.ELEVENLABS_SAMPLE_RATE
 # person is a recording nobody can follow.
 DRIVER_VOICE = "CwhRBWXzGAHq8TQ4Fs17"        # Roger — laid-back, casual
 
-# What the drive is. Both visual paths, and the scene one twice so a listener
-# hears whether two answers off the same road sound like the same person.
+# What the drive is: both visual paths, and one turn deliberately broken in
+# half so a listener hears what a hesitation actually costs.
 #
-# NO "HEY" IN FRONT. The first recording opened with "Hey, what do you see?"
-# and she answered "Hey. What's up." — read as a greeting, camera never
-# called, which is defensible behaviour and a useless demo. A driver would say
-# it that way, and that it lands as a greeting is worth knowing; it is just not
-# what this recording is for.
+# `gap_ms` splices silence into the middle of an utterance. It is there because
+# an earlier recording opened with "Hey, what do you see?", she answered "Hey.
+# What's up.", and this script stopped listening — which read as "the camera
+# was never called". It was called, 2.4 seconds later, and the question was
+# answered. The recording was wrong, not the car.
+#
+# Kept as a case rather than removed, because the thing worth hearing is the
+# real behaviour: a greeting, then the answer.
 SCRIPT = [
-    "What do you see?",
-    "What's that car ahead?",
-    "What's the road like now?",
+    {"say": "What do you see?"},
+    {"say": "What's that car ahead?"},
+    {"say": "Hey,|what do you see?", "gap_ms": 1200,
+     "note": "a hesitation mid-question — the detector ends the turn on it"},
 ]
 
 
@@ -143,8 +147,14 @@ async def run(base: str, out: Path, video: str):
         async with client.realtime.connect(
                 model=config.OPENAI_REALTIME_MODEL) as conn:
             await conn.session.update(session=cfg)
-            for question in SCRIPT:
-                q_pcm = say_as_driver(question)
+            for turn in SCRIPT:
+                question = turn["say"].replace("|", " ")
+                if "|" in turn["say"]:
+                    head, tail = turn["say"].split("|", 1)
+                    q_pcm = (say_as_driver(head) + silence(turn["gap_ms"])
+                             + say_as_driver(tail))
+                else:
+                    q_pcm = say_as_driver(turn["say"])
                 track += silence(500) + q_pcm + silence(250)
                 heard["pcm"] = bytearray()
                 rid = {"id": "t"}
@@ -186,8 +196,15 @@ async def run(base: str, out: Path, video: str):
                     elif ev.type == "response.output_text.done":
                         said.append((question, path["v"], ev.text))
                     elif ev.type == "response.done":
-                        if said and said[-1][0] == question:
-                            await sink.end(rid["id"])
+                        await sink.end(rid["id"])
+                        # KEEP LISTENING UNLESS THE CAMERA HAS ANSWERED.
+                        #
+                        # A turn split by a hesitation produces a greeting
+                        # first — "Hey. What's up." — and the real question
+                        # arrives as a second turn a beat later. Stopping at
+                        # the first response is what made an earlier recording
+                        # report that the camera was never called.
+                        if path["v"] or "what" not in question.lower():
                             break
                     if time.perf_counter() - t0 > 75:
                         break
@@ -204,9 +221,12 @@ async def run(base: str, out: Path, video: str):
                         break
                 track += bytes(heard["pcm"])
                 took = (time.perf_counter() - t0) * 1000
-                spoken = said[-1][2] if said and said[-1][0] == question else None
-                print(f"    {question!r}\n      [{path['v'] or 'no tool call'}] "
-                      f"{spoken!r}  ({took:.0f} ms, "
+                mine = [t for t in said if t[0] == question]
+                print(f"    {question!r}"
+                      + (f"   ({turn['note']})" if turn.get("note") else ""))
+                for _, p, text in mine:
+                    print(f"      [{p or 'no tool'}] {text!r}")
+                print(f"      ({took:.0f} ms, "
                       f"{len(heard['pcm']) / (RATE * 2):.1f}s of audio)")
                 await asyncio.sleep(1.0)
 
