@@ -556,9 +556,8 @@ it?" Not every time: an ordinary car in ordinary traffic has nothing to
 offer.
 
 ONLY WHEN THEY ASK. "Tell me more", "what's the history", or just "yes" after
-you offered — then use the research tool. Say a holding line first, because
-that one does take a few seconds. Keep the answer to three or four sentences
-and offer to go on rather than going on.
+you offered — then the research tool, holding line and all, and an answer of
+three or four sentences that offers to go on rather than going on.
 
 Never use the research tool for anything you can see — it has no picture, and
 refuses a first look anyway.
@@ -645,9 +644,10 @@ every place you read out — the same place, already resolved.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
-Use deep_dive. Say something natural first — "let me check", "give me a
-second" — then answer in your own voice when it comes back. Never mention the
-tool, and never suggest that anything other than you answered.
+Use deep_dive, with a holding line in front of it that is TRUE: looking
+something up takes ten to twenty-five seconds, so "give me a moment, I'm
+looking that up" — never "one second". Then answer in your own voice. Never
+mention the tool, or suggest that anything else answered.
 
 If it comes back with ok: false, do not mention that either. Just answer as
 well as you can from what you already know, or say plainly that you cannot
@@ -1251,7 +1251,11 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
     q = (question or "").strip()
     if not q:
         return {"ok": False, "note": "no question"}
-    timeout = float(config.REALTIME_TOOL_TIMEOUT_S if timeout_s is None else timeout_s)
+    # ITS OWN CEILING, not the one the instant tools share: this is the only
+    # tool that goes and reads things, and the shared 25 s was sized against a
+    # guess of six seconds that measurement did not support.
+    timeout = float(config.DEEP_ANSWER_TIMEOUT_S if timeout_s is None
+                    else timeout_s)
 
     prompt = q if not context else f"{q}\n\nContext from the conversation: {context}"
     tools = [{"type": "web_search"}] if config.REALTIME_WEB_SEARCH else []
@@ -1276,7 +1280,13 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
             ),
             input=prompt,
             tools=tools,
-            max_output_tokens=int(config.DEEP_ANSWER_MAX_TOKENS),
+            # BOTH BUDGETS, because the API takes one number for the thinking
+            # and the answer together. Sending only the answer's ceiling is
+            # what made this tool fail on any question that needed a search:
+            # the reasoning pass spent all of it and there was nothing left to
+            # say. See config.DEEP_REASONING_MAX_TOKENS.
+            max_output_tokens=int(config.DEEP_ANSWER_MAX_TOKENS
+                                  + config.DEEP_REASONING_MAX_TOKENS),
         )
     except Exception as e:
         took = round((time.time() - t0) * 1000, 1)
@@ -1286,8 +1296,44 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
 
     text = (getattr(resp, "output_text", "") or "").strip()
     took = round((time.time() - t0) * 1000, 1)
+
+    # WHAT THE MODEL ACTUALLY DID, pulled out whether or not it worked. An
+    # answer that comes back empty is the failure this tool is most likely to
+    # have, and it used to be the only one that produced no line in the log:
+    # the exception path has always said why, and the empty-answer path said
+    # nothing at all. From the passenger seat those are the same event -- RIO
+    # saying she cannot look it up -- and from the log they were a stack trace
+    # and a silence.
+    status = getattr(resp, "status", None)
+    detail = getattr(resp, "incomplete_details", None)
+    why = getattr(detail, "reason", None) if detail else None
+    usage = getattr(resp, "usage", None)
+    reasoning_tokens = getattr(
+        getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
+    out_tokens = getattr(usage, "output_tokens", None)
+    searches = sum(1 for item in (getattr(resp, "output", None) or [])
+                   if getattr(item, "type", "") == "web_search_call")
+    shape = (f"status={status} reason={why} out_tokens={out_tokens} "
+             f"reasoning_tokens={reasoning_tokens} searches={searches}")
+
     if not text:
-        return {"ok": False, "note": "empty answer", "took_ms": took}
+        # NAMED, not just counted. "It thought until the budget was gone" and
+        # "the model refused" are different faults with different fixes, and
+        # the note is what a drive log has to distinguish them by.
+        note = ("thought past the answer budget"
+                if why == "max_output_tokens" else f"empty answer ({status})")
+        print(f"[realtime] deep_dive returned nothing after {took} ms: "
+              f"{note} — {shape}", flush=True)
+        return {"ok": False, "note": note, "took_ms": took,
+                "status": status, "reason": why,
+                "reasoning_tokens": reasoning_tokens, "searches": searches}
+    if status == "incomplete":
+        # There ARE words, so the driver gets an answer; it is just one that
+        # stopped early, which is worth a line rather than a shrug.
+        print(f"[realtime] deep_dive answered but ran out: {took} ms — {shape}",
+              flush=True)
+    else:
+        print(f"[realtime] deep_dive {took} ms — {shape}", flush=True)
     return {
         "ok": True, "answer": text, "took_ms": took,
         "model": config.OPENAI_REASONING_MODEL,

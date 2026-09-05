@@ -633,11 +633,21 @@ def main():
     ap.add_argument("--out", default="/tmp/rio_tools.wav")
     ap.add_argument("--dump", default=None,
                     help="write every event of the drive to this file")
+    ap.add_argument("--ask", default=None,
+                    help="one question, spoken, instead of a script — for "
+                         "diagnosing a single turn against a live session")
     ap.add_argument("--script", default="tools", choices=("tools", "nav"),
                     help="tools: the six questions that were failing. "
                          "nav: one route, called out loud, rerouted and "
                          "stopped by voice.")
     args = ap.parse_args()
+    if args.ask:
+        # THE WHOLE RIG FOR ONE QUESTION. Everything about this file is here
+        # to answer "what does a driver actually hear when they ask X", and
+        # until now that could only be asked of a fixed list. A slow tool is
+        # given room: deep_dive alone can take 25 seconds.
+        SCRIPT[:] = [{"say": args.ask, "want": "whatever it is evidence for",
+                      "budget_s": 50.0}]
     return asyncio.run(run(args.base, Path(args.out), args.video,
                            args.dump, args.script))
 

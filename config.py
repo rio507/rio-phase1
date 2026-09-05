@@ -81,10 +81,15 @@ REALTIME_SPEECH_CHANNELS = {"nav": True, "health": True, "headway": True}
 REALTIME_ENABLED = True
 
 # How long RIO waits for the reasoning model before carrying on without it.
-# Sol answers a plain question in ~4 s and a web-search one in ~6 s; past this
-# the driver has been listening to silence for too long, and an answer she
-# gives from what she already knows is better than a better answer that arrives
-# after the exit.
+# The camera, the route, the car and the places search: all of them answer in
+# under a second or fail. Past this the driver has been listening to silence
+# for too long, and an answer she gives from what she already knows is better
+# than a better answer that arrives after the exit.
+#
+# deep_dive is NOT bound by this any more — see DEEP_ANSWER_TIMEOUT_S. It was,
+# and the note here used to say a web-search answer took about six seconds,
+# which measurement did not support: a news question with three searches took
+# 25.4 s and would have been aborted one tenth of a second before it arrived.
 REALTIME_TOOL_TIMEOUT_S = 25.0
 # Let the reasoning model search when the question needs current information.
 REALTIME_WEB_SEARCH = True
@@ -113,6 +118,42 @@ DEPTH_WINDOW_S = 120.0
 # an essay, and an essay read aloud in a car is a monologue nobody can
 # interrupt politely. Three or four sentences, then an offer to go on.
 DEEP_ANSWER_MAX_TOKENS = 320
+
+# ...AND WHAT IT MAY SPEND THINKING BEFORE IT WRITES THEM, because the API
+# takes ONE number for both and this is the second time that has cost an
+# answer. OPENAI_MAX_TOKENS below carries the same lesson from the chat path:
+# a budget that covers reasoning AND output, set to the length of the reply,
+# is a budget the reasoning pass can spend in full before saying anything.
+#
+# On deep_dive it is worse, because web_search reasons BETWEEN searches.
+# "What happened in the Pacific Palisades fire?" spent 320 of 320 tokens on
+# reasoning across two searches, came back `incomplete` with
+# reason=max_output_tokens and no text at all, and RIO told the driver she
+# could not look it up right now. Measured, the same question needs 168-530
+# reasoning tokens depending on effort, and answers in 9-13 seconds.
+#
+# So the answer keeps its own ceiling and the thinking gets its own, and what
+# goes to the API is the sum. 1,200 is roughly twice the worst case measured,
+# which is the point: this number exists to be generous, and the one that
+# keeps an answer short is the one above it.
+DEEP_REASONING_MAX_TOKENS = 1200
+
+# ...AND HOW LONG THE DRIVER WAITS FOR IT. Measured against the live API on
+# news questions, which are the slow ones because each search is a round trip
+# the model then reasons about:
+#
+#   no search at all ("why did carmakers switch to EPS")     2.1 s
+#   one search, one fact ("who won the last World Cup")      4.2 s
+#   two searches ("what changed in California EV rebates")  12.9 s
+#   six searches ("latest on the fire recovery")            19.6 s
+#   three searches ("what happened in the Palisades fire")  25.4 s
+#
+# The old ceiling was the 25 s every other tool shares, and the last row is
+# what that costs: an answer that existed, was paid for, and was thrown away
+# a tenth of a second before it arrived. This is roughly twice the worst case
+# measured, and it is a ceiling rather than a target — the holding line in the
+# instructions is what makes the wait tolerable, not this number.
+DEEP_ANSWER_TIMEOUT_S = 45.0
 
 # --- brevity, out loud ------------------------------------------------------
 # The ceiling on any single spoken response, enforced at the API rather than

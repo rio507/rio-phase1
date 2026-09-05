@@ -31,7 +31,9 @@ and the one tool that ACTS rather than reports — starting a route because the
 driver asked to be taken somewhere (J).
 """
 import argparse
+import contextlib
 import inspect
+import io
 import json
 import os
 import re
@@ -609,8 +611,28 @@ class _FakeClient:
 
 
 class _Result:
-    def __init__(self, text):
+    """What the Responses API hands back, in the shape escalate() reads it.
+
+    `status`, `incomplete_details` and `usage` are here because the failure
+    that made this class grow was invisible without them: a response can be
+    perfectly successful, cost twenty thousand input tokens, and carry no text
+    at all because the reasoning pass spent the whole output budget.
+    """
+
+    def __init__(self, text, status="completed", reason=None,
+                 reasoning_tokens=0, output_tokens=None, searches=0):
         self.output_text = text
+        self.status = status
+        self.incomplete_details = (
+            type("D", (), {"reason": reason})() if reason else None)
+        self.usage = type("U", (), {
+            "output_tokens": (len(text) // 4 if output_tokens is None
+                              else output_tokens),
+            "output_tokens_details": type("O", (), {
+                "reasoning_tokens": reasoning_tokens})(),
+        })()
+        self.output = [type("I", (), {"type": "web_search_call"})()
+                       for _ in range(searches)]
 
 
 def _with_client(behaviour):
@@ -636,9 +658,26 @@ def run_failure():
            "and the conversation context goes with the question")
         ok("READ ALOUD" in sent["instructions"] or "read aloud" in sent["instructions"].lower(),
            "asked for prose to be spoken — no markdown, no citations read out")
-        ok(fake.timeouts and fake.timeouts[-1] == config.REALTIME_TOOL_TIMEOUT_S,
-           f"under the configured timeout ({config.REALTIME_TOOL_TIMEOUT_S}s), "
-           "which aborts the request rather than abandoning it")
+        ok(fake.timeouts and fake.timeouts[-1] == config.DEEP_ANSWER_TIMEOUT_S,
+           f"under its OWN timeout ({config.DEEP_ANSWER_TIMEOUT_S}s), which "
+           "aborts the request rather than abandoning it — the tool that goes "
+           "and reads things is not bound by the ceiling the instant ones "
+           f"share ({config.REALTIME_TOOL_TIMEOUT_S}s)")
+        ok(config.DEEP_ANSWER_TIMEOUT_S >= 40,
+           "and that ceiling clears the slowest answer measured against the "
+           f"live API (25.4 s, three searches) with room ({config.DEEP_ANSWER_TIMEOUT_S}s)")
+
+        # THE BUDGET THAT COST AN ANSWER. The API takes one number for the
+        # thinking and the words, and sending only the words' ceiling is what
+        # made every question that needed a search come back empty.
+        ok(sent["max_output_tokens"] == config.DEEP_ANSWER_MAX_TOKENS
+           + config.DEEP_REASONING_MAX_TOKENS,
+           "the budget sent covers the reasoning AND the answer "
+           f"({sent['max_output_tokens']} = {config.DEEP_ANSWER_MAX_TOKENS} "
+           f"+ {config.DEEP_REASONING_MAX_TOKENS})")
+        ok(config.DEEP_REASONING_MAX_TOKENS >= 2 * config.DEEP_ANSWER_MAX_TOKENS,
+           "and the thinking half is the generous one — a news question spent "
+           "530 reasoning tokens across two searches before writing a word")
         ok(any(t.get("type") == "web_search" for t in (sent.get("tools") or [])),
            "with web search available for anything that changes")
 
@@ -658,6 +697,38 @@ def run_failure():
         _with_client(lambda kw: _Result("   "))
         ok(realtime.escalate("anything")["ok"] is False,
            "an empty answer -> ok:false rather than a moment of silence")
+
+        # THE FAILURE THIS TOOL ACTUALLY HAD, and the one thing it never did:
+        # say so. "What happened in the Pacific Palisades fire?" came back
+        # `incomplete`, 320 of 320 output tokens spent on reasoning across two
+        # searches, no text — and the log said nothing, because only the
+        # exception path had ever printed anything.
+        _with_client(lambda kw: _Result(
+            "", status="incomplete", reason="max_output_tokens",
+            reasoning_tokens=320, output_tokens=320, searches=2))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            r = realtime.escalate("what happened in the Palisades fire?")
+        logged = buf.getvalue()
+        ok(r["ok"] is False and r["note"] == "thought past the answer budget",
+           "a budget spent on thinking is named as that, not as 'empty "
+           f"answer' — got {r['note']!r}")
+        ok(r["reason"] == "max_output_tokens" and r["reasoning_tokens"] == 320,
+           "with the numbers that prove it, on the result the panel logs")
+        ok("deep_dive returned nothing" in logged
+           and "reasoning_tokens=320" in logged and "searches=2" in logged,
+           "and the server says why, in one line, every time — never silent: "
+           + logged.strip()[:120])
+
+        # ...and a healthy answer says so too, because "how long did that take
+        # and did it search" is the question a slow drive asks afterwards.
+        _with_client(lambda kw: _Result("Fine.", reasoning_tokens=180,
+                                        output_tokens=220, searches=1))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            realtime.escalate("anything")
+        ok("deep_dive" in buf.getvalue() and "searches=1" in buf.getvalue(),
+           "a successful call is logged with its timing and its searches")
 
         _with_client(lambda kw: _Result("fine"))
         old = config.REALTIME_WEB_SEARCH
