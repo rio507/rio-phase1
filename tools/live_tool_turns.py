@@ -91,6 +91,15 @@ SCRIPT = [
      "want": "nav_directions, read aloud — the turn that resurfaced the old "
              "behaviour",
      "budget_s": 25.0},
+    # HOW SHE TALKS ABOUT THE CAR, and it is here because the delivery of that
+    # changed: the health register used to ride in every response and now
+    # arrives with the data, in vehicle_status's `rules`. The thing to listen
+    # for is that it is interpreted rather than recited — "about where they
+    # should be", not "twenty-nine PSI" — and that nothing is claimed past the
+    # window the data covers.
+    {"say": "How are my tires?",
+     "want": "the car, interpreted rather than recited",
+     "budget_s": 25.0},
 ]
 
 
@@ -266,6 +275,15 @@ async def run(base, out_path, video, dump=None):
             if wav:
                 print(f"\n  wrote {out_path}  ({wav[0]['seconds']:.1f}s of RIO)")
                 print(f"  counters: {json.dumps(wav[0]['counters'])}")
+            allow = [lim for n in panel.notes
+                     if n.get("type") == "rate_limits.updated"
+                     for lim in (n["ev"].get("rate_limits") or [])
+                     if lim.get("name") == "tokens"]
+            if allow:
+                low = min(allow, key=lambda l: l.get("remaining", 0))
+                print(f"\n  lowest the minute's token budget got over the "
+                      f"whole drive: {low.get('remaining'):,} of "
+                      f"{low.get('limit'):,}")
             if dump:
                 Path(dump).write_text(
                     "\n".join(json.dumps(n) for n in panel.notes))
@@ -305,6 +323,13 @@ def report(turn, notes, t_ask):
              and n["ev"].get("type") == "LIVE_RESPONSE_FAILED"]
     heard = [n for n in notes if n.get("note") == "voice"
              and n["ev"].get("type") == "VOICE_UTTERANCE_DONE"]
+    # WHAT THE MINUTE HAS LEFT, from the session itself. The ceiling the
+    # instructions are sized against is not a number out of a document: the
+    # session reports its own limit and what is left of it on every response,
+    # and this is the only place that can watch a real drive approach it.
+    limits = [lim for n in notes if n.get("type") == "rate_limits.updated"
+              for lim in (n["ev"].get("rate_limits") or [])
+              if lim.get("name") == "tokens"]
     transcript = [n["ev"].get("transcript") for n in notes
                   if n.get("k") == "wire_in" and n.get("type") ==
                   "conversation.item.input_audio_transcription.completed"]
@@ -325,6 +350,10 @@ def report(turn, notes, t_ask):
     print(f"      said: {spoken[:220]!r}")
     print(f"      utterances that reached the speaker: {len(heard)}"
           + ("   <-- SILENT" if not heard else ""))
+    if limits:
+        low = min(limits, key=lambda l: l.get("remaining", 0))
+        print(f"      tokens left in the minute: {low.get('remaining'):,} of "
+              f"{low.get('limit'):,}")
 
 
 def main():

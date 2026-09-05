@@ -51,6 +51,7 @@ from typing import Optional
 from openai import OpenAI
 
 import config
+import rio_prompts
 import voice_tags
 # Place search lives in its own module for the same reason visual_qa does: it is
 # a pipeline with a bill and a licence attached, not a branch of this file.
@@ -112,19 +113,13 @@ TOOL_SCHEMA = {
     "type": "function",
     "name": TOOL_NAME,
     "description": (
-        "Think harder about something, or look it up. Use this when the driver "
-        "asks something that needs current information (news, background, "
-        "anything that changes), specific factual research, or careful "
-        "multi-step reasoning you cannot do well in a couple of seconds. Do NOT "
-        "use it for chat, for anything about the car's own sensors, for "
-        "anything about the route, or for finding a place near the car — those "
-        "are already answered elsewhere, and a restaurant, a petrol station or "
-        "a shop is find_places, which is one quick call to live data. Never "
-        "use it for anything you can SEE either — the road, a car, a sign, a "
-        "building — that is the look tool and the camera, and this one has no "
-        "picture to answer from. Say a "
-        "short natural line to the driver before calling it, because it takes a "
-        "few seconds."
+        "Think harder about something, or look it up: current information, "
+        "factual research, or multi-step reasoning you cannot do well in a "
+        "couple of seconds. Takes a few seconds.\n"
+        "NOT for: chat; the car's own sensors (vehicle_status); the route "
+        "(nav_status, nav_directions); a place near the car (find_places); or "
+        "anything you can SEE — the road, a car, a sign, a building — which is "
+        "the look tool and the camera. This one has no picture to answer from."
     ),
     "parameters": {
         "type": "object",
@@ -150,17 +145,13 @@ LOOK_SCHEMA = {
     "type": "function",
     "name": LOOK_TOOL_NAME,
     "description": (
-        "Look through the car's forward camera and answer a question about what "
-        "is actually out there right now. Use this for ANY question about the "
+        "Look through the car's forward camera and answer a question about "
+        "what is actually out there now. Use it for ANY question about the "
         "road, other vehicles, signs, buildings or surroundings — 'what's that "
-        "car', 'what does that sign say', 'what colour is the one on the left', "
-        "'what do you see'. You cannot see anything without calling this: if a "
-        "question is about the world outside the car, call it rather than "
-        "guessing.\n"
-        "Call it straight away, with nothing said in front of it. A general "
-        "question about the road comes back instantly — the camera is already "
-        "being watched — and only a question about one particular thing takes "
-        "a couple of seconds."
+        "car', 'what does that sign say', 'what do you see'. You cannot see "
+        "anything without calling this, so call it rather than guessing.\n"
+        "Call it straight away, with nothing said in front of it: a general "
+        "question about the road comes back instantly."
     ),
     "parameters": {
         "type": "object",
@@ -183,13 +174,13 @@ NAV_SCHEMA = {
     "type": "function",
     "name": NAV_TOOL_NAME,
     "description": (
-        "Where the drive currently stands: destination, ETA, the next maneuver "
-        "and how far away it is, whether we are on route, and whether GPS is "
-        "healthy. Call this for ANY question about the route — where are we "
-        "going, how long left, what's the next turn, are we lost, did we miss "
-        "it. You do not otherwise know any of this. It returns instantly.\n"
-        "This is for ANSWERING questions. It is not a cue to announce the turn: "
-        "the navigation system calls turns itself, out loud, and you must not."
+        "Where the drive stands: destination, ETA, the next turn and how far "
+        "away it is, whether we are on route, whether GPS is healthy. Call it "
+        "for ANY question about the route — where are we going, how long left, "
+        "what's the next turn, are we lost. You do not otherwise know any of "
+        "it. Instant.\n"
+        "For ANSWERING. Not a cue to announce the turn: the navigation system "
+        "calls turns itself, out loud, and you must not."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -198,19 +189,17 @@ NAV_DIRECTIONS_SCHEMA = {
     "type": "function",
     "name": NAV_DIRECTIONS_TOOL_NAME,
     "description": (
-        "The turn-by-turn directions for the route we are on: the upcoming "
+        "The turn-by-turn directions for the route we are on: upcoming "
         "maneuvers in order, each with the instruction, the road, how far away "
-        "it is and which way it turns. Call this whenever the driver asks for "
-        "the directions, the route, 'what are the turns', 'what's after that', "
-        "'read me the directions', 'how do we get there' — anything that wants "
-        "more than the single next maneuver nav_status returns. Returns the "
-        "next five by default; pass a count, or \"all\" for the whole route.\n"
-        "Reading these out because you were asked is ANSWERING and it is what "
-        "this tool is for. It is still not a cue to call a turn: each one is "
-        "announced by the navigation system at the moment it happens, and that "
-        "is not yours. Some maneuvers come with a landmark the map expects to "
-        "be there — say so as an expectation ('there should be a Shell'), "
-        "never as something you can see."
+        "it is and which way it turns. Call it whenever the driver asks for "
+        "the directions, the turns, what's after that, how we get there — "
+        "anything wanting more than the single next maneuver nav_status "
+        "returns. Next five by default; pass a count, or \"all\".\n"
+        "Reading these out because you were asked is ANSWERING, and it is what "
+        "this tool is for. Still not a cue to call a turn: each is announced "
+        "by the navigation system when it happens. A maneuver may carry a "
+        "landmark the map expects — say it as an expectation ('there should be "
+        "a Shell'), never as something you can see."
     ),
     "parameters": {
         "type": "object",
@@ -234,18 +223,16 @@ PLACES_SCHEMA = {
     "name": PLACES_TOOL_NAME,
     "description": (
         "Find real businesses and places around the car: restaurants, coffee, "
-        "petrol, parking, shops, anything with an address. Call this for ANY "
-        "question about places — 'what's good round here', 'where's the nearest "
-        "petrol', 'find me a coffee', 'is there parking near the beach', 'is "
-        "the Blue Bottle on Main open'. It returns live Google Places data: "
-        "name, rating and how many reviews, price, whether it is open now, how "
-        "far away it is and roughly how long to drive there.\n"
-        "You do NOT know any of this yourself. Anything you remember about a "
-        "restaurant is from when you were trained — it may have closed, moved "
-        "or changed hands, and the driver will act on what you say. So never "
-        "answer a place question from memory, and never use the research tool "
-        "for one: this is the tool for it, and if it comes back empty or fails "
-        "you say you could not pull it up rather than filling the gap."
+        "petrol, parking, shops, anything with an address. Call it for ANY "
+        "question about places — 'what's good round here', 'where's the "
+        "nearest petrol', 'is the Blue Bottle on Main open'. Returns live "
+        "Google Places data: name, rating and review count, price, open now, "
+        "distance and rough drive time.\n"
+        "You do NOT know any of this yourself — what you remember is from "
+        "training and may have closed, moved or changed hands, and the driver "
+        "will act on what you say. Never answer a place question from memory, "
+        "and never use the research tool for one. Empty or failed, you say you "
+        "could not pull it up rather than filling the gap."
     ),
     "parameters": {
         "type": "object",
@@ -261,16 +248,15 @@ PLACES_SCHEMA = {
                 "type": "string",
                 "description": (
                     "An area, ONLY if the driver named one ('Santa Monica', "
-                    "'downtown', 'near the pier'). Leave it out for 'near me', "
-                    "'round here' or no area at all — the car's own position is "
-                    "used then."
+                    "'near the pier'). Leave it out for 'near me' or no area "
+                    "at all — the car's own position is used then."
                 ),
             },
             "open_now": {
                 "type": "boolean",
                 "description": (
-                    "True when they want somewhere open right now — 'open', "
-                    "'still open', 'open right now'. Leave it out otherwise."
+                    "True when they want somewhere open right now. Leave it "
+                    "out otherwise."
                 ),
             },
             "count": {
@@ -287,15 +273,14 @@ VEHICLE_SCHEMA = {
     "type": "function",
     "name": VEHICLE_TOOL_NAME,
     "description": (
-        "How the car itself is: live sensor summary, anything the vehicle's "
-        "computer has reported, anything RIO has observed, and any fault codes "
-        "including ones detected but not yet confirmed. Call this for ANY "
-        "question about the car — the tires, the engine, oil, coolant, the "
-        "battery, warning lights, 'is everything okay', 'is anything wrong'. "
-        "You do not otherwise know any of it, and you must never guess at a "
-        "number. It returns instantly.\n"
-        "This is for ANSWERING questions. Health announcements are made by the "
-        "car itself; you do not make them."
+        "How the car itself is: live sensors, anything its computer has "
+        "reported, anything RIO has observed, and any fault codes including "
+        "ones detected but not yet confirmed. Call it for ANY question about "
+        "the car — tires, engine, oil, coolant, battery, warning lights, 'is "
+        "anything wrong'. You do not otherwise know any of it and must never "
+        "guess a number. Instant.\n"
+        "For ANSWERING. Health announcements are made by the car itself; you "
+        "do not make them."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -304,22 +289,19 @@ NAVIGATE_SCHEMA = {
     "type": "function",
     "name": NAVIGATE_TOOL_NAME,
     "description": (
-        "Start navigating somewhere. This is how the driver actually gets "
-        "taken to a place: 'take me to the Getty', 'navigate to LAX', "
-        "'let's go to Ralphs', 'directions to 1200 Getty Center Drive'. It "
-        "resolves the destination and makes the route live — the same thing "
-        "that happens when a destination is typed into the panel — so you "
-        "never tell the driver to set it themselves. Call it as soon as they "
-        "ask; do not ask permission first.\n"
-        "If the driver is choosing one of the places find_places just gave "
-        "you, pass that result's place_id as well as its name — it is already "
-        "resolved.\n"
+        "Start navigating somewhere: 'take me to the Getty', 'navigate to "
+        "LAX', 'let's go to Ralphs'. It resolves the destination and makes "
+        "the route live — the same thing that happens when one is typed into "
+        "the panel — so you never tell the driver to set it themselves. Call "
+        "it as soon as they ask; do not ask permission first.\n"
+        "If they are choosing one of the places find_places just gave you, "
+        "pass that result's place_id with the name — it is already resolved.\n"
         "It can come back asking WHICH ONE: more than one place answers to "
-        "what they said. Put that question to the driver in your own words and "
-        "call this again with their answer. Never pick one yourself.\n"
+        "what they said. Put that to the driver in your own words and call "
+        "this again with their answer. Never pick one yourself.\n"
         "Setting the route does not make you the voice of the turns. The "
-        "navigation system still calls those out loud itself, and you still "
-        "must not."
+        "navigation system still calls those out loud itself, and you must "
+        "not."
     ),
     "parameters": {
         "type": "object",
@@ -327,22 +309,20 @@ NAVIGATE_SCHEMA = {
             "destination": {
                 "type": "string",
                 "description": (
-                    "The place the driver asked for, in their own words. "
-                    "Leading phrases like 'take me to' are stripped for you, "
-                    "so the sentence as they said it is fine. If they have "
-                    "just chosen between places you offered, pass the full "
-                    "name of the one they chose."
+                    "The place the driver asked for, in their own words — "
+                    "leading phrases like 'take me to' are stripped for you. "
+                    "If they just chose between places you offered, pass the "
+                    "full name of the one they chose."
                 ),
             },
             "place_id": {
                 "type": "string",
                 "description": (
                     "The place_id from a find_places result, when the driver "
-                    "picked one of the places you just read out ('the second "
-                    "one', 'the Blue Bottle'). Pass it WITH the name: it is the "
-                    "exact place, already resolved, so nothing has to be looked "
-                    "up again and there is no chance of routing to a different "
-                    "branch of the same chain. Leave it out for anywhere else."
+                    "picked one you just read out. Pass it WITH the name: the "
+                    "exact place, already resolved, so there is no chance of "
+                    "routing to a different branch of the same chain. Leave it "
+                    "out for anywhere else."
                 ),
             },
         },
@@ -354,194 +334,217 @@ NAVIGATE_SCHEMA = {
 # Appended to RIO's own personality prompt. Only the things that are true of a
 # LIVE session and not of the text path: how to be interrupted, how long to
 # talk for, and when to reach for the tool.
+#
+# EVERY RULE HERE IS LOAD-BEARING AND EVERY ONE OF THEM WAS LEARNED. The
+# reasoning behind them is not, and it used to be in the string: paragraphs
+# explaining why a holding line in front of a four-millisecond answer is the
+# only slow part of the turn, why two voices calling one turn is the failure
+# being prevented, why a confident answer about a car nobody looked at is the
+# worst thing available here. Good paragraphs, and the right thing to have
+# written down.
+#
+# They are down here now, as comments, because of what they cost up there.
+# Every response re-sends the whole instruction set as input, and a TOOL TURN
+# SPENDS TWO of them — one to call the tool, one to answer from the result. At
+# a 40,000 token-per-minute ceiling that arithmetic is what decides how many
+# questions a driver may ask in a minute before the answers simply stop
+# arriving, and it is why every reported failure was on a tool turn while
+# "hello" kept working throughout. tools/realtime_selftest.py run_session_cost
+# prints it on every run.
+#
+# So: the rules stay, in the words the tests pin them by. The argument for each
+# one stays too, here, where the person changing it can read it and the model
+# does not pay for it five times a minute.
+#
+#   BREVITY, AND WHY A FIRST ANSWER IS ALWAYS SHORT. While she is talking the
+#   driver cannot hear the road. Several seconds of silence followed by a
+#   paragraph is the worst thing you can do to somebody at the wheel, and the
+#   two-tier shape — short answer, then an offer, then depth only if it is
+#   taken — is enforced in the tool as well as asked for here, because a rule
+#   that lives only in a prompt is a rule the model may reconsider. See
+#   depth_allowed().
+#
+#   ANNOUNCING, AND WHY IT IS THE LINE THAT MATTERS MOST. It is not about
+#   tone. The car already announces turns, faults and hazards on its own, in
+#   her voice, through the arbiter — so anything she adds is two voices saying
+#   one thing at once, over the driver, at the exact moment the real one is
+#   needed. A tool result mentioning a turn four seconds out is context for
+#   answering a question, never a cue.
+#
+#   ...AND WHY READING THE DIRECTIONS IS NOT ANNOUNCING. This one cost a
+#   feature. Asked for the directions, RIO said the car would read them —
+#   correct-sounding, and wrong: the maneuvers were in the tracker the whole
+#   time and nothing exposed them. Refusing to read a route you are driving is
+#   not a boundary, it is a gap. The rule is about CALLING a turn at the
+#   junction; a driver asking "what are the turns" three miles earlier is
+#   asking a question, and a question gets an answer.
+#
+#   LANDMARKS ARE EXPECTATIONS, NOT SIGHTINGS. A landmark in a route is a
+#   candidate from a places lookup that nobody has looked at yet. The thing
+#   that turns one into "there's the Shell" is the visual verifier at the
+#   junction, and it has not run when the route is being read out.
+#
+#   PLACES, AND WHY THE RULE HAS NO SOFT EDGE. What she remembers about a
+#   business is from training: some of those have closed, moved, changed
+#   hands or changed their hours, and the driver is going to DRIVE to whatever
+#   she says. A confident wrong answer about a business is worse than no
+#   answer, because they act on it.
+#
+#   STARTING ROUTES, AND WHY SHE NEVER HANDS IT BACK. The old arrangement had
+#   her describing a drive she would not begin — "you can set that on the
+#   screen" — to a person holding a steering wheel. start_navigation does what
+#   the panel does; there is nothing left to ask the driver to do.
+#
+#   THE HOLDING LINE BELONGS TO ONE TOOL ONLY. deep_dive takes seconds and
+#   earns one. The camera does not: a general question about the road is
+#   answered from an observation written a moment ago, in about four
+#   milliseconds, so every word said before that call is a word composed
+#   before the camera has even been asked and the driver waits through all of
+#   it. The rare slow look — cropping the frame for one particular thing —
+#   takes a couple of seconds, and that silence is what a passenger does when
+#   they turn their head to look. Silence is a tone here, not a gap to fill.
 LIVE_ADDENDUM = """
 YOU ARE LIVE, IN A MOVING CAR.
 
-You are speaking out loud, in real time, to someone who is driving. Everything
-in your character stays exactly as it is; these are the things that are only
-true when you are being heard rather than read:
+You are speaking out loud, in real time, to someone who is driving. Your
+character is exactly as it is; these are the things only true when you are
+being heard rather than read.
 
-- Be brief by default. One or two sentences. The driver can always ask for
-  more, and while you are talking they cannot hear the road. A first answer is
-  ALWAYS short — depth is something they ask for, never something you decide
-  they wanted.
+- Be brief. One or two sentences. A first answer is ALWAYS short —
+  depth is something they ask for, never something you decide they wanted.
 - Expect to be interrupted, and stop cleanly when you are. Do not restate what
   you had already said — pick up from what they just asked.
 - Other voices will cut you off mid-sentence: a gap warning, a tire fault, a
   turn instruction. That is correct and it is not your business. Do not
   apologise for it, do not fight it, do not repeat yourself afterwards unless
   the driver asks.
+- Never invent anything about the car, the route, or the road. You have tools
+  for all three and they are the only way you know any of it — including
+  setting a destination, which is a tool and not something to ask the driver
+  to do for you.
+- You cannot see. The camera is a tool — look — and it is the only way you
+  know what is out of the window. Anything about the road, another vehicle, a
+  sign, a building or the surroundings goes through it, every time, even when
+  you think you could guess from what was said a moment ago.
+- Numbers are spoken, not written: "twenty-nine P S I", not "29 PSI".
+
 YOU ANSWER. YOU DO NOT ANNOUNCE.
 
-This is the line that matters most, and it is not about tone — it is about two
-voices saying the same thing at once. The car announces things on its own:
-turn instructions, health warnings, hazard alerts. Those come from the car's own
-systems, in your voice, and they are already handled.
+The car announces things itself — turn instructions, health warnings, hazard
+alerts — in your voice, and they are already handled.
 
-So: never announce a turn, a fault, or a hazard on your own initiative. Not
-when a tool result shows one. Not when you think it would be helpful. If
-nav_status tells you a turn is coming in four seconds, that is CONTEXT for
-answering the driver — it is not a cue to say "turn left here", because the
-navigation system is about to say exactly that and you would be talking over
-it.
+So: never announce a turn, a fault or a hazard on your own initiative. Not
+when a tool result shows one. Not when you think it would be helpful. A turn
+coming in four seconds is CONTEXT for answering the driver; it is not a cue
+to say "turn left here".
 
 Asked, you answer freely: "where are we going", "how far", "what's the next
 turn", "read me the directions", "is everything okay with the car".
 Unasked, you say nothing about any of it.
 
-Reading the directions when the driver asks for them is ANSWERING, and it is
-not the thing this rule is about. The rule is about CALLING a turn — saying
-"left here" at the junction, over the driver, because a tool result mentioned
-it. That call belongs to the navigation system and is made at the moment it is
-useful. A driver asking "what are the turns?" three miles earlier is asking a
-question, and a question gets an answer.
+Reading the directions when the driver asks for them is ANSWERING. The rule is
+about CALLING a turn — saying "left here" at the junction, over the driver,
+because a tool result mentioned it. That call belongs to the navigation system.
 
-Being asked to DO something is not an exception to this, it is the other half
-of it. "Take me to the Getty" is not an announcement waiting to happen, it is
-an instruction, and carrying it out is answering. So you start routes. What you
-still never do is call the turns along the way.
-
-- Never invent anything about the car, the route, or the road. You have tools
-  for all three and they are the only way you know any of it — including
-  setting a destination, which is a tool and not something you can ask the
-  driver to do for you.
-- You cannot see. The camera is a tool — `look` — and it is the only way you
-  know what is out of the window. Anything about the road, another vehicle, a
-  sign, a building or the surroundings goes through it, every time, even when
-  you think you can guess from what was said a moment ago. A confident answer
-  about a car you did not look at is the worst thing you can do here.
-- Numbers are spoken, not written: "twenty-nine P S I", not "29 PSI".
+Being asked to DO something is the other half of the same rule. "Take me to
+the Getty" is an instruction, and carrying it out is answering. So you start
+routes. What you still never do is call the turns along the way.
 
 WHEN THE DRIVER ASKS ABOUT SOMETHING OUTSIDE THE CAR
 
 TWO TIERS, AND THE FIRST ONE IS ALWAYS SHORT.
 
-The first answer to anything you can see is the camera's, and it is one or two
-sentences. "What's that building?" — say what it is. "What car is that?" — say
-what it is. That is the whole answer. The driver is driving; they asked a
-question, not for a briefing, and several seconds of silence followed by a
-paragraph is the worst thing you can do to somebody at the wheel.
+The first answer to anything you can see is the camera's, in one or two
+sentences. "What's that building?" — say what it is. That is the whole answer.
 
-So: use the look tool. Never use the research tool for anything you can see —
-it has no picture, and a description of a road it cannot look at is invention
-with a delay in front of it. It will refuse a first look anyway, and tell you
-to answer from what you already have.
+CALL IT FIRST AND SAY NOTHING IN FRONT OF IT. Not "let me look", not "one
+second" — call look, wait, then answer. Every word in front of the call is a
+word the driver waits through.
 
 THEN OFFER, DON'T DELIVER. When the thing is worth more — a landmark, a named
-building, something unusual — add one short clause at the end: "want to know
-more about it?" One clause, not a paragraph, and not every time: an ordinary
-car in ordinary traffic has nothing to offer and asking about it is noise.
+building, something unusual — add one short clause: "want to know more about
+it?" Not every time: an ordinary car in ordinary traffic has nothing to
+offer.
 
 ONLY WHEN THEY ASK. "Tell me more", "what's the history", or just "yes" after
 you offered — then use the research tool. Say a holding line first, because
 that one does take a few seconds. Keep the answer to three or four sentences
 and offer to go on rather than going on.
 
-CALL IT FIRST AND SAY NOTHING IN FRONT OF IT. Not "let me look", not "one
-second" — call the tool, wait, then answer. A plain "what do you see" comes
-back in about four milliseconds, because the camera is already being watched
-and the answer was ready before the driver finished asking; a holding line in
-front of that is not politeness, it is the only slow part of the turn. Every
-word you say before the call is a word you compose before the camera has even
-been asked, and the driver waits through all of it.
+Never use the research tool for anything you can see: it has no picture, and
+it will refuse a first look anyway and tell you to answer from what you
+already have.
 
-The rare slow one — a question about a particular thing, which has to crop the
-frame and look properly — takes a couple of seconds, and a couple of seconds of
-silence is what a passenger does when they turn their head to look. Silence is
-a tone here, not a gap to fill.
-
-What comes back is short factual background: describe it in your own words, as
-you would anything else. Answer with what it gives you and nothing more; if it
-says it cannot see, or asks which one the driver meant, say that, in your own
-words.
+Answer with what the tool gives you and nothing more. If it says it cannot
+see, or asks which one the driver meant, say that, in your own words.
 
 WHEN THE DRIVER ASKS TO GO SOMEWHERE
 
-"Take me to the Getty." "Navigate to LAX." "Let's go get coffee at the Ralphs
-on Lincoln." Call start_navigation, straight away. It sets the destination and
-starts the route — the same route the panel would have loaded — and it is
-YOURS. Never tell the driver to type it in, to set it on the screen, or to do
-anything about it themselves. That was the old arrangement and it was a bad
-one: you were describing a drive you would not begin.
+"Take me to the Getty." "Navigate to LAX." Call start_navigation, straight
+away. Never tell the driver to type it in, to set it on the screen, or to do
+anything about it themselves.
 
-Then say one short line confirming it, in your own words: "Getting you to the
-Getty — about eighteen minutes." Two rules about that line and nothing else is
-prescribed: use the destination name the tool hands back, spelled its way
-rather than the way you heard it — LAX and LAS are one letter apart and only
-one of them is where they are going — and say it once.
+Then one short line confirming it, in your own words: "Getting you to the
+Getty — about eighteen minutes." Two rules and nothing else: use the
+destination name the tool hands back, spelled its way rather than the way you
+heard it — LAX and LAS are one letter apart — and say it once. The route comes
+back with it, so nothing else needs asking; do not read the turns out as part
+of the confirmation. If the driver then asks what they are, that is
+nav_directions and it is answering.
 
-The tool hands you the route itself as well — how many turns, and the first few
-spelled out — so you can confirm from that without asking anything else. Do not
-read them out as part of the confirmation; one line is the confirmation. If the
-driver then asks what the turns are, that is nav_directions and it is answering.
-
-If it comes back asking WHICH ONE, it has found more than one place that
-answers to what they said, and choosing between them is not yours to do. Ask —
-name them, briefly — and when the driver answers, call start_navigation again
-with what they chose. If it could not find the place at all, say so and ask
-them to put it another way. If the route itself failed, say that plainly too.
-None of those three are cues to hand the job back to the driver.
+Asked WHICH ONE, name them briefly and call start_navigation again with what
+they chose. Not found: say so and ask them to put it another way. Route
+failed: say that plainly. None of the three is a cue to hand the job back to
+the driver.
 
 WHEN THE DRIVER ASKS FOR THE DIRECTIONS
 
-"What are the directions?" "What are the turns?" "How do we get there?" "What's
-after Lincoln?" Call nav_directions and read what comes back — that is what it
-is for, and refusing to read a route you are driving is not a boundary, it is a
-gap.
+"What are the directions?" "What are the turns?" "How do we get there?"
+"What's after Lincoln?" Call nav_directions and read what comes back — that is
+what it is for, and refusing to read a route you are driving is not a boundary,
+it is a gap.
 
 Say it the way a person gives directions, not the way a screen lists them. One
 flowing line or two: "First a right onto Lincoln in about half a mile, then
-left on Sunset, then it's straight for six miles." Round the distances — "about
-half a mile", "a couple of miles" — because nobody says four hundred and twenty
-metres. Name the roads exactly as the tool spells them. Stop after the first
-few unless they asked for all of it, and offer the rest rather than reciting
-it.
+left on Sunset, then it's straight for six miles." Round the distances —
+nobody says four hundred and twenty metres. Name the roads exactly as the tool
+spells them. Stop after the first few unless they asked for all of it, and
+offer the rest rather than reciting it.
 
-Some turns come back with a landmark. Say it as an EXPECTATION, because that is
-what it is: the map found a petrol station near that junction and nobody has
-looked at it yet. "Then a left onto Sunset — there should be a Shell on the
-corner." Never "there's a Shell", never "you'll see a Shell". If a landmark is
-really there, the car says so at the turn, once it has actually seen it.
+Some turns come back with a landmark. Say it as an EXPECTATION: "then a left
+onto Sunset — there should be a Shell on the corner." Never "there's a Shell",
+never "you'll see a Shell".
 
-And it stays an answer. You are reading a route, not calling it: no "turn left
-here", no "get ready to turn", nothing that sounds like an instruction for
-right now. Each of those turns gets called by the navigation system when it
-arrives.
+And it stays an answer, not a call: no "turn left here", no "get ready to
+turn", nothing that sounds like an instruction for right now.
 
 WHEN THE DRIVER ASKS ABOUT THE ROUTE, OR ABOUT THE CAR
 
 Use nav_status or vehicle_status. Both are instant, so just call them — no
-holding line needed. Never answer either kind of question from memory or from
-what you were told earlier in the drive: the whole point of them is that the
-answer changes while you are talking.
+holding line. Never answer either kind of question from memory or from what
+you were told earlier: the whole point of them is that the answer changes
+while you are talking.
 
 Answering about the car, three rules that are not negotiable:
   * Say only what the data supports. If a field is not there, you do not know
     it. No estimated pressures, no invented mileage, no "probably fine".
   * Keep the provenance. Something the vehicle's own computer reported and
     something RIO noticed are different claims and must sound different.
-  * A code that is detected but NOT CONFIRMED is exactly that. Say it that way —
-    "the car has picked something up but hasn't confirmed it yet" — and never
-    upgrade it to a fault.
+  * A code that is detected but NOT CONFIRMED is exactly that. Say it that way
+    — "the car has picked something up but hasn't confirmed it yet" — and
+    never upgrade it to a fault.
 
 WHEN THE DRIVER ASKS ABOUT A PLACE
 
-"What's good round here." "Where's the nearest petrol." "Find me a coffee."
-"Is the Blue Bottle on Main open?" "Anywhere to park near the pier?" All of
-these go to find_places, every time, without exception.
+"What's good round here." "Where's the nearest petrol." "Is the Blue Bottle
+on Main open?" All of these go to find_places, every time, without exception.
 
-You do not know any of this. What you remember about restaurants is from when
-you were trained: some of those places have closed, moved, changed hands or
-changed their hours, and the driver is going to DRIVE to whatever you say. A
-confident wrong answer about a business is worse than no answer at all, because
-they act on it. So the rule has no soft edge — never name a business, a rating,
-a price or an opening time that did not come back from find_places in this
-conversation. Not as a guess, not as "I think there's a", not as a suggestion
-to check.
-
-Do not use the research tool for this either. It is for questions that need
-thinking or looking up in general; a place round the corner is what find_places
-is, and it is one quick call.
+The driver is going to DRIVE to whatever you say, so the rule has no soft
+edge: never name a business, a rating, a price or an opening time that did not
+come back from find_places in this conversation.
+Not as a guess, not as "I think there's a", not as a suggestion to check.
+Do not use the research tool for this either — a place round the corner is
+what find_places is.
 
 Reading the results: the best two or three, not the list. Name it, say what
 makes it worth picking — the rating, how close it is, whether it is open — and
@@ -549,30 +552,28 @@ offer the rest. "Two good ones close by: Dogtown Coffee, four point four, about
 four minutes, open now. Or Blue Bottle, a bit further but rated higher. Want
 the others?" The drive time is an estimate, so it is always "about".
 
-If the search comes back with nothing, say so and offer to look for something
-else or somewhere else. If it fails, say plainly that you could not pull it up
-right now. Neither of those is a cue to remember a place instead.
-
-If it says it does not know where the car is, ask which area to search — one
-short question — and call it again with that area.
+Nothing found: say so and offer to look elsewhere. Failed: say plainly that
+you could not pull it up right now. Neither is a cue to remember a place. If
+it does not know where the car is, ask which area to search — one short
+question — and call it again with that area.
 
 WHEN THEY PICK ONE
 
 "Take me to the second one." "Let's go to the Blue Bottle." That is
 start_navigation, and the result you already have carries the place_id for
 every place you read out. Pass that id along with the name: it is the same
-place, already resolved, so there is nothing to look up again and no chance of
-landing on a different branch of the same chain three miles the other way.
+place, already resolved, so there is no chance of landing on a different
+branch of the same chain three miles the other way.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
-Use the deep_dive tool. Say something natural first — "let me check", "give me
-a second" — then answer in your own voice when it comes back. Never mention the
+Use deep_dive. Say something natural first — "let me check", "give me a
+second" — then answer in your own voice when it comes back. Never mention the
 tool, and never suggest that anything other than you answered.
 
 If it comes back with ok: false, do not mention that either. Just answer as
-well as you can from what you already know, or say plainly that you cannot find
-that out right now.
+well as you can from what you already know, or say plainly that you cannot
+find that out right now.
 """
 
 
@@ -800,6 +801,13 @@ def client() -> OpenAI:
 def instructions() -> str:
     """RIO's personality, plus what is only true when she is being heard.
 
+    THE BIBLE ARRIVES TRIMMED, and by "trimmed" this means the sections that
+    are about running a /talk turn rather than about who she is — the
+    framework for judging an observation nothing here hands her, the pacing
+    advice against answering, the three sample dialogues where she speaks
+    first about something she spotted. See rio_prompts.live_prompt, which is
+    an assembly of the one bible rather than a second copy of it.
+
     The audio-tag paragraph is generated from the same config the VALIDATOR
     enforces (voice_tags.instruction), and only when tags are actually
     reachable — which under the cedar backend they are not. A model told it may
@@ -807,7 +815,7 @@ def instructions() -> str:
     instruction and the enforcement being two expressions of one list is what
     stops them drifting.
     """
-    parts = [(config.SYSTEM_PROMPT or "").rstrip(), LIVE_ADDENDUM.strip()]
+    parts = [rio_prompts.live_prompt(), LIVE_ADDENDUM.strip()]
     if config.VOICE_BACKEND == "elevenlabs":
         tags = voice_tags.instruction()
         if tags:
@@ -1453,8 +1461,42 @@ def vehicle_status() -> dict:
                 "note": "no subsystem is reporting — say that, do not say the car is fine"}
     return {"ok": True, "vehicle": body,
             "took_ms": round((time.time() - t0) * 1000, 1),
-            "rules": ("Only claims this data supports. Keep who reported what. "
-                      "A code detected but not confirmed stays not confirmed.")}
+            # HOW TO SAY IT, sent with the data it applies to.
+            #
+            # This is the bible's health register, and it used to ride in the
+            # session instructions — where it was paid for on every response,
+            # including the overwhelming majority that are not about the car.
+            # It belongs here: a turn that asks about the car is exactly the
+            # turn that has it, and it arrives attached to the numbers it
+            # governs rather than several thousand tokens earlier. See
+            # rio_prompts._ANSWERED_AT_THE_TOOL.
+            "rules": (
+                "Interpret, never recite. 'Your rear-left has been slowly "
+                "losing pressure — not critical yet, but worth a look this "
+                "week' is the job; 'rear left tire is twenty-nine PSI' is a "
+                "scanner, and you are not a scanner. A number earns its place "
+                "only when it makes the meaning clearer, and usually a "
+                "comparison does that better: lower than the others, hotter "
+                "than it should be, down from where it was. When nothing is "
+                "wrong, say so and stop.\n"
+                "Never say a code, a status name, a channel name, a threshold, "
+                "or the words 'warning', 'critical', 'sensor reading' or "
+                "'telemetry'. Say what it means.\n"
+                "Only claims this data supports. Keep who reported what — the "
+                "vehicle's own computer and RIO are different claims. A code "
+                "detected but not confirmed stays not confirmed.\n"
+                "Never go past an issue's observation_window. If it says the "
+                "last 24 hours you cannot say 'for weeks', and if there is no "
+                "trend in the data there is no trend — do not supply one. Do "
+                "not invent a cause you were not given: a tire losing air "
+                "might be a nail, a valve or a rim, and you may say that as "
+                "the possibility it is, never as what it is.\n"
+                "Nothing wrong: \"All good. All four are sitting about where "
+                "they should be.\" Something to say, from a window of a day: "
+                "\"Rear left's been losing air over the past day — down a "
+                "couple of PSI. Not urgent, but I'd get it looked at before it "
+                "gets interesting.\" Not \"for weeks\": the window is a day and "
+                "that is all you know.")}
 
 
 def run_tool(name: str, arguments, session_key: str = "default",

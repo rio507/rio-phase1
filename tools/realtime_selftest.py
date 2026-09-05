@@ -46,6 +46,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import config          # noqa: E402
 import places          # noqa: E402
 import realtime        # noqa: E402
+import rio_prompts     # noqa: E402
 import voice_tags      # noqa: E402
 
 PASS, FAIL = [], []
@@ -231,10 +232,77 @@ def run_text_session():
 
     # --- THE WHOLE INSTRUCTION SET ----------------------------------------
     instr = text["instructions"]
-    ok(config.SYSTEM_PROMPT.strip() in instr,
-       "the bible is carried whole, not summarised")
+    flat = re.sub(r"\s+", " ", instr)
+    ok(rio_prompts.live_prompt() in instr,
+       "the bible is carried as the live session's assembly of it, whole")
     ok(realtime.LIVE_ADDENDUM.strip() in instr,
        "and the live addendum whole after it")
+
+    # WHAT THE LIVE ASSEMBLY DROPS, AND WHY IT IS NOT A SUMMARY.
+    #
+    # /talk still gets every word (that is asserted below, against the
+    # constant itself). What the live session does not get is the machinery of
+    # a /talk turn: nothing here hands her an observation, so a framework for
+    # judging one has nothing to judge, and three of the sample dialogues have
+    # her speaking FIRST about a hazard or a car she spotted -- which is the
+    # one thing the addendum exists to forbid. They were being paid for on
+    # every response and argued with on every response.
+    for gone, why in (
+            ("# Decision framework", "the framework for judging an "
+                                     "observation nothing here provides"),
+            ("# Pacing — silence is your default state",
+             "the pacing advice against answering"),
+            ("## Scenario 2 — Hazard", "her speaking first about a hazard"),
+            ("## Scenario 3 — Cool car spotted", "...or about a car she spotted"),
+            ("## Scenario 4 — Breaking long silence",
+             "...or to break a silence nobody asked her to break"),
+            ("## Scenario 6 — Vehicle health, nothing wrong",
+             "or the health dialogues, which travel with the health rules"),
+            ("## Scenario 7 — Vehicle health, something to say",
+             "...both of them")):
+        ok(gone not in instr, f"the live session is not sent {why}")
+        ok(gone in config.SYSTEM_PROMPT,
+           f"...while /talk, which needs it, still is ({gone})")
+
+    # ...and her character is all still there. This is the half that would
+    # make a saving into a regression.
+    for kept in ("You are RIO.", "# How you talk", "# Banned words",
+                 "# Your four tonal modes",
+                 "# Hard boundaries — you never", "## Scenario 1 — Greeting",
+                 "## Scenario 5 — Navigation question"):
+        ok(kept in instr, f"and who she is survives it: {kept!r}")
+
+    # THE HEALTH REGISTER IS NOT DROPPED, IT IS DELIVERED LATER. It applies to
+    # the turns that ask about the car and to no others, and those turns carry
+    # it: vehicle_status returns it as `rules`, attached to the numbers it
+    # governs. Paying for it on every response was paying for it on the great
+    # majority of responses that never mention the car.
+    ok("# The car's own health" not in instr,
+       "the health register is not in every response")
+    ok("# The car's own health" in config.SYSTEM_PROMPT,
+       "...while /talk keeps it, because nothing hands /talk a tool result")
+    import vehicle_health
+    real = vehicle_health.context
+    try:
+        vehicle_health.context = lambda full=True: PENDING_CONTEXT
+        rules = realtime.vehicle_status().get("rules") or ""
+    finally:
+        vehicle_health.context = real
+    for rule, what in (
+            ("Interpret, never recite", "interpret rather than recite"),
+            ("you are not a scanner", "...with the line that says why"),
+            ("a comparison does that better",
+             "a number only when it makes the meaning clearer"),
+            ("Never say a code", "no codes, thresholds or the word warning"),
+            ("Keep who reported what", "provenance"),
+            ("observation_window", "and the window the evidence actually "
+                                   "covers, which is the rule that stops "
+                                   "'for weeks' out of a day of data"),
+            ("All four are sitting about where they should be",
+             "with the nothing-wrong answer as words"),
+            ("Rear left's been losing air over the past day",
+             "...and the something-to-say one, window and all")):
+        ok(rule in rules, f"and it arrives with the data instead: {what}")
 
     # The sections, each by a phrase from its own body. Symptom 3 was RIO
     # saying the car would read the directions -- the behaviour from before
@@ -246,7 +314,7 @@ def run_text_session():
              "...and it says to call the tool rather than defer to the car"),
             ("refusing to read a route you are driving is not a boundary",
              "...and names the old behaviour as the gap it is"),
-            ("A first answer is\n  ALWAYS short",
+            ("A first answer is ALWAYS short",
              "the two-tier visual policy: the first answer is short"),
             ("depth is something they ask for",
              "...and depth is the driver's to ask for"),
@@ -258,7 +326,9 @@ def run_text_session():
              "the route-and-car section"),
             ("YOU ANSWER. YOU DO NOT ANNOUNCE.",
              "and the rule the whole live addendum is built around")]:
-        ok(phrase in instr, what)
+        # Against the unwrapped text: these are paragraphs, and a phrase that
+        # happens to straddle a newline is not a different instruction.
+        ok(phrase in flat, what)
 
     if voice_tags.instruction().strip():
         ok(voice_tags.instruction().strip() in instr,
@@ -286,6 +356,16 @@ def run_text_session():
         ok("WHEN THE DRIVER ASKS FOR THE DIRECTIONS"
            in (sess.get("instructions") or ""),
            "and with the directions section intact")
+
+
+# What the account actually has, per minute, for the realtime model. Not from
+# a doc: the live session reports it on every response in rate_limits.updated,
+# and tools/live_tool_turns.py prints the lowest it saw on a real drive.
+TPM = 40_000
+
+# ...and therefore what one response may cost. Four tool turns a minute is
+# eight responses; see run_session_cost for why that is the cadence to size to.
+PER_RESPONSE_CEILING = TPM // 8
 
 
 def run_session_cost():
@@ -332,17 +412,32 @@ def run_session_cost():
 
     ok(floor > 0, f"one response carries {floor:,} tokens of input before the "
                   f"driver has said anything")
-    # A ceiling worth stating out loud. 40k tokens/min is the entry limit on
-    # the realtime model, and the arithmetic below is why a drive with three
-    # tool questions in a minute stops answering.
-    for tpm in (40_000, 200_000):
-        plain = tpm // floor
-        tool = tpm // (floor * 2)
-        print(f"      at {tpm:>7,} TPM: ~{plain} plain answers a minute, "
-              f"~{tool} tool answers")
-    ok(floor < 12_000,
-       f"and it is under twelve thousand ({floor:,}) — past that a 40k/min "
-       "account cannot finish three tool turns in a minute")
+    for tpm in (TPM, 200_000):
+        print(f"      at {tpm:>7,} TPM: ~{tpm // floor} plain answers a "
+              f"minute, ~{tpm // (floor * 2)} tool answers")
+
+    # THE BUDGET, AS A TEST RATHER THAN AS A NOTE.
+    #
+    # 40,000 tokens a minute is what the account actually has — the session
+    # says so itself on every response, in rate_limits.updated, and that is
+    # where this number comes from rather than from a doc.
+    #
+    # A driver asking something every fifteen seconds is four turns a minute.
+    # If all four need a tool that is eight responses, so a response has 5,000
+    # tokens to spend before the answers start failing — and they fail
+    # silently, as a response the API refuses and nothing said. That is the
+    # ceiling this asserts, and it is asserted rather than noted because the
+    # instructions are exactly the kind of thing that grows by a paragraph at
+    # a time and nobody notices until a drive goes quiet.
+    #
+    # Room to grow: what is left of the 5,000 after today's prompt.
+    ok(floor <= PER_RESPONSE_CEILING,
+       f"one response fits the budget: {floor:,} tokens against a ceiling of "
+       f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare), "
+       f"so {TPM // (floor * 2)} tool turns a minute fit in {TPM:,}")
+    ok(floor * 2 * 4 <= TPM,
+       f"...and four tool turns in a minute — the cadence of a driver asking "
+       f"something every fifteen seconds — costs {floor * 2 * 4:,} of {TPM:,}")
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +662,10 @@ def run_firewall():
     # `observer` and `re` arrived with the fast path for visual questions: the
     # observer is a read that runs Qwen over frames already in the ring, and it
     # is checked below like places is.
+    # `rio_prompts` is the bible itself, as text. It is imported for
+    # live_prompt(), which assembles the same prompt /talk gets minus the
+    # sections about running a /talk turn -- a string operation over a string
+    # constant, with nothing on the other side of it.
     # `voice_tags` is the newest name on this list and the one that needs its
     # own sentence. It is a regex over a string and a read of a config tuple —
     # it cannot synthesise, cannot reach a policy and cannot start a sentence.
@@ -577,7 +676,7 @@ def run_firewall():
     ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
                         "openai", "config", "visual_qa", "router",
                         "vehicle_health", "places", "observer",
-                        "base64", "io", "wave", "voice_tags"},
+                        "base64", "io", "wave", "voice_tags", "rio_prompts"},
        f"and imports only read-side code and stdlib ({sorted(live_imports)})")
     tag_imports = _imports_of(os.path.join(REPO, "voice_tags.py"))
     ok(tag_imports <= {"re", "config"},

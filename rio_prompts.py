@@ -270,6 +270,115 @@ You are RIO. The road is the interface. Talk only when it matters.
 
 
 # ---------------------------------------------------------------------------
+# ...AND THE SAME BIBLE, FOR A CONVERSATION SHE IS HAVING OUT LOUD.
+# ---------------------------------------------------------------------------
+# RIO_SYSTEM_PROMPT above is written for the /talk turn, and /talk is a
+# particular shape of turn: an observer's note plus a transcript go in, and one
+# line — possibly the empty string — comes out. Several sections of it are
+# about running THAT turn rather than about who she is.
+#
+# In a live session they are worse than wasted. Nothing hands her an
+# observation, so a framework for judging one has nothing to judge; every turn
+# begins with the driver asking her something, so "most observations should
+# produce NO reply" and "wait at least 30 seconds" are advice against
+# answering; and three of the sample dialogues are her SPEAKING FIRST about a
+# hazard or a car she spotted, which is the one thing LIVE_ADDENDUM exists to
+# forbid. The addendum was spending its own tokens arguing with them.
+#
+# THE COST OF SENDING THEM ANYWAY, which is the reason this exists at all:
+# every response re-sends the whole instruction set, and a tool turn spends two
+# responses — one to call the tool, one to answer from the result. At a 40,000
+# token-per-minute ceiling that is what decides how many questions a driver can
+# ask in a minute before the answers stop coming, and it is why the failures
+# were all on tool turns while "hello" kept working. See
+# tools/realtime_selftest.py run_session_cost for the arithmetic.
+#
+# ONE BIBLE, TWO ASSEMBLIES. Not two bibles: her character is one thing and a
+# second copy of it is a second thing to drift. What is dropped is named by
+# heading, and every name is CHECKED to have matched — a heading renamed
+# upstream fails the suite rather than quietly going back to being sent.
+
+# Sections that describe how a /talk turn is decided, not who RIO is.
+_BATCH_ONLY_SECTIONS = (
+    "# Pacing — silence is your default state",
+    "# Decision framework — every turn, you decide:",
+)
+
+# ...and one that IS live-relevant and still does not belong in every response:
+# how to talk about the car's health. It is needed on the turns that ask about
+# the car and on no others, and those turns already carry it — vehicle_status
+# returns it as `rules` alongside the data it applies to, which is both where
+# it is relevant and where it cannot be forgotten. The three rules that are
+# absolute (what the data supports, provenance, pending stays pending) are in
+# LIVE_ADDENDUM as well, because those are about truthfulness rather than
+# register and are worth being told twice.
+#
+# /talk keeps it in the prompt, and has to: nothing hands /talk a tool result.
+_ANSWERED_AT_THE_TOOL = (
+    "# The car's own health",
+)
+
+# ...and the sample dialogues where she speaks FIRST, off an observation.
+# Scenario 3's line is already in tonal mode 3 word for word, so this drops a
+# duplicate rather than a definition.
+_BATCH_ONLY_SCENARIOS = (
+    "## Scenario 2 — Hazard",
+    "## Scenario 3 — Cool car spotted",
+    "## Scenario 4 — Breaking long silence",
+    # ...and the two health dialogues, which travel with the health register
+    # they illustrate rather than ahead of every response. Same reason as
+    # _ANSWERED_AT_THE_TOOL: an example of how to answer about the tires is
+    # worth having on the turn that asks about the tires. Both are in
+    # realtime.vehicle_status's `rules`, in shorter words.
+    "## Scenario 6 — Vehicle health, nothing wrong",
+    "## Scenario 7 — Vehicle health, something to say",
+)
+
+
+def _sections(text, level):
+    """Split on markdown headings of exactly `level`, keeping each heading."""
+    out, cur = [], []
+    mark = "#" * level + " "
+    for line in text.split("\n"):
+        if line.startswith(mark) and not line.startswith(mark + "#"):
+            if cur:
+                out.append("\n".join(cur))
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def live_prompt() -> str:
+    """The bible as a live session should hear it. Never used by /talk."""
+    kept, dropped = [], []
+    for block in _sections(RIO_SYSTEM_PROMPT, 1):
+        head = block.split("\n", 1)[0].strip()
+        if head in _BATCH_ONLY_SECTIONS or head in _ANSWERED_AT_THE_TOOL:
+            dropped.append(head)
+            continue
+        if head.startswith("# Sample dialogues"):
+            scenes = []
+            for scene in _sections(block, 2):
+                name = scene.split("\n", 1)[0].strip()
+                if name in _BATCH_ONLY_SCENARIOS:
+                    dropped.append(name)
+                    continue
+                scenes.append(scene.rstrip())
+            block = "\n\n".join(scenes)
+        kept.append(block.rstrip())
+    missing = [n for n in _BATCH_ONLY_SECTIONS + _ANSWERED_AT_THE_TOOL
+               + _BATCH_ONLY_SCENARIOS if n not in dropped]
+    if missing:
+        # Loud, not silent. A heading that no longer matches means the section
+        # is being sent again, five times a minute, and nothing else would say
+        # so. tools/realtime_selftest.py asserts this is empty.
+        raise ValueError(f"live_prompt: no such section(s): {missing}")
+    return "\n\n".join(kept).strip()
+
+# ---------------------------------------------------------------------------
 # Few-shot examples for the GPT-4o turn — paste these as prior turns when
 # you want even tighter conformance. Optional — start without them.
 # ---------------------------------------------------------------------------
