@@ -1208,6 +1208,24 @@ def depth_allowed(session_key: str, question: str, context: str = "") -> dict:
     right for them and this gate never sees them.
     """
     text = f"{question or ''} {context or ''}"
+    # WHAT THE DRIVER ASKED, kept apart from what the model wrote ABOUT what
+    # the driver asked.
+    #
+    # `context` is the model's own commentary on its own tool call, and it is
+    # written freely: "Driver asked for a concise explanation. THIS is general
+    # automotive history and engineering context, not a place, route, or
+    # vehicle status." Every refusal below used to be decided on that string
+    # as well as on the question, and one demonstrative pronoun in it was
+    # enough -- so a question about power steering, asked a minute after a
+    # look at the car ahead, was refused as a follow-up about the car. The
+    # model was saying in as many words that it was NOT about the camera and
+    # the gate read the sentence saying so as the evidence that it was.
+    #
+    # So: A REFUSAL IS DECIDED BY THE DRIVER'S QUESTION. Only an ALLOWANCE may
+    # read the context, where a false positive costs nothing worse than a
+    # research answer to a research question -- which is what _DEPTH_REQUEST
+    # below is, and it is the one check that still sees both.
+    asked = question or ""
     key = str(session_key or "default")
     now = time.time()
 
@@ -1220,7 +1238,7 @@ def depth_allowed(session_key: str, question: str, context: str = "") -> dict:
     if st.get("depth_until", 0) > now:
         return {"allowed": True, "reason": "depth_window_open"}
 
-    if _LOOKS_VISUAL.search(text):
+    if _LOOKS_VISUAL.search(asked):
         return {"allowed": False, "reason": "visual_question"}
 
     looked_recently = (now - st.get("last_look_t", 0)) < float(config.DEPTH_COLD_S)
@@ -1229,8 +1247,8 @@ def depth_allowed(session_key: str, question: str, context: str = "") -> dict:
         # question, and the answer is not "yes, because of the clock" -- see
         # _subject_words above for what that cost.
         last_q = st.get("last_look_q") or ""
-        if (_subject_words(text) & _subject_words(last_q)
-                or _BACK_REFERENCE.search(text)):
+        if (_subject_words(asked) & _subject_words(last_q)
+                or _BACK_REFERENCE.search(asked)):
             return {"allowed": False, "reason": "first_look"}
         return {"allowed": True, "reason": "different_question"}
     return {"allowed": True, "reason": "not_a_visual_question"}

@@ -2974,6 +2974,52 @@ def run_two_tier():
         ok(not g["allowed"] and g["reason"] == "first_look",
            f"a follow-up that {why} is still the same turn, and refused: {q!r}")
 
+    # 3c. THE MODEL'S OWN COMMENTARY IS NOT EVIDENCE ABOUT THE DRIVER.
+    #
+    # `context` is written by the model about its own call, and it writes
+    # freely. This exact pair came off a live drive: a power-steering question
+    # asked a minute after a look at the car ahead, refused as a follow-up
+    # about that car because the model's context contained the word "This".
+    # It was, in the same sentence, saying the question was NOT about the
+    # camera. Symptom three of three, and the only one where the gate refused
+    # on a string the driver never said.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "What kind of car is in front of us?")
+    g = realtime.depth_allowed(
+        key, "Why carmakers switched from hydraulic power steering to "
+             "electric power steering.",
+        "Driver asked for a concise explanation. This is general automotive "
+        "history and engineering context, not a place, route, or vehicle "
+        "status.")
+    ok(g["allowed"] and g["reason"] == "different_question",
+       f"a demonstrative in the model's context does not make a research "
+       f"question a follow-up ({g['reason']})")
+
+    # ...nor does a word the model happens to share with the last look.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "what is that vehicle ahead")
+    g = realtime.depth_allowed(
+        key, "how does regenerative braking work",
+        "Not a place, route, or vehicle status — general engineering.")
+    ok(g["allowed"],
+       f"nor does a subject word that appears only in the model's own note "
+       f"({g['reason']})")
+
+    # AND THE REFUSALS THAT MATTER STILL LAND, because they were always in
+    # what the driver said. A context that cannot rescue a follow-up is the
+    # other half of the same rule.
+    realtime._visual_turns.pop(key, None)
+    realtime.note_look(key, "what is that building")
+    g = realtime.depth_allowed(key, "is it open to the public",
+                               "General knowledge question about a landmark.")
+    ok(not g["allowed"] and g["reason"] == "first_look",
+       "a driver pointing back at the thing is still the same turn, whatever "
+       "the model writes alongside it")
+    g = realtime.depth_allowed(key, "what is that sign",
+                               "The driver wants general road-sign trivia.")
+    ok(not g["allowed"] and g["reason"] == "visual_question",
+       "and a visual question is still visual, however it is annotated")
+
     # 4. A QUESTION THAT WAS NEVER VISUAL IS NEVER TOUCHED BY ANY OF THIS.
     realtime._visual_turns.pop(key, None)
     for q in ("how does regenerative braking work",
