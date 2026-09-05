@@ -236,14 +236,26 @@ async def run(base, out_path, video, dump=None):
                 mark = len(panel.notes)
                 t_ask = time.perf_counter()
 
-                # The driver speaks, at the speed a driver speaks.
-                payload = q_pcm + silence(int(config.REALTIME_VAD_SILENCE_MS) + 400)
+                # THE DRIVER SPEAKS, AND THE MICROPHONE KEEPS RUNNING.
+                #
+                # The tail used to be sized from REALTIME_VAD_SILENCE_MS, and
+                # that broke the moment turn detection stopped being a silence
+                # timer: a detector observes silence in the audio it is given
+                # and cannot observe an absence of audio, so a tail shorter
+                # than its slowest decision leaves the turn hanging. Three of
+                # six questions in a drive went unanswered that way, and then
+                # arrived merged into one turn — a fault entirely in this
+                # file. A real cabin never stops sending.
+                payload = q_pcm + silence(4000)
                 step = int(RATE * 20 / 1000) * 2
+                start = time.perf_counter()
                 for i in range(0, len(payload), step):
+                    delay = start + (i / 2) / RATE - time.perf_counter()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
                     await oai.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(payload[i:i + step]).decode()}))
-                    await asyncio.sleep(0.02)
 
                 # Wait for the answer, then for the speaker to run out. A
                 # script that asks the next question over the tail of the last

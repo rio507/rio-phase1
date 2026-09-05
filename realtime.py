@@ -823,6 +823,46 @@ def instructions() -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def turn_detection() -> dict:
+    """When the DRIVER has finished talking. Not when RIO should stop.
+
+    Those are two different questions and this answers only the first. RIO
+    stopping is the browser's, on its own evidence, and nothing here changes
+    it: `interrupt_response` stays off under either detector, and
+    `input_audio_buffer.speech_started` — the event the barge-in gate is built
+    on — is emitted identically by both. Checked, because the whole
+    interruption design rests on it.
+
+    TWO WAYS TO DECIDE THE DRIVER HAS STOPPED.
+    ------------------------------------------
+    `server_vad` waits for a fixed stretch of quiet. `semantic_vad` waits
+    until the sentence sounds finished. The second is what a person does, and
+    the difference shows up on exactly the utterance a timer cannot handle: a
+    driver hesitating in the middle of one. "Take me to... um... the Getty" is
+    two turns to a timer set shorter than the pause and one turn to a listener.
+
+    The measurement is in config.REALTIME_TURN_DETECTION and the tool that
+    produced it is tools/turn_end_bench.py. The short version: the 700 ms
+    silence window this used to run cost 829 ms on every turn and still cut
+    three hesitations in eight in half. semantic_vad cuts none of them, at
+    752 ms.
+    """
+    if str(config.REALTIME_TURN_DETECTION).lower() == "semantic_vad":
+        td = {"type": "semantic_vad",
+              "eagerness": str(config.REALTIME_SEMANTIC_EAGERNESS)}
+    else:
+        td = {"type": "server_vad",
+              "threshold": float(config.REALTIME_VAD_THRESHOLD),
+              "prefix_padding_ms": int(config.REALTIME_VAD_PREFIX_MS),
+              "silence_duration_ms": int(config.REALTIME_VAD_SILENCE_MS)}
+    # THE SAME UNDER BOTH, AND DELIBERATELY. A finished sentence gets an answer
+    # without a button; and interruption is decided in the browser, which is
+    # the only side that can tell a driver from a door. See session_config.
+    td["create_response"] = True
+    td["interrupt_response"] = False
+    return td
+
+
 def session_config() -> dict:
     """The live session, as the API wants it.
 
@@ -875,15 +915,7 @@ def session_config() -> dict:
         "audio": {
             "input": {
                 "transcription": {"model": config.OPENAI_STT_MODEL},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": float(config.REALTIME_VAD_THRESHOLD),
-                    "prefix_padding_ms": int(config.REALTIME_VAD_PREFIX_MS),
-                    "silence_duration_ms": int(config.REALTIME_VAD_SILENCE_MS),
-                    "create_response": True,
-                    # See the docstring: the browser owns interruption.
-                    "interrupt_response": False,
-                },
+                "turn_detection": turn_detection(),
             },
             "output": {"voice": config.OPENAI_REALTIME_VOICE},
         },

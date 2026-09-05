@@ -157,10 +157,90 @@ REALTIME_LOOK_ANSWER_MAX_TOKENS = 60
 # activity detector firing on RIO's own voice coming back through the cabin, or
 # on a cough, a door, a wiper — and the answer being thrown away for it.
 #
-# Server VAD defaults (threshold 0.5, 300 ms prefix, 500 ms silence) are tuned
-# for a quiet room with a headset. A car is neither. The threshold goes up so
-# ordinary cabin noise does not read as speech, and the silence window goes up
-# so a pause for breath mid-question does not end the driver's turn early.
+# HOW THE DRIVER'S TURN ENDS, which is a different question from how RIO's
+# does and is answered by a different mechanism. See REALTIME_BARGE_* below
+# for the second one; nothing here touches it.
+#
+# "semantic_vad" ends the turn on whether the sentence SOUNDS FINISHED, and
+# "server_vad" ends it on a fixed stretch of quiet. That difference is the
+# whole point, because a silence timer is a bet that no driver pauses for
+# longer than it, and drivers do: "take me to... um... the Getty".
+#
+# MEASURED, on the real API, thirty complete questions and eight with a
+# hesitation spliced into the middle (tools/turn_end_bench.py):
+#
+#   config              p50     p95   ended   sentences cut in half
+#   server_vad 400     528m    568m   30/30      6/8
+#   server_vad 500     631m    669m   30/30      4/8
+#   server_vad 600     728m    769m   30/30      4/8
+#   server_vad 700     829m    869m   30/30      3/8   <- what this was
+#   semantic_vad low   762m    942m   26/30*     0/8
+#   semantic_vad med   723m   1678m   29/30*     0/8
+#   semantic_vad high  705m   1308m   50/50      0/40  <- what this is
+#
+# * READ THOSE TWO STARS AS UNKNOWN, NOT AS BAD. Those runs fed a fixed tail
+#   of silence after each question and then stopped sending; a detector
+#   observes silence in the audio it is given and cannot observe an absence of
+#   audio, so a decision slower than the tail had nothing left to decide on
+#   and the turn simply never ended. That is the bench, not the detector, and
+#   it is fixed (tools/turn_end_bench.py TAIL_MS, and the microphone in
+#   tools/live_tool_turns.py, which now keeps running the way a cabin does).
+#   The chosen row was re-measured after the fix and did not need the excuse:
+#   50 questions, 50 turns ended, 40 hesitations and none cut.
+#
+# Read the 600 ms row against the last one: the same median wait, and four
+# hesitations cut instead of none. That is the whole argument for the switch —
+# not that semantic_vad is dramatically quicker, but that every server_vad
+# setting fast enough to be worth having cuts more sentences in half than the
+# one it replaces.
+#
+# The 700 ms silence window was buying protection it did not deliver: at that
+# setting three of eight hesitations still cut the sentence in half, and the
+# driver paid 829 ms on every single turn for it. semantic_vad cut none of
+# them and is faster at the median.
+#
+# WHAT IT COSTS, stated because it is real: the tail is worse and less
+# predictable. server_vad is a timer and lands within 100 ms of the same
+# number every time; semantic_vad is a judgement, and the same sentence came
+# back at 647 ms and at 1,090 ms on different runs. The median is better than
+# what it replaces and the p95 is worse, and a driver notices both.
+#
+# "high" over "medium" on the tail, which is the only place they differ that
+# matters: medium's p95 was 1,678 ms against high's 1,308, and the medians are
+# within the jitter of each other. "high" is also the row that was
+# re-measured at scale after the bench was fixed, so it is the one whose
+# numbers above are not carrying an asterisk.
+#
+# WHAT THE GUARANTEE ACTUALLY IS, stated exactly rather than as "no false
+# cuts". A silence timer cuts on the GAP and does not care what was said, so
+# it splits "take me to... um... the Getty" whatever the words are. This cuts
+# on the WORDS: it holds a half left dangling on a preposition or an auxiliary
+# — "take me to...", "navigate to...", "what do you..." — which is what a
+# hesitating driver leaves, measured at 0 cuts in 40 over gaps from 350 to
+# 900 ms. It ends a half that was already a question: "What's that... car
+# ahead?" gets ended after "What's that", and so does "Can you find me... a
+# coffee?" after "Can you find me". That is the detector working. The
+# difference in what it costs is the point — a turn ended there gets a
+# sensible answer to a real question, where a timer ending after "take me to"
+# answers a fragment.
+#
+# NO THRESHOLD UNDER semantic_vad, and that turned out not to matter. The 0.62
+# below was raised from 0.5 to stop RIO's own voice returning through the
+# cabin from reading as speech -- and measured, it never did that job: her
+# voice at a tenth of full scale fires the detector at 0.62, at 0.5, and under
+# semantic_vad, identically. What actually protects an answer from the cabin
+# is the browser's sustain gate, exactly as REALTIME_BARGE_SUSTAIN_MS says.
+# The server_vad numbers below are kept because server_vad is one env var
+# away and they are what it should be set to.
+REALTIME_TURN_DETECTION = os.getenv("RIO_TURN_DETECTION", "semantic_vad")
+
+# How ready semantic_vad is to call a sentence finished: low, medium, high or
+# auto. Higher is quicker to end the turn and quicker to be wrong about it.
+REALTIME_SEMANTIC_EAGERNESS = os.getenv("RIO_SEMANTIC_EAGERNESS", "high")
+
+# ...and the server_vad settings, for when it is selected. Defaults (threshold
+# 0.5, 300 ms prefix, 500 ms silence) are tuned for a quiet room with a
+# headset; a car is neither.
 REALTIME_VAD_THRESHOLD = 0.62
 REALTIME_VAD_PREFIX_MS = 300
 REALTIME_VAD_SILENCE_MS = 700

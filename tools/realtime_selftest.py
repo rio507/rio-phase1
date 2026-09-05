@@ -76,7 +76,8 @@ def run_session():
        "and it is one of the two voices chosen for her")
 
     td = s["audio"]["input"]["turn_detection"]
-    ok(td["type"] == "server_vad", "the server listens for turns itself")
+    ok(td["type"] == str(config.REALTIME_TURN_DETECTION),
+       f"the server decides when the driver has finished ({td['type']})")
     ok(td.get("create_response") is True,
        "a finished sentence gets an answer without a button")
 
@@ -93,16 +94,49 @@ def run_session():
     ok(td.get("interrupt_response") is False,
        "interruption is the BROWSER's decision, not the server's — it is the "
        "only side that can tell a driver from a door")
-    ok(td.get("threshold") == config.REALTIME_VAD_THRESHOLD
-       and td["threshold"] > 0.5,
-       f"the detector is tuned for a cabin rather than a headset "
-       f"(threshold {td.get('threshold')} vs the 0.5 default)")
-    ok(td.get("silence_duration_ms") == config.REALTIME_VAD_SILENCE_MS
-       and td["silence_duration_ms"] > 500,
-       f"and a pause for breath does not end the driver's turn early "
-       f"({td.get('silence_duration_ms')} ms vs the 500 ms default)")
-    ok(td.get("prefix_padding_ms") == config.REALTIME_VAD_PREFIX_MS,
-       "with the prefix padding stated rather than defaulted")
+
+    # WHICHEVER DETECTOR IS SELECTED, ITS OWN SETTINGS ARE STATED RATHER THAN
+    # DEFAULTED. Both are supported and one env var apart, so both are checked
+    # against the numbers config actually holds -- a test that only knew about
+    # the one in use would go quiet the moment somebody switched.
+    if td["type"] == "semantic_vad":
+        ok(td.get("eagerness") == str(config.REALTIME_SEMANTIC_EAGERNESS),
+           f"...on whether the sentence sounds finished, at eagerness "
+           f"{td.get('eagerness')!r}")
+        ok(td.get("eagerness") in ("low", "medium", "high", "auto"),
+           "which is one of the four the API takes")
+        ok("threshold" not in td and "silence_duration_ms" not in td,
+           "and it carries no silence timer, because it is not one — the "
+           "measurement is in config.REALTIME_TURN_DETECTION")
+    else:
+        ok(td.get("threshold") == config.REALTIME_VAD_THRESHOLD
+           and td["threshold"] > 0.5,
+           f"the detector is tuned for a cabin rather than a headset "
+           f"(threshold {td.get('threshold')} vs the 0.5 default)")
+        ok(td.get("silence_duration_ms") == config.REALTIME_VAD_SILENCE_MS
+           and td["silence_duration_ms"] > 500,
+           f"and a pause for breath does not end the driver's turn early "
+           f"({td.get('silence_duration_ms')} ms vs the 500 ms default)")
+        ok(td.get("prefix_padding_ms") == config.REALTIME_VAD_PREFIX_MS,
+           "with the prefix padding stated rather than defaulted")
+
+    # ...AND THE BARGE-IN CONTRACT SURVIVES THE SWITCH, WHICHEVER IT IS.
+    # Turn detection decides when the DRIVER has stopped. Interruption decides
+    # when RIO has to, and it is the browser's — so the two things the browser
+    # needs are checked against both detectors rather than against the one
+    # that happened to be configured when this was written.
+    real = config.REALTIME_TURN_DETECTION
+    try:
+        for kind in ("server_vad", "semantic_vad"):
+            config.REALTIME_TURN_DETECTION = kind
+            other = realtime.turn_detection()
+            ok(other["type"] == kind and other["create_response"] is True
+               and other["interrupt_response"] is False,
+               f"{kind} answers without a button and never cancels her "
+               f"itself — the browser is still the only thing that can tell "
+               f"a driver from a door")
+    finally:
+        config.REALTIME_TURN_DETECTION = real
 
     # The other half of the policy, which the browser must not hold its own
     # copy of — same discipline as the verbatim dictation instruction.
@@ -1437,6 +1471,145 @@ def run_split_turn():
        f"on the first turn: {heard2}")
 
 
+def run_turn_end():
+    """How long she waits before realising the driver has stopped, and whether
+    she can be made to jump the gun.
+
+    MEASURED, against the real API, because turn detection happens on the
+    server and there is nothing local to test. Two cases, and they are the two
+    halves of one trade -- a detector can always be made faster by being
+    wronger, so checking the speed without checking the cut is checking
+    nothing:
+
+      FAST COMPLETE    a finished question ends the turn quickly. This is the
+                       driver's complaint: "I stop talking and she sits there".
+      SLOW UNFINISHED  a driver hesitating mid-sentence does NOT get their
+                       sentence cut in half and answered as two.
+
+    The full sweep across detectors and settings is tools/turn_end_bench.py;
+    this is the two numbers that must not regress, pinned where the suite
+    will run them.
+    """
+    section("M. ending the driver's turn — quickly, and not too quickly")
+
+    import asyncio
+    import statistics
+
+    from openai import AsyncOpenAI
+
+    from tools.turn_end_bench import (TAIL_MS, Log, run_one, say,
+                                  silence)
+
+    td = realtime.turn_detection()
+
+    async def drive(clips):
+        """Feed each clip and report (ms to turn end, turns it produced)."""
+        client = AsyncOpenAI()
+        cfg = realtime.session_config()
+        # No responses: this measures ears, not mouth, and a model answering
+        # every clip would spend the minute's tokens on nothing.
+        cfg["audio"]["input"]["turn_detection"] = dict(td, create_response=False)
+        out = []
+        log = Log()
+        async with client.realtime.connect(
+                model=config.OPENAI_REALTIME_MODEL) as conn:
+            await conn.session.update(session=cfg)
+
+            async def reader():
+                async for ev in conn:
+                    log.events.append((time.perf_counter(), ev.type))
+
+            task = asyncio.create_task(reader())
+            await asyncio.sleep(0.5)
+            for pcm in clips:
+                start, t_end = await run_one(conn, log, pcm, TAIL_MS, 2.0)
+                ends = log.since(start, "input_audio_buffer.committed")
+                out.append(((ends[0] - t_end) * 1000 if ends else None,
+                            len(ends)))
+                await asyncio.sleep(0.4)
+            task.cancel()
+        return out
+
+    # --- 1. A FINISHED QUESTION, ENDED QUICKLY ----------------------------
+    complete = ["What do you see?", "What's that car ahead?",
+                "How far to the next turn?", "Take me to the Getty.",
+                "What are the directions?"]
+    got = asyncio.run(drive([say(q) for q in complete]))
+    ended = [ms for ms, n in got if ms is not None]
+    ok(len(ended) == len(complete),
+       f"every finished question ends the driver's turn ({len(ended)}/"
+       f"{len(complete)})")
+    if ended:
+        med = statistics.median(ended)
+        print(f"      turn-end latency: {[round(x) for x in ended]}  "
+              f"median {med:.0f} ms")
+        # A ceiling rather than a target. The median measured on the shipped
+        # detector is ~750 ms; 1,100 leaves room for the jitter that a
+        # judgement has and a timer does not, and still fails if the wait goes
+        # back to what it was.
+        ok(med < 1100,
+           f"and does it in {med:.0f} ms at the median, against the 829 ms "
+           f"the 700 ms silence window used to cost")
+    ok(all(n == 1 for _, n in got),
+       "with one turn per question — no finished sentence split in two")
+
+    # --- 2. A DRIVER HESITATING, NOT CUT IN HALF --------------------------
+    # "Take me to... um... the Getty" is the utterance every silence timer
+    # gets wrong, and the reason the window was set so wide in the first
+    # place. Each detector is checked against its OWN promise: semantic_vad
+    # claims to hear that the sentence is unfinished, server_vad only claims
+    # to wait out a pause shorter than its window.
+    # THE FIRST HALF HAS TO BE SYNTACTICALLY UNFINISHED, and getting that
+    # wrong is how this test lied twice before it was right. It was written
+    # with "What's that... car ahead?" and then "Can you find me... a coffee?"
+    # and both were cut in two — correctly, because "What's that?" and "Can
+    # you find me?" are complete questions and a detector that hears
+    # completeness is supposed to hear it there.
+    #
+    # THAT IS THE REAL SHAPE OF THE GUARANTEE, and it is worth saying exactly
+    # rather than as "no false cuts". A silence timer cuts on the GAP and does
+    # not care what was said, so "take me to... um... the Getty" is two turns
+    # to it whatever the words are. A content-based detector cuts on the
+    # WORDS: it holds an utterance left dangling on a preposition or an
+    # auxiliary — which is what a hesitating driver leaves — and it ends one
+    # whose first half was already a question, which then gets a sensible
+    # answer rather than an answer to a fragment.
+    #
+    # These four are dangling halves, and tools/turn_end_bench.py measures
+    # this class at 0 cuts in 40 over gaps from 350 to 900 ms.
+    gaps = [700, 900] if td["type"] == "semantic_vad" else [
+        max(120, int(config.REALTIME_VAD_SILENCE_MS) - 300)]
+    clips, labels = [], []
+    for gap in gaps:
+        clips.append(say("Take me to") + silence(gap) + say("the Getty."))
+        labels.append(f"take me to... [{gap} ms] ...the Getty")
+        clips.append(say("Navigate to") + silence(gap) + say("LAX please."))
+        labels.append(f"navigate to... [{gap} ms] ...LAX please")
+    got = asyncio.run(drive(clips))
+    for label, (_, n) in zip(labels, got):
+        ok(n == 1, f"one sentence, one turn: {label} (got {n})")
+    if td["type"] == "semantic_vad":
+        ok(True, "...which a silence timer cannot do: at 700 ms of quiet it "
+                 "has already answered half a sentence")
+        # And the limit, stated as a behaviour rather than as a caveat: an
+        # unfinished sentence whose first half IS a sentence gets ended there,
+        # and nothing content-based can avoid that.
+        # ...and the edge of it, reported rather than asserted. A half that
+        # could BE a question is where content-based detection stops helping,
+        # and it is borderline rather than binary — the same clip lands on
+        # either side of the line on different runs. Printed so the boundary
+        # stays visible; not asserted, because an assertion about a coin is a
+        # flaky test rather than a guarantee.
+        print("      where it stops helping — a first half that is itself a "
+              "question:")
+        for head, tail in (("What's that", "car ahead?"),
+                           ("Can you find me", "a coffee?")):
+            got = asyncio.run(drive(
+                [say(head) + silence(900) + say(tail)]))
+            print(f"        \"{head}... [900 ms] ...{tail}\" -> "
+                  f"{got[0][1]} turn(s)")
+
+
 def run_latency():
     section("LATENCY — text to first audio, the old way and the new")
     import statistics
@@ -2717,6 +2890,7 @@ def main():
         run_verbatim()
         run_latency()
         run_split_turn()
+        run_turn_end()
     if args.chain:
         run_chain()
 

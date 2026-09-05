@@ -87,10 +87,11 @@ def run_session():
     ok(audio_in["transcription"]["model"] == config.OPENAI_STT_MODEL,
        "audio input is untouched: the same Whisper transcribes the driver")
     td = audio_in["turn_detection"]
-    ok(td["type"] == "server_vad"
-       and abs(td["threshold"] - float(config.REALTIME_VAD_THRESHOLD)) < 1e-9
-       and td["silence_duration_ms"] == int(config.REALTIME_VAD_SILENCE_MS),
-       "...and the cabin-tuned detector, at the same numbers")
+    ok(td == realtime.turn_detection(),
+       f"...and the same turn detector, whichever it is ({td['type']}) — the "
+       f"voice backend is about her mouth and must not reach her ears")
+    ok(td.get("interrupt_response") is False,
+       "with interruption still the browser's to decide")
     ok(td["interrupt_response"] is False,
        "...and interruption is still the browser's decision, not the server's")
     ok(cfg["audio"]["output"]["voice"] == config.OPENAI_REALTIME_VOICE,
