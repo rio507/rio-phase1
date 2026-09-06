@@ -41,6 +41,14 @@ transcriber is `gpt-transcribe` now, not `whisper-1`.
 which is what `python -m tools.render_alerts --force` does, and the
 deterministic lines go back to being dictated.)*
 
+> **The clip library grew.** It is no longer only the red headway tier and the
+> two tire fast-path lines: the four junction turn calls — `"Left here."`,
+> `"Right here."`, `"Take this exit."`, `"Turn around here."` — are pre-rendered
+> too, because they name no road and are therefore a closed set. They are
+> rendered by the same command, verified the same way, and recorded in the same
+> manifest, so switching backends re-renders all nine together. See
+> `docs/realtime_conversation.md`.
+
 > **The conversation model was v3 first, and v3 was wrong.** The voice is a
 > professional clone, and a clone is trained against a set of base models. This
 > one publishes eight of them — the whole v2 family, `eleven_multilingual_v2`

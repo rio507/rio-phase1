@@ -1,4 +1,4 @@
-"""Pre-render the red-tier warning clips to static/audio/.
+"""Pre-render the lines that cannot wait, to static/audio/.
 
     python -m tools.render_alerts            # render anything missing
     python -m tools.render_alerts --force    # re-render everything
@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config  # noqa: E402
 from headway import live_policy  # noqa: E402
+from navigation import speech as nav_speech  # noqa: E402
 
 AUDIO_DIR = Path(__file__).resolve().parent.parent / "static" / "audio"
 
@@ -82,6 +83,25 @@ TIRE_CLIPS = {
         "I've lost the sensor on a tire that was already losing air. Check it "
         "by hand when you stop.",
 }
+
+# THE IMMINENT TURN CALL, for the same reason and by the same argument.
+#
+# "Left here." at the junction is the most time-critical sentence RIO says that
+# is not a safety warning, and while it was dictated it was also the one most
+# likely to arrive in the fallback voice: it keeps the tightest budget in the
+# system precisely because it cannot be late, and a tight budget is a budget
+# that gets missed. Measured on a clean navigating drive, it was the only line
+# of eleven that fell back.
+#
+# It can be a file where the other turn calls cannot, and the difference is not
+# a preference: every other call names a road, and there is no set of roads to
+# render. The imminent call names nothing — it is two words on purpose — so the
+# whole set of sentences it can ever produce is four, and four is a set.
+#
+# ASKED OF navigation.speech RATHER THAN LISTED HERE. A second copy of these
+# sentences is a second copy to forget, and forgetting this one means a turn
+# called in the wrong voice at the moment it matters most.
+IMMINENT_CLIPS = dict(nav_speech.imminent_clips())
 
 
 # A clip is written once and played for months, so a wrong word in one is a
@@ -274,6 +294,7 @@ def render(force: bool = False, backend: str = None) -> list:
     out = []
     everything = [(line, live_policy.LINE_TEXT[line]) for line in CLIP_LINES]
     everything += sorted(TIRE_CLIPS.items())
+    everything += sorted(IMMINENT_CLIPS.items())
     for line, text in everything:
         path = AUDIO_DIR / f"{line}.mp3"
         if path.exists() and not force:
@@ -308,6 +329,7 @@ def main() -> int:
     if args.list:
         listing = [(k, live_policy.LINE_TEXT[k]) for k in CLIP_LINES]
         listing += sorted(TIRE_CLIPS.items())
+        listing += sorted(IMMINENT_CLIPS.items())
         for line, text in listing:
             p = AUDIO_DIR / f"{line}.mp3"
             size = p.stat().st_size if p.exists() else 0

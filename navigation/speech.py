@@ -249,6 +249,61 @@ def imminent_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# THE IMMINENT CALL IS A CLOSED SET, AND THAT IS WHY IT CAN BE A FILE
+# ---------------------------------------------------------------------------
+# Every other call names a road. "Take the next left onto Cloverfield
+# Boulevard" cannot be pre-rendered, because there is no set of roads to render
+# — which is the same constraint the tire clips run into, and the reason those
+# say the thing that is true of all four corners.
+#
+# The imminent call names nothing. It is two words, deliberately (see
+# imminent_text), and the whole set of sentences it can ever produce is four:
+#
+#     "Left here."  "Right here."  "Take this exit."  "Turn around here."
+#
+# A closed set of fixed sentences is a set that can be rendered once, offline,
+# in her voice, and played from disk at the junction with no network, no queue
+# and no deadline to miss. Which matters here more than anywhere else in
+# navigation: this is the one line whose worst case IS the point. Dictating it
+# meant a budget, a budget meant a timeout, and a timeout meant that the most
+# time-critical sentence in the system was also the one most likely to come out
+# in the fallback voice — measured at exactly that, one line in eleven, the
+# only one that fell back on a clean drive.
+#
+# So it stops being spoken and starts being played. The dictation path is kept
+# behind it, for a clip that is missing or will not decode.
+#
+# ENUMERATED FROM imminent_text RATHER THAN TYPED OUT. A second list of these
+# sentences is a second list to forget: add a maneuver type tomorrow and a
+# hand-written table silently stops covering it, which is a turn called in the
+# wrong voice at the worst moment. This asks the function.
+_CLIP_ID_CHARS = str.maketrans({" ": "_", ".": "", "'": ""})
+
+
+def imminent_clip_id(text: str) -> str:
+    """A stable file name for one imminent sentence. "Left here." -> left_here."""
+    return (text or "").strip().lower().translate(_CLIP_ID_CHARS).strip("_")
+
+
+def imminent_clips() -> dict:
+    """{clip_id: sentence} for every imminent line that exists.
+
+    Built by asking imminent_text for one of each shape it answers to, so the
+    set cannot fall behind the function that produces it.
+    """
+    out = {}
+    for kind in (M.TURN, M.RAMP, M.FORK, M.UTURN):
+        for direction in (M.LEFT, M.RIGHT, M.UNKNOWN):
+            text = imminent_text(M.CanonicalManeuver(
+                id="_probe", sequence=0, type=kind, direction=direction,
+                road_name="", latitude=0.0, longitude=0.0,
+                route_distance_position=0.0, polyline_index=0))
+            if text:
+                out[imminent_clip_id(text)] = text
+    return out
+
+
 def arrival_text(destination_name: str, side: str) -> str:
     """"Your destination is on the right." — and only when the provider said so.
 
@@ -306,9 +361,16 @@ def build(maneuver: "M.CanonicalManeuver", destination_name: str = "",
     # NOT varied, and this is the line that must not be. Two seconds from a
     # junction the driver is listening for a word, not a sentence, and every
     # millisecond of novelty is a millisecond of parsing.
+    #
+    # It is also the line that is not spoken at all any more: `clips` names the
+    # pre-rendered file the browser plays instead, off disk, at the junction.
+    # Named by the SERVER for the same reason the sentence is — the browser
+    # holds neither, it is told both — and named next to the sentence so the
+    # two cannot come to disagree about which line the file says.
     i = imminent_text(maneuver)
     if i:
         out[IMMINENT] = i
+        out.setdefault("clips", {})[IMMINENT] = imminent_clip_id(i)
     return out
 
 
@@ -330,6 +392,11 @@ def text_for(route: "M.CanonicalRoute", maneuver_id: str, call_type: str,
             if a.get("anchor_id") == anchor_id:
                 return a.get("speech") or man.speech.get(PRIMARY)
         return None      # an anchor that is not on this route is not a sentence
+    # `clips` lives in the same dict and is not a sentence. CALL_TYPES is
+    # closed so no caller can ask for it, but a lookup that would return a
+    # dict to a text endpoint is worth refusing by name rather than by luck.
+    if call_type not in CALL_TYPES:
+        return None
     return man.speech.get(call_type)
 
 

@@ -192,10 +192,20 @@ def check_weights():
 
     audio = REPO / "static/audio"
     clips = sorted(p.stem for p in audio.glob("*.mp3")) if audio.exists() else []
-    expected = {"back_off", "too_close", "watch_distance",
-                "tire_critical", "tire_sensor_lost"}
+    # ASKED OF THE RENDERER rather than listed here, so a clip added to the
+    # set cannot be missing from the check that exists to notice it missing.
+    # A hardcoded five is how this read "9/5" the day the junction calls were
+    # added -- a pass that was counting the wrong thing.
+    try:
+        from tools import render_alerts as _ra
+        expected = (set(_ra.CLIP_LINES) | set(_ra.TIRE_CLIPS)
+                    | set(_ra.IMMINENT_CLIPS))
+    except Exception:
+        expected = {"back_off", "too_close", "watch_distance",
+                    "tire_critical", "tire_sensor_lost"}
     missing = sorted(expected - set(clips))
-    check(not missing, f"pre-rendered alert clips ({len(clips)}/{len(expected)})",
+    check(not missing,
+          f"pre-rendered clips ({len(expected) - len(missing)}/{len(expected)})",
           f"the fast paths fall back to a TTS round trip they exist to avoid, "
           f"or go silent: {missing}",
           "python -m tools.render_alerts")

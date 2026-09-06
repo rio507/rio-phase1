@@ -478,6 +478,28 @@ def verdict(turns, panel_alive=True, legs=None):
     if legs:
         called = sum(l["calls"] for l in legs)
         spoke = sum(l["heard"] for l in legs)
+        # THE JUNCTION CALL IS ITS OWN CRITERION. It is the one line in
+        # navigation whose value is entirely in when it arrives, and it is a
+        # pre-rendered file precisely so that "when" is not a question about
+        # the network, the mouth or a budget. A clip that took a hundred
+        # milliseconds is a clip that was not preloaded.
+        imm = [i for l in legs for i in l.get("imminent", [])]
+        if imm:
+            clips = [i for i in imm if i["how"] == "clip"]
+            slow = [i for i in clips if i["ms"] > 100]
+            worst = max(i["ms"] for i in imm)
+            print(f"  junction calls: {len(clips)}/{len(imm)} played from a "
+                  f"local file, worst {worst:.0f} ms to audio")
+            if len(clips) != len(imm):
+                other = [i["how"] for i in imm if i["how"] != "clip"]
+                bad_legs.append(
+                    f"{len(imm) - len(clips)} junction call(s) were not played "
+                    f"from a file ({', '.join(sorted(set(other)))}) — the clip "
+                    f"is missing or would not decode")
+            if slow:
+                bad_legs.append(
+                    f"{len(slow)} junction call(s) took over 100 ms from a "
+                    f"local file, which means it was not preloaded")
         print(f"  turns called while driving: {called}, of which "
               f"{spoke} reached the speaker")
         for l in legs:
@@ -603,6 +625,7 @@ def report_drive(turn, notes, t0):
     other = [n["ev"]["type"] for n in notes if n.get("note") == "nav"
              and not n["ev"].get("call_type")]
     calls = spoken or planned
+    imminent = []
     print(f"\n  [driving {turn['drive_s']:.0f}s]   ({turn['want']})")
     for c in calls:
         print(f"      {c.get('call_type'):>8}  {c.get('text')!r}"
@@ -610,8 +633,45 @@ def report_drive(turn, notes, t0):
     if len(planned) != len(spoken):
         print(f"      planned {len(planned)}, spoken {len(spoken)}")
     if audio:
-        print(f"      synthesised and played: {len(audio)} lines, "
-              f"{sum(a['seconds'] for a in audio):.1f}s of audio")
+        print(f"      played from a file or the synthesiser: {len(audio)} "
+              f"lines, {sum(a['seconds'] for a in audio):.1f}s of audio")
+
+    # THE JUNCTION CALL, TIMED. "Left here." is the one line whose worth is
+    # entirely in when it arrives, and it is now a pre-rendered file played off
+    # a preloaded element rather than a sentence dictated on a 900 ms budget.
+    # The claim that makes is a number, so it is measured.
+    #
+    # ANCHORED ON THE PLANNER'S DECISION, not on NAV_SPEECH_SPOKEN. The
+    # arbiter emits SPOKEN when it has handed the line over, and for a clip
+    # that is AFTER the audio has already started -- so measuring from it
+    # searched past the sound it was looking for and found the next one, a
+    # minute later. The honest zero is the moment the planner said the turn was
+    # due.
+    for note in notes:
+        if note.get("note") != "nav":
+            continue
+        ev = note["ev"]
+        if ev.get("call_type") != "imminent" or ev.get("type") == "NAV_SPEECH_SPOKEN":
+            continue
+        t0 = note["t"]
+        hit = next((n for n in notes if n.get("t", 0) >= t0
+                    and (n.get("note") == "nav_audio"
+                         or (n.get("note") == "live"
+                             and n["ev"].get("type") == "LIVE_DICTATION_START"))),
+                   None)
+        if not hit:
+            print(f"      {ev.get('text')!r} -> NEVER REACHED A SPEAKER")
+            imminent.append({"text": ev.get("text"), "how": "silent",
+                             "ms": float("inf")})
+            continue
+        how = "clip" if hit.get("note") == "nav_audio" else "dictated"
+        ms = (hit["t"] - t0) * 1000
+        print(f"      {ev.get('text')!r} -> {how}, {ms:.0f} ms from the call "
+              f"to the audio"
+              + (f" (decode {hit.get('wait_ms')} ms)"
+                 if how == "clip" and hit.get("wait_ms") is not None else "")
+              + ("   <-- SLOW" if ms > 100 else ""))
+        imminent.append({"text": ev.get("text"), "how": how, "ms": ms})
     if other:
         print(f"      also: {', '.join(sorted(set(other)))}")
     # THE POINT OF THE LEG. A call the planner decided on and nobody heard is
@@ -630,7 +690,7 @@ def report_drive(turn, notes, t0):
     if not calls:
         print("      no turns called")
     return {"leg_s": turn["drive_s"], "calls": len(calls),
-            "heard": audible,
+            "heard": audible, "imminent": imminent,
             "texts": [c.get("text") for c in calls]}
 
 

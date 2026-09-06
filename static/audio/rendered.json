@@ -8,6 +8,30 @@
       "sha1": "5674a5a1532f",
       "voice": "marin"
     },
+    "left_here": {
+      "at": 1788730422.9,
+      "backend": "openai_realtime",
+      "bytes": 10485,
+      "model": "gpt-realtime-2.1",
+      "sha1": "631437c4b659",
+      "voice": "marin"
+    },
+    "right_here": {
+      "at": 1788730422.9,
+      "backend": "openai_realtime",
+      "bytes": 7437,
+      "model": "gpt-realtime-2.1",
+      "sha1": "30b79c0671f8",
+      "voice": "marin"
+    },
+    "take_this_exit": {
+      "at": 1788730422.9,
+      "backend": "openai_realtime",
+      "bytes": 12285,
+      "model": "gpt-realtime-2.1",
+      "sha1": "817e6c07bbf4",
+      "voice": "marin"
+    },
     "tire_critical": {
       "at": 1788724589.9,
       "backend": "openai_realtime",
@@ -30,6 +54,14 @@
       "bytes": 14061,
       "model": "gpt-realtime-2.1",
       "sha1": "f4191bb88283",
+      "voice": "marin"
+    },
+    "turn_around_here": {
+      "at": 1788730422.9,
+      "backend": "openai_realtime",
+      "bytes": 14469,
+      "model": "gpt-realtime-2.1",
+      "sha1": "adbf08a6e528",
       "voice": "marin"
     },
     "watch_distance": {

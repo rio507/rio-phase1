@@ -343,7 +343,7 @@ difference; nothing else is forgiven.
 
 | | path | first audio |
 |---|---|---|
-| red-tier warnings, tire fast path | **pre-rendered clip**, local file | 0 ms |
+| red-tier warnings, tire fast path, **junction turn calls** | **pre-rendered clip**, local file | 0 ms (measured) |
 | everything else deterministic | dictated to the live session | 418 ms – 1.3 s (p50 ~700 ms) |
 | no session / dictation stalls | ElevenLabs, through the existing endpoints | 145–180 ms |
 | synthesiser unreachable too | the clip, if the line has one | 0 ms |
@@ -625,7 +625,7 @@ budget is now per channel, and for navigation per **call type**
 
 | line | budget | why |
 |---|---|---|
-| nav / `imminent` — *"Left here."* | **900 ms** | the backup call, AT the turn. The one line whose worst case is the whole point, so it keeps the tight budget and spends the voice to bound the delay. |
+| nav / `imminent` — *"Left here."* | **900 ms**, and now a **contingency** | the backup call, AT the turn. It is played from a pre-rendered clip and does not use this budget at all; the number is what speaks the turn if a clip is ever missing. See below. |
 | nav / `primary` — *"Take the next left onto 16th St."* | 1500 ms | the instruction, issued with room in front of the maneuver |
 | nav / `early`, `arrival` | 2000 ms | seconds out; nothing about them is late at a second and a half |
 | `health` | 2000 ms | an announcement. The urgent ones are not dictated at all — the two tire fast-path lines play pre-rendered clips. |
@@ -638,11 +638,71 @@ already on the candidate, as the `/nav/voice` address.
 
 **The result is the last row of the table above, and the one line that still
 fell back was `'Right here.'` — an `imminent` call, the one that deliberately
-kept 900 ms.** The design spending the voice exactly where it said it would.
+kept 900 ms.** The design spending the voice exactly where it said it would —
+and spending it on the worst possible line to lose.
+
+### ...so the junction call stopped being spoken at all
+
+Bounding the worst case by spending the voice was the right trade to make with
+the mechanism available. It was the wrong mechanism.
+
+**`"Left here."` names no road, and that is the whole of it.** Every other turn
+call does — `"Take the next left onto Cloverfield Boulevard"` — and there is no
+set of roads to pre-render, which is the same constraint the tire clips run
+into and the reason those say the thing that is true of all four corners. The
+imminent call is two words on purpose (see `navigation/speech.imminent_text`),
+so the complete set of sentences it can ever produce is four:
+
+> `"Left here."`  `"Right here."`  `"Take this exit."`  `"Turn around here."`
+
+A closed set of fixed sentences is a set that can be rendered once, offline, in
+marin, and played off disk at the junction with **no network, no queue and no
+deadline to miss** — exactly the bypass the red headway tier and the tire fast
+path have always had. So the imminent call joined the clip library:
+
+* `navigation/speech.imminent_clips()` **enumerates the set by asking
+  `imminent_text`**, rather than listing it. A second copy of these sentences
+  is a second copy to forget, and forgetting this one means a turn called in
+  the wrong voice at the moment it matters most.
+* `build()` puts the clip id on the maneuver **beside the words**, so the
+  server names the file for the same reason it names the sentence and the two
+  cannot come to disagree about what the audio says.
+* `rio_nav.js` holds one preloaded `<audio>` per clip and **decodes them when
+  the route attaches**, not at the junction — the first play of an MP3 is
+  precisely the delay the file exists to avoid, and a route is minutes of
+  notice that these four sentences are coming.
+* `rio_speak.js` gained `clipFirst`, which inverts the ladder for this one
+  line: the file, then dictation, then the synthesiser. A clip that will not
+  decode is a turn that still has to be called.
+* `playClip` now **rewinds a held element rather than reassigning its `src`** —
+  assigning the same url again throws the decoded buffer away and re-fetches
+  it, which is the fast path quietly becoming a network call because one
+  assignment looked idempotent and was not.
+
+**Measured over three navigating drives**, from the planner deciding the turn
+is due to a listener hearing it:
+
+| | |
+|---|---|
+| junction calls played from a local file | **10 of 10** |
+| worst time from the call to the audio | **0 ms** (decode 0-1 ms) |
+| deterministic lines in marin | **11/11, 10/11, 11/11** |
+
+The single miss in the middle run was a `primary` call — `"Take the next right
+onto Cloverfield Blvd."` — at its 1500 ms budget. That budget is not raised to
+close it, and the reason is three seconds away: the imminent call follows the
+primary by about that, and a primary that starts at 2 s and runs 1.4 s is a
+primary the junction call cuts off. 1500 ms is where it belongs, and when it
+misses, the cost is now one instruction in the fallback voice while the line
+that actually matters is a file.
+
+The 900 ms `imminent` budget stays in the table, unreachable in normal
+operation and doing exactly one job: it is what speaks the turn if a clip is
+ever missing.
 
 The lines where this would matter most are still not dictated at all: the red
 headway tier and the tire fast path play local files, and no number here can
-make them late.
+make them late — and now neither can the junction call.
 
 ### The harness was answering for her
 

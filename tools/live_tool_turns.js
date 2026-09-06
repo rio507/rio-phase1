@@ -104,48 +104,94 @@ global.AbortController = global.AbortController || function () {
   return { signal: null, abort() {} };
 };
 
-global.Audio = function () {
+/* AN ELEMENT THAT CAN BE PRELOADED, because one of them now is.
+ *
+ * The old stub decoded on `src =` and emitted the audio there, with play() a
+ * no-op. That models a blob being fetched and played once, which is what every
+ * caller did -- and it models a PRELOADED element as silence, because a
+ * preloaded element is never given a new src: it is rewound and played. The
+ * imminent turn call is exactly that now, so a harness with the old stub would
+ * have recorded the junction as silent and sent this back for a fix that was
+ * not needed.
+ *
+ * So loading and playing are separate here, as they are in a browser. `src =`
+ * decodes and holds; play() emits what is held, at the moment it was asked
+ * for. The gap between those two is the thing worth measuring, and it is
+ * reported as `wait_ms`: on a preloaded clip it is zero, and on a blob that is
+ * still being fetched it is the fetch.
+ */
+global.Audio = function (initialSrc) {
   const el = {
     preload: '', muted: false, currentTime: 0,
     onended: null, onerror: null,
     pause: () => {},
-    play: () => Promise.resolve(),
   };
   let src = '';
-  Object.defineProperty(el, 'src', {
-    get: () => src,
-    set(v) {
-      src = v;
-      const bytes = blobs.get(v);
-      if (!bytes || !bytes.length) {
-        setTimeout(() => { if (el.onerror) el.onerror(); }, 0);
-        return;
-      }
-      // WHEN a listener started hearing it, taken before the decode so the
-      // hundred milliseconds ffmpeg costs this harness do not appear in the
-      // recording as a hundred milliseconds of RIO being late.
-      const at = ctx.currentTime;
+  let decoded = null;            // Promise<Float32Array|null>, once loaded
+
+  function decode(bytes) {
+    return new Promise((resolve) => {
       require('child_process').execFile(
         'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0',
                    '-f', 's16le', '-ar', String(RATE), '-ac', '1', 'pipe:1'],
         { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 },
         (err, pcm) => {
-          if (!err && pcm && pcm.length) {
-            const n = pcm.length >> 1;
-            const data = new Float32Array(n);
-            for (let i = 0; i < n; i++) data[i] = pcm.readInt16LE(i * 2) / 32768;
-            heard.push({ at: at,
-                         buf: { length: n, getChannelData: () => data } });
-            out({ k: 'note', note: 'nav_audio', at: at,
-                  seconds: n / RATE });
-          } else {
-            out({ k: 'note', note: 'nav_audio_failed',
-                  error: String(err && err.message) });
-          }
-          if (el.onended) el.onended();
+          if (err || !pcm || !pcm.length) return resolve(null);
+          const n = pcm.length >> 1;
+          const data = new Float32Array(n);
+          for (let i = 0; i < n; i++) data[i] = pcm.readInt16LE(i * 2) / 32768;
+          resolve(data);
         }).stdin.end(bytes);
-    },
+    });
+  }
+
+  function load(v) {
+    // A blob the page just fetched...
+    const bytes = blobs.get(v);
+    if (bytes && bytes.length) { decoded = decode(bytes); return; }
+    // ...or a file the page is serving, which is what a preloaded clip holds.
+    const m = /\/static\/(.+)$/.exec(String(v || ''));
+    if (m) {
+      try {
+        decoded = decode(fs.readFileSync(path.join(REPO, 'static', m[1])));
+        return;
+      } catch (e) { /* falls through to the null below */ }
+    }
+    decoded = Promise.resolve(null);
+  }
+
+  Object.defineProperty(el, 'src', {
+    get: () => src,
+    set(v) { src = v; load(v); },
   });
+
+  el.play = () => {
+    if (!decoded) {
+      setTimeout(() => { if (el.onerror) el.onerror(); }, 0);
+      return Promise.resolve();
+    }
+    // WHEN a listener started hearing it, taken before the decode is awaited
+    // so the time ffmpeg costs this harness does not appear in the recording
+    // as RIO being late. `wait_ms` reports it separately instead.
+    const at = ctx.currentTime;
+    return decoded.then((data) => {
+      if (!data) {
+        out({ k: 'note', note: 'nav_audio_failed', src: src });
+        if (el.onerror) el.onerror();
+        return;
+      }
+      heard.push({ at: at, buf: { length: data.length,
+                                  getChannelData: () => data } });
+      out({ k: 'note', note: 'nav_audio', at: at, src: src,
+            seconds: data.length / RATE,
+            // Zero on an element that was already holding this file, which is
+            // the whole claim the preloading makes.
+            wait_ms: Math.round((ctx.currentTime - at) * 1000) });
+      if (el.onended) el.onended();
+    });
+  };
+
+  if (initialSrc) { src = initialSrc; load(initialSrc); }
   return el;
 };
 /* THE ONE BROWSER GLOBAL THE SINK CANNOT DO WITHOUT. Audio arrives off the

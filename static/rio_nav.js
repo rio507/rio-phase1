@@ -147,19 +147,70 @@
        --------------------------------------------------------------------- */
     var navAudio = new Audio();
     navAudio.preload = 'auto';
+
+    /* THE IMMINENT CALL, PRELOADED, ONE ELEMENT PER SENTENCE.
+     *
+     * Same mechanism the red headway tier has used all along and for the same
+     * reason: an element that already holds decoded audio turns "say this now"
+     * into a play() call, with no network, no queue and no deadline to miss.
+     *
+     * It matters here because this is the line that cannot be late. Dictated,
+     * it carried the tightest budget in the system — 900 ms, because a turn
+     * call at the junction is past the junction a moment later — and carrying
+     * the tightest budget made it the likeliest line to miss it. On a clean
+     * navigating drive it was the only one of eleven that fell back, and it
+     * was the one where falling back costs the most.
+     *
+     * The set is small and fixed (four sentences, none of them naming a road),
+     * so all of it is held. Lazily built rather than listed: the server names
+     * the clip on the candidate, so a sentence this file has never heard of
+     * still gets an element the first time it is called for. */
+    var clipEls = {};
+    function clipElement(id) {
+      if (!clipEls[id]) {
+        var a = new Audio('/static/audio/' + id + '.mp3');
+        a.preload = 'auto';
+        clipEls[id] = a;
+        if (unlocked) unlockOne(a);
+      }
+      return clipEls[id];
+    }
+
     var unlocked = false;
+
+    // iOS Safari plays an element from a timer only once it has been played
+    // inside a real user gesture, and EVERY element needs its own. A clip that
+    // was never unlocked is a turn call that is silent at the junction, which
+    // is the one failure this whole path exists to prevent.
+    function unlockOne(a) {
+      try {
+        a.muted = true;
+        var p = a.play();
+        if (p && p.then) {
+          p.then(function () { a.pause(); a.currentTime = 0; a.muted = false; })
+           .catch(function () { a.muted = false; });
+        } else { a.muted = false; }
+      } catch (e) { a.muted = false; }
+    }
 
     function unlock() {
       if (unlocked) return;
       unlocked = true;
-      try {
-        navAudio.muted = true;
-        var p = navAudio.play();
-        if (p && p.then) {
-          p.then(function () { navAudio.pause(); navAudio.currentTime = 0; navAudio.muted = false; })
-           .catch(function () { navAudio.muted = false; });
-        } else { navAudio.muted = false; }
-      } catch (e) { navAudio.muted = false; }
+      unlockOne(navAudio);
+      Object.keys(clipEls).forEach(function (id) { unlockOne(clipEls[id]); });
+    }
+
+    /* ...and warmed at the moment a route attaches, rather than at the moment
+       the turn arrives. Decoding an MP3 the first time it is played is exactly
+       the delay the file exists to avoid, and a route is minutes of warning
+       that these four sentences are going to be needed. */
+    function warmClips(route) {
+      var seen = {};
+      ((route && route.maneuvers) || []).forEach(function (m) {
+        var id = m.speech && m.speech.clips && m.speech.clips.imminent;
+        if (id && !seen[id]) { seen[id] = true; clipElement(id); }
+      });
+      return Object.keys(seen).length;
     }
 
     function audioFor(candidate) {
@@ -178,9 +229,17 @@
               + '&m=' + encodeURIComponent(candidate.maneuver_id)
               + '&call=' + encodeURIComponent(candidate.call_type)
               + (candidate.anchor_id ? '&anchor=' + encodeURIComponent(candidate.anchor_id) : '');
+      /* THE FILE, WHERE THERE IS ONE, AND THE MOUTH BEHIND IT.
+         Only the imminent call has a clip, and for it the ordinary ladder is
+         upside down: dictation is the contingency and the pre-rendered file is
+         the path. Everything else keeps the order it had. */
+      var clipId = candidate.clip || null;
       return RIO.speak.provider({
         text: candidate.text || '',
         channel: 'nav',
+        clipUrl: clipId ? '/static/audio/' + clipId + '.mp3' : null,
+        clipFirst: !!clipId,
+        clipElement: clipId ? clipElement(clipId) : null,
         // WHICH OF THE FOUR CALLS THIS IS, and it decides how long the line
         // waits for her voice before being synthesised instead. "Left here."
         // at the junction cannot be late; the early call, seconds out, can.
@@ -449,6 +508,11 @@
 
     function attach(r) {
       route = r;
+      // Decode the junction calls NOW, not at the junction. A route is minutes
+      // of notice that these four sentences are coming, and decoding an MP3
+      // the first time it is played is exactly the delay the file exists to
+      // avoid.
+      warmClips(r);
       tracker = RIO.navcore.create(r);
       planner = RIO.navplan.create({
         tracker: tracker, arbiter: RIO.speech, route: r,

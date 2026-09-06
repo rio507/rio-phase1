@@ -281,6 +281,14 @@
         route_generation: route.generation_id,
         route_id: route.route_id,
         call_type: callType,
+        // THE PRE-RENDERED FILE FOR THIS EXACT SENTENCE, if the server named
+        // one. Only the imminent call has one, and only because it is the one
+        // call that names no road: a closed set of four sentences is a set
+        // that can be rendered once and played off disk at the junction. The
+        // browser is TOLD which file, next to the words, so the two cannot
+        // come to disagree about what the audio says.
+        clip: (man.speech && man.speech.clips
+               && man.speech.clips[callType]) || null,
         anchor_id: anchor ? anchor.anchor_id : null,
         priority: (callType === CALL.IMMINENT) ? P.TURN_NEAR : P.NAV,
         created_at: clock,

@@ -16,6 +16,12 @@
  *      the fallback path by definition;
  *   3. a pre-rendered clip, if the line has one.
  *
+ * ...AND FOR ONE KIND OF LINE, THAT ORDER IS UPSIDE DOWN. `clipFirst` puts the
+ * pre-rendered file at the top and the session underneath it, which is what
+ * the imminent turn call and the red headway tier want: a sentence whose whole
+ * value is arriving NOW does not want a mouth that might be busy, it wants a
+ * decoded buffer and a play() call. See the note on `clipFirst` below.
+ *
  * A warning NEVER waits on a cloud call it is not getting. Dictation is given
  * a bounded time to START and then abandoned — the synthesiser is about 180 ms
  * away and a late warning has stopped being a warning.
@@ -86,9 +92,20 @@
     };
   }
 
+  /* PLAY A LOCAL FILE, AND DO NOT RE-FETCH ONE THAT IS ALREADY HELD.
+   *
+   * `element.src = url` on an element that is ALREADY pointing at that url
+   * throws the buffer away and loads it again, which is the entire cost the
+   * preloading was there to avoid — the fast path quietly becoming a network
+   * fetch because one assignment looked idempotent and was not.
+   *
+   * So a preloaded element is rewound and played; only an element that is
+   * pointing somewhere else is given a new src. */
   function playClip(element, url) {
     var stopped = false;
     var release = null;
+    var held = !!(url && element && element.src
+                  && element.src.indexOf(url) >= 0);
     return {
       abort: function () {
         stopped = true;
@@ -109,7 +126,8 @@
           element.onended = function () { done(resolve); };
           element.onerror = function () { done(reject, new Error('clip error')); };
           element.muted = false;
-          element.src = url;
+          if (held) { try { element.currentTime = 0; } catch (e) {} }
+          else { element.src = url; }
           var p = element.play();
           if (p && p.catch) p.catch(function (e) { done(reject, e); });
         });
@@ -125,6 +143,10 @@
    *             junction and one issued seconds out have different deadlines
    *   ttsUrl    the fallback synthesiser endpoint for this line
    *   clipUrl   a pre-rendered file, if this line has one
+   *   clipFirst play that file INSTEAD of dictating, with dictation kept
+   *             underneath it for a clip that is missing or will not decode
+   *   clipElement a preloaded element already holding that file, played
+   *             without being reloaded — which is what makes it instant
    *   element   the audio element to play fallbacks through
    *   timeoutMs an explicit override; otherwise the budget is resolved from
    *             the channel and call type, per config.speak_timeout_ms
@@ -170,7 +192,7 @@
           // its path at all, which is exactly the situation this is now in.
           if (opts.clipUrl && !stopped) {
             record('clip');
-            current = playClip(element, opts.clipUrl);
+            current = playClip(opts.clipElement || element, opts.clipUrl);
             return current.play();
           }
           record('silent');
@@ -179,16 +201,49 @@
       }
       if (opts.clipUrl) {
         record('clip');
-        current = playClip(element, opts.clipUrl);
+        current = playClip(opts.clipElement || element, opts.clipUrl);
         return current.play();
       }
       record('silent');
       return Promise.reject(new Error(reason || 'no audio path'));
     }
 
+    /* THE FILE FIRST, AND THE MOUTH BEHIND IT.
+     *
+     * For a line whose entire value is arriving at a particular instant, every
+     * mechanism that could take time is a mechanism that could take too much
+     * of it. A pre-rendered clip has no network, no queue and no deadline —
+     * it is a decoded buffer and a play() call — so where one exists for the
+     * exact sentence, it IS the fast path and dictation is the contingency.
+     *
+     * This is the imminent turn call. It used to be dictated on the tightest
+     * budget in the system, 900 ms, precisely because it cannot be late; and
+     * being the tightest budget made it the likeliest to be missed. On a clean
+     * navigating drive it was the only line of eleven that fell back, which is
+     * the worst possible line to lose: the one at the junction. A file makes
+     * it both instant and hers, which the budget could only trade between.
+     *
+     * The ladder underneath is unchanged and still ordered by speed —
+     * dictation, then the synthesiser — because a clip that will not decode is
+     * a line that still has to be said. */
+    function clipThenMouth() {
+      record('clip');
+      current = playClip(opts.clipElement || element, opts.clipUrl);
+      return current.play().catch(function (e) {
+        if (stopped) return;
+        if (dictate) {
+          return live.speak(text(), { timeoutMs: budget() })
+            .then(function (r) { record('dictated'); return r; })
+            .catch(function (err) { return fallback(err && err.message); });
+        }
+        return fallback(e && e.message);
+      });
+    }
+
     return {
       play: function () {
         if (stopped) return Promise.resolve();
+        if (opts.clipFirst && opts.clipUrl) return clipThenMouth();
         if (!dictate) return fallback('no_session');
         return live.speak(text(), { timeoutMs: budget() })
           .then(function (r) { record('dictated'); return r; })

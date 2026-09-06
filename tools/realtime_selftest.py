@@ -48,6 +48,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import config          # noqa: E402
 import places          # noqa: E402
 import realtime        # noqa: E402
+from navigation import model as M  # noqa: E402
 import rio_prompts     # noqa: E402
 import voice_tags      # noqa: E402
 
@@ -3246,6 +3247,64 @@ def run_backend(live: bool = False):
     ok(config.speak_timeout_ms("nav", "primary") >= imminent,
        f"the instruction sits between them "
        f'({config.speak_timeout_ms("nav", "primary")} ms)')
+
+    # --- ...AND THE JUNCTION CALL DOES NOT USE THAT BUDGET AT ALL -----------
+    #
+    # Keeping the tight budget bounded the worst case by spending the voice,
+    # and on a clean drive it spent it exactly once: "Right here." was the one
+    # line of eleven that fell back. That is the worst line in the system to
+    # lose, so it stopped being a sentence that is spoken and became a file
+    # that is played -- no network, no queue, no deadline, and hers.
+    #
+    # It can be a file where no other turn call can, and the reason is a
+    # property of the sentence rather than a preference: every other call names
+    # a road and there is no set of roads to render. This one names nothing.
+    from navigation import speech as nav_speech
+
+    clips = nav_speech.imminent_clips()
+    ok(len(clips) >= 4,
+       f"the imminent call is a CLOSED set of sentences ({len(clips)}: "
+       f"{', '.join(sorted(clips.values()))})")
+    ok(all(" onto " not in t for t in clips.values()),
+       "...and not one of them names a road, which is what makes the set "
+       "closed and the set being closed is what makes it renderable")
+    ok(clips == nav_speech.imminent_clips(),
+       "enumerated from imminent_text rather than typed out, so a maneuver "
+       "type added tomorrow cannot leave a sentence without a file")
+
+    # (that each of those four is on disk and in marin is checked by the
+    # manifest loop below, which takes its list from the same function)
+
+    # The server names the file, next to the words, so the two cannot drift.
+    man = M.CanonicalManeuver(
+        id="m", sequence=0, type=M.TURN, direction=M.LEFT, road_name="16th St",
+        latitude=0.0, longitude=0.0, route_distance_position=0.0,
+        polyline_index=0)
+    built = nav_speech.build(man)
+    ok(built.get("clips", {}).get("imminent") == "left_here",
+       f"a maneuver carries the clip id beside the sentence "
+       f"({built.get('clips')})")
+    ok(built["imminent"] == clips[built["clips"]["imminent"]],
+       "...and the id names the file that says exactly those words")
+    ok(nav_speech.text_for(None, "m", "clips") is None,
+       "and the clip table can never be handed back as if it were a sentence")
+
+    nav_js = open(os.path.join(REPO, "static", "rio_nav.js")).read()
+    plan_js = open(os.path.join(REPO, "static", "rio_navplan.js")).read()
+    ok("man.speech.clips" in plan_js,
+       "the planner puts the server's clip id on the candidate")
+    ok("clipFirst: !!clipId" in nav_js and "clipElement(clipId)" in nav_js,
+       "...and the junction call plays the FILE first, off a preloaded "
+       "element, with dictation kept underneath it")
+    ok("warmClips(r)" in nav_js,
+       "...decoded when the route attaches rather than at the junction, "
+       "because the first play of an MP3 is the delay the file exists to avoid")
+    ok("opts.clipFirst && opts.clipUrl" in speak_js,
+       "and rio_speak honours that ordering rather than always dictating first")
+    ok("element.currentTime = 0" in speak_js and "else { element.src = url; }"
+       in speak_js,
+       "...replaying a held element rather than reassigning its src, which "
+       "would throw the preloaded buffer away and re-fetch it")
     ok(config.speak_timeout_ms("health") > config.REALTIME_SPEAK_TIMEOUT_MS,
        f"a health announcement waits longer for her voice "
        f"({config.speak_timeout_ms('health')} ms) — the urgent ones are not "
@@ -3285,7 +3344,8 @@ def run_backend(live: bool = False):
 
     doc = ra.manifest()
     rendered = doc.get("clips", {})
-    expected = sorted(ra.CLIP_LINES) + sorted(ra.TIRE_CLIPS)
+    expected = (sorted(ra.CLIP_LINES) + sorted(ra.TIRE_CLIPS)
+                + sorted(ra.IMMINENT_CLIPS))
     for line in expected:
         path = ra.AUDIO_DIR / f"{line}.mp3"
         got = rendered.get(line) or {}

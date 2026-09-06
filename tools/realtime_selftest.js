@@ -873,6 +873,69 @@ section('the fallback chain — a warning never waits on a cloud call');
   }
 
   {
+    /* THE JUNCTION CALL IS A FILE, AND THE MOUTH IS BEHIND IT.
+     *
+     * Every other deterministic line asks the session first and falls back to
+     * a synthesiser. The imminent turn call inverts that: it plays a
+     * pre-rendered clip off a preloaded element, and dictation is what happens
+     * only if the clip is missing or will not decode.
+     *
+     * The reason is that this is the one line whose entire value is arriving
+     * at a particular instant. Dictated, it carried the tightest budget in the
+     * system BECAUSE it cannot be late -- and carrying the tightest budget
+     * made it the likeliest line to miss it. On a clean navigating drive it
+     * was the only one of eleven that fell back, at the worst possible moment
+     * to fall back. A file is both instant and hers, which a budget could only
+     * trade between. */
+    const asked = [];
+    const session = {
+      speak: (t, o) => { asked.push(t); return Promise.resolve({}); },
+      speechEnabled: () => true,
+      speakTimeout: () => 900,
+    };
+    const b = stubBrowser({ session });
+    // A preloaded element already holding the file, as rio_nav builds.
+    const held = { src: '/static/audio/left_here.mp3', muted: false,
+                   currentTime: 7, played: 0, reloaded: 0,
+                   pause() {}, play() { this.played++;
+                                        setTimeout(() => this.onended && this.onended(), 0);
+                                        return Promise.resolve(); } };
+    Object.defineProperty(held, 'srcAssigned', { value: true });
+
+    await speak.provider({
+      text: 'Left here.', channel: 'nav', callType: 'imminent',
+      clipUrl: '/static/audio/left_here.mp3', clipFirst: true,
+      clipElement: held, ttsUrl: '/nav/voice?x=1', element: b.element,
+    }).play();
+
+    ok(held.played === 1,
+       'the junction call plays the preloaded element');
+    ok(asked.length === 0,
+       '...and asks the session for nothing — no mouth, no queue, no budget');
+    ok(speak.stats().last === 'clip',
+       '...and the drive records it as the file it was');
+    ok(held.currentTime === 0,
+       '...rewound rather than re-sourced, so the decoded buffer it was '
+       + 'holding is the buffer that plays');
+
+    /* ...AND THE MOUTH IS STILL THERE UNDERNEATH. A clip that will not decode
+       is a turn that still has to be called. */
+    const dead = { src: '/static/audio/left_here.mp3', muted: false,
+                   currentTime: 0, pause() {},
+                   play() { setTimeout(() => this.onerror
+                                       && this.onerror(new Error('bad')), 0);
+                            return Promise.resolve(); } };
+    await speak.provider({
+      text: 'Left here.', channel: 'nav', callType: 'imminent',
+      clipUrl: '/static/audio/left_here.mp3', clipFirst: true,
+      clipElement: dead, ttsUrl: '/nav/voice?x=1', element: b.element,
+    }).play();
+    ok(asked.length === 1 && asked[0] === 'Left here.',
+       'a clip that will not play falls through to the session, so the turn '
+       + 'is still called');
+  }
+
+  {
     /* HOW LONG THIS LINE WAITS, resolved per channel and per call type.
      *
      * One budget for all of them is why "one voice everywhere" was running at
