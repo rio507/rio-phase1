@@ -8,12 +8,52 @@
       "sha1": "5674a5a1532f",
       "voice": "marin"
     },
+    "left_at_the_roundabout": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 16341,
+      "model": "gpt-realtime-2.1",
+      "sha1": "017a95f6514b",
+      "voice": "marin"
+    },
     "left_here": {
       "at": 1788730422.9,
       "backend": "openai_realtime",
       "bytes": 10485,
       "model": "gpt-realtime-2.1",
       "sha1": "631437c4b659",
+      "voice": "marin"
+    },
+    "merge": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 7173,
+      "model": "gpt-realtime-2.1",
+      "sha1": "900dc03789c3",
+      "voice": "marin"
+    },
+    "merge_left": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 10005,
+      "model": "gpt-realtime-2.1",
+      "sha1": "3f3e38d35c64",
+      "voice": "marin"
+    },
+    "merge_right": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 9981,
+      "model": "gpt-realtime-2.1",
+      "sha1": "93d4871a45c5",
+      "voice": "marin"
+    },
+    "right_at_the_roundabout": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 15957,
+      "model": "gpt-realtime-2.1",
+      "sha1": "7305a2627d7a",
       "voice": "marin"
     },
     "right_here": {
@@ -24,12 +64,36 @@
       "sha1": "30b79c0671f8",
       "voice": "marin"
     },
+    "stay_left": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 8421,
+      "model": "gpt-realtime-2.1",
+      "sha1": "bb70c6966bbe",
+      "voice": "marin"
+    },
+    "stay_right": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 8421,
+      "model": "gpt-realtime-2.1",
+      "sha1": "433d7f287a46",
+      "voice": "marin"
+    },
     "take_this_exit": {
       "at": 1788730422.9,
       "backend": "openai_realtime",
       "bytes": 12285,
       "model": "gpt-realtime-2.1",
       "sha1": "817e6c07bbf4",
+      "voice": "marin"
+    },
+    "this_one": {
+      "at": 1788732470.5,
+      "backend": "openai_realtime",
+      "bytes": 8757,
+      "model": "gpt-realtime-2.1",
+      "sha1": "d9ca1a5e556f",
       "voice": "marin"
     },
     "tire_critical": {

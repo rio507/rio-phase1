@@ -650,10 +650,56 @@ the mechanism available. It was the wrong mechanism.
 call does — `"Take the next left onto Cloverfield Boulevard"` — and there is no
 set of roads to pre-render, which is the same constraint the tire clips run
 into and the reason those say the thing that is true of all four corners. The
-imminent call is two words on purpose (see `navigation/speech.imminent_text`),
-so the complete set of sentences it can ever produce is four:
+imminent call is short on purpose (see `navigation/speech.imminent_text`), so
+the complete set of sentences it can ever produce is **twelve**, and a closed
+set is a set that can be a directory.
 
-> `"Left here."`  `"Right here."`  `"Take this exit."`  `"Turn around here."`
+### What the junction actually says, per maneuver
+
+Reading `imminent_text` against `providers/google._MANEUVER_MAP` — the map that
+*is* the provider's contract with RIO — turned up that it covered three shapes
+out of ten, and that one of the three was wrong:
+
+| provider enum | canonical | junction call | |
+|---|---|---|---|
+| `TURN_*`, `TURN_SLIGHT_*`, `TURN_SHARP_*` | TURN/LEFT·RIGHT | `"Left here."` / `"Right here."` | |
+| *anything this map has never seen* | TURN/UNKNOWN | `"This one."` | **was silent** |
+| `TURN_U_TURN_*`, `UTURN_*` | UTURN | `"Turn around here."` | |
+| `RAMP_LEFT/RIGHT` | RAMP | `"Take this exit."` | |
+| `FORK_LEFT/RIGHT` | FORK | `"Stay left."` / `"Stay right."` | **was `"Take this exit."`** |
+| `KEEP_LEFT/RIGHT` | KEEP | `"Stay left."` / `"Stay right."` | **was silent** |
+| `MERGE_LEFT/RIGHT` | MERGE | `"Merge left."` / `"Merge right."` | **was silent** |
+| `MERGE` | MERGE/UNKNOWN | `"Merge."` | **was silent** |
+| `ROUNDABOUT_LEFT/RIGHT` | ROUNDABOUT | `"Left at the roundabout."` / `"Right…"` | **was silent** |
+| `STRAIGHT`, `NAME_CHANGE` | STRAIGHT | *(silent — no junction to confirm)* | |
+| `DEPART` | DEPART | *(silent — nothing has happened yet)* | |
+| `DESTINATION*` | ARRIVE | *(silent — `build()` gives arrival its own lines)* | |
+
+**The fork was the only one that was wrong rather than missing**, and it is the
+reason the function was worth re-reading rather than extending: `FORK_LEFT` and
+`FORK_RIGHT` both came back as `"Take this exit."` A fork is the road splitting
+under the car and the answer is which side to be on; *"take this exit"* at one
+is an instruction to leave a road the route stays on.
+
+**`KEEP` and `FORK` say the same words deliberately.** Bearing left at a fork
+and keeping left at a split are one action to a driver, and two near-identical
+sentences two seconds from a junction is exactly the novelty the imminent line
+exists to refuse.
+
+**The roundabout is called by direction and never by an exit number.**
+`"Second exit."` is not sayable here: `CanonicalManeuver.exit_information`
+exists on the model and no provider populates it, so nothing in this system
+knows which exit it is. A number said at a roundabout is a number the driver
+acts on, so an invented one is the worst thing this file could produce — the
+same rule `ArrivalInfo` follows when it refuses to guess a side (§28). What
+*is* provider data is the direction, so that is what gets said.
+
+**And the catch-all now has a line.** Anything `_MANEUVER_MAP` does not
+recognise becomes TURN/UNKNOWN by design, which made the one maneuver shape
+guaranteed to exist the day Google adds an enum value the one shape with no
+junction call. `"This one."` says the only thing still true when the direction
+is unknown — and confirming *which* junction is the half of this call that
+survives not knowing the direction.
 
 A closed set of fixed sentences is a set that can be rendered once, offline, in
 marin, and played off disk at the junction with **no network, no queue and no
@@ -663,7 +709,14 @@ path have always had. So the imminent call joined the clip library:
 * `navigation/speech.imminent_clips()` **enumerates the set by asking
   `imminent_text`**, rather than listing it. A second copy of these sentences
   is a second copy to forget, and forgetting this one means a turn called in
-  the wrong voice at the moment it matters most.
+  the wrong voice at the moment it matters most. It walks the **whole canonical
+  vocabulary** from `model.py`, not the types that happened to have lines when
+  it was written — the first version walked exactly the four that already had
+  sentences, so it could only ever have confirmed the coverage it already had.
+* `imminent_silent()` states which shapes are **meant** to have no call, so a
+  test can tell "decided against" from "never written" — which for six enum
+  values were the same thing until the file was read. It is checked against
+  `imminent_text` over all 40 shapes the model can hold.
 * `build()` puts the clip id on the maneuver **beside the words**, so the
   server names the file for the same reason it names the sentence and the two
   cannot come to disagree about what the audio says.

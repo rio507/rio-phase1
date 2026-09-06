@@ -933,6 +933,31 @@ section('the fallback chain — a warning never waits on a cloud call');
     ok(asked.length === 1 && asked[0] === 'Left here.',
        'a clip that will not play falls through to the session, so the turn '
        + 'is still called');
+
+    /* AND IT IS NOT THE TURN CALL THAT IS SPECIAL, IT IS THE MECHANISM.
+     * The junction set covers merges, forks, keeps, roundabouts and the
+     * unrecognised-maneuver fallback as well, and every one of them reaches
+     * the speaker down this same path -- the server names a clip on the
+     * candidate and the panel plays that file. A path that only ever worked
+     * for left_here would pass every test above and be silent at a fork. */
+    for (const [id, line] of [['stay_left', 'Stay left.'],
+                              ['merge_right', 'Merge right.'],
+                              ['this_one', 'This one.']]) {
+      const el = { src: '/static/audio/' + id + '.mp3', muted: false,
+                   currentTime: 3, played: 0, pause() {},
+                   play() { this.played++;
+                            setTimeout(() => this.onended && this.onended(), 0);
+                            return Promise.resolve(); } };
+      await speak.provider({
+        text: line, channel: 'nav', callType: 'imminent',
+        clipUrl: '/static/audio/' + id + '.mp3', clipFirst: true,
+        clipElement: el, ttsUrl: '/nav/voice?x=1', element: b.element,
+      }).play();
+      ok(el.played === 1 && el.currentTime === 0,
+         `${line} plays ${id}.mp3 off its own preloaded element`);
+    }
+    ok(asked.length === 1,
+       '...and none of them asked the session for anything');
   }
 
   {

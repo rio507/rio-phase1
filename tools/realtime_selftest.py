@@ -3223,6 +3223,18 @@ def run_backend(live: bool = False):
        "synthesiser, then a pre-rendered clip — a warning never waits on a "
        "cloud call it is not getting")
 
+    # --- WHOSE CLIPS THESE ARE, read once: two sections below check against
+    # the manifest, and it is the same manifest.
+    from tools import render_alerts as ra
+
+    want = ra.voice_signature()
+    ok(want == {"backend": "openai_realtime", "voice": "marin",
+                "model": config.OPENAI_REALTIME_MODEL},
+       f"clips rendered today would be marin on the live model ({want})")
+
+    doc = ra.manifest()
+    rendered = doc.get("clips", {})
+
     # --- HOW LONG EACH LINE WAITS FOR HER VOICE -----------------------------
     #
     # One budget for every deterministic line was the reason "one voice
@@ -3262,18 +3274,91 @@ def run_backend(live: bool = False):
     from navigation import speech as nav_speech
 
     clips = nav_speech.imminent_clips()
-    ok(len(clips) >= 4,
+    ok(len(clips) >= 12,
        f"the imminent call is a CLOSED set of sentences ({len(clips)}: "
        f"{', '.join(sorted(clips.values()))})")
     ok(all(" onto " not in t for t in clips.values()),
        "...and not one of them names a road, which is what makes the set "
        "closed and the set being closed is what makes it renderable")
-    ok(clips == nav_speech.imminent_clips(),
-       "enumerated from imminent_text rather than typed out, so a maneuver "
-       "type added tomorrow cannot leave a sentence without a file")
 
-    # (that each of those four is on disk and in marin is checked by the
-    # manifest loop below, which takes its list from the same function)
+    # --- EVERY MANEUVER THE PROVIDER CAN EMIT, ASKED OF THE PROVIDER --------
+    #
+    # This is the check that would have caught the gap, and the reason it is
+    # phrased against _MANEUVER_MAP rather than against a list here: the map IS
+    # the provider's contract with RIO, so "what can arrive" is a fact in that
+    # file and not an opinion in this one. Six of Google's enum values -- both
+    # KEEPs, all three MERGEs and both ROUNDABOUTs -- produced no junction call
+    # at all, and a seventh (FORK) produced the wrong one, and nothing said so
+    # because nothing was asking the provider what it could send.
+    from navigation.providers.google import _MANEUVER_MAP
+
+    shapes = nav_speech.imminent_shapes()
+    emitted = dict(_MANEUVER_MAP)
+    # ...plus the one shape that is in no table: anything the map does not
+    # recognise becomes TURN/UNKNOWN, which is the shape guaranteed to exist
+    # the day Google adds an enum value.
+    emitted["<any enum this map has never seen>"] = (M.TURN, M.UNKNOWN)
+
+    missing, silent = [], []
+    for raw, (kind, direction) in sorted(emitted.items()):
+        line = shapes.get((kind, direction))
+        if nav_speech.imminent_silent(kind, direction):
+            silent.append(raw)
+            ok(line is None,
+               f"{raw} ({kind}/{direction}) is deliberately silent at the "
+               f"junction, and is silent")
+            continue
+        if not line:
+            missing.append(f"{raw} -> {kind}/{direction}")
+            continue
+        cid = nav_speech.imminent_clip_id(line)
+        path = ra.AUDIO_DIR / f"{cid}.mp3"
+        got = rendered.get(cid) or {}
+        ok(bool(line) and path.exists() and path.stat().st_size > 0
+           and got.get("voice") == "marin",
+           f"{raw} -> {line!r}, on disk in marin ({cid}.mp3)")
+    ok(not missing,
+       f"every maneuver the provider can emit has a junction call or is named "
+       f"as silent" + (f" — MISSING: {missing}" if missing else ""))
+    ok(len(silent) >= 4,
+       f"...and the silent ones are a DECISION rather than a gap "
+       f"({len(silent)}: {', '.join(silent)})")
+
+    # The policy and the behaviour are two statements and they are checked
+    # against each other, over the whole model rather than over the provider:
+    # a shape that goes quiet without being named in IMMINENT_SILENT or
+    # _NEEDS_DIRECTION is the failure this whole section exists to produce.
+    disagreed = [(k, d) for (k, d), v in shapes.items()
+                 if (v is None) != nav_speech.imminent_silent(k, d)]
+    ok(not disagreed,
+       f"and imminent_silent() describes imminent_text() exactly, over all "
+       f"{len(shapes)} shapes the model can hold ({disagreed or 'no'} "
+       f"disagreements)")
+
+    # THE ONE THAT WAS WRONG RATHER THAN MISSING. A fork is the road splitting
+    # under the car; "Take this exit." at one is an instruction to leave a road
+    # the route stays on.
+    fork = shapes[(M.FORK, M.LEFT)]
+    ok(fork == "Stay left.",
+       f"a fork says which side to be on, not that there is an exit ({fork!r})")
+    ok(shapes[(M.KEEP, M.LEFT)] == fork,
+       "...and a keep says the same words, because bearing left at a fork and "
+       "keeping left at a split are one action to a driver")
+    ok(shapes[(M.RAMP, M.LEFT)] == "Take this exit.",
+       "while a ramp, which IS an exit, still says so")
+
+    # ...AND THE ONE THAT MUST NOT BE INVENTED. exit_information is on the
+    # model and no provider fills it, so RIO does not know which exit of a
+    # roundabout this is. A number said at a roundabout is a number the driver
+    # acts on.
+    ok("exit" not in (shapes[(M.ROUNDABOUT, M.LEFT)] or "").lower(),
+       f"a roundabout is called by its direction, never by an exit number "
+       f"nothing here knows ({shapes[(M.ROUNDABOUT, M.LEFT)]!r})")
+    ok(shapes[(M.TURN, M.UNKNOWN)] == "This one.",
+       "and an unrecognised maneuver still confirms WHICH junction, which is "
+       "the half of this call that survives not knowing the direction")
+
+    plan_js = open(os.path.join(REPO, "static", "rio_navplan.js")).read()
 
     # The server names the file, next to the words, so the two cannot drift.
     man = M.CanonicalManeuver(
@@ -3286,11 +3371,32 @@ def run_backend(live: bool = False):
        f"({built.get('clips')})")
     ok(built["imminent"] == clips[built["clips"]["imminent"]],
        "...and the id names the file that says exactly those words")
+
+    # ...FOR EVERY FAMILY, not just the one that had clips first. build() is
+    # the path the route actually takes, and a clip attached only to turns
+    # would leave the new lines rendered on disk and never reachable.
+    for kind, direction in ((M.MERGE, M.LEFT), (M.KEEP, M.RIGHT),
+                            (M.FORK, M.LEFT), (M.ROUNDABOUT, M.RIGHT),
+                            (M.UTURN, M.LEFT), (M.RAMP, M.RIGHT)):
+        b = nav_speech.build(M.CanonicalManeuver(
+            id="m", sequence=0, type=kind, direction=direction, road_name="",
+            latitude=0.0, longitude=0.0, route_distance_position=0.0,
+            polyline_index=0, instruction="Merge onto I-10 E"))
+        cid = (b.get("clips") or {}).get("imminent")
+        ok(cid and (ra.AUDIO_DIR / f"{cid}.mp3").exists()
+           and b["imminent"] == clips[cid],
+           f"{kind}/{direction} -> {b.get('imminent')!r} ({cid}.mp3)")
+
+    # And the planner fires it on the SENTENCE existing, not on the type — so
+    # a family that gained a line today does not also need a code change to be
+    # heard. This is the condition that makes the whole set reachable.
+    ok("man.speech && man.speech.imminent &&" in plan_js,
+       "the planner arms the junction call on the line existing, not on the "
+       "maneuver being a turn")
     ok(nav_speech.text_for(None, "m", "clips") is None,
        "and the clip table can never be handed back as if it were a sentence")
 
     nav_js = open(os.path.join(REPO, "static", "rio_nav.js")).read()
-    plan_js = open(os.path.join(REPO, "static", "rio_navplan.js")).read()
     ok("man.speech.clips" in plan_js,
        "the planner puts the server's clip id on the candidate")
     ok("clipFirst: !!clipId" in nav_js and "clipElement(clipId)" in nav_js,
@@ -3335,15 +3441,6 @@ def run_backend(live: bool = False):
        "which is the whole reason the split exists")
 
     # --- ONE VOICE: the clips that never touch the network -------------------
-    from tools import render_alerts as ra
-
-    want = ra.voice_signature()
-    ok(want == {"backend": "openai_realtime", "voice": "marin",
-                "model": config.OPENAI_REALTIME_MODEL},
-       f"clips rendered today would be marin on the live model ({want})")
-
-    doc = ra.manifest()
-    rendered = doc.get("clips", {})
     expected = (sorted(ra.CLIP_LINES) + sorted(ra.TIRE_CLIPS)
                 + sorted(ra.IMMINENT_CLIPS))
     for line in expected:

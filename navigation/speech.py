@@ -233,19 +233,74 @@ def contextual_text(maneuver: "M.CanonicalManeuver", spoken_label: str,
 
 
 def imminent_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
-    """The backup at the junction. Two words, because there is no time for more.
+    """The backup at the junction. Short, because there is no time for more.
 
     Stays armed even when a contextual call has already been spoken (§11C): the
     contextual line explains the turn, this one confirms it is *this* one. Its
     own timing and validity decide whether it is ever heard.
+
+    EVERY MANEUVER THE PROVIDER CAN EMIT HAS A LINE HERE, OR HAS ONE
+    DELIBERATELY WITHHELD. It used to cover three shapes out of ten, and the
+    silence was not a decision — it was the shapes nobody had written yet:
+
+      A FORK WAS BEING CALLED AN EXIT. FORK_LEFT and FORK_RIGHT both came back
+      as "Take this exit.", which is not what a fork is. A fork is the road
+      splitting under you and the answer is which side to be on; "take this
+      exit" at one is an instruction to leave a road the route stays on. That
+      is the only line here that was WRONG rather than missing, and it is the
+      reason this function was worth re-reading rather than extending.
+
+      KEEP, MERGE AND ROUNDABOUT HAD NOTHING AT ALL. Six of Google's enum
+      values (KEEP_LEFT/RIGHT, MERGE, MERGE_LEFT/RIGHT, ROUNDABOUT_LEFT/RIGHT)
+      produced no junction call whatever, which on a freeway is precisely where
+      one is wanted: the early call is a minute back and the instruction is the
+      provider's own long sentence.
+
+      AND SO DID THE CATCH-ALL. Anything this vocabulary does not recognise
+      becomes TURN/UNKNOWN by design (see providers/google._MANEUVER_MAP), and
+      TURN with no direction fell through to None. So the one maneuver shape
+      guaranteed to exist the day a provider adds an enum was the one shape
+      with no line. "This one." says the only thing that is still true when the
+      direction is not known, which is also exactly what this call is for.
+
+    KEEP AND FORK SAY THE SAME WORDS, and that is not an oversight. Bearing
+    left at a fork and keeping left at a split are one action to a driver, and
+    two near-identical sentences two seconds from a junction is the novelty the
+    docstring above exists to refuse. One meaning, one line.
+
+    WHAT IS STILL DELIBERATELY SILENT: STRAIGHT (there is no junction to
+    confirm), DEPART (nothing has happened yet), and ARRIVE (build() gives
+    arrival its own lines and a backup call at a destination is a confirmation
+    of nothing).
     """
     d = _DIR_WORD.get(maneuver.direction)
-    if maneuver.type == M.TURN and d:
-        return f"{d.capitalize()} here."
-    if maneuver.type in (M.RAMP, M.FORK):
-        return "Take this exit."
+
+    if maneuver.type == M.TURN:
+        # No direction: the unrecognised-provider-enum case. It cannot say
+        # which way, and it can still say WHICH JUNCTION, which is the half of
+        # this call that matters when a contextual line has already explained
+        # the turn.
+        return f"{d.capitalize()} here." if d else "This one."
     if maneuver.type == M.UTURN:
         return "Turn around here."
+    if maneuver.type == M.RAMP:
+        # Left-hand exits exist and this does not name the side. Kept as it
+        # was: the primary call carries the provider's own wording, and a
+        # two-word line that says "exit" at the exit is not wrong, only terse.
+        return "Take this exit."
+    if maneuver.type in (M.FORK, M.KEEP):
+        return f"Stay {d}." if d else None
+    if maneuver.type == M.MERGE:
+        return f"Merge {d}." if d else "Merge."
+    if maneuver.type == M.ROUNDABOUT:
+        # NOT "Second exit.", and the reason is that nothing here knows which
+        # exit it is: CanonicalManeuver.exit_information exists on the model
+        # and no provider populates it. A number said at a roundabout is a
+        # number the driver will act on, so an invented one is the worst thing
+        # this file could produce -- the same rule ArrivalInfo follows when it
+        # refuses to guess a side (§28). What IS provider data is the
+        # direction, so that is what gets said.
+        return f"{d.capitalize()} at the roundabout." if d else None
     return None
 
 
@@ -286,22 +341,89 @@ def imminent_clip_id(text: str) -> str:
     return (text or "").strip().lower().translate(_CLIP_ID_CHARS).strip("_")
 
 
+# THE WHOLE CANONICAL VOCABULARY, not a list of the types that had lines when
+# this was written. That distinction is the entire point of enumerating rather
+# than listing: the first version of this walked four types, which was exactly
+# the four that already had sentences -- so it would have rendered clips for
+# the coverage that existed and stayed silent about the coverage that did not.
+# A set built from the answers can only ever confirm what it already knew.
+#
+# Asked of model.py instead, which is the vocabulary a provider is mapped INTO
+# (providers/google._MANEUVER_MAP) and therefore the real bound on what can
+# arrive. A type added there gets probed here without anyone remembering to.
+_ALL_TYPES = (M.TURN, M.MERGE, M.RAMP, M.FORK, M.ROUNDABOUT, M.KEEP,
+              M.STRAIGHT, M.UTURN, M.DEPART, M.ARRIVE)
+_ALL_DIRECTIONS = (M.LEFT, M.RIGHT, M.STRAIGHT_DIR, M.UNKNOWN)
+
+# THE MANEUVERS THAT GET NO JUNCTION CALL, WRITTEN DOWN AS A DECISION.
+#
+# Silence and an unwritten sentence look identical from outside this file, and
+# for six enum values they were the same thing until they were read. So the
+# ones that are meant to be silent are named here, and the test asserts against
+# THIS rather than against whatever imminent_text currently happens to return —
+# which makes a new type with no line a failure instead of a fourth entry
+# nobody notices.
+#
+#   STRAIGHT   there is no junction to confirm. The early call already says
+#              "Stay on Lincoln", which is the whole of what can be said.
+#   DEPART     nothing has happened yet.
+#   ARRIVE     build() gives arrival its own lines, and a backup call at a
+#              destination confirms nothing — the driver is looking at it.
+IMMINENT_SILENT = frozenset({M.STRAIGHT, M.DEPART, M.ARRIVE})
+
+# ...AND THE SECOND REASON A SHAPE IS SILENT, which is not about the type.
+#
+# "Stay left." without a side is not a shorter instruction, it is a different
+# one, and there is no honest two-word version of a fork whose direction is
+# unknown — unlike a turn, where "This one." still confirms the junction, or a
+# merge, where "Merge." is complete on its own. These three are the shapes
+# where the direction IS the instruction.
+#
+# No provider emits them: FORK, KEEP and ROUNDABOUT are directional in every
+# entry of _MANEUVER_MAP. They are named anyway, because "unreachable today"
+# and "would be handled correctly" are different claims and the second one is
+# the one worth holding.
+_NEEDS_DIRECTION = frozenset({M.FORK, M.KEEP, M.ROUNDABOUT})
+
+
+def imminent_silent(kind: str, direction: str = M.UNKNOWN) -> bool:
+    """Is this shape MEANT to have no junction call?
+
+    The whole reason this is a function and not an absence: silence and an
+    unwritten sentence are indistinguishable from outside speech.py, and for
+    six of Google's enum values they were the same thing until somebody read
+    the file. Now a shape that goes quiet without being named here is a test
+    failure rather than a gap nobody notices.
+    """
+    return kind in IMMINENT_SILENT or (
+        kind in _NEEDS_DIRECTION and direction not in (M.LEFT, M.RIGHT))
+
+
+def imminent_shapes() -> dict:
+    """{(type, direction): sentence or None} for every shape in the model.
+
+    The None entries are as much of the answer as the sentences are: they are
+    the maneuvers that deliberately have no junction call, and a test that
+    could not see them could not tell "decided against" from "never written".
+    """
+    return {
+        (kind, direction): imminent_text(M.CanonicalManeuver(
+            id="_probe", sequence=0, type=kind, direction=direction,
+            road_name="", latitude=0.0, longitude=0.0,
+            route_distance_position=0.0, polyline_index=0))
+        for kind in _ALL_TYPES for direction in _ALL_DIRECTIONS
+    }
+
+
 def imminent_clips() -> dict:
     """{clip_id: sentence} for every imminent line that exists.
 
-    Built by asking imminent_text for one of each shape it answers to, so the
-    set cannot fall behind the function that produces it.
+    Built by asking imminent_text for one of each shape the model can hold, so
+    the set cannot fall behind the function that produces it — which is what
+    makes "render the junction calls" a command rather than a checklist.
     """
-    out = {}
-    for kind in (M.TURN, M.RAMP, M.FORK, M.UTURN):
-        for direction in (M.LEFT, M.RIGHT, M.UNKNOWN):
-            text = imminent_text(M.CanonicalManeuver(
-                id="_probe", sequence=0, type=kind, direction=direction,
-                road_name="", latitude=0.0, longitude=0.0,
-                route_distance_position=0.0, polyline_index=0))
-            if text:
-                out[imminent_clip_id(text)] = text
-    return out
+    return {imminent_clip_id(t): t
+            for t in imminent_shapes().values() if t}
 
 
 def arrival_text(destination_name: str, side: str) -> str:
