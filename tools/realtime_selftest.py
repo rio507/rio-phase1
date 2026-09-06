@@ -235,13 +235,35 @@ def run_text_session():
     ok(audio["output_modalities"] == ["audio"],
        "...and under cedar it speaks")
 
-    # THE WHOLE PAYLOAD, MINUS THE ONE FIELD THAT IS ALLOWED TO DIFFER.
+    # THE WHOLE PAYLOAD, MINUS THE FIELDS THAT ARE ALLOWED TO DIFFER — and
+    # each of them is allowed for the same reason, which is why the list is
+    # short and why every entry is named rather than the diff being loosened.
+    #
+    # WHAT THE SESSION PRODUCES is the one decision the backend makes, and the
+    # other two follow from it arithmetically rather than being second
+    # decisions: `max_output_tokens` is a ceiling counted in whatever it
+    # produces, and audio tokens are not text tokens (20 a second of speech,
+    # measured), so the same LENGTH is a different NUMBER. `instructions`
+    # differ by the audio-tag paragraph, checked immediately below.
+    #
+    # The point of this diff is that nothing ELSE moves: not the model, not a
+    # tool, not the detector, not the transcriber.
     a, b = dict(text), dict(audio)
     a.pop("output_modalities"), b.pop("output_modalities")
     a.pop("instructions"), b.pop("instructions")
+    cap_text, cap_audio = a.pop("max_output_tokens"), b.pop("max_output_tokens")
     ok(a == b,
        "and nothing else about the session changes with the voice — same "
-       "model, same tools, same detector, same limits")
+       "model, same tools, same detector, same transcriber")
+    ok(cap_text == config.REALTIME_MAX_RESPONSE_TEXT_TOKENS
+       and cap_audio == config.REALTIME_MAX_RESPONSE_AUDIO_TOKENS,
+       f"the answer ceiling is stated in the units each mouth is billed in "
+       f"({cap_text} text / {cap_audio} audio)")
+    ok(abs(cap_text / 8 - cap_audio / 35) < 10,
+       f"...and it is the SAME LENGTH either way — {cap_text / 8:.0f}s "
+       f"against {cap_audio / 35:.0f}s of speech — which is the thing the "
+       f"number is a proxy for and the thing that must not change with the "
+       f"voice")
 
     # The instructions differ by the audio-tag paragraph and nothing else,
     # because tags are only reachable on the backend that can speak them.
@@ -448,7 +470,13 @@ def run_session_cost():
 
     ok(floor > 0, f"one response carries {floor:,} tokens of input before the "
                   f"driver has said anything")
-    cap = int(config.REALTIME_MAX_RESPONSE_TOKENS)
+    # THE CAP THAT IS ACTUALLY IN FORCE, not the text-mode one. The floor above
+    # is deliberately measured under elevenlabs because the two payloads differ
+    # only in modality; the CEILING is the one thing that does not carry over,
+    # because audio tokens and text tokens are not the same size. Sizing the
+    # budget on 300 while the session is minted at 1,200 would be a budget for
+    # a drive nobody is taking.
+    cap = int(config.max_response_tokens())
     worst = floor + cap
     print(f"      answer ceiling {cap:>6,} tokens   "
           f"(a response at full length: {worst:,})")
@@ -3061,19 +3089,32 @@ def run_two_tier():
     # 6. THE ANSWER LENGTHS ARE CAPPED WHERE IT COUNTS: at the API, not in a
     #    prompt that can be reconsidered.
     cfg = realtime.session_config()
-    ok(cfg.get("max_output_tokens") == config.REALTIME_MAX_RESPONSE_TOKENS,
-       f"the live session has a hard ceiling on any one answer "
-       f"({config.REALTIME_MAX_RESPONSE_TOKENS} tokens)")
-    # Now sitting exactly on this bound, and deliberately: 300 tokens is about
-    # thirty-five seconds of speech, which is already a long time to hold a
-    # driver. Past it the ceiling stops being the point at which something has
-    # gone wrong and becomes a length she is allowed to reach, and the budget
-    # arithmetic in run_session_cost changes with it — so raising it again
-    # should fail here and be argued for rather than edited in.
-    ok(config.REALTIME_MAX_RESPONSE_TOKENS <= 300,
+    cap = int(config.max_response_tokens())
+    ok(cfg.get("max_output_tokens") == cap,
+       f"the live session has a hard ceiling on any one answer ({cap} tokens "
+       f"under {config.VOICE_BACKEND})")
+    # THE BOUND IS SECONDS OF SPEECH, not tokens, and that is the only version
+    # of it that survives a change of modality. A token is about an eighth of a
+    # second of TEXT being read out and about a fifteenth of a second of AUDIO
+    # being produced, so the same number means two very different lengths --
+    # which is how a 300 that was a real ceiling in text mode became a mid-
+    # sentence cut in audio.
+    #
+    # Fifty seconds is already a long time to hold a driver. Past it the
+    # ceiling stops being the point at which something has gone wrong and
+    # becomes a length she is allowed to reach, and the budget arithmetic in
+    # run_session_cost changes with it -- so raising it should fail here and be
+    # argued for rather than edited in.
+    # MEASURED, not assumed, for the audio rate: the deltas of a real drive
+    # decoded back to samples put audio output at a flat 20 tokens per second
+    # of speech, with the transcript on top taking the total to 25-36 on
+    # answers long enough to matter. 35 is the median of that.
+    per_s = 8 if config.VOICE_BACKEND == "elevenlabs" else 35
+    seconds = cap / per_s
+    ok(seconds <= 40,
        f"and it is short enough to be a limit rather than a formality "
-       f"({config.REALTIME_MAX_RESPONSE_TOKENS} tokens, ~"
-       f"{config.REALTIME_MAX_RESPONSE_TOKENS // 8}s of speech)")
+       f"({cap} tokens, ~{seconds:.0f}s of speech under "
+       f"{config.VOICE_BACKEND})")
     ok(config.DEEP_ANSWER_MAX_TOKENS <= 400,
        f"a deep answer is capped for speech too ({config.DEEP_ANSWER_MAX_TOKENS})")
 
@@ -3149,9 +3190,10 @@ def run_backend(live: bool = False):
     ok(cfg["audio"]["input"]["transcription"]["model"] == "gpt-transcribe",
        "and it transcribes the driver with gpt-transcribe — the id the "
        "playground calls \"User transcript model\"")
-    ok(int(cfg["max_output_tokens"]) == 300,
-       f"the ceiling on a spoken answer is unchanged at 300 "
-       f"({cfg['max_output_tokens']})")
+    ok(int(cfg["max_output_tokens"]) == 1200,
+       f"the ceiling on a spoken answer is 1,200 AUDIO tokens "
+       f"({cfg['max_output_tokens']}) — the same ~35 seconds of speech that "
+       f"300 bought in text mode, in the currency this session is billed in")
     ok(config.OPENAI_REALTIME_MODEL == "gpt-realtime-2.1",
        f"on the same model as before ({config.OPENAI_REALTIME_MODEL})")
 
@@ -3179,6 +3221,59 @@ def run_backend(live: bool = False):
        "the fallback ladder is intact underneath it: dictate, then the "
        "synthesiser, then a pre-rendered clip — a warning never waits on a "
        "cloud call it is not getting")
+
+    # --- HOW LONG EACH LINE WAITS FOR HER VOICE -----------------------------
+    #
+    # One budget for every deterministic line was the reason "one voice
+    # everywhere" ran at about half on this backend: a navigating drive
+    # dictated five of eleven lines in marin and lost six to a 900 ms timeout
+    # that exists because of the single most urgent sentence in the system.
+    #
+    # The trade is not voice-versus-speed, and reading it that way gets the
+    # sign wrong. With budget B a line that starts in time is heard at up to B
+    # in her voice, and one that misses is heard at about B + 180 ms in the
+    # other. Looser buys the voice and lengthens the WORST CASE. So the only
+    # line whose worst case is the whole point keeps the tight budget, and the
+    # ones issued with room in front of them do not.
+    imminent = config.speak_timeout_ms("nav", "imminent")
+    early = config.speak_timeout_ms("nav", "early")
+    ok(imminent <= config.REALTIME_SPEAK_TIMEOUT_MS,
+       f'"Left here." at the junction keeps the tight budget ({imminent} ms): '
+       "it is the one dictated line whose worst case is the whole point")
+    ok(early > imminent,
+       f"...and a call issued seconds out does not ({early} ms), because "
+       "nothing about it is late at a second and a half")
+    ok(config.speak_timeout_ms("nav", "primary") >= imminent,
+       f"the instruction sits between them "
+       f'({config.speak_timeout_ms("nav", "primary")} ms)')
+    ok(config.speak_timeout_ms("health") > config.REALTIME_SPEAK_TIMEOUT_MS,
+       f"a health announcement waits longer for her voice "
+       f"({config.speak_timeout_ms('health')} ms) — the urgent ones are not "
+       "dictated at all, they are pre-rendered clips")
+    # The calm headway tier is the one loosened budget with a hard stop behind
+    # it: its arbiter item carries a 2500 ms TTL, because a gap measured three
+    # seconds ago is not a gap. Budget plus fallback has to fit inside that.
+    headway = config.speak_timeout_ms("headway")
+    ok(headway + 180 < 2500,
+       f"the calm headway budget plus its fallback fits inside the 2500 ms TTL "
+       f"the line is discarded at ({headway} + 180 ms)")
+    ok(config.speak_timeout_ms("something_new") ==
+       config.REALTIME_SPEAK_TIMEOUT_MS,
+       "and a channel the table has never heard of gets the SHORT default, so "
+       "a new one is conservative rather than accidentally patient")
+
+    # One copy of the table, and it is config.py's. The browser resolves a
+    # line's budget from what the session carried, so there is nothing to drift.
+    ok("speak_timeout_ms_by_channel" in open(
+           os.path.join(REPO, "realtime.py")).read(),
+       "the whole table travels with the session")
+    ok("live.speakTimeout(opts.channel, opts.callType)" in speak_js,
+       "...and rio_speak asks the session for it per channel and call type "
+       "rather than holding a number of its own")
+    ok("callType: candidate.call_type" in open(
+           os.path.join(REPO, "static", "rio_nav.js")).read(),
+       "...with navigation passing which of the four calls it is making, "
+       "which is the whole reason the split exists")
 
     # --- ONE VOICE: the clips that never touch the network -------------------
     from tools import render_alerts as ra

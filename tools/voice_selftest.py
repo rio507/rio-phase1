@@ -100,8 +100,9 @@ def run_session():
        f"the voice is named ({config.OPENAI_REALTIME_VOICE}) whatever the "
        "modality, so the tier-2 fallback is a modality switch and not a "
        "first-time configuration")
-    ok(int(cfg["max_output_tokens"]) == int(config.REALTIME_MAX_RESPONSE_TOKENS),
-       "the ceiling on a spoken answer is unchanged")
+    ok(int(cfg["max_output_tokens"]) == int(config.max_response_tokens()),
+       f"the ceiling on a spoken answer is the one this modality is billed in "
+       f"({config.max_response_tokens()} tokens under {config.VOICE_BACKEND})")
 
     # What travels to the browser with the session.
     payload_keys = ("voice_backend", "live_voice", "voice_sample_rate",

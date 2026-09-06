@@ -17,8 +17,17 @@
  *   3. a pre-rendered clip, if the line has one.
  *
  * A warning NEVER waits on a cloud call it is not getting. Dictation is given
- * a few hundred milliseconds to START and then abandoned — the synthesiser is
- * 200 ms away and a late warning has stopped being a warning.
+ * a bounded time to START and then abandoned — the synthesiser is about 180 ms
+ * away and a late warning has stopped being a warning.
+ *
+ * HOW LONG THAT IS DEPENDS ON THE LINE, and getting this wrong is not a matter
+ * of taste. With a budget B, a line that starts in time is heard at up to B in
+ * her voice, and a line that misses is heard at about B + 180 ms in the other
+ * one. So a looser budget buys vocal consistency and lengthens the WORST CASE.
+ * "Left here." at the junction wants the worst case bounded; "Right turn coming
+ * up onto Cloverfield Blvd.", issued seconds out, wants her voice. The table
+ * lives in config.py (REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL), travels with the
+ * session, and is read here per channel and per call type.
  *
  * What this file does NOT do is decide anything about priority, ordering or
  * interruption. Every caller keeps the arbiter item it already had; this
@@ -110,11 +119,15 @@
 
   /* An audio provider for an arbiter item: {play, stop}.
    *
-   *   text     the exact words, as written by the policy that decided them
-   *   channel  'headway' | 'health' | 'nav' — which dictation switch applies
-   *   ttsUrl   the fallback synthesiser endpoint for this line
-   *   clipUrl  a pre-rendered file, if this line has one
-   *   element  the audio element to play fallbacks through
+   *   text      the exact words, as written by the policy that decided them
+   *   channel   'headway' | 'health' | 'nav' — which dictation switch applies
+   *   callType  for nav, which of the four calls this is: a backup call at the
+   *             junction and one issued seconds out have different deadlines
+   *   ttsUrl    the fallback synthesiser endpoint for this line
+   *   clipUrl   a pre-rendered file, if this line has one
+   *   element   the audio element to play fallbacks through
+   *   timeoutMs an explicit override; otherwise the budget is resolved from
+   *             the channel and call type, per config.speak_timeout_ms
    */
   function provider(opts) {
     opts = opts || {};
@@ -127,6 +140,23 @@
                      (!live.speechEnabled || live.speechEnabled(opts.channel)));
 
     function text() { return (opts.text || '').trim(); }
+
+    /* HOW LONG THIS LINE WAITS, and it is not one number for all of them.
+     *
+     * The budget is the point at which a line stops waiting for her voice and
+     * is synthesised instead, so it is a question about THIS sentence's
+     * deadline: "Left here." at the junction cannot be late, and "Right turn
+     * coming up onto Cloverfield Blvd." can. Asked of the session, which
+     * carries the table config.py decided, so there is one copy of it and it
+     * is not this one. */
+    function budget() {
+      if (opts.timeoutMs) return opts.timeoutMs;
+      if (live && live.speakTimeout) {
+        var ms = live.speakTimeout(opts.channel, opts.callType);
+        if (ms) return ms;
+      }
+      return undefined;          // the controller's own default
+    }
 
     function record(path) { stats[path]++; stats.last = path; }
 
@@ -160,7 +190,7 @@
       play: function () {
         if (stopped) return Promise.resolve();
         if (!dictate) return fallback('no_session');
-        return live.speak(text(), { timeoutMs: opts.timeoutMs })
+        return live.speak(text(), { timeoutMs: budget() })
           .then(function (r) { record('dictated'); return r; })
           .catch(function (e) {
             // Dictation did not start in time, the session went away, or it was

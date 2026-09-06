@@ -1017,12 +1017,14 @@ def session_config() -> dict:
         "tools": list(BASE_TOOLS),
         "tool_choice": "auto",
         # A ceiling on any single spoken answer, at the API rather than in the
-        # prompt. The instructions ask for brevity and mostly get it; this is
+        # prompt, and IN THE UNITS THIS SESSION IS BILLED IN — audio tokens
+        # when she speaks for herself, text tokens when something else does.
+        # See config.max_response_tokens. The instructions ask for brevity and mostly get it; this is
         # what makes a five-paragraph answer impossible rather than unlikely.
         # It is not a target — ordinary answers are a fraction of it — it is
         # the point past which something has gone wrong and the driver should
         # not have to sit through the rest of it.
-        "max_output_tokens": int(config.REALTIME_MAX_RESPONSE_TOKENS),
+        "max_output_tokens": int(config.max_response_tokens()),
     }
 
 
@@ -1119,6 +1121,15 @@ def mint_client_secret() -> dict:
         "look_answer_max_tokens": int(config.look_answer_max_tokens()),
         "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
         "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),
+        # ...AND PER CHANNEL, because a turn call at the junction and a health
+        # announcement have completely different tolerance for a few hundred
+        # milliseconds. The whole table travels rather than the one number, so
+        # rio_speak resolves a line's budget from the same place config.py
+        # decides it and the browser holds no copy of any of them.
+        "speak_timeout_ms_by_channel": {
+            channel: dict(by_call) for channel, by_call
+            in config.REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL.items()
+        },
         # A vetted answer is not a warning and does not share its
         # deadline. See REALTIME_DIRECT_SPEECH_TIMEOUT_MS.
         "direct_speech_timeout_ms":

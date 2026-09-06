@@ -344,15 +344,19 @@ difference; nothing else is forgiven.
 | | path | first audio |
 |---|---|---|
 | red-tier warnings, tire fast path | **pre-rendered clip**, local file | 0 ms |
-| everything else deterministic | dictated to the live session | 390–585 ms |
-| no session / dictation stalls | ElevenLabs, through the existing endpoints | 145–172 ms |
+| everything else deterministic | dictated to the live session | 418 ms – 1.3 s (p50 ~700 ms) |
+| no session / dictation stalls | ElevenLabs, through the existing endpoints | 145–180 ms |
 | synthesiser unreachable too | the clip, if the line has one | 0 ms |
 
-A warning **never waits on a cloud call it is not getting**: dictation gets
-900 ms to *start* and is then abandoned, cancelled at the model so it cannot
-speak over the fallback. The lines where those milliseconds would genuinely
-matter are not dictated at all — they are local files, preloaded, with no
-network in the path. That bypass is unchanged; the clips are simply rendered in
+A warning **never waits on a cloud call it is not getting**: dictation gets a
+bounded time to *start* and is then abandoned, cancelled at the model so it
+cannot speak over the fallback. **How long that is depends on the line** — 900
+ms for `"Left here."` at the junction, 2000 ms for a call issued seconds out —
+because a looser budget buys her voice and lengthens the worst case, and only
+one of those lines cares about the worst case. See *One voice everywhere, and
+the budget that was costing half of it* below. The lines where those
+milliseconds would genuinely matter are not dictated at all — they are local
+files, preloaded, with no network in the path. That bypass is unchanged; the clips are simply rendered in
 the same voice now (`python -m tools.render_alerts --force`), verified by
 transcribing the finished MP3 and re-rendering if it does not match.
 
@@ -400,6 +404,21 @@ OPENAI_REALTIME_VOICE=marin                # cedar | marin — her voice under
                                            # what tier 2 falls back to otherwise
 VOICE_BACKEND=openai_realtime              # openai_realtime | elevenlabs
 ```
+
+Three numbers are **modality-dependent** and are resolved by a function rather
+than read as a constant, because the same value means two different things
+depending on whether the session is producing words or sound:
+
+| | text mode | audio mode | resolved by |
+|---|---|---|---|
+| ceiling on one answer | 300 | 1,200 | `config.max_response_tokens()` |
+| ceiling on a scene answer | 60 | 240 | `config.look_answer_max_tokens()` |
+| how long a dictated line waits | 900 ms | 900–2000 ms, per channel and call type | `config.speak_timeout_ms()` |
+
+The first two are the same LENGTH expressed in each currency (~35 s of speech,
+two short sentences). The third is not a units conversion at all — it is the
+one number that genuinely differs per line, and the table is in
+`REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL`.
 
 The defaults in `config.py` are these values, not other ones. A default that
 disagreed with the running config would be a second voice waiting for the day
@@ -525,59 +544,105 @@ a single number is wrong for one of the two backends whichever value it holds.
 The same question, after: *"White BMW 5 Series ahead, likely an E60. The exact
 trim is too blurry to call."*
 
-### ...and the same arithmetic applies to the 300 cap, which is UNCHANGED
+### ...and the same arithmetic applies to the response cap
 
-`REALTIME_MAX_RESPONSE_TOKENS` is still 300, deliberately and by instruction.
-It should be read knowing what it now buys: **300 output tokens of audio is
-roughly 160-260 characters**, against well over a thousand in text mode. On the
-six-turn drive four of six answers reached it and stopped mid-sentence —
+`REALTIME_MAX_RESPONSE_TOKENS` was 300, and under audio that is 160-260
+characters. On the six-turn drive four of six answers reached it and stopped
+mid-sentence —
 
 > "…so this is coming from the tire data that is"
 
-— which is the driver hearing her trail off, and is the thing the comment above
-that constant says a ceiling must not do. **Flagged, not changed.** The number
-to revisit is that one; the arithmetic for revisiting it is in this section.
+— which is the driver hearing her trail off, and the thing the comment above
+that constant says a ceiling must not do.
 
-### One voice everywhere is a rate, not a yes
+**The unit that settled it is seconds, not tokens or characters.** Tokens per
+character varies from 1.25 to 3.6, mostly with how much fixed per-response
+overhead a short answer carries. Decoding the audio deltas of a real drive back
+to samples gives a flat number instead:
+
+* **audio output is exactly 20 tokens per second of speech**
+* total output, on answers long enough to matter, is **25-36 tokens/second**
+
+So the ceiling, in the only unit that survives a change of modality:
+
+| | cap | seconds of speech |
+|---|---|---|
+| text mode | 300 | ~35 s |
+| audio mode | **1,200** | ~34 s |
+
+The number changed because the units did; what a driver is allowed to sit
+through did not. It is bounded from above too, so it is not merely large
+enough: `run_session_cost` asserts three tool turns a minute fit at
+`(floor + cap) × 2 × 3 ≤ 40,000`, which caps the cap at about 1,830 — 1,200
+sits inside that at 37,194 of 40,000 in the pessimistic reading where every
+answer runs the whole way.
+
+And it is still a ceiling rather than a length. On the drive after the change
+the longest honest answer used **585 tokens, 49% of it**, and nothing
+truncated: 6/6 turns spoke, 6/6 finished the sentence.
+
+`config.max_response_tokens()` picks the pair, the same shape
+`look_answer_max_tokens()` uses, because one number is wrong for one of the two
+backends whichever value it holds.
+
+### One voice everywhere, and the budget that was costing half of it
 
 The navigation drive is the one that can hear this, because it is the only one
 where the car says something nobody asked it to. Under this backend a turn call
-is DICTATED into the live session — the same verbatim injection — so it comes
-out in marin, in the same voice as the answer before it. Measured over three
-runs of `--script nav`, eleven deterministic lines each:
+is DICTATED into the live session, so it comes out in marin, in the same voice
+as the answer before it — and it was only managing that about half the time:
 
 | run | dictated (marin) | fell back to ElevenLabs | silent |
 |---|---|---|---|
-| 1 | 10 | 1 | 1 |
-| 2 | 3 | 8 | 8 |
-| 3 | 5 | 6 | 0 |
+| before, run 1 | 10 | 1 | 1 |
+| before, run 2 | 3 | 8 | 8 |
+| before, run 3 | 5 | 6 | 0 |
+| **after** | **10** | **1** | **0** |
 
-Run 2's eight silences were the harness (see below). Runs 1 and 3 are the real
-number, and the real number is **not all of them**: every miss is a `timeout`,
-not a `busy` — the line was asked for and did not make a sound inside
-`REALTIME_SPEAK_TIMEOUT_MS`.
+Run 2's eight silences were the harness (below). Every other miss was a
+`timeout`, not a busy mouth: the line was asked for and did not make a sound
+inside `REALTIME_SPEAK_TIMEOUT_MS`.
 
-That budget is 900 ms, and it was measured on an IDLE session, where dictation
-reaches first audio in 390-585 ms. A drive is not an idle session: the realtime
-API serialises responses, so a turn call asked for while she is finishing a
-sentence — or while the previous turn call is still being spoken — waits behind
-it. When it misses, `rio_speak.js` does exactly what it is built to do and
-synthesises the line on the ElevenLabs endpoint instead, 145-172 ms away, and
-the driver hears the turn called in a slightly different voice.
+That budget was 900 ms for every deterministic line in the system, and it was
+measured on an IDLE session, where the injection lands in 390-585 ms. A drive
+is not idle — the realtime API serialises responses, so a turn call asked for
+while she is finishing a sentence, or while the previous turn call is still
+being spoken, waits behind it. Measured from `response.created` to first audio
+over two drives (n=27): **min 418 ms, p50 ~700 ms, p90 ~1140 ms, max 1277 ms.**
+A 900 ms budget misses about a third of them.
 
-**Left as it is, and flagged.** Raising it trades warning latency for vocal
-consistency, and that is a judgement about safety timing rather than a
-regression to fix quietly. Two things worth knowing before making it:
+**The trade is not voice versus speed, and reading it that way gets the sign
+wrong on the one line that matters.** With a budget B, a line that starts in
+time is heard at up to B in her voice; a line that misses is heard at about
+B + 180 ms — the fallback's measured first byte — in the other one. So a
+*looser* budget buys vocal consistency and lengthens the **worst case**. A
+tighter one bounds the worst case and spends the voice.
 
-* The lines this budget governs are nav calls, health announcements and the
-  calm headway tier. The genuinely time-critical ones — the red headway tier
-  and the two tire fast-path lines — are **not dictated at all**; they play
-  pre-rendered local files with no network in the path, and they are in marin
-  because the clip library was re-rendered.
-* Not all dictated lines are equally time-critical either. `"Left here."`
-  arriving 1.5 s late may be past the turn; `"Right turn coming up onto
-  Cloverfield Blvd."` will not be. A per-channel or per-call-type budget is the
-  principled version of this number, and it does not exist yet.
+Which of those a line wants depends entirely on what it is saying, so the
+budget is now per channel, and for navigation per **call type**
+(`REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL`, resolved by
+`config.speak_timeout_ms()`):
+
+| line | budget | why |
+|---|---|---|
+| nav / `imminent` — *"Left here."* | **900 ms** | the backup call, AT the turn. The one line whose worst case is the whole point, so it keeps the tight budget and spends the voice to bound the delay. |
+| nav / `primary` — *"Take the next left onto 16th St."* | 1500 ms | the instruction, issued with room in front of the maneuver |
+| nav / `early`, `arrival` | 2000 ms | seconds out; nothing about them is late at a second and a half |
+| `health` | 2000 ms | an announcement. The urgent ones are not dictated at all — the two tire fast-path lines play pre-rendered clips. |
+| `headway` | 1200 ms | only the CALM tier reaches dictation. Shortest of the loosened budgets because its arbiter item carries a 2500 ms TTL: a gap measured three seconds ago is not a gap, and B + fallback has to fit inside it. |
+| anything else | 900 ms | a channel the table has not been taught about is conservative rather than accidentally patient |
+
+The whole table travels with the session; `rio_speak.js` asks for a line's
+budget by channel and call type, and `rio_nav.js` passes `callType` — it was
+already on the candidate, as the `/nav/voice` address.
+
+**The result is the last row of the table above, and the one line that still
+fell back was `'Right here.'` — an `imminent` call, the one that deliberately
+kept 900 ms.** The design spending the voice exactly where it said it would.
+
+The lines where this would matter most are still not dictated at all: the red
+headway tier and the tire fast path play local files, and no number here can
+make them late.
 
 ### The harness was answering for her
 

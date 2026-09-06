@@ -181,6 +181,11 @@
       return RIO.speak.provider({
         text: candidate.text || '',
         channel: 'nav',
+        // WHICH OF THE FOUR CALLS THIS IS, and it decides how long the line
+        // waits for her voice before being synthesised instead. "Left here."
+        // at the junction cannot be late; the early call, seconds out, can.
+        // Already on the candidate — it is the /nav/voice address above.
+        callType: candidate.call_type,
         ttsUrl: url,
         element: navAudio,
       });

@@ -75,15 +75,86 @@ REALTIME_SPEECH_ENABLED = True
 # How long a dictated line may take to START before RIO gives up on the live
 # session and says it the other way.
 #
-# MEASURED on this stack, across two sessions: dictation reaches first audio in
-# 390-585 ms, ElevenLabs in 145-172 ms, a pre-rendered clip in 0. So the budget
-# sits above the observed worst case with room, and below a second: a false bail
-# costs a line in the fallback voice, while a budget that is too generous costs
-# the driver the delay AND the fallback on top of it.
+# ONE NUMBER WAS THE WRONG SHAPE FOR THIS, and the drive that showed it is the
+# navigating one: of eleven deterministic lines, five reached the speaker in
+# marin and six timed out into the ElevenLabs fallback. Every miss was a
+# `timeout`, not a busy mouth. So "one voice everywhere" was running at about
+# half, and the cause was a budget derived from the single most urgent line
+# being applied to every line.
 #
-# The lines where this would actually matter are not dictated at all — the red
-# tier and the tire fast path play local clips.
+# MEASURED, from `response.created` to the first audio, over a tools drive and
+# a navigating drive (n=27):
+#
+#     min 418 ms   p50 ~700 ms   p90 ~1140 ms   max 1277 ms
+#
+# The old 900 ms came from an IDLE session, where the same injection lands in
+# 390-585 ms. A drive is not idle: the realtime API serialises responses, so a
+# turn call asked for while she is finishing a sentence — or while the previous
+# turn call is still being spoken — waits behind it.
+#
+# WHAT THE TRADE ACTUALLY IS, because it is not "voice versus speed" and
+# reading it that way gets the sign wrong on the one line that matters. With a
+# budget B: a line that starts in time is heard at up to B, in her voice; a
+# line that misses is heard at about B + 180 ms (the fallback's measured first
+# byte), in the other one. So a LOOSER budget buys vocal consistency and
+# lengthens the WORST CASE. A tighter budget bounds the worst case and spends
+# the voice.
+#
+# Which of those two a channel wants depends entirely on what it is saying, and
+# that is why the numbers below differ:
+#
+#   nav / imminent    "Left here." The backup call, AT the turn. This is the
+#                     one line where the worst case is the whole point — late
+#                     enough and the driver has passed it — so it keeps the
+#                     tight budget and spends the voice to bound the delay.
+#   nav / primary     "Take the next left onto 16th St." The instruction, and
+#                     it is issued with room in front of the maneuver.
+#   nav / early       "Right turn coming up onto Cloverfield Blvd." Seconds
+#                     out. Nothing about this is time-critical.
+#   nav / arrival     Ditto.
+#   health            An announcement about the car. The genuinely urgent ones
+#                     are not dictated at all: the two tire fast-path lines
+#                     play pre-rendered clips with no network in the path.
+#   headway           Only the CALM tier reaches dictation — coaching, not an
+#                     alert; the red tier plays clips. Kept the shortest of the
+#                     loosened budgets because its arbiter item carries a
+#                     2500 ms TTL: a gap measured three seconds ago is not a
+#                     gap, and B + fallback has to fit inside that.
+#
+# THE LINES WHERE THIS WOULD MATTER MOST ARE STILL NOT DICTATED AT ALL. The red
+# headway tier and the tire fast path play local files, and no number here can
+# make them late.
 REALTIME_SPEAK_TIMEOUT_MS = 900
+
+# Per channel, and for navigation per CALL TYPE, because "a turn call" is four
+# different sentences with four different deadlines. `_default` covers a call
+# type this table has not been taught about, so a new one is loose rather than
+# accidentally urgent.
+REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL = {
+    "nav": {
+        "imminent": 900,
+        "primary": 1500,
+        "early": 2000,
+        "arrival": 2000,
+        "_default": 1500,
+    },
+    "health": {"_default": 2000},
+    "headway": {"_default": 1200},
+}
+
+
+def speak_timeout_ms(channel: str = None, call_type: str = None) -> int:
+    """How long THIS line may take to start before RIO says it the other way.
+
+    Falls back to REALTIME_SPEAK_TIMEOUT_MS for a channel the table does not
+    name, which keeps the old behaviour for anything new rather than giving it
+    the loosest budget in the file by accident.
+    """
+    by_call = REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL.get(channel)
+    if not by_call:
+        return int(REALTIME_SPEAK_TIMEOUT_MS)
+    return int(by_call.get(call_type or "_default",
+                           by_call.get("_default", REALTIME_SPEAK_TIMEOUT_MS)))
 
 # ...AND THE SAME QUESTION FOR A LINE THAT IS NOT A WARNING.
 #
@@ -219,7 +290,67 @@ DEEP_ANSWER_TIMEOUT_S = 45.0
 # tools/realtime_selftest.py run_session_cost adds the cap to the per-response
 # input floor and asserts that three tool turns a minute still fit inside the
 # account's 40,000 even if every single answer runs the whole way to it.
-REALTIME_MAX_RESPONSE_TOKENS = 300
+#
+# AND THE UNITS ARE THE MODALITY'S, which is the second time that has cost an
+# answer -- REALTIME_LOOK_ANSWER_* below carries the same lesson from the same
+# afternoon. `max_output_tokens` counts what the session PRODUCES. Under text
+# mode that is words. Under speech to speech it is SOUND, and audio tokens
+# dominate: measured over a real drive, audio costs a flat 20 tokens for every
+# second of speech, and the transcript that comes with it costs more on top.
+#
+# So 300 is about 1,200 characters written and about 160-260 characters spoken,
+# and on the six-turn audio drive four of six answers reached it and stopped
+# mid-sentence:
+#
+#     "...so this is coming from the tire data that is"
+#
+# which is the driver hearing her trail off, and is precisely what the
+# paragraph above says a ceiling must not do. Same fault as the 200 -> 300
+# raise, arrived at by changing the modality rather than the number.
+#
+# 1,200 UNDER AUDIO, AND THE UNIT THAT PICKED IT IS SECONDS.
+#
+# Tokens per character was the wrong way to reason about this -- it varies from
+# 1.25 to 3.6 depending mostly on how much fixed per-response overhead a short
+# answer is carrying. Measured against the ACTUAL AUDIO instead (decoded from
+# the deltas of a real drive, n=10), the picture is flat and obvious:
+#
+#     audio output is exactly 20 tokens per second of speech
+#     total output, on answers long enough to matter, is 25-36 tokens/second
+#
+# So the ceiling in the only unit that survives a change of modality:
+#
+#     300 text tokens   ~35 seconds   (the text-mode number, and its intent)
+#   1,200 audio tokens  ~34 seconds   (the same length, in the other currency)
+#
+# That is the whole derivation. The number changed because the units did; what
+# a driver is allowed to sit through did not.
+#
+# Bounded from above as well, so it is not merely large enough:
+# run_session_cost asserts three tool turns a minute fit at
+# (floor + cap) * 2 * 3 <= 40,000. With today's floor that caps the cap at
+# about 1,830, and 1,200 sits comfortably inside it rather than against it --
+# 37,194 of 40,000 in the pessimistic reading where every answer runs the whole
+# way to the ceiling.
+REALTIME_MAX_RESPONSE_TEXT_TOKENS = 300
+REALTIME_MAX_RESPONSE_AUDIO_TOKENS = 1200
+
+
+def max_response_tokens() -> int:
+    """The ceiling on one answer, in the units the live session is billed in.
+
+    A function for the same reason look_answer_max_tokens() is: VOICE_BACKEND
+    is decided further down this file, and a constant that had to be kept in
+    step with the backend by hand is the shape of the bug it replaces.
+    """
+    return (REALTIME_MAX_RESPONSE_TEXT_TOKENS if VOICE_BACKEND == "elevenlabs"
+            else REALTIME_MAX_RESPONSE_AUDIO_TOKENS)
+
+
+# The old name. Kept because it is what the cut-off classification and two
+# suites talk about, and because it is the number under the backend the
+# comment above was originally written for.
+REALTIME_MAX_RESPONSE_TOKENS = REALTIME_MAX_RESPONSE_TEXT_TOKENS
 
 # What a spoken answer to "what do you see" may run to.
 #

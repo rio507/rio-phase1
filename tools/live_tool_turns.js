@@ -439,6 +439,15 @@ RIO.realtime = {
       const chans = session.speech_channels || {};
       return chans[channel] !== false;
     },
+    /* ...and the same per-line budget the page resolves. Copied rather than
+       simplified, for the same reason speechEnabled is: a harness that made
+       up its own deadline would be recording a path the car does not take. */
+    speakTimeout: (channel, callType) => {
+      const table = session.speak_timeout_ms_by_channel || {};
+      const byCall = table[channel];
+      if (!byCall) return session.speak_timeout_ms;
+      return byCall[callType] || byCall._default || session.speak_timeout_ms;
+    },
   }),
 };
 

@@ -2312,6 +2312,18 @@
                 var chans = session.speech_channels || {};
                 return chans[channel] !== false;
               },
+              /* How long THIS line may take to start speaking before it is
+                 synthesised instead. Per channel, and for navigation per call
+                 type, because a backup call at the junction and one issued
+                 seconds out have different deadlines. The table is decided in
+                 config.py and travels with the session; this only reads it. */
+              speakTimeout: function (channel, callType) {
+                var table = session.speak_timeout_ms_by_channel || {};
+                var byCall = table[channel];
+                if (!byCall) return session.speak_timeout_ms;
+                return byCall[callType] || byCall._default
+                       || session.speak_timeout_ms;
+              },
               /* Which voice this drive is actually using, for the panel and
                  for the tests. Read from the controller rather than from the
                  session payload: the payload says what was INTENDED, and after

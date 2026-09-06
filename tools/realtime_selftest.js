@@ -872,6 +872,66 @@ section('the fallback chain — a warning never waits on a cloud call');
        'with nothing left to try it reports silence rather than pretending');
   }
 
+  {
+    /* HOW LONG THIS LINE WAITS, resolved per channel and per call type.
+     *
+     * One budget for all of them is why "one voice everywhere" was running at
+     * about half on the speech-to-speech backend: a navigating drive dictated
+     * five of eleven lines in marin and lost six to a 900 ms timeout that
+     * exists because of "Left here." at the junction. The plumbing from
+     * config.py to `live.speak` is four hops and every one of them is silent
+     * when it breaks -- the line still gets spoken, just in the wrong voice --
+     * so it is pinned here rather than trusted. */
+    const asked = [];
+    const session = {
+      speak: (t, o) => { asked.push(o && o.timeoutMs);
+                         return Promise.resolve({ transcript: t }); },
+      speechEnabled: () => true,
+      // The facade the panel and the harness both expose, reading the table
+      // the session carried.
+      speakTimeout: (channel, callType) => {
+        const table = { nav: { imminent: 900, early: 2000, _default: 1500 },
+                        health: { _default: 2000 } };
+        const byCall = table[channel];
+        if (!byCall) return 900;
+        return byCall[callType] || byCall._default || 900;
+      },
+    };
+    const b = stubBrowser({ session });
+    const say = (o) => speak.provider(Object.assign(
+      { element: b.element, ttsUrl: '/x' }, o)).play();
+
+    await say({ text: 'Left here.', channel: 'nav', callType: 'imminent' });
+    ok(asked[asked.length - 1] === 900,
+       'the backup call at the junction is given the short budget (900 ms) — '
+       + 'it is the one line whose worst case is the whole point');
+
+    await say({ text: 'Right turn coming up onto Cloverfield Blvd.',
+                channel: 'nav', callType: 'early' });
+    ok(asked[asked.length - 1] === 2000,
+       '...and the call issued seconds out is given a long one (2000 ms), so '
+       + 'it is heard in her voice rather than beaten to the speaker');
+
+    await say({ text: 'Take the next left.', channel: 'nav',
+                callType: 'primary' });
+    ok(asked[asked.length - 1] === 1500,
+       '...with the instruction between them, from the channel default');
+
+    await say({ text: 'Front left is low.', channel: 'health' });
+    ok(asked[asked.length - 1] === 2000,
+       'a channel with no call types uses its own default');
+
+    await say({ text: 'x', channel: 'headway' });
+    ok(asked[asked.length - 1] === 900,
+       'a channel the table does not name falls back to the short default, '
+       + 'never to the longest number in the file');
+
+    await say({ text: 'x', channel: 'nav', callType: 'imminent',
+                timeoutMs: 42 });
+    ok(asked[asked.length - 1] === 42,
+       '...and an explicit override still wins, which is what the benches use');
+  }
+
   delete global.fetch;
   delete global.URL;
 }
