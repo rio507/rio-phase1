@@ -75,7 +75,7 @@
                          send()/close() and onmessage/onopen/onclose
        context,          an AudioContext, or a factory, or neither
        sampleRate,       what the server is sending (it says so on `ready`)
-       onEvent(ev)       observability, and the cedar fallback
+       onEvent(ev)       observability, and the tier-2 fallback
      }
      ------------------------------------------------------------------- */
   function createSink(cfg) {
@@ -209,7 +209,7 @@
         if (m.open === false) {
           // Nothing to fall back FROM. The controller is told now so the drive
           // starts in the voice it is going to keep.
-          emit('VOICE_FALLBACK', { tier: 'cedar', cause: 'socket_unavailable' });
+          emit('VOICE_FALLBACK', { tier: 'live_voice', cause: 'socket_unavailable' });
         }
         return;
       }

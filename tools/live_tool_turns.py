@@ -52,6 +52,7 @@ same one the page would see.
 import argparse
 import asyncio
 import base64
+import contextlib
 import json
 import subprocess
 import sys
@@ -219,8 +220,19 @@ class Panel:
                 ev = json.loads(raw)
             except Exception:
                 continue
-            self.notes.append({"k": "wire_in", "type": ev.get("type"),
-                               "t": time.perf_counter(), "ev": ev})
+            # THE AUDIO GOES TO THE PANEL, NOT INTO THE REPORT. Under
+            # openai_realtime RIO's voice arrives here as base64 PCM, a few
+            # kilobytes per event and hundreds of events per answer. Kept in
+            # `notes` it would be most of a drive's memory and all of a --dump
+            # file, for a payload nothing on this side ever reads: the WAV is
+            # written by the panel, from the same events, in the order a
+            # listener would have heard them.
+            note = {"k": "wire_in", "type": ev.get("type"),
+                    "t": time.perf_counter(), "ev": ev}
+            if ev.get("type") == "response.output_audio.delta":
+                note["ev"] = {**{k: v for k, v in ev.items() if k != "delta"},
+                              "delta_bytes": len(ev.get("delta") or "")}
+            self.notes.append(note)
             self.tell({"k": "ev", "ev": ev})
 
     async def pump_relay(self):
@@ -256,8 +268,16 @@ async def run(base, out_path, video, dump=None, script="tools"):
               f"{session['output_modalities']}, "
               f"{len(session['tools'])} tools "
               f"({', '.join(session['tools'])})")
-        assert session["output_modalities"] == ["text"], \
-            "this drive is only interesting in text mode"
+        # WHOSE MOUTH THIS DRIVE HAS. Read, reported, and not asserted: this
+        # used to insist on text mode, which made the harness unable to record
+        # the backend it is now recording. Both are real drives and the only
+        # thing that changes is where the audio comes back from.
+        text_mode = session["output_modalities"] == ["text"]
+        print(f"    voice: {session['voice_backend']} "
+              f"({session.get('live_voice')}), "
+              f"dictation={'on' if session.get('speech_enabled') else 'off'}, "
+              f"audio arrives on "
+              f"{'the relay socket' if text_mode else 'the session socket'}")
 
         # LET THE CAMERA GET AHEAD OF THE QUESTION. The fast path answers
         # from an observation written in the last couple of seconds; asked
@@ -272,18 +292,25 @@ async def run(base, out_path, video, dump=None, script="tools"):
         oai_url = ("wss://api.openai.com/v1/realtime?model="
                    + config.OPENAI_REALTIME_MODEL)
         ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
-        async with websockets.connect(
+        # THE RELAY IS OPENED ONLY IF IT IS THE MOUTH. Under openai_realtime
+        # nothing would ever be sent on it, and an idle dialogue socket is not
+        # free: it holds one of the workspace's 21 dialogue seats for the whole
+        # drive, out of a pool a real car is competing for.
+        async with contextlib.AsyncExitStack() as stack:
+            oai = await stack.enter_async_context(websockets.connect(
                 oai_url,
                 additional_headers={
                     "Authorization": "Bearer " + session["client_secret"]},
-                max_size=None) as oai, \
-                websockets.connect(
-                    f"{ws_base}/voice/dialogue?session_id={sid}",
-                    max_size=None) as relay:
-            panel.oai, panel.relay = oai, relay
+                max_size=None))
+            panel.oai = oai
             pumps = [asyncio.create_task(panel.pump_node()),
-                     asyncio.create_task(panel.pump_session()),
-                     asyncio.create_task(panel.pump_relay())]
+                     asyncio.create_task(panel.pump_session())]
+            if text_mode:
+                panel.relay = await stack.enter_async_context(
+                    websockets.connect(
+                        f"{ws_base}/voice/dialogue?session_id={sid}",
+                        max_size=None))
+                pumps.append(asyncio.create_task(panel.pump_relay()))
             await asyncio.sleep(1.5)     # sockets settle, relay says ready
 
             turns = NAV_SCRIPT if script == "nav" else SCRIPT
@@ -424,6 +451,7 @@ def verdict(turns, panel_alive=True, legs=None):
     silent = [t for t in turns if not t["spoke"]]
     cut = [t for t in turns if t["truncated"] or t["cutoffs"]]
     split = [t for t in turns if t["commits"] > 1]
+    tagged = [t for t in turns if t.get("tags")]
     ends = sorted(t["committed_ms"] for t in turns
                   if t["committed_ms"] is not None)
     print(f"\n  {len(turns) - len(silent)}/{len(turns)} turns spoke, "
@@ -462,7 +490,15 @@ def verdict(turns, panel_alive=True, legs=None):
         for b in bad_legs:
             print(f"      <-- {b}")
 
-    bad = silent or cut or split or bad_legs
+    if tagged:
+        print("  EXPRESSIVE TAGS REACHED THE SPEAKER:")
+        for t in tagged:
+            print(f"      {t['tags']}  in {t['say']!r}")
+    else:
+        print("  no expressive tag in any spoken output "
+              f"({len(turns)} turns checked)")
+
+    bad = silent or cut or split or bad_legs or tagged
     if not panel_alive:
         print("  VOID -- the panel process died during the drive, so the "
               "silences above are this harness's and not hers")
@@ -485,6 +521,70 @@ async def settle(panel, mark, quiet_s=2.5, cap_s=12.0):
             return
 
 
+# ---------------------------------------------------------------------------
+# WHAT "SHE SPOKE" MEANS, AND WHY IT IS NOT ONE THING
+# ---------------------------------------------------------------------------
+# The evidence that a line reached a speaker is different under each backend,
+# and a reporter that knows only one of them calls the other one silent. That
+# is not a hypothetical: the first audio-mode drive read SILENT on all six
+# turns while the WAV had six answers in it, because "spoke" was being read off
+# VOICE_UTTERANCE_DONE -- an event only the ElevenLabs sink emits.
+#
+#   elevenlabs        the session writes, the sink speaks. The sink says so:
+#                     VOICE_UTTERANCE_DONE, one per utterance.
+#   openai_realtime   the session speaks. The audio IS the evidence:
+#                     response.output_audio.delta, many per utterance.
+#
+# Both are counted here so neither reporter has to care which drive it is on.
+def _audio_out(notes) -> list:
+    """Every event that is RIO's voice arriving, under either backend."""
+    return [n for n in notes
+            if (n.get("note") == "voice"
+                and n["ev"].get("type") == "VOICE_UTTERANCE_DONE")
+            or (n.get("k") == "wire_in"
+                and n.get("type") == "response.output_audio.delta")]
+
+
+def _spoken_text(notes) -> str:
+    """What she said, in words, whichever way she said it.
+
+    Under text mode the words ARE the output. Under audio mode they are the
+    session's own transcript of its own speech -- which is what the controller
+    reads too, and the only written record of an answer that never existed as
+    text on its way to the speaker.
+    """
+    said = "".join(n["ev"].get("delta", "") for n in notes
+                   if n.get("k") == "wire_in"
+                   and n.get("type") == "response.output_text.delta")
+    if said:
+        return said
+    done = [n["ev"].get("transcript") or "" for n in notes
+            if n.get("k") == "wire_in"
+            and n.get("type") == "response.output_audio_transcript.done"]
+    if any(done):
+        return " ".join(t for t in done if t)
+    return "".join(n["ev"].get("delta", "") for n in notes
+                   if n.get("k") == "wire_in"
+                   and n.get("type") == "response.output_audio_transcript.delta")
+
+
+# A BRACKET IN SOMETHING SHE SAID OUT LOUD.
+#
+# Expressive tags are an ElevenLabs v3 mechanism ([laughs], [sighs]) and they
+# are not reachable from a speech-to-speech session -- there is no text between
+# the model and the speaker to write one into, and she is never told they
+# exist. "Not reachable" is an argument, though, and this is evidence: the
+# transcripts of a real drive, checked for the thing that must not be in them.
+# What it would sound like if it ever were is the word "sighs" read out at a
+# junction, which is the failure voice_tags.py exists to prevent everywhere
+# else.
+_BRACKETED = __import__("re").compile(r"\[[^\]\n]{1,40}\]")
+
+
+def _tags_in(text: str) -> list:
+    return _BRACKETED.findall(text or "")
+
+
 def report_drive(turn, notes, t0):
     """One leg with nobody talking: what the car said, and in whose voice."""
     # TWO DIFFERENT QUESTIONS, and the drive that could not tell them apart was
@@ -498,8 +598,7 @@ def report_drive(turn, notes, t0):
               and n["ev"].get("type") == "NAV_SPEECH_SPOKEN"]
     # ...and one more: what came out of a speaker. A line the arbiter believes
     # it spoke and no listener heard is the failure a WAV exists to show.
-    heard = [n for n in notes if n.get("note") == "voice"
-             and n["ev"].get("type") == "VOICE_UTTERANCE_DONE"]
+    heard = _audio_out(notes)
     audio = [n for n in notes if n.get("note") == "nav_audio"]
     other = [n["ev"]["type"] for n in notes if n.get("note") == "nav"
              and not n["ev"].get("call_type")]
@@ -522,6 +621,9 @@ def report_drive(turn, notes, t0):
     # A navigation line does not go through the conversation's sink under the
     # ElevenLabs backend — it is synthesised by /nav/voice and played through
     # the element — so BOTH are counted and either one means it was audible.
+    # Under openai_realtime the line is DICTATED and the first term is the
+    # session's own audio, which is the whole point of this drive: a turn call
+    # in the same voice as the answer before it.
     audible = len(heard) + len(audio)
     print(f"      reached a speaker: {audible}"
           + ("   <-- SILENT" if calls and not audible else ""))
@@ -534,17 +636,13 @@ def report_drive(turn, notes, t0):
 
 def report(turn, notes, t_ask, t_speech_end):
     """What happened to one question, in the terms the failure was reported."""
-    said = "".join(
-        n["ev"].get("delta", "") for n in notes
-        if n.get("k") == "wire_in"
-        and n.get("type") == "response.output_text.delta")
+    said = _spoken_text(notes)
     direct = [n for n in notes if n.get("note") == "live"
               and n["ev"].get("type") == "LIVE_DIRECT_ANSWER"]
     tools = [n for n in notes if n.get("note") == "tool"]
     fails = [n for n in notes if n.get("note") == "live"
              and n["ev"].get("type") == "LIVE_RESPONSE_FAILED"]
-    heard = [n for n in notes if n.get("note") == "voice"
-             and n["ev"].get("type") == "VOICE_UTTERANCE_DONE"]
+    heard = _audio_out(notes)
     # WHAT THE MINUTE HAS LEFT, from the session itself. The ceiling the
     # instructions are sized against is not a number out of a document: the
     # session reports its own limit and what is left of it on every response,
@@ -597,8 +695,12 @@ def report(turn, notes, t_ask, t_speech_end):
             print(f"      RESPONSE FAILED: {f['ev'].get('code')} "
                   f"retrying={f['ev'].get('retrying')}")
     print(f"      said: {spoken[:220]!r}")
-    print(f"      utterances that reached the speaker: {len(heard)}"
+    print(f"      audio that reached the speaker: {len(heard)} events"
           + ("   <-- SILENT" if not heard else ""))
+    tags = _tags_in(spoken)
+    if tags:
+        print(f"      <-- EXPRESSIVE TAG IN SPOKEN OUTPUT: {tags} — a "
+              f"bracketed direction reached the speaker")
     if limits:
         low = min(limits, key=lambda l: l.get("remaining", 0))
         print(f"      tokens left in the minute: {low.get('remaining'):,} of "
@@ -620,7 +722,7 @@ def report(turn, notes, t_ask, t_speech_end):
               + (f" ({c.get('reason')})" if c.get("reason") else ""))
     return {"say": turn["say"], "stopped_ms": stopped_ms,
             "committed_ms": committed_ms, "commits": commits,
-            "spoke": bool(heard), "said": spoken,
+            "spoke": bool(heard), "said": spoken, "tags": tags,
             "truncated": [(i.get("status_details") or {}).get("reason")
                           for i in incomplete],
             "cutoffs": [c.get("cause") for c in cutoffs]}

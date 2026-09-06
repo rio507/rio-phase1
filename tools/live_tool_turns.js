@@ -14,6 +14,14 @@
  * how it once had the very bug it was recording. This runs the shipped code
  * against the shipped server and writes down what came out of the speaker.
  *
+ * TWO MOUTHS, ONE RECORDER. Under VOICE_BACKEND=elevenlabs the session writes
+ * and the dialogue sink speaks, so the audio arrives on the relay socket.
+ * Under openai_realtime the session SPEAKS -- audio comes back on the session
+ * socket itself, as `response.output_audio.delta` -- and there is no relay at
+ * all. Which one is live is read off the minted session, never assumed, and
+ * both end up in the same recorder on the same clock, so the WAV means the
+ * same thing either way: what a listener would have heard, when.
+ *
  * Line-delimited JSON on stdin and stdout. In:
  *   {k:'ev', ev}          one event off the live session
  *   {k:'wire', m}         one message off the dialogue relay
@@ -67,14 +75,31 @@ global.document = {
  * listener would have heard them. */
 const blobs = new Map();
 let blobSeq = 0;
-global.URL = {
-  createObjectURL(blob) {
-    const key = 'blob:' + (++blobSeq);
-    blobs.set(key, blob && blob.__bytes);
-    return key;
-  },
-  revokeObjectURL(key) { blobs.delete(key); },
+/* THE TWO BLOB METHODS, ADDED TO `URL` RATHER THAN INSTEAD OF IT.
+ *
+ * This used to REPLACE global.URL with an object carrying only these two
+ * functions, and on a node without a global `fetch` that was harmless: the
+ * shim below builds its own `URL` out of require('url'), so nothing noticed.
+ *
+ * Node 18.19 HAS a global fetch, so the shim is not installed and undici's is
+ * used -- and undici resolves every request through `new URL(...)`. Against a
+ * plain object that is "URL is not a constructor", which undici reports as
+ * `TypeError: Failed to parse URL from http://127.0.0.1:8888/...` with the
+ * real cause one level down. What that looked like from the report was RIO
+ * failing every tool in the drive: six turns, six `unreachable`s, and her
+ * saying she could not see the camera or reach the car. None of it was hers.
+ *
+ * So the constructor is kept and the two browser-only methods are hung off a
+ * subclass of it. A stub that removes a standard global is not a stub, it is a
+ * different runtime. */
+class HarnessURL extends URL {}
+HarnessURL.createObjectURL = function (blob) {
+  const key = 'blob:' + (++blobSeq);
+  blobs.set(key, blob && blob.__bytes);
+  return key;
 };
+HarnessURL.revokeObjectURL = function (key) { blobs.delete(key); };
+global.URL = HarnessURL;
 global.AbortController = global.AbortController || function () {
   return { signal: null, abort() {} };
 };
@@ -139,7 +164,20 @@ global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
    a local tool throws before it does anything and the catch below files it as
    'panel error', which reads in the report as RIO's route failing rather than
    as this file never having asked for one. */
-if (typeof global.fetch !== 'function') {
+/* THIS SHIM, ALWAYS — not only when node has no `fetch` of its own.
+ *
+ * The condition used to be `if (typeof global.fetch !== 'function')`, which on
+ * node 18 means never, and that quietly changed what a `blob()` is. The
+ * fallback voice path is `fetch('/nav/voice') -> r.blob() ->
+ * URL.createObjectURL(blob)`, and the object store two hundred lines up reads
+ * `blob.__bytes` because that is what this shim returns. Node's own fetch
+ * returns a real Blob, which has no `__bytes`, so every fallback line was
+ * fetched, decoded to nothing and played as silence -- a nav drive reporting
+ * `tts: 8, silent: 8` while the server had synthesised all eight.
+ *
+ * The browser has one `fetch` and one `Blob` and they agree with each other.
+ * This file has to supply both halves or neither, so it supplies both. */
+{
   const http = require('http');
   const { URL } = require('url');
   global.fetch = function (url, opts) {
@@ -265,6 +303,11 @@ function writeWav(file) {
   return total / RATE;
 }
 
+/* The session the browser was given, and the one thing about it that decides
+   how this file behaves: whose mouth RIO has. */
+const session = JSON.parse(process.argv[4] || '{}');
+const textMode = (session.output_modalities || ['audio'])[0] === 'text';
+
 /* The relay socket, as the sink's `transport`: send() goes to python, and
    python pushes what came back into onmessage. */
 const transport = {
@@ -272,15 +315,58 @@ const transport = {
   send(text) { out({ k: 'wire', obj: JSON.parse(text) }); },
   close() {},
 };
-const sink = eleven.createSink({ transport, context: ctx, sampleRate: RATE,
-                                 onEvent: (ev) => out({ k: 'note',
-                                                        note: 'voice', ev }) });
-sink.open().catch(() => {});
+const sink = textMode
+  ? eleven.createSink({ transport, context: ctx, sampleRate: RATE,
+                        onEvent: (ev) => out({ k: 'note', note: 'voice', ev }) })
+  : null;
+if (sink) sink.open().catch(() => {});
+
+/* ---------------------------------------------------------------------------
+   THE SPEECH-TO-SPEECH MOUTH.
+
+   In the car this is an <audio> element carrying a WebRTC track: the session
+   speaks, the browser plays it, and muting the element is how RIO is silenced
+   the instant the driver starts talking. Over a WebSocket there is no track --
+   the same audio arrives as base64 PCM on the session socket -- so this is the
+   speaker, and it writes down what it played for the same reason the sink
+   does.
+
+   A SPEAKER, NOT A BUFFER, and that is the whole reason for `playHead`. The
+   model generates faster than real time: a four-second answer lands in about a
+   second. Stamping each chunk at the moment it ARRIVED would compress the
+   answer into a third of its length and make every gap in the recording look
+   smaller than it was. So chunks queue behind each other exactly as they would
+   in a speaker, and the recording runs at the speed a person would hear.
+
+   MUTED AUDIO IS NOT RECORDED, for the same reason: a muted element is silence
+   in the cabin. The clock still advances through it, because the session is
+   still speaking and the element is still playing -- it is just inaudible.
+   That is the difference between a barge-in (heard as RIO stopping) and a
+   cancel (heard as RIO stopping AND the rest never existing), and a recording
+   that could not tell them apart would be no use for the thing this exists
+   for. */
+let muted = false;
+let playHead = 0;
+const audioMouth = {
+  mute() { muted = true; },
+  unmute() { muted = false; },
+  push(b64) {
+    const raw = Buffer.from(b64 || '', 'base64');
+    const n = raw.length >> 1;
+    if (!n) return;
+    const at = Math.max(ctx.currentTime, playHead);
+    playHead = at + n / RATE;
+    if (muted) return;
+    const data = new Float32Array(n);
+    for (let i = 0; i < n; i++) data[i] = raw.readInt16LE(i * 2) / 32768;
+    heard.push({ at, buf: { length: n, getChannelData: () => data } });
+  },
+};
+const mouth = sink || audioMouth;
 
 /* ---------------------------------------------------------------------------
    The controller, wired exactly as static/index.html wires it.
    --------------------------------------------------------------------------- */
-const session = JSON.parse(process.argv[4] || '{}');
 const controller = rt.createController({
   arbiter: require(path.join(REPO, 'static', 'rio_speech.js')).makeArbiter(),
   send: (obj) => out({ k: 'send', obj }),
@@ -312,9 +398,14 @@ const controller = rt.createController({
     }).then((r) => r.json()).then(finish)
       .catch(() => finish({ ok: false, note: 'unreachable' }));
   },
-  audio: { mute: () => sink.mute(), unmute: () => sink.unmute() },
+  audio: { mute: () => mouth.mute(), unmute: () => mouth.unmute() },
+  // `voice` is what puts the controller in text mode. Absent under
+  // openai_realtime, which is what makes it forward audio instead of words.
   voice: sink,
-  cedarVoice: session.cedar_voice || 'cedar',
+  // The voice the SESSION carried, and no default behind it: a harness that
+  // quietly substitutes a voice is a harness that would have recorded the
+  // cedar/marin mix-up as a clean drive.
+  liveVoice: session.live_voice,
   // The tools the session ships with, and the ones that wait for a route.
   // Without these the recording is of a drive where "avoid the freeway" had
   // no tool to reach for -- which is what the first one was.
@@ -323,6 +414,7 @@ const controller = rt.createController({
   verbatimInstruction: session.verbatim_instruction,
   resumeInstruction: session.resume_instruction,
   speakTimeoutMs: session.speak_timeout_ms,
+  directSpeechTimeoutMs: session.direct_speech_timeout_ms,
   lookAnswerMaxTokens: session.look_answer_max_tokens,
   bargeSustainMs: session.barge_sustain_ms,
   bargeConfirmMs: session.barge_confirm_ms,
@@ -363,6 +455,81 @@ RIO.bus.on('*', (ev) => {
 });
 
 /* ---------------------------------------------------------------------------
+   ONE EVENT OFF THE SESSION, INTO THE PAGE.
+
+   Two things happen here that do not happen in a browser, and both are
+   TRANSPORT differences rather than behaviour ones -- the same difference this
+   file's header already documents for `output_audio_buffer.clear`.
+
+   THE AUDIO. In the car RIO's voice arrives on a WebRTC media track and never
+   passes through the controller at all; the browser plays the track and the
+   controller only ever sees events. Over a WebSocket the audio IS an event, so
+   it is peeled off here and handed to the speaker. The controller is given the
+   event too, unchanged, because it is entitled to see everything the session
+   sent.
+
+   THE START AND STOP OF A SPOKEN LINE. `output_audio_buffer.started` and
+   `.stopped` are emitted by the server for WebRTC sessions ONLY. The
+   controller uses `started` for exactly one thing and it is not cosmetic: it
+   is how a DICTATED line -- a turn call, a headway warning -- learns that it
+   is actually being spoken, so the fallback armed against it never starting
+   can stand down. Without that event every dictated line in this harness would
+   sit out its whole budget and then be re-spoken by the synthesiser, and the
+   recording would show a drive where dictation never worked. That would be a
+   fault entirely in this file, and the last time this harness invented one of
+   those it was believed for a week.
+
+   So the two events are SYNTHESISED from the audio, and only if the real ones
+   did not arrive -- if the transport ever starts sending them, the real ones
+   win and this does nothing. Which happened is reported, because "the bridge
+   was used" and "the bridge was not needed" are different facts about the
+   run and the report should not have to guess.
+   --------------------------------------------------------------------------- */
+const bridged = { started: 0, stopped: 0, real: 0 };
+const speaking = new Set();
+
+function forward(ev) {
+  const type = ev && ev.type;
+
+  if (type === 'output_audio_buffer.started'
+      || type === 'output_audio_buffer.stopped') {
+    bridged.real++;
+    controller.handle(ev);
+    return;
+  }
+
+  if (type === 'response.output_audio.delta') {
+    if (!speaking.has(ev.response_id)) {
+      speaking.add(ev.response_id);
+      bridged.started++;
+      controller.handle({ type: 'output_audio_buffer.started',
+                          response_id: ev.response_id });
+    }
+    mouth.push && mouth.push(ev.delta);
+    controller.handle(ev);
+    return;
+  }
+
+  if (type === 'response.done') {
+    const id = (ev.response && ev.response.id) || ev.response_id;
+    /* BEFORE `response.done`, not after. The controller treats
+       `output_audio_buffer.stopped` and `response.done` as the same ending and
+       finishes the response on whichever arrives first, so a stop sent
+       afterwards would land on a response that is already closed and be
+       dropped -- and a dictation would be finished by the wrong branch. */
+    if (speaking.delete(id)) {
+      bridged.stopped++;
+      controller.handle({ type: 'output_audio_buffer.stopped',
+                          response_id: id });
+    }
+    controller.handle(ev);
+    return;
+  }
+
+  controller.handle(ev);
+}
+
+/* ---------------------------------------------------------------------------
    stdin
    --------------------------------------------------------------------------- */
 let buf = '';
@@ -375,7 +542,7 @@ process.stdin.on('data', (d) => {
     let m;
     try { m = JSON.parse(line); } catch (e) { continue; }
     if (m.k === 'ev') {
-      try { controller.handle(m.ev); }
+      try { forward(m.ev); }
       catch (e) { out({ k: 'note', note: 'handler_threw',
                         error: String(e && e.message), type: m.ev && m.ev.type }); }
     } else if (m.k === 'wire') {
@@ -396,6 +563,8 @@ process.stdin.on('data', (d) => {
             counters: controller.state().counters });
     } else if (m.k === 'wav') {
       out({ k: 'note', note: 'wav', path: m.path, seconds: writeWav(m.path),
+            mouth: textMode ? 'elevenlabs_sink' : 'live_session',
+            bridged: bridged,
             counters: controller.state().counters });
     } else if (m.k === 'sim') {
       const nav = RIO.nav;

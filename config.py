@@ -28,19 +28,43 @@ from rio_prompts import RIO_SYSTEM_PROMPT
 #   CHAT        the text conversation path (/talk, /ask), which is what answers
 #               when the live session is not running, and what the visual
 #               question path is built on.
-#   STT         Whisper. Kept deliberately: every transcript consumer outside
-#               the live loop — the session log, /last_talk, the router, the
-#               visual pipeline — reads what Whisper produced, and the live
-#               session is configured to transcribe with the same model so a
-#               drive's transcripts come from one place.
+#   STT         What the driver said, in writing. ONE model for the whole
+#               system: the live session transcribes the cabin with it, and so
+#               do the consumers outside the live loop — the session log,
+#               /last_talk, the router, the visual pipeline, the clip
+#               verifier. Two transcribers would make two records that
+#               disagree, and the disagreement would only ever show up in a
+#               drive nobody could reproduce.
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
 OPENAI_REASONING_MODEL = os.getenv("OPENAI_REASONING_MODEL", "gpt-5.6-sol")
 OPENAI_CHAT_MODEL = "gpt-5.5"
-OPENAI_STT_MODEL = "whisper-1"
+# gpt-transcribe, the model the realtime playground calls "User transcript
+# model". Whisper is still accepted by both APIs and is one env var away.
+#
+# CHECKED ON THIS ACCOUNT, both halves, because "the realtime session takes it"
+# and "the REST endpoint takes it" are two claims and only one of them was in
+# doubt. The realtime mint echoes it back in
+# session.audio.input.transcription.model; /v1/audio/transcriptions returns the
+# same words Whisper returned for the same clip, in a third of the time
+# (0.99 s against 3.36 s on a five-second file).
+#
+# ONE INCOMPATIBILITY, and it costs nothing here: response_format
+# "verbose_json" is refused by every gpt-*-transcribe model ("Use 'json' or
+# 'text' instead"). Nothing in this system asks for it — every caller takes the
+# default json and reads `.text` — so this is a drop-in. If a caller ever needs
+# segment timings back, that caller needs whisper-1 by name and this constant
+# is the wrong thing to change.
+OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-transcribe")
 
 # cedar or marin. Config, not code: it is the single most noticeable thing
 # about RIO and the one most likely to be argued about.
-OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "cedar")
+#
+# THE DEFAULT IS THE VOICE, not a fallback to be corrected by .env. Everything
+# that speaks names this constant — the live session, the dictated warnings,
+# the pre-rendered clips, the mid-drive fallback — so a default that disagreed
+# with the running config would be a second voice waiting for the day somebody
+# starts a process without the environment.
+OPENAI_REALTIME_VOICE = os.getenv("OPENAI_REALTIME_VOICE", "marin")
 
 # --- deterministic speech through the live voice ---------------------------
 # Warnings, health announcements and turn instructions dictated to the live
@@ -60,6 +84,28 @@ REALTIME_SPEECH_ENABLED = True
 # The lines where this would actually matter are not dictated at all — the red
 # tier and the tire fast path play local clips.
 REALTIME_SPEAK_TIMEOUT_MS = 900
+
+# ...AND THE SAME QUESTION FOR A LINE THAT IS NOT A WARNING.
+#
+# A vetted scene answer is injected the same way a warning is, and the budget
+# above is wrong for it — not because the mechanism differs but because the
+# ARGUMENT does. 900 ms is derived from "a warning that arrives late has
+# stopped being a warning", and a passenger answering "what's out there" a
+# second and a half later has not stopped answering.
+#
+# MEASURED, and this is why it is a separate number rather than the same one:
+# a warning dictated into an idle session reaches first audio in 390-585 ms,
+# but a scene answer is injected immediately after a tool call, and on a real
+# drive one took longer than 900 ms to make a sound. The budget fired, the line
+# was cancelled and counted as a failure, an ordinary response was asked for as
+# the recovery — and the audio then arrived anyway. She said the right thing,
+# and everything watching her said it had gone wrong.
+#
+# The thing on the other side of this trade is not silence, it is the composed
+# answer, which costs a further round trip and about 450 ms of model. So the
+# budget sits well above the observed case and still below the point where
+# giving up would have been the faster route to a sentence.
+REALTIME_DIRECT_SPEECH_TIMEOUT_MS = 2500
 
 # Channels dictated to the live voice. Per-channel because they are not the
 # same kind of speech: a turn instruction six seconds out and a gap warning
@@ -188,9 +234,52 @@ REALTIME_MAX_RESPONSE_TOKENS = 300
 # elaborate: the road looks how it looks, and the useful version is the
 # sentence a passenger would say without being asked twice.
 #
-# ~60 tokens is two short sentences. Small enough to be a real ceiling, large
-# enough that an ordinary one-sentence answer never touches it.
-REALTIME_LOOK_ANSWER_MAX_TOKENS = 60
+# TWO NUMBERS, BECAUSE A TOKEN IS NOT ONE THING.
+# ----------------------------------------------
+# The budget wanted here is "two short sentences", and how many tokens that
+# costs depends entirely on what the session is producing.
+#
+# Under a TEXT-mode session the output is words, and 60 of them is two short
+# sentences. That number was measured under that backend and is still right
+# for it.
+#
+# Under a SPEECH-TO-SPEECH session the output is SOUND, and `max_output_tokens`
+# counts audio tokens — which dominate. Measured over a real audio drive
+# (tools/live_tool_turns, six turns): a spoken answer costs about 1.16 audio
+# tokens per character, plus roughly 0.62 text tokens for each of those for the
+# transcript that comes with it. So 60 tokens is not two sentences under audio,
+# it is TWENTY-SIX CHARACTERS — and the drive that proved it has her answering
+# "what kind of car is in front of us" with:
+#
+#     "Looks like a BMW 5 Series,"
+#
+# cut there, mid-clause, and filed as max_output_tokens. Which is precisely the
+# failure REALTIME_MAX_RESPONSE_TOKENS was raised to 300 to fix, on a different
+# constant, arrived at by flipping the backend rather than by editing anything.
+#
+# 240 is two short sentences of SPEECH by the same measurement (~100 characters
+# → ~116 audio + ~72 text, with room). Still a real ceiling — an ordinary
+# one-sentence scene answer measured 90-150 output tokens on that drive — and
+# still far below the session's own cap.
+#
+# Named as two constants and a function rather than one number, because the
+# number is wrong for one of the two backends whichever value it holds, and a
+# single constant is how it was wrong in the first place.
+REALTIME_LOOK_ANSWER_TEXT_TOKENS = 60
+REALTIME_LOOK_ANSWER_AUDIO_TOKENS = 240
+
+
+def look_answer_max_tokens() -> int:
+    """The scene-answer ceiling, in the units the live session is billed in.
+
+    A function and not a constant: VOICE_BACKEND is decided further down this
+    file, so anything evaluated here would read it before it exists — and a
+    constant that had to be kept in step with the backend by hand is the shape
+    of the bug this replaces.
+    """
+    return (REALTIME_LOOK_ANSWER_TEXT_TOKENS if VOICE_BACKEND == "elevenlabs"
+            else REALTIME_LOOK_ANSWER_AUDIO_TOKENS)
+
 
 # --- when RIO should stop talking, and when she should not ------------------
 # The complaint these exist for: her answers cut out mid-sentence and the
@@ -327,32 +416,48 @@ OPENAI_REASONING_EFFORT = "none"
 # ---------------------------------------------------------------------------
 # Two backends, one at a time, chosen by VOICE_BACKEND and read at startup:
 #
+#   "openai_realtime"  RIO's voice is the live session's own. Speech to speech:
+#                      one model hears the driver, thinks, and speaks, and the
+#                      words never exist as text on the way to the speaker.
+#                      THIS IS THE SHIPPED PATH. Deterministic lines — a turn,
+#                      a health announcement, a headway warning — are DICTATED
+#                      into that same session word for word, which is what
+#                      makes one voice everywhere a mechanism rather than a
+#                      coincidence of two configs agreeing.
 #   "elevenlabs"       RIO's voice is ElevenLabs. The live session still hears
 #                      the driver and still does the thinking, but it is put in
 #                      TEXT mode and its words are synthesised — streamed into
 #                      a Text-to-Dialogue socket phrase by phrase, so the first
 #                      audio starts before the model has finished the sentence.
-#   "openai_realtime"  RIO's voice is the live session's own (cedar). The path
-#                      this file described for the last three months, kept
-#                      whole rather than deleted, because it is what speaks
-#                      when ElevenLabs is not there at all.
+#                      Complete and DORMANT: nothing on the active path reaches
+#                      it, and it is one env var from being the voice again.
 #
 # The choice is config plus a restart, not a runtime toggle, and deliberately:
 # the two paths differ in what the live session is even asked to PRODUCE, and a
 # session that changed its mind about that halfway through a drive would be a
 # third path nobody had tested. The per-utterance fallbacks below are what
 # handles trouble inside a drive; this decides which mouth a drive starts with.
-VOICE_BACKEND = os.getenv("VOICE_BACKEND", "elevenlabs")
+#
+# DORMANT IS NOT DELETED, and the distinction is the whole reason the losing
+# branch is kept compiling. Under this backend the ElevenLabs endpoints are
+# still the SECOND tier of the deterministic fallback chain (see rio_speak.js):
+# dictation first, the synthesiser if the session will not start the line in
+# time, a pre-rendered clip if that fails too. A warning that arrives in a
+# slightly different voice is a much smaller thing than a warning that does
+# not arrive, so "nothing on the active path" means exactly that and not
+# "nothing anywhere".
+VOICE_BACKEND = os.getenv("VOICE_BACKEND", "openai_realtime")
 # "realtime" was what this setting called the live voice before ElevenLabs came
 # back. Old .env files and old shell exports still say it, and a car that comes
 # up mute because a value was renamed is a bad trade for a tidier vocabulary.
 if VOICE_BACKEND == "realtime":
     VOICE_BACKEND = "openai_realtime"
 
-# The one thing that does not vary. Every path below — the dialogue socket, the
-# deterministic lines, the pre-rendered clips, both fallback tiers — names THIS
-# voice, which is what makes "one voice everywhere" a property of the config
-# rather than a thing to check.
+# The one thing that does not vary WHEN ELEVENLABS IS THE VOICE. Every
+# ElevenLabs path below — the dialogue socket, the deterministic lines, the
+# pre-rendered clips, both fallback tiers — names THIS voice. Under
+# openai_realtime the same job is done by OPENAI_REALTIME_VOICE, and by the
+# same argument: one constant that everything which speaks reads.
 ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
 
 # RIO's conversation, when ElevenLabs is her voice.
@@ -498,17 +603,35 @@ ELEVENLABS_FAILURES_BEFORE_CEDAR = 2
 #
 # The list is short on purpose. Every tag on it is something a friend in the
 # passenger seat actually does; nothing on it is a performance.
+# UNREACHABLE UNDER openai_realtime, and left switched on rather than switched
+# off, because the thing that makes them unreachable is not this flag. A
+# speech-to-speech session emits sound, not text: there is no string between
+# the model and the speaker for a bracket to be written into, and nothing on
+# that path could read one if there were. So the gate is upstream of the
+# feature — realtime.instructions() adds the tag paragraph ONLY under
+# elevenlabs, and a model never told about a mechanism does not reach for it.
+# The regression pass checks the transcripts anyway, because "cannot happen"
+# and "did not happen" are different claims and only one of them is evidence.
 AUDIO_TAGS_ENABLED = True
 AUDIO_TAGS_ALLOWED = ("laughs", "sighs", "whispers", "exhales")
 AUDIO_TAGS_MAX_PER_UTTERANCE = 1
 
 # --- the old shape, still true ----------------------------------------------
 # The server's TTS endpoints (/nav/voice, /headway_voice,
-# /vehicle/health/voice) synthesise with this. Under VOICE_BACKEND=elevenlabs
-# they are not the fallback path any more — they are THE path for everything
-# deterministic, which is what requirement 6 means by one voice everywhere:
-# nav, health and the calm headway tier all come out of flash on the same voice
-# id RIO converses in.
+# /vehicle/health/voice) synthesise with this. Which tier they are depends on
+# whose voice RIO has, and that is the only thing that changes:
+#
+#   openai_realtime   the FALLBACK. Nav, health and the calm headway tier are
+#                     dictated into the live session, and these endpoints are
+#                     what the browser reaches for when a line will not start
+#                     in REALTIME_SPEAK_TIMEOUT_MS. A different voice for one
+#                     late warning, which is the right trade for that warning
+#                     arriving at all.
+#   elevenlabs        THE path for everything deterministic — nav, health and
+#                     the calm headway tier all come out of flash on the same
+#                     voice id RIO converses in, which is what made one voice
+#                     everywhere true under that backend without dictating
+#                     anything.
 VOICE_FALLBACK_BACKEND = "elevenlabs"
 
 SYSTEM_PROMPT = RIO_SYSTEM_PROMPT

@@ -60,7 +60,8 @@ function section(name) { console.log('\n=== ' + name + ' ==='); }
 const pageInit = {};
 const tick = () => new Promise(r => setTimeout(r, 0));
 // Long enough for both barge-in timers in the harness (4 ms + 8 ms) to run.
-const settle = () => new Promise(r => setTimeout(r, 40));
+// 40 ms unless a check needs to outlast a timer it set itself.
+const settle = (ms) => new Promise(r => setTimeout(r, ms || 40));
 
 /* One live session on a fake wire. `sent` is what went to the model, `muted`
    is what the driver can actually hear. */
@@ -982,6 +983,209 @@ section('awareness — the three tools a live session needs');
      + 'because the API refuses `text` by name');
   ok(controller.state().counters.spoken_directly === 1,
      'and the drive counts how many answers skipped the model');
+}
+
+{
+  /* THE SAME ANSWER, ON THE BACKEND THAT HAS NO SYNTHESISER.
+   *
+   * Speech to speech: RIO's voice IS the session, so there is no sink to push
+   * the observer's sentence into and it has to be READ by her -- the verbatim
+   * injection the deterministic channels already use.
+   *
+   * This is a regression test for a SILENT drive, not for a nicety. Without
+   * it the browser skipped speaking the line and asked for an ordinary
+   * response anyway, while the tool result told the model in as many words
+   * that the line "has ALREADY BEEN SAID to the driver". So she was told not
+   * to repeat something nobody had said, and said nothing: measured on a real
+   * drive as path=observer_direct, 44 ms to the camera, and one audio event
+   * of silence.
+   */
+  const SPOKEN = 'Open freeway, light traffic — dry hills both sides';
+  const arbiter = speech.makeArbiter();
+  const sent = [];
+  const events = [];
+  const muted = [];
+  const controller = rt.createController({
+    arbiter: arbiter,
+    send: (o) => sent.push(o),
+    tool: () => Promise.resolve({
+      ok: true, answer: SPOKEN, speech: SPOKEN, speak_directly: true,
+      path: 'observer_direct', took_ms: 4, seen_s_ago: 0.6 }),
+    audio: { mute: () => muted.push('mute'), unmute: () => muted.push('unmute') },
+    voice: null,                       // <-- the whole difference
+    verbatimInstruction: 'READ THIS VERBATIM>>',
+    directSpeechTimeoutMs: 5000,
+    onEvent: (ev) => events.push(ev),
+  });
+  controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'look', call_id: 'v3',
+    arguments: JSON.stringify({ question: 'what do you see' }),
+  });
+  await settle();
+
+  const creates = sent.filter(e => e.type === 'response.create');
+  ok(creates.length === 1,
+     'exactly one response is asked for, and it is the line being read — not '
+     + 'a model being asked to compose an answer that was already written');
+  const req = creates[0].response || {};
+  ok(req.conversation === 'none',
+     'out of band, like every other verbatim line: the words are already going '
+     + 'into the history as an assistant message, and twice would be twice');
+  ok((req.output_modalities || [])[0] === 'audio', 'as audio');
+  ok(req.instructions === 'READ THIS VERBATIM>>' + SPOKEN,
+     'with the observer\'s exact sentence at the end of the verbatim '
+     + 'instruction, which is the same injection a warning uses');
+  ok(arbiter.state().speaking && /^live:direct/.test(arbiter.state().speaking.id),
+     'through the arbiter at conversation priority, so a warning still cuts '
+     + 'through it exactly as it cuts through anything she says');
+  const assistantYet = () => sent.find(e => e.type === 'conversation.item.create'
+                                    && e.item && e.item.role === 'assistant');
+  /* NOT YET. Through the session the words are a REQUEST, and an assistant
+     message is a claim about what the driver HEARD. Writing it here would be
+     writing it before the line has made a sound -- and a line that then fails
+     to start leaves a history saying she answered a question she was silent
+     on. Through the sink it is written at this point, because handing the
+     words to the sink IS the line being spoken. */
+  ok(!assistantYet(),
+     'the session is NOT told she said it yet — the words have only been '
+     + 'asked for, and nothing has come out of the speaker');
+  ok(controller.state().counters.spoken_directly === 1,
+     'counted as an answer that skipped the model');
+
+  /* ...AND THE MOUTH IS GIVEN BACK WHEN THE LINE IS DONE, not before and not
+     never. A direct entry that is never released holds CONVO priority for the
+     rest of the drive, and the next question is answered into a mouth that is
+     still busy. */
+  controller.handle({ type: 'response.created', response: { id: 'rd1' } });
+  controller.handle({ type: 'output_audio_buffer.started', response_id: 'rd1' });
+  ok(arbiter.state().speaking && /^live:direct/.test(arbiter.state().speaking.id),
+     'the injected response does not claim the mouth for itself — the direct '
+     + 'entry already holds it');
+  const assistant = assistantYet();
+  ok(!!assistant && assistant.item.content[0].text === SPOKEN,
+     'and NOW the session is told what she said, in the same words — written '
+     + 'from the audio starting, which is the moment it became true');
+  controller.handle({ type: 'response.done',
+                      response: { id: 'rd1', status: 'completed' } });
+  await settle();
+  ok(!arbiter.state().speaking,
+     'and when it finishes, the mouth is free again');
+  ok(controller.state().counters.direct_speech_failures === 0,
+     'with nothing counted as a failure');
+}
+
+{
+  /* A LINE THAT NEVER STARTS IS NOT A LINE THAT WAS SAID.
+   *
+   * The injection is given the same budget a dictated warning gets, and the
+   * same treatment when it runs out: cancel, and say so. Reporting it as
+   * spoken is how a turn ends silent with the history claiming an answer,
+   * which is the failure this whole path was rebuilt around. */
+  const arbiter = speech.makeArbiter();
+  const sent = [];
+  const events = [];
+  const controller = rt.createController({
+    arbiter: arbiter,
+    send: (o) => sent.push(o),
+    tool: () => Promise.resolve({
+      ok: true, answer: 'x', speech: 'Dry hills both sides',
+      speak_directly: true, path: 'observer_direct' }),
+    audio: { mute: () => {}, unmute: () => {} },
+    voice: null,
+    verbatimInstruction: 'V>>',
+    // The DIRECT budget, not the warning one: they are separate numbers
+    // because the argument for 900 ms is about warnings and does not apply
+    // to an answer. See config.REALTIME_DIRECT_SPEECH_TIMEOUT_MS.
+    directSpeechTimeoutMs: 20,
+    onEvent: (ev) => events.push(ev),
+  });
+  controller.handle({
+    type: 'response.function_call_arguments.done',
+    name: 'look', call_id: 'v4',
+    arguments: JSON.stringify({ question: 'what do you see' }),
+  });
+  await settle(80);
+  ok(sent.some(e => e.type === 'response.cancel'),
+     'a line that has not started speaking inside the budget is cancelled');
+  ok(events.some(e => e.type === 'LIVE_DIRECT_SPEECH_FAILED'),
+     '...and reported, rather than counted as spoken');
+  ok(controller.state().counters.direct_speech_failures === 1,
+     '...and counted, so a drive can say how often it happened');
+  ok(!arbiter.state().speaking,
+     '...and the mouth is handed back either way — a failed line must not '
+     + 'hold conversation priority for the rest of the drive');
+  ok(!sent.some(e => e.type === 'conversation.item.create'
+                && e.item && e.item.role === 'assistant'),
+     '...and the session is NOT told she said a line that never made a sound');
+  ok(sent.filter(e => e.type === 'response.create').length === 2,
+     '...and the question is asked of the model instead, so it is answered '
+     + 'late rather than never');
+
+  /* AND A RESPONSE THAT ENDS WITHOUT EVER MAKING A SOUND IS THE SAME THING.
+     `response.done` with status completed is the model's account of itself;
+     whether the driver heard anything is a question about audio. */
+  const c2 = rt.createController({
+    arbiter: speech.makeArbiter(),
+    send: () => {},
+    tool: () => Promise.resolve({ ok: true, speech: 'Quiet road',
+                                  speak_directly: true, path: 'observer_direct' }),
+    audio: { mute: () => {}, unmute: () => {} },
+    voice: null, verbatimInstruction: 'V>>', directSpeechTimeoutMs: 5000,
+    onEvent: () => {},
+  });
+  c2.handle({ type: 'response.function_call_arguments.done', name: 'look',
+              call_id: 'v5', arguments: '{}' });
+  await settle();
+  c2.handle({ type: 'response.created', response: { id: 'rd2' } });
+  c2.handle({ type: 'response.done',
+              response: { id: 'rd2', status: 'completed' } });
+  await settle();
+  ok(c2.state().counters.direct_speech_failures === 1,
+     'a response that completed without ever starting audio is a line the '
+     + 'driver did not hear, whatever its status says');
+}
+
+{
+  /* A LINE GIVEN UP ON IS NOT A CUT-OFF ANSWER.
+   *
+   * Both out-of-band paths -- a dictated warning and an injected line -- are
+   * recognised by their own state still being set when `response.done`
+   * arrives. Give up on one early and that state is gone, so the late done
+   * fell through to the CONVERSATION's branch and was filed as a truncated
+   * answer.
+   *
+   * Measured on a real drive: a scene answer whose audio started a little
+   * after its budget spoke perfectly well -- the full sentence, in her voice
+   * -- and appeared in the tally as `token_cap`. A cut-off count that includes
+   * lines nobody lost is worse than no count, because the number is the entire
+   * reason it exists. */
+  const cuts = [];
+  const arbiter = speech.makeArbiter();
+  const controller = rt.createController({
+    arbiter: arbiter,
+    send: () => {},
+    tool: () => Promise.resolve({ ok: true, speech: 'Dry hills both sides',
+                                  speak_directly: true, path: 'observer_direct' }),
+    audio: { mute: () => {}, unmute: () => {} },
+    voice: null, verbatimInstruction: 'V>>', directSpeechTimeoutMs: 20,
+    onEvent: (ev) => { if (ev.type === 'LIVE_CUTOFF') cuts.push(ev); },
+  });
+  controller.handle({ type: 'response.function_call_arguments.done',
+                      name: 'look', call_id: 'v6', arguments: '{}' });
+  await settle();
+  controller.handle({ type: 'response.created', response: { id: 'rd3' } });
+  await settle(80);                       // the budget expires here
+  // ...and the response the model was already generating lands afterwards.
+  controller.handle({ type: 'response.done', response: { id: 'rd3',
+    status: 'incomplete', status_details: { reason: 'max_output_tokens' } } });
+  await settle();
+  ok(cuts.length === 0,
+     'a line the injection gave up on is not counted as a cut-off answer, '
+     + 'even when the response that follows it says max_output_tokens');
+  ok(controller.state().counters.cutoffs === undefined
+     || !controller.state().counters.cutoffs,
+     '...and nothing about the conversation was disturbed by it');
 }
 
 {
@@ -2306,7 +2510,7 @@ section('text mode — she writes, and something else speaks');
       tool: opts.tool || (() => Promise.resolve({ ok: true })),
       audio: { mute: () => rig.sink.mute(), unmute: () => rig.sink.unmute() },
       voice: rig.sink,
-      cedarVoice: 'cedar',
+      liveVoice: opts.noVoice ? undefined : 'marin',
       onEvent: (ev) => events.push(ev),
       bargeSustainMs: opts.bargeSustainMs === undefined ? 4 : opts.bargeSustainMs,
       bargeConfirmMs: opts.bargeConfirmMs === undefined ? 8 : opts.bargeConfirmMs,
@@ -2815,21 +3019,37 @@ section('text mode — she writes, and something else speaks');
     const h = textHarness();
     ok(h.controller.state().voice_backend === 'elevenlabs',
        'the drive starts on ElevenLabs');
-    ok(h.controller.useCedar('service_down') === true,
+    ok(h.controller.useLiveVoice('service_down') === true,
        'and can be handed back to the session mid-drive');
     const update = h.sent.filter((e) => e.type === 'session.update').pop();
     ok(update && update.session.output_modalities[0] === 'audio',
        'the session is asked for audio from here on');
-    ok(update && update.session.audio.output.voice === 'cedar',
-       'in the voice it was configured with, named now because a session that ' +
+    ok(update && update.session.audio.output.voice === 'marin',
+       'in the voice the SESSION carried, named now because a session that ' +
        'has produced no audio can still be told whose voice to use');
     ok(h.controller.state().voice_backend === 'openai_realtime',
        'and the drive reports the voice it is actually using');
-    ok(h.controller.useCedar('again') === false,
+    ok(h.controller.useLiveVoice('again') === false,
        'once, and only once — a voice that flickers because the network is ' +
        'flickering is worse than either voice');
 
-    // ...and after the switch it behaves exactly like the cedar path did.
+    /* AND IT REFUSES RATHER THAN INVENTING A VOICE.
+     *
+     * This used to read `cfg.cedarVoice || 'cedar'`, which looks like a
+     * harmless default and stopped being one the moment RIO's voice became
+     * marin: a session payload that failed to carry the voice would have
+     * handed the driver a different person mid-drive and logged that the
+     * fallback succeeded. The voice is named in config.py and carried by the
+     * mint; there is no third place for it to come from. */
+    const bare = textHarness({ noVoice: true });
+    ok(bare.controller.useLiveVoice('service_down') === false,
+       'a session that carried no voice cannot be switched to one — the ' +
+       'fallback refuses instead of picking a name out of the source');
+    ok(!bare.sent.some((e) => e.type === 'session.update'),
+       '...and asks the session for nothing, so the drive stays on the ' +
+       'mouth it has rather than changing speaker on a guess');
+
+    // ...and after the switch it behaves exactly like the live-voice path did.
     h.controller.handle({ type: 'response.created', response: { id: 'r6' } });
     h.controller.handle({ type: 'response.output_audio_transcript.delta',
                           response_id: 'r6', delta: 'Back in my own voice.' });

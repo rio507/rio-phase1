@@ -166,7 +166,7 @@ def run_session():
        "and the wait for a transcript is longer than the gate that precedes it")
 
     ok(s["audio"]["input"]["transcription"]["model"] == config.OPENAI_STT_MODEL,
-       f"transcripts still come from Whisper ({config.OPENAI_STT_MODEL}) — the "
+       f"transcripts come from one model ({config.OPENAI_STT_MODEL}) — the "
        "session log, /last_talk and the router all read what it produced")
 
     tools = [t["name"] for t in s["tools"]]
@@ -534,23 +534,28 @@ def run_config():
        f"realtime model defaults to gpt-realtime-2.1 ({config.OPENAI_REALTIME_MODEL})")
     ok(config.OPENAI_REASONING_MODEL == "gpt-5.6-sol",
        f"reasoning model defaults to gpt-5.6-sol ({config.OPENAI_REASONING_MODEL})")
-    ok(config.OPENAI_STT_MODEL == "whisper-1",
-       "Whisper is still configured, and still what every transcript comes from")
+    ok(config.OPENAI_STT_MODEL == "gpt-transcribe",
+       f"one transcriber for the whole system ({config.OPENAI_STT_MODEL}) — "
+       "the live session and every consumer outside it read the same words")
 
     # Proved by starting a fresh interpreter with the environment set, rather
-    # than by reading the source for os.getenv and believing it.
+    # than by reading the source for os.getenv and believing it. The values are
+    # deliberately NOT the defaults: an override probe that asks for the value
+    # the constant already has proves nothing at all.
     env = dict(os.environ,
                OPENAI_REALTIME_MODEL="test-realtime-id",
                OPENAI_REASONING_MODEL="test-reasoning-id",
-               OPENAI_REALTIME_VOICE="marin")
+               OPENAI_REALTIME_VOICE="cedar",
+               OPENAI_STT_MODEL="whisper-1")
     out = subprocess.run(
         [sys.executable, "-c",
          "import config;print(config.OPENAI_REALTIME_MODEL, "
-         "config.OPENAI_REASONING_MODEL, config.OPENAI_REALTIME_VOICE)"],
+         "config.OPENAI_REASONING_MODEL, config.OPENAI_REALTIME_VOICE, "
+         "config.OPENAI_STT_MODEL)"],
         env=env, cwd=REPO, capture_output=True, text=True, timeout=120)
     got = (out.stdout or "").strip()
-    ok(got == "test-realtime-id test-reasoning-id marin",
-       f"all three are overridable from the environment ({got or out.stderr[:80]})")
+    ok(got == "test-realtime-id test-reasoning-id cedar whisper-1",
+       f"all four are overridable from the environment ({got or out.stderr[:80]})")
 
     src = inspect.getsource(realtime)
     ok("gpt-realtime" not in src and "gpt-5" not in src,
@@ -1036,7 +1041,7 @@ def run_dictation():
     # WHOSE VOICE, and what dictation means under each backend.
     #
     # Dictation exists so a warning comes out of the same mouth as a
-    # conversation. Under the cedar backend that means dictating INTO the live
+    # conversation. Under openai_realtime that means dictating INTO the live
     # session; under ElevenLabs it is already true without dictating anything,
     # because /nav/voice and friends synthesise on the same voice id — so the
     # mechanism above is kept whole and switched off rather than removed, and
@@ -1051,8 +1056,13 @@ def run_dictation():
            "dictation unnecessary rather than missing")
     else:
         ok(config.REALTIME_SPEECH_ENABLED,
-           "with cedar as the voice, deterministic lines are dictated into the "
-           "live session so a warning and a conversation are one person")
+           f"with {config.OPENAI_REALTIME_VOICE} as the voice, deterministic "
+           "lines are dictated into the live session so a warning and a "
+           "conversation are one person")
+        speak_js = open(os.path.join(REPO, "static", "rio_speak.js")).read()
+        ok("live.speechEnabled(opts.channel)" in speak_js,
+           "...and the fallback chain asks the SESSION whether a channel is "
+           "dictated, not config — the browser holds no copy of the switch")
     ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
        "and the server's TTS endpoints synthesise with ElevenLabs")
 
@@ -1563,7 +1573,7 @@ def run_verbatim():
         heard = client.audio.transcriptions.create(
             model=config.OPENAI_STT_MODEL, file=buf).text
         same = spoken_norm(heard) == spoken_norm(line)
-        ok(same, f"and Whisper hears the same words back"
+        ok(same, f"and {config.OPENAI_STT_MODEL} hears the same words back"
                  + ("" if same else f" — heard {heard.strip()!r}"))
 
 
@@ -1619,8 +1629,15 @@ def run_split_turn():
                     elif ev.type == "response.function_call_arguments.done":
                         log.append(("tool", ev.name))
                         return
+                    # WHAT SHE SAID, UNDER EITHER BACKEND. A text-mode
+                    # session emits words and a speech-to-speech session emits
+                    # its own transcript of its own speech. Reading only the
+                    # first is how this section reported a silent drive on the
+                    # backend that was actually talking.
                     elif ev.type == "response.output_text.done":
                         log.append(("said", ev.text))
+                    elif ev.type == "response.output_audio_transcript.done":
+                        log.append(("said", ev.transcript))
             try:
                 await asyncio.wait_for(read(), timeout=budget)
             except asyncio.TimeoutError:
@@ -3084,6 +3101,171 @@ def run_two_tier():
        "worse at the one thing an object question asks")
 
 
+# ---------------------------------------------------------------------------
+# B2. The backend flip — one voice, everywhere, and where it came from
+# ---------------------------------------------------------------------------
+def run_backend(live: bool = False):
+    """RIO's voice is the live session's own, it is marin, and it is one voice.
+
+    This section exists because "we switched the backend" is four separate
+    claims wearing one sentence, and three of them are invisible from any one
+    place:
+
+      the SESSION       is asked for audio, in marin, transcribing with
+                        gpt-transcribe — and `live` checks that against the
+                        API rather than against the dict we built
+      the CLIPS         the three lines that never touch the network are in
+                        the same voice as everything that does, which is a
+                        claim about five files on disk and is checked against
+                        the manifest beside them
+      the DETERMINISTIC
+      CHANNELS          nav, health and headway are DICTATED into that session
+                        rather than synthesised somewhere else, which is what
+                        makes one voice a mechanism and not a coincidence
+      ELEVENLABS        is dormant: still compiling, still the second tier of
+                        the fallback ladder, and reached by nothing on the
+                        active path
+
+    The last one is why this is not simply `assert VOICE_BACKEND == ...`. A
+    backend that is switched off by deleting it cannot be switched back on, and
+    the whole reason it is kept is that it is one env var from being the voice
+    again.
+    """
+    section("B2. the backend — whose voice, and whether it is the same one "
+            "everywhere")
+
+    ok(config.VOICE_BACKEND == "openai_realtime",
+       f"RIO's voice is the live session's own ({config.VOICE_BACKEND}): "
+       "speech to speech, no text between the model and the speaker")
+    ok(config.OPENAI_REALTIME_VOICE == "marin",
+       f"and the voice is marin ({config.OPENAI_REALTIME_VOICE})")
+
+    cfg = realtime.session_config()
+    ok(cfg["output_modalities"] == ["audio"],
+       "the session is asked for AUDIO — the thing that was text under the "
+       "other backend, and the only thing the backend is allowed to change")
+    ok(cfg["audio"]["output"]["voice"] == "marin",
+       f"in marin ({cfg['audio']['output']['voice']})")
+    ok(cfg["audio"]["input"]["transcription"]["model"] == "gpt-transcribe",
+       "and it transcribes the driver with gpt-transcribe — the id the "
+       "playground calls \"User transcript model\"")
+    ok(int(cfg["max_output_tokens"]) == 300,
+       f"the ceiling on a spoken answer is unchanged at 300 "
+       f"({cfg['max_output_tokens']})")
+    ok(config.OPENAI_REALTIME_MODEL == "gpt-realtime-2.1",
+       f"on the same model as before ({config.OPENAI_REALTIME_MODEL})")
+
+    # --- ONE VOICE: the deterministic channels ------------------------------
+    # A nav callout, a health announcement and a headway line are policy text.
+    # Under this backend every one of them is read INTO the live session, so
+    # the driver hears one person; the synthesiser behind them is the fallback
+    # for a line that will not start in time, not the path.
+    ok(config.REALTIME_SPEECH_ENABLED,
+       "deterministic lines are dictated into the live session rather than "
+       "synthesised beside it")
+    ok(all(config.REALTIME_SPEECH_CHANNELS.get(c) for c in
+           ("nav", "health", "headway")),
+       f"...on all three channels ({config.REALTIME_SPEECH_CHANNELS}) — a "
+       "channel switched off here is a second voice in the car")
+    speech_enabled = bool(config.REALTIME_SPEECH_ENABLED
+                          and config.VOICE_BACKEND != "elevenlabs")
+    ok(speech_enabled,
+       "and the SESSION carries that as speech_enabled, which is the copy the "
+       "browser acts on")
+
+    speak_js = open(os.path.join(REPO, "static", "rio_speak.js")).read()
+    ok("live.speak(text()" in speak_js and "opts.ttsUrl" in speak_js
+       and "opts.clipUrl" in speak_js,
+       "the fallback ladder is intact underneath it: dictate, then the "
+       "synthesiser, then a pre-rendered clip — a warning never waits on a "
+       "cloud call it is not getting")
+
+    # --- ONE VOICE: the clips that never touch the network -------------------
+    from tools import render_alerts as ra
+
+    want = ra.voice_signature()
+    ok(want == {"backend": "openai_realtime", "voice": "marin",
+                "model": config.OPENAI_REALTIME_MODEL},
+       f"clips rendered today would be marin on the live model ({want})")
+
+    doc = ra.manifest()
+    rendered = doc.get("clips", {})
+    expected = sorted(ra.CLIP_LINES) + sorted(ra.TIRE_CLIPS)
+    for line in expected:
+        path = ra.AUDIO_DIR / f"{line}.mp3"
+        got = rendered.get(line) or {}
+        ok(path.exists() and path.stat().st_size > 0
+           and got.get("voice") == "marin"
+           and got.get("backend") == "openai_realtime",
+           f"{line}: on disk and in marin "
+           f"({got.get('backend')}/{got.get('voice')}, "
+           f"{path.stat().st_size if path.exists() else 0} B)")
+    ok(doc.get("voice") == want,
+       "and the manifest beside them agrees with the running config, which is "
+       "what makes 'the clips are in her voice' a thing anyone can check")
+
+    # --- ELEVENLABS: DORMANT, NOT DELETED ------------------------------------
+    # Dormant means two things at once and both have to be true, so both are
+    # checked: nothing on the ACTIVE path reaches it, and it is still whole.
+    ok(not speech_enabled or config.VOICE_BACKEND != "elevenlabs",
+       "nothing on the active path is text mode")
+    ok(cfg["output_modalities"] != ["text"],
+       "...so no words are produced for a synthesiser to read")
+
+    import voice
+    import voice_dialogue
+    ok(callable(voice_dialogue.DialogueSession) and callable(voice.synthesize_stream),
+       "the ElevenLabs path still imports and still builds — kept whole so it "
+       "is one env var away, not a rewrite away")
+    ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
+       "and it is still the SECOND tier of the deterministic ladder, which is "
+       "the one place a dormant backend is allowed to speak: a warning in a "
+       "different voice beats a warning that does not arrive")
+
+    # THE INSTRUCTION THE MODEL NEVER GETS. Expressive tags are an ElevenLabs
+    # v3 mechanism. A speech-to-speech session has no text between the model
+    # and the speaker for a bracket to be written into -- but a model TOLD it
+    # may use them is a model that will try, and what a driver would hear is
+    # the word "sighs" read out at a junction.
+    instr = realtime.instructions()
+    ok("[laughs]" not in instr and "HOW YOU SOUND" not in instr,
+       "the audio-tag paragraph is NOT in the instructions under this backend "
+       "— she is never told about a mechanism she cannot reach")
+    ok("[" not in realtime.VERBATIM_INSTRUCTION,
+       "and a dictated line carries no bracket either")
+
+    if not live:
+        return
+
+    # --- AND THE SAME THING, ASKED OF THE API --------------------------------
+    # Everything above is this process reading its own dict. A session is
+    # minted for real here because the interesting failures are the ones where
+    # the API silently drops a field or refuses a value: `gpt-transcribe` is
+    # accepted on THIS account or it is not, and a drive is the wrong place to
+    # find out.
+    minted = realtime.mint_client_secret()
+    ok(bool(minted.get("client_secret")), "a real session mints")
+    ok(minted["output_modalities"] == ["audio"],
+       f"...asking for audio ({minted['output_modalities']})")
+    ok(minted["voice"] == "marin" and minted["live_voice"] == "marin",
+       f"...in marin, carried to the page by value ({minted['live_voice']})")
+    ok(minted["voice_backend"] == "openai_realtime",
+       "...naming the backend, so the page holds no copy of the decision")
+    ok(minted["speech_enabled"] is True,
+       "...with dictation on, so nav, health and headway speak as her")
+
+    # The API ECHOES the transcription model back. A value it does not know is
+    # a 400 at creation naming every value it does know, which is why this is
+    # a check and not a hope.
+    echoed = ((realtime.client().realtime.client_secrets
+               .create(session=realtime.session_config())
+               .model_dump().get("session") or {})
+              .get("audio") or {}).get("input") or {}
+    ok((echoed.get("transcription") or {}).get("model") == "gpt-transcribe",
+       f"and the API accepts gpt-transcribe and echoes it back "
+       f"({(echoed.get('transcription') or {}).get('model')})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true",
@@ -3096,6 +3278,7 @@ def main():
     run_text_session()
     run_session_cost()
     run_config()
+    run_backend(live=args.live)
     run_dispatch()
     run_failure()
     run_firewall()

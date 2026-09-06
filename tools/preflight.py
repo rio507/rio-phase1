@@ -240,7 +240,8 @@ def check_voice():
           "VOICE_BACKEND=elevenlabs|openai_realtime in .env")
 
     if backend != "elevenlabs":
-        print("  (cedar backend — ElevenLabs is the fallback only)")
+        print(f"  (speech to speech in {_cfg.OPENAI_REALTIME_VOICE}; "
+              f"ElevenLabs is the fallback only)")
         return
 
     # The key is never printed. What is checked is that it EXISTS and that it

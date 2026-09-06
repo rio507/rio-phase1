@@ -973,22 +973,31 @@ def session_config() -> dict:
     hop away from the microphone; the browser already has the audio and the
     element to mute, so the browser decides.
 
-    `transcription` names the SAME Whisper model the rest of the system uses.
-    The live session does not need a transcript to work, but the session log,
+    `transcription` names the SAME model every other transcript in the system
+    comes from — config.OPENAI_STT_MODEL, which is gpt-transcribe. The live
+    session does not need a transcript to work, but the session log,
     /last_talk and every review of a drive do, and having them come from a
     different model than every other transcript in the JSONL would be a quiet
     way to make two records that disagree.
 
+    That model is the one the realtime playground calls "User transcript
+    model", and it is accepted here rather than assumed: the mint echoes
+    `session.audio.input.transcription.model` back, and a value this API does
+    not know is a 400 at session creation naming every value it does know. So
+    a wrong id here is a session that fails loudly at the start of a drive, not
+    a drive that runs without transcripts.
+
     WHAT THE SESSION PRODUCES depends on whose voice RIO has, and it is the
-    ONLY thing that does. Under the ElevenLabs backend the output is text and
-    something else speaks it; under the cedar backend the output is audio and
-    she speaks for herself. The INPUT half is identical either way — she is
-    still listening to the cabin, still transcribing with the same Whisper,
+    ONLY thing that does. Under openai_realtime — the shipped path — the output
+    is AUDIO and she speaks for herself, speech to speech, with no text between
+    the model and the speaker. Under the ElevenLabs backend the output is text
+    and something else speaks it. The INPUT half is identical either way — she
+    is still listening to the cabin, still transcribing with the same model,
     still deciding for herself when the driver has stopped talking — because
     the change is about her mouth and nothing about her ears.
 
     The voice is named even in text mode. It costs nothing, produces nothing
-    while the modality is text, and means the cedar fallback is a modality
+    while the modality is text, and means the tier-2 fallback is a modality
     switch rather than a modality switch plus a configuration the session has
     to be told for the first time mid-drive.
     """
@@ -1070,6 +1079,14 @@ def mint_client_secret() -> dict:
         # policies are: the browser holds no second copy of a decision made in
         # config.py, so there is nothing to drift.
         "voice_backend": config.VOICE_BACKEND,
+        # THE VOICE, BY VALUE. Named `live_voice` and not `cedar_voice`,
+        # because it stopped being cedar and a field whose NAME is a voice is a
+        # field that goes on saying the old one. The page reads this to build
+        # the tier-2 session.update, so a stale name here is a drive that
+        # changes speaker halfway through — which is the exact failure the
+        # whole one-voice argument exists to prevent.
+        "live_voice": config.OPENAI_REALTIME_VOICE,
+        # The old name, for one release. Nothing in this repo reads it.
         "cedar_voice": config.OPENAI_REALTIME_VOICE,
         "voice_sample_rate": int(config.ELEVENLABS_SAMPLE_RATE),
         "output_modalities": cfg["output_modalities"],
@@ -1080,22 +1097,32 @@ def mint_client_secret() -> dict:
         "barge_sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS),
         "barge_confirm_ms": int(config.REALTIME_BARGE_CONFIRM_MS),
         "max_resumes": int(config.REALTIME_MAX_RESUMES),
-        # DICTATION IS A PROPERTY OF THE CEDAR BACKEND.
+        # DICTATION IS A PROPERTY OF THE openai_realtime BACKEND, and it is
+        # what makes ONE VOICE EVERYWHERE true on it.
         #
-        # It exists so a warning comes out of the same mouth as a conversation,
-        # and under ElevenLabs it already does: /nav/voice, /headway_voice and
+        # It exists so a warning comes out of the same mouth as a
+        # conversation. Under this backend that mouth is the live session
+        # itself, so a nav callout, a health announcement and a headway line
+        # are read into it word for word and arrive in the same voice as the
+        # answer before them. Under ElevenLabs it is already true without
+        # dictating anything — /nav/voice, /headway_voice and
         # /vehicle/health/voice synthesise on the SAME voice id, on the model
-        # that is fastest to first byte. Dictating to a text-mode session would
-        # produce a warning as text, spoken by the conversational model through
-        # a socket built for prosody — slower, out of band, and for nothing.
+        # that is fastest to first byte — and dictating to a text-mode session
+        # would produce a warning as text, spoken by the conversational model
+        # through a socket built for prosody: slower, out of band, and for
+        # nothing.
         "speech_enabled": bool(config.REALTIME_SPEECH_ENABLED
                                and config.VOICE_BACKEND != "elevenlabs"),
         # How long an answer to a camera question may be. Carried with the
         # session like every other policy the page enforces, so the number
         # lives in config.py and the browser holds no copy of it.
-        "look_answer_max_tokens": int(config.REALTIME_LOOK_ANSWER_MAX_TOKENS),
+        "look_answer_max_tokens": int(config.look_answer_max_tokens()),
         "speech_channels": dict(config.REALTIME_SPEECH_CHANNELS),
         "speak_timeout_ms": int(config.REALTIME_SPEAK_TIMEOUT_MS),
+        # A vetted answer is not a warning and does not share its
+        # deadline. See REALTIME_DIRECT_SPEECH_TIMEOUT_MS.
+        "direct_speech_timeout_ms":
+            int(config.REALTIME_DIRECT_SPEECH_TIMEOUT_MS),
     }
 
 

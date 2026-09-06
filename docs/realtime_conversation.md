@@ -1,16 +1,16 @@
 # RIO live — speech-to-speech conversation
 
-**Status:** implemented and desk-verified against the real models. The audio
-half has not been driven in a car yet; see *What is unproven* at the end.
+**Status:** THE SHIPPED PATH. `VOICE_BACKEND=openai_realtime`, voice `marin`,
+model `gpt-realtime-2.1`, driver transcription `gpt-transcribe`. Verified with
+audio output over a real six-turn drive and a real navigating drive — see
+*The audio-mode regression pass* below, which is the section that used to say
+this half was unproven.
 
-> **Superseded in part by `docs/voice_elevenlabs.md`.** RIO's voice is now
-> ElevenLabs by default (`VOICE_BACKEND=elevenlabs`): the live session is put
-> in TEXT mode and its words are synthesised on `eleven_v3_conversational`.
-> Everything in this document about her EARS — the detector, the transcription,
-> the tools, the escalation, the barge-in policy and the arbiter — is
-> unchanged and still current. Everything about her MOUTH describes the
-> `openai_realtime` backend, which is kept whole, is what a tier-2 fallback
-> returns to, and is one config value away.
+> **`docs/voice_elevenlabs.md` describes the other backend, which is now
+> dormant.** It is kept whole and still compiles: it is one env var
+> (`VOICE_BACKEND=elevenlabs`) from being RIO's voice again, and it is still
+> the second tier of the deterministic fallback ladder. Nothing on the active
+> path reaches it.
 
 ---
 
@@ -19,9 +19,42 @@ half has not been driven in a car yet; see *What is unproven* at the end.
 | | before | now |
 |---|---|---|
 | hearing | Whisper (`whisper-1`), per push-to-talk recording | the live session hears continuously |
+| transcribing the driver | `whisper-1` | `gpt-transcribe` |
 | thinking | `gpt-5.5` chat completions | `gpt-realtime-2.1` |
-| speaking | ElevenLabs TTS of the finished reply | the same model, in its own voice (`cedar`) |
+| speaking | ElevenLabs TTS of the finished reply | the same model, in its own voice (`marin`) |
 | deeper work | — | `gpt-5.6-sol`, reached as a tool |
+
+### The transcription model, and why it is one model
+
+`config.OPENAI_STT_MODEL` is `gpt-transcribe` — the id the realtime playground
+labels **User transcript model** — and it is used in BOTH places: the live
+session's `audio.input.transcription.model`, and every consumer outside the
+live loop (`/talk`, the session log, `/last_talk`, the router, the clip
+verifier). One model, because two transcribers make two records that disagree
+and the disagreement only ever shows up in a drive nobody can reproduce.
+
+Both halves were checked against this account rather than assumed:
+
+* **The realtime mint accepts it** and echoes it back in
+  `session.audio.input.transcription.model`. A value the API does not know is a
+  400 at session creation that names every value it does know, so a wrong id
+  here is a loud failure at the start of a drive, not a silent drive without
+  transcripts. The accepted set, as the API itself lists it: `whisper-1`,
+  `gpt-realtime-whisper`, `gpt-live-transcribe`, `gpt-transcribe`,
+  `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`,
+  `gpt-4o-mini-transcribe-2025-03-20`, `gpt-4o-mini-transcribe-2025-12-15`.
+* **`/v1/audio/transcriptions` accepts it too**, returning the same words
+  `whisper-1` returned for the same clip in roughly a third of the time
+  (0.99 s against 3.36 s on a five-second file). So it is a clean drop-in for
+  the non-realtime consumers as well, and they were switched rather than left
+  behind on a second model.
+
+**The one incompatibility, which costs nothing here:** `response_format:
+"verbose_json"` is refused by every `gpt-*-transcribe` model — *"Use 'json' or
+'text' instead"*. Nothing in this system asks for it; every caller takes the
+default `json` and reads `.text`. A future caller that needs segment timings
+needs `whisper-1` **by name**, and `OPENAI_STT_MODEL` is the wrong thing for it
+to change.
 
 Three models in series became one session. The driver's audio goes in, RIO's
 audio comes out, and either of them can interrupt the other mid-word.
@@ -301,8 +334,8 @@ asked about — and it is a fact about the car, not a thing she said.
 **Verbatim is requested and then verified.** A model can always paraphrase, so
 what stops that shipping is the check, not the sentence: the tests transcribe
 the audio that came back and compare it with what was asked for, twice over —
-the model's own transcript (catches a paraphrase) and Whisper on the audio
-(catches the first claim being wrong). Comparison folds spoken numbers to
+the model's own transcript (catches a paraphrase) and an independent
+transcription of the audio (catches the first claim being wrong). Comparison folds spoken numbers to
 digits, because "twenty-six P S I" transcribed as "26 psi" is a rendering
 difference; nothing else is forgiven.
 
@@ -340,16 +373,18 @@ THE path for everything deterministic, on the same voice id RIO converses in,
 and dictation is switched off because it has nothing left to fix. See
 `docs/voice_elevenlabs.md`.
 
-## Whisper, still
+## One transcriber, still
 
-The live session is configured to transcribe its input with `whisper-1` — the
-same model the rest of the system uses. The session does not need a transcript
+The live session is configured to transcribe its input with `gpt-transcribe` —
+the same model the rest of the system uses, which is the property that matters
+and the reason this section exists. The session does not need a transcript
 to work; the session log, `/last_talk`, the router and the visual pipeline all
 do, and transcripts from two different transcribers in one JSONL is a quiet way
-to make two records that disagree.
+to make two records that disagree. That is why `OPENAI_STT_MODEL` moved as one
+value rather than being changed for the live session alone.
 
-The hold-to-talk path (`/talk`: Whisper → chat model → ElevenLabs) is intact
-and is the fallback: if a live session cannot be started, the mic button
+The hold-to-talk path (`/talk`: `gpt-transcribe` → chat model → ElevenLabs) is
+intact and is the fallback: if a live session cannot be started, the mic button
 reverts to it for the rest of the drive.
 
 ---
@@ -359,11 +394,17 @@ reverts to it for the rest of the drive.
 ```
 OPENAI_REALTIME_MODEL=gpt-realtime-2.1     # env override, default in config.py
 OPENAI_REASONING_MODEL=gpt-5.6-sol
-OPENAI_REALTIME_VOICE=cedar                # cedar | marin — her voice under
+OPENAI_STT_MODEL=gpt-transcribe            # the driver's words, everywhere
+OPENAI_REALTIME_VOICE=marin                # cedar | marin — her voice under
                                            # VOICE_BACKEND=openai_realtime, and
                                            # what tier 2 falls back to otherwise
-VOICE_BACKEND=elevenlabs                   # elevenlabs | openai_realtime
+VOICE_BACKEND=openai_realtime              # openai_realtime | elevenlabs
 ```
+
+The defaults in `config.py` are these values, not other ones. A default that
+disagreed with the running config would be a second voice waiting for the day
+somebody starts a process without the environment — and the pre-rendered clip
+renderer is exactly such a process.
 
 Neither model id appears anywhere but `config.py`, which the tests assert by
 starting a fresh interpreter with the environment set rather than by reading
@@ -400,12 +441,183 @@ for the tool, and does she confirm rather than send the driver to the dashboard.
 
 ---
 
+## The audio-mode regression pass
+
+Everything below this line landed while the session was in TEXT mode and the
+sink did the speaking. Flipping the backend does not re-run any of it, so it
+was re-run: `tools/live_tool_turns.py` drives the SHIPPED controller against
+the SHIPPED server over a real session and writes a WAV of what a listener
+would have heard, with `--script nav` doing the same for a route being called
+out loud.
+
+**Three things were broken on the audio path and are fixed here.** None of them
+was visible from the text-mode suites, because all three are the difference
+between producing words and producing sound.
+
+### The scene answer was silent
+
+`look()` returns the observer's own vetted sentence with `speak_directly` set,
+and — in the same tool result — tells the model *"This has ALREADY BEEN SAID to
+the driver, out loud, in your voice. Do not say it again."*
+
+That is true when something speaks it. The browser's condition for speaking it
+was `result.speak_directly && result.speech && sink`, and under
+`openai_realtime` there is no sink: RIO's voice IS the session. So the line was
+never spoken, the ordinary request went out anyway, and the model did as it was
+told and said nothing. Measured on a real drive: *"What do you see outside?"*,
+`path=observer_direct`, 44 ms to the camera, **one audio event of silence.**
+
+The `&& sink` was the bug. Whether she can say a line directly is
+`speakDirect`'s question, and it now answers it for both mouths: through the
+sink under ElevenLabs, and through the **verbatim injection** — out of band,
+audio only, the words at the end of the instruction — under this one. It is the
+same mechanism a headway warning uses, at conversation priority instead of a
+warning's, so a real warning still cuts through it.
+
+One thing moved with it. The assistant message telling the session what she
+said is a claim about what the DRIVER HEARD, so through the session it is
+written when the audio starts, not when the request is sent. If the line never
+starts it is cancelled, counted (`direct_speech_failures`), and the question is
+asked of the model instead — answered late rather than never, with nothing in
+the history claiming she spoke.
+
+**And it waits longer than a warning does.** The first version reused
+`REALTIME_SPEAK_TIMEOUT_MS`, which is 900 ms — a number derived entirely from
+*"a warning that arrives late has stopped being a warning"*. A passenger
+answering *"what's out there"* a second and a half later has not stopped
+answering, and on a real drive the warning budget fired on a line that then
+spoke perfectly well: she said the right thing and everything watching her
+recorded a failure. `REALTIME_DIRECT_SPEECH_TIMEOUT_MS` is 2500 ms, which sits
+well above the observed case and still below the point where giving up would
+have been the faster route to a sentence.
+
+That drive also produced a cut-off that never happened. Both out-of-band paths
+— a dictated warning and an injected line — are recognised by their own state
+still being set when `response.done` arrives; give up on one early and that
+state is gone, so the late `response.done` fell through to the CONVERSATION's
+branch and was filed as `token_cap`. The controller now remembers which
+response ids were out of band (including one that had not been created yet when
+it was abandoned), because a cut-off count that includes lines nobody lost is
+worse than no count at all.
+
+### A token is not one thing, and one ceiling was in the wrong units
+
+`max_output_tokens` counts what the session PRODUCES. Under text mode that is
+words; under audio it is **audio tokens, which dominate**. Measured over a
+six-turn drive: about **1.16 audio tokens per character** of speech, plus
+roughly 0.62 text tokens for each of those for the transcript that comes with
+it.
+
+So `REALTIME_LOOK_ANSWER_MAX_TOKENS = 60` — commented as *"~60 tokens is two
+short sentences"*, which was measured and true under text mode — is **26
+characters** under audio. The drive that found it has her answering *"what kind
+of car is in front of us"* with:
+
+> "Looks like a BMW 5 Series,"
+
+cut there, mid-clause, filed as `max_output_tokens`. That is exactly the
+failure `REALTIME_MAX_RESPONSE_TOKENS` was raised from 200 to 300 to fix,
+arrived at by flipping a backend rather than by editing anything.
+
+It is now two constants and a function (`config.look_answer_max_tokens()`) —
+60 text tokens, 240 audio tokens, both meaning "two short sentences" — because
+a single number is wrong for one of the two backends whichever value it holds.
+The same question, after: *"White BMW 5 Series ahead, likely an E60. The exact
+trim is too blurry to call."*
+
+### ...and the same arithmetic applies to the 300 cap, which is UNCHANGED
+
+`REALTIME_MAX_RESPONSE_TOKENS` is still 300, deliberately and by instruction.
+It should be read knowing what it now buys: **300 output tokens of audio is
+roughly 160-260 characters**, against well over a thousand in text mode. On the
+six-turn drive four of six answers reached it and stopped mid-sentence —
+
+> "…so this is coming from the tire data that is"
+
+— which is the driver hearing her trail off, and is the thing the comment above
+that constant says a ceiling must not do. **Flagged, not changed.** The number
+to revisit is that one; the arithmetic for revisiting it is in this section.
+
+### One voice everywhere is a rate, not a yes
+
+The navigation drive is the one that can hear this, because it is the only one
+where the car says something nobody asked it to. Under this backend a turn call
+is DICTATED into the live session — the same verbatim injection — so it comes
+out in marin, in the same voice as the answer before it. Measured over three
+runs of `--script nav`, eleven deterministic lines each:
+
+| run | dictated (marin) | fell back to ElevenLabs | silent |
+|---|---|---|---|
+| 1 | 10 | 1 | 1 |
+| 2 | 3 | 8 | 8 |
+| 3 | 5 | 6 | 0 |
+
+Run 2's eight silences were the harness (see below). Runs 1 and 3 are the real
+number, and the real number is **not all of them**: every miss is a `timeout`,
+not a `busy` — the line was asked for and did not make a sound inside
+`REALTIME_SPEAK_TIMEOUT_MS`.
+
+That budget is 900 ms, and it was measured on an IDLE session, where dictation
+reaches first audio in 390-585 ms. A drive is not an idle session: the realtime
+API serialises responses, so a turn call asked for while she is finishing a
+sentence — or while the previous turn call is still being spoken — waits behind
+it. When it misses, `rio_speak.js` does exactly what it is built to do and
+synthesises the line on the ElevenLabs endpoint instead, 145-172 ms away, and
+the driver hears the turn called in a slightly different voice.
+
+**Left as it is, and flagged.** Raising it trades warning latency for vocal
+consistency, and that is a judgement about safety timing rather than a
+regression to fix quietly. Two things worth knowing before making it:
+
+* The lines this budget governs are nav calls, health announcements and the
+  calm headway tier. The genuinely time-critical ones — the red headway tier
+  and the two tire fast-path lines — are **not dictated at all**; they play
+  pre-rendered local files with no network in the path, and they are in marin
+  because the clip library was re-rendered.
+* Not all dictated lines are equally time-critical either. `"Left here."`
+  arriving 1.5 s late may be past the turn; `"Right turn coming up onto
+  Cloverfield Blvd."` will not be. A per-channel or per-call-type budget is the
+  principled version of this number, and it does not exist yet.
+
+### The harness was answering for her
+
+The recording rig stubbed `global.URL` with an object carrying only
+`createObjectURL`/`revokeObjectURL`. On a node without a global `fetch` that
+was harmless — the file's own shim builds its `URL` from `require('url')`. Node
+18.19 HAS a global fetch, so undici's was used, and undici resolves every
+request through `new URL(...)`: *"URL is not a constructor"*, reported as
+`TypeError: Failed to parse URL from http://127.0.0.1:8888/…`.
+
+What that looked like in the report was RIO failing every tool in the drive —
+six turns, six `unreachable`s, her saying she could not see the camera or reach
+the car. **None of it was hers.** The constructor is kept now and the two
+browser-only methods hang off a subclass of it. A stub that removes a standard
+global is not a stub, it is a different runtime.
+
+A second one hid behind the first. Making node's own `fetch` work meant it
+started being USED, and it returns a real `Blob` where this file's shim returns
+`{__bytes}` — which is what its object store reads. So every fallback line was
+fetched, decoded to nothing, and played as silence: a nav drive reporting
+`tts: 8, silent: 8` while the server had synthesised all eight. The shim is now
+installed unconditionally, because the browser has one `fetch` and one `Blob`
+that agree with each other, and this file has to supply both halves or neither.
+
+The rig also learned the audio backend: it opens the ElevenLabs relay only when
+that relay is the mouth, records `response.output_audio.delta` through a
+playback queue so the WAV runs at the speed a person would hear rather than the
+speed the model generates, and bridges `output_audio_buffer.started/.stopped`
+— WebRTC-only events the controller uses to know a dictated line is actually
+being spoken — from the audio itself when the WebSocket does not send them.
+
+---
+
 ## What is unproven
 
-- **The audio itself.** WebRTC needs a browser; this has been verified as far
-  as the SDP endpoint accepting an ephemeral credential (a deliberately
-  malformed offer comes back "no audio media section", which proves URL, auth
-  and content type). Echo cancellation, barge-in feel and voice quality in a
-  moving car are a road test.
+- **The browser transport.** The drives above reach the session over a
+  WebSocket; the car reaches it over WebRTC. The event stream is the same,
+  which is why the controller does not know the difference — but echo
+  cancellation, barge-in feel and voice quality in a moving car are a road
+  test, and `output_audio_buffer.*` is bridged in the harness where the browser
+  gets it from the server.
 - **Conversation transcripts are not logged** from the live path. The session
   log records that a session opened and what RIO escalated, not what was said.

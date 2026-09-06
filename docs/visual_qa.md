@@ -39,7 +39,7 @@ Five components, and the division of labour is the whole design:
                 ├─ membership.py   stable track ids, which is the lead ~1 ms
                 └─ framebuf        retain the frame, ~6 s of them
                         │
-  driver speaks ──► whisper ──► router ──┬─ not visual ─► llm_interface (unchanged)
+  driver speaks ──► transcribe ─► router ──┬─ not visual ─► llm_interface (unchanged)
                                          │
                                          └─ visual ─► scene graph
                                                       reference resolution ──► track_id
@@ -438,7 +438,7 @@ Per visual question, warm:
 | GPT-5.5 total | 2.7 s | 2.4 s | 2.0 s |
 | **end to end** | **2.7 s** | **2.8 s** | **2.0 s** |
 
-Add ~0.5–1 s of Whisper at the front and the first TTS chunk at the back for the
+Add ~0.5–1 s of transcription at the front and the first TTS chunk at the back for the
 spoken path. Everything before the model call is **under 400 ms**; the answer is
 dominated by generation, which is where it should be.
 

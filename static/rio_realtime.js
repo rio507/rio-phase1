@@ -538,7 +538,8 @@
        send(obj),                    put an event on the data channel
        tool(name, args) -> Promise,  run one tool call server-side
        audio: { mute(), unmute() },  whatever RIO's voice comes out of
-       voice,                        the ElevenLabs sink, or absent for cedar
+       voice,                        the ElevenLabs sink, or absent when the
+                                     live session speaks for herself
        onEvent(ev)                   observability
      }
 
@@ -565,7 +566,7 @@
     var runTool = cfg.tool || function () { return Promise.resolve({ ok: false }); };
     var audio = cfg.audio || { mute: function () {}, unmute: function () {} };
     /* RIO's mouth, when it is not the model's own. Nullable, and null is the
-       cedar path — every `if (sink)` below reads as "unless she is speaking
+       live-voice path — every `if (sink)` below reads as "unless she is speaking
        for herself", which is what it means. */
     var sink = cfg.voice || null;
     var listeners = [];
@@ -616,6 +617,7 @@
                      // Utterances the sink could not speak in the voice it was
                      // meant to, and the one time a drive gave up on it.
                      voice_fallbacks: 0, voice_backend_changed: 0,
+                     direct_speech_failures: 0,
                      // Answers spoken straight from the running observation,
                      // with no model between the sentence and the speaker.
                      spoken_directly: 0,
@@ -720,10 +722,49 @@
        does not claim the mouth (its caller already holds it, at its own
        priority) and it does not enter the conversation history. */
     var dictation = null;
+    /* A vetted line being spoken by the SESSION rather than by a synthesiser.
+       Only ever set under the speech-to-speech backend; see speakDirect. */
+    var directSpeech = null;
+    /* THE RESPONSES THAT ARE NOT THE CONVERSATION, remembered past the point
+       where the thing tracking them let go.
+     *
+     * A dictated warning and an injected line are both out of band, and both
+     * are normally recognised by `dictation`/`directSpeech` still being set
+     * when their `response.done` arrives. When one of them is given up on
+     * early -- a budget expiring -- that state is cleared, and the late
+     * `response.done` then fell through to the CONVERSATION's branch and was
+     * filed as a cut-off answer.
+     *
+     * Which is how a scene answer that spoke perfectly well appeared in the
+     * tally as `token_cap`: the line was slow to start, the budget fired, and
+     * the response that arrived afterwards looked like an answer that had been
+     * truncated. A tally that counts a warning as a lost answer is worse than
+     * no tally, because the number is the whole reason it exists. */
+    var outOfBand = [];
+    function markOutOfBand(responseId) {
+      if (!responseId) return;
+      outOfBand.push(responseId);
+      if (outOfBand.length > 8) outOfBand.shift();
+    }
+    function isOutOfBand(responseId) {
+      return !!responseId && outOfBand.indexOf(responseId) >= 0;
+    }
+    /* ...AND THE ONE THAT HAS NO ID YET WHEN IT IS GIVEN UP ON.
+     *
+     * The binding above needs a `response.created` to attach to. Give up on a
+     * line before that arrives and the response is still coming: it gets
+     * created, it belongs to nobody, and without this it would claim the mouth
+     * as an ordinary answer and be counted as one. Exactly one is expected --
+     * the abandoned line -- and the recovery response asked for immediately
+     * after it is the conversation and must still claim the mouth normally. */
+    var orphanOutOfBand = 0;
     var verbatimInstruction = cfg.verbatimInstruction ||
       'Read the text below out loud, exactly as written, word for word. ' +
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
     var speakTimeoutMs = cfg.speakTimeoutMs || 700;
+    /* A vetted answer read into the session is injected the same way a warning
+       is, and waits a different length of time for it. See injectDirect. */
+    var directSpeechTimeoutMs = cfg.directSpeechTimeoutMs || 2500;
     // The ceiling on a camera answer, from config.py by way of the session
     // payload. Null leaves the session's own limit in charge.
     var lookAnswerMaxTokens = cfg.lookAnswerMaxTokens || null;
@@ -875,6 +916,25 @@
          navigation, which is upside down. */
       if (dictation && !dictation.responseId) {
         dictation.responseId = responseId;
+        markOutOfBand(responseId);
+        return;
+      }
+      /* ...and so does the response a DIRECT LINE was injected as. Same
+         correlation and for the same reason -- the first response created
+         after it was sent is it -- but the opposite conclusion about the
+         mouth: a dictated warning claims the mouth at its caller's priority,
+         while a direct line has ALREADY claimed it, at CONVO, in speakDirect.
+         Either way this response must not claim it a second time. */
+      if (directSpeech && !directSpeech.realId
+          && String(responseId || '').indexOf('direct:') !== 0) {
+        directSpeech.realId = responseId;
+        markOutOfBand(responseId);
+        return;
+      }
+      if (orphanOutOfBand > 0
+          && String(responseId || '').indexOf('direct:') !== 0) {
+        orphanOutOfBand--;
+        markOutOfBand(responseId);
         return;
       }
       /* A NEW ANSWER WHILE THE LAST ONE IS STILL BEING HEARD.
@@ -1350,9 +1410,86 @@
      * it, a barge-in stops it, and the session is told what she said so the
      * next question lands against a conversation that happened. What it does
      * not do is ask a model to say it. */
+    /* THE SAME LINE, SPOKEN BY THE SESSION ITSELF.
+     *
+     * Under the speech-to-speech backend there is no sink to push words into:
+     * RIO's voice IS the session, so a line that is not to be composed has to
+     * be READ by her -- which is the verbatim injection the deterministic
+     * channels already use, out of band, with the words at the end of the
+     * instruction.
+     *
+     * WITHOUT THIS THE QUESTION WENT SILENT, and silently. The server offers
+     * the vetted sentence and, in the same tool result, tells the model:
+     * "This has ALREADY BEEN SAID to the driver, out loud, in your voice. Do
+     * not say it again." That is true when something speaks it. When the
+     * browser had no sink it skipped speaking it and asked for an ordinary
+     * response anyway -- so the model was told not to repeat a line nobody had
+     * said, and said nothing at all. Measured on a real drive: "What do you
+     * see outside?" answered by the camera in 44 ms, path=observer_direct, and
+     * one audio event of silence.
+     *
+     * Not `speak()`, though it is the same wire message: `speak()` is
+     * dictation, which is out of band AND at the caller's own warning
+     * priority. This is a conversational answer -- CONVO priority, cut off by
+     * a warning, stopped by a barge-in -- and speakDirect has already claimed
+     * the mouth on those terms before this is reached. */
+    function injectDirect(line, release, onSpoken) {
+      return new Promise(function (resolve) {
+        var d = { line: line, realId: null, started: false, timer: null,
+                  onSpoken: onSpoken };
+        d.finish = function (okay, why) {
+          if (directSpeech !== d) return;
+          directSpeech = null;
+          if (d.timer) { clearTimeout(d.timer); d.timer = null; }
+          if (!okay) {
+            // Given up on before it was ever bound to a response? Then the
+            // response is still on its way and is nobody's. See
+            // orphanOutOfBand.
+            if (!d.realId) orphanOutOfBand++;
+            counters.direct_speech_failures++;
+            emit('LIVE_DIRECT_SPEECH_FAILED', { text: line, reason: why });
+            /* A LAST TRY, rather than a silent turn. The tool result is
+               already in the conversation, so asking for a response gets the
+               question answered late instead of not at all -- the same
+               recovery the mouth-was-busy branch makes. Nothing was written
+               into the history claiming she spoke, because that is written
+               from `started` and this line never started. */
+            try { send({ type: 'response.create' }); } catch (e) {}
+          }
+          release();
+          resolve(okay);
+        };
+        directSpeech = d;
+        /* The same budget a dictated warning gets, and for the same reason:
+           NOT the warning budget, and the difference is the argument rather
+           than the mechanism: 900 ms exists because a late warning has stopped
+           being a warning, and a scene answer arriving a second later has not
+           stopped being an answer. On a real drive the warning budget fired on
+           a line that then spoke perfectly well. See
+           config.REALTIME_DIRECT_SPEECH_TIMEOUT_MS. */
+        d.timer = setTimeout(function () {
+          try { send({ type: 'response.cancel' }); } catch (e) {}
+          d.finish(false, 'timeout');
+        }, directSpeechTimeoutMs);
+        try {
+          audio.unmute();
+          send({
+            type: 'response.create',
+            response: {
+              conversation: 'none',
+              output_modalities: ['audio'],
+              instructions: verbatimInstruction + line,
+            },
+          });
+        } catch (e) {
+          d.finish(false, 'send_failed');
+        }
+      });
+    }
+
     function speakDirect(text, meta) {
       var line = (text || '').trim();
-      if (!sink || stopped || !line) return false;
+      if (stopped || !line) return false;
       var id = 'direct:' + (++directs);
       beginResponse(id, { direct: true });
       var entry = speaking;
@@ -1370,6 +1507,7 @@
         if (speaking === entry) endResponse(id);
         return true;
       };
+      if (!sink) return injectDirect(line, release, meta && meta.onSpoken);
       try {
         sink.delta(id, line);
         return sink.end(id).then(release, release);
@@ -1435,15 +1573,34 @@
              the tool result is already in the conversation, so asking for a
              response gets the same sentence composed by the model, a few
              hundred milliseconds later instead of none at all. */
-          if (name === 'look' && result.speak_directly && result.speech && sink) {
-            var spoken = speakDirect(result.speech, {
-              path: result.path, seen_s_ago: result.seen_s_ago });
-            if (spoken !== false) {
+          /* NO `&& sink` HERE. That was the whole of the silent scene
+             answer: the condition read "...and there is a synthesiser", so on
+             the speech-to-speech backend the line was never spoken and the
+             ordinary request went out underneath a tool result that said it
+             already had been. Whether she CAN say it directly is speakDirect's
+             question, and it answers `false` when the mouth is not available
+             — which is the branch below. */
+          if (name === 'look' && result.speak_directly && result.speech) {
+            /* WHEN TO TELL THE SESSION SHE SAID IT, and it is not the same
+               moment under both backends.
+               Through the sink, handing the words over IS the line being
+               spoken -- the sink owns delivery from there and reports its own
+               failures. Through the session, the words are a REQUEST, and the
+               moment that becomes speech is the audio starting. So the write
+               is handed to speakDirect as a callback and fired at whichever
+               of those two moments this backend has. */
+            var tellSession = function () {
               send({
                 type: 'conversation.item.create',
                 item: { type: 'message', role: 'assistant',
                         content: [{ type: 'output_text', text: result.speech }] },
               });
+            };
+            var spoken = speakDirect(result.speech, {
+              path: result.path, seen_s_ago: result.seen_s_ago,
+              onSpoken: tellSession });
+            if (spoken !== false) {
+              if (sink) tellSession();
               emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
                                          ok: true, path: result.path,
                                          took_ms: result.took_ms || null,
@@ -1485,6 +1642,25 @@
               dictationStarted();
               break;
             }
+            if (directSpeech && directSpeech.realId === ev.response_id) {
+              // Ditto for a vetted line the session is reading: it has
+              // started, so it will not be given up on -- and NOW the session
+              // is told she said it. Not before: an assistant message is a
+              // claim about what the driver heard, and writing it while the
+              // line might still fail to start is how a turn ends silent with
+              // the history saying she answered.
+              directSpeech.started = true;
+              if (directSpeech.timer) {
+                clearTimeout(directSpeech.timer);
+                directSpeech.timer = null;
+              }
+              if (directSpeech.onSpoken) {
+                var tell = directSpeech.onSpoken;
+                directSpeech.onSpoken = null;
+                try { tell(); } catch (e) {}
+              }
+              break;
+            }
             // Belt and braces: on some paths audio starts without a
             // response.created having been seen by this client.
             beginResponse(ev.response_id);
@@ -1496,6 +1672,16 @@
               finishDictation(null);
               break;
             }
+            if (directSpeech && directSpeech.realId ===
+                ((ev.response && ev.response.id) || ev.response_id)) {
+              /* SPOKEN, OR NOT SPOKEN, AND THE DIFFERENCE IS THE AUDIO.
+                 A response that ended without ever starting audio is a line
+                 the driver did not hear, whatever its status says, and
+                 reporting it as spoken is how a turn ends silent with the
+                 history claiming an answer. */
+              directSpeech.finish(directSpeech.started, 'ended_unspoken');
+              break;
+            }
             /* A response can be "done" because it finished or because it ran
                out of room, and the difference is invisible from the audio. The
                cap is deliberate (REALTIME_MAX_RESPONSE_TOKENS) so this is
@@ -1503,6 +1689,14 @@
                the limit -- but it is counted, because a driver hearing an
                answer stop at the same length every time is hearing a fault
                with a name. */
+            if (ev.type === 'response.done' && ev.response
+                && isOutOfBand(ev.response.id)) {
+              // A warning or a vetted line, arriving after whatever was
+              // tracking it gave up. Not the conversation, so not a cut-off
+              // answer and not a failed one.
+              finishResponse(ev.response.id);
+              break;
+            }
             if (ev.type === 'response.done' && ev.response) {
               var det = ev.response.status_details || {};
               if (ev.response.status === 'completed') {
@@ -1538,7 +1732,15 @@
           case 'response.output_audio_transcript.delta':
             // What she is saying, as she says it. The only record of how far
             // an answer got, and therefore the only thing a resume can carry.
-            if (!dictation || dictation.responseId !== ev.response_id) {
+            //
+            // A dictated warning and a vetted direct line are both excluded,
+            // and for one reason: neither is resumable. Their words were
+            // chosen by policy, not composed, so "carry on from where you
+            // stopped" is not a thing the model can do with them -- it would
+            // rewrite them. A direct line cut off is dropped, which is the
+            // same decision transcriptArrived already makes via `wasDirect`.
+            if ((!dictation || dictation.responseId !== ev.response_id)
+                && (!directSpeech || directSpeech.realId !== ev.response_id)) {
               partial += (ev.delta || '');
             }
             break;
@@ -1547,6 +1749,8 @@
             // was asked to say; in the car it is what the log records.
             if (dictation && dictation.responseId === ev.response_id) {
               dictation.transcript = ev.transcript || '';
+            } else if (directSpeech && directSpeech.realId === ev.response_id) {
+              directSpeech.transcript = ev.transcript || '';
             } else if (ev.transcript) {
               partial = ev.transcript;
             }
@@ -1661,13 +1865,26 @@
        * One-way and sticky. A voice that alternates between two people because
        * the network is alternating is worse than either of them, and the
        * driver has no way to interpret it -- so this happens once, is logged
-       * once, and the drive finishes in cedar.
+       * once, and the drive finishes in the live session's own voice.
        *
        * The session is asked for audio from here on. It has produced none so
        * far, which is the only reason the voice can be named this late: a
-       * realtime session's voice is fixed once it has spoken. */
-      useCedar: function (why) {
+       * realtime session's voice is fixed once it has spoken.
+       *
+       * NO LITERAL VOICE NAME IN HERE, and that is the point of the throw. The
+       * old code said `cfg.cedarVoice || 'cedar'`, which reads as a harmless
+       * default and is not one: the day the voice became marin, a session
+       * payload that failed to carry it would have handed the driver a
+       * different person mid-drive and logged that everything was fine.
+       * config.py names the voice, the mint carries it, and if it did not
+       * arrive this refuses rather than inventing one. */
+      useLiveVoice: function (why) {
         if (!sink || stopped) return false;
+        var voice = cfg.liveVoice;
+        if (!voice) {
+          emit('LIVE_ERROR', { where: 'useLiveVoice', why: 'no_voice_in_session' });
+          return false;
+        }
         var gone = sink;
         sink = null;
         counters.voice_backend_changed++;
@@ -1678,12 +1895,12 @@
             session: {
               type: 'realtime',
               output_modalities: ['audio'],
-              audio: { output: { voice: cfg.cedarVoice || 'cedar' } },
+              audio: { output: { voice: voice } },
             },
           });
         } catch (e) {}
         emit('LIVE_VOICE_BACKEND', {
-          backend: 'openai_realtime', voice: cfg.cedarVoice || 'cedar',
+          backend: 'openai_realtime', voice: voice,
           why: why || 'elevenlabs_unavailable' });
         return true;
       },
@@ -1919,6 +2136,7 @@
           // from the one the tests check.
           verbatimInstruction: session.verbatim_instruction,
           speakTimeoutMs: session.speak_timeout_ms,
+          directSpeechTimeoutMs: session.direct_speech_timeout_ms,
           lookAnswerMaxTokens: session.look_answer_max_tokens,
           // Interruption policy, decided in config.py and carried here with
           // the session exactly as the dictation policy is. The browser holds
@@ -1961,7 +2179,7 @@
           // same reason -- the sustain gate has to be able to change its mind.
           audio: audioFacade,
           voice: sink,
-          cedarVoice: session.cedar_voice || session.voice,
+          liveVoice: session.live_voice || session.voice,
           // The tool list, and the part of it that waits for a precondition.
           // Both come from the server; see mint_client_secret.
           toolSchemas: session.tool_schemas,
@@ -1976,7 +2194,7 @@
         };
 
         /* Anything that has to be SAID to the session has to wait for a
-           channel to say it on. The one that matters is the cedar fallback:
+           channel to say it on. The one that matters is the tier-2 fallback:
            the relay can refuse before the data channel has finished opening,
            and a session.update sent into a channel that is not open yet is not
            a fallback, it is a drive with no voice at all. */
@@ -2002,7 +2220,7 @@
          * automatic reroute, and this asks one question of each event rather
          * than knowing who sent it.
          *
-         * Sent through the same wait-for-the-channel gate the cedar fallback
+         * Sent through the same wait-for-the-channel gate the tier-2 fallback
          * uses. A route set before the data channel finishes opening is
          * ordinary — the driver can ask for one in the first second — and a
          * session.update into a channel that is not open yet is silently
@@ -2010,24 +2228,24 @@
         controller.watchToolConditions(root.RIO && root.RIO.bus, onChannelOpen);
 
         /* The sink's own bad news. A per-utterance fallback is counted and the
-           drive carries on; a cedar fallback changes what the session is asked
+           drive carries on; a tier-2 fallback changes what the session is asked
            to produce, and the mouth moves back to the element in the same
            breath so the very next response is audible. */
         if (sink) {
           sink.onEvent(function (ev) {
             if (!ev) return;
             if (ev.type === 'VOICE_FALLBACK') {
-              if (ev.tier === 'cedar') {
+              if (ev.tier === 'live_voice') {
                 mouth.at = elementMouth;
                 onChannelOpen(function () {
-                  controller.useCedar(ev.cause || 'elevenlabs_unavailable');
+                  controller.useLiveVoice(ev.cause || 'elevenlabs_unavailable');
                 });
               } else {
                 controller.noteVoiceFallback(ev);
               }
             } else if (ev.type === 'VOICE_TRANSPORT_LOST') {
               mouth.at = elementMouth;
-              onChannelOpen(function () { controller.useCedar('voice_relay_lost'); });
+              onChannelOpen(function () { controller.useLiveVoice('voice_relay_lost'); });
             }
           });
         }
@@ -2053,7 +2271,7 @@
           voiceReady = sink.open().catch(function () {
             mouth.at = elementMouth;
             onChannelOpen(function () {
-              controller.useCedar('voice_relay_unavailable');
+              controller.useLiveVoice('voice_relay_unavailable');
             });
             return null;
           });
@@ -2097,7 +2315,7 @@
               /* Which voice this drive is actually using, for the panel and
                  for the tests. Read from the controller rather than from the
                  session payload: the payload says what was INTENDED, and after
-                 a cedar fallback those are two different answers. */
+                 a tier-2 fallback those are two different answers. */
               voiceBackend: function () {
                 return controller.state().voice_backend;
               },

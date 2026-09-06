@@ -113,7 +113,7 @@ function makeSession(opts) {
           unmute: () => { audio.muted = false; rig.sink.unmute(); } }
       : { mute: () => { audio.muted = true; }, unmute: () => { audio.muted = false; } },
     voice: rig ? rig.sink : null,
-    cedarVoice: 'cedar',
+    liveVoice: opts.liveVoice || 'marin',
     onEvent: (ev) => events.push(ev),
     bargeSustainMs: opts.sustain,
     bargeConfirmMs: opts.confirm,
@@ -343,8 +343,12 @@ async function main() {
     : 'openai_realtime (the session speaks for itself)');
   console.log('=========================================================');
   RECOVERABLE = TURNS.filter(t => t.recoverable).length;
-  TURNS.forEach((t, i) => console.log('  %d. %-52s %s', i + 1, t.name,
-                                      t.recoverable ? '(should survive)' : ''));
+  // padEnd rather than '%-52s': node's console.log understands %d and %s and
+  // nothing about widths, so the width spec was printed literally and the
+  // column it was there to make never existed.
+  TURNS.forEach((t, i) => console.log(
+    '  ' + String(i + 1).padStart(2) + '. ' + t.name.padEnd(52)
+    + (t.recoverable ? '(should survive)' : '')));
 
   const r = await drive({ sustain: 4, confirm: 40,
                           eleven: voiceArg === 'elevenlabs' });

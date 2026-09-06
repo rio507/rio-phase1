@@ -87,7 +87,7 @@ policy, no endpoint and no client code.
 
 ```
 POST /talk  (or /ask)
-  └─ Whisper
+  └─ transcription (OPENAI_STT_MODEL)
   └─ _route_and_prepare()
        └─ router.classify()
             ├─ vehicle_health_question → _health_policy.note_status_request()

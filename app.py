@@ -759,7 +759,7 @@ def voice_status_endpoint():
         "configured": voice_dialogue.configured(),
         "conversation_model": config.ELEVENLABS_CONVERSATION_MODEL,
         "deterministic_model": config.ELEVENLABS_DETERMINISTIC_MODEL,
-        "cedar_voice": config.OPENAI_REALTIME_VOICE,
+        "live_voice": config.OPENAI_REALTIME_VOICE,
         "first_byte_budget_ms": config.ELEVENLABS_FIRST_BYTE_BUDGET_MS,
         "chunk": {"min_tokens": config.ELEVENLABS_CHUNK_MIN_TOKENS,
                   "max_wait_ms": config.ELEVENLABS_CHUNK_MAX_WAIT_MS},

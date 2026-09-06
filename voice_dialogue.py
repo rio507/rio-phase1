@@ -542,7 +542,7 @@ class DialogueSession:
         # utterance goes to flash. See ELEVENLABS_CAPACITY_BACKOFF_S.
         self._no_seat_until = 0.0
 
-        self.degraded = False     # tier 2: ElevenLabs is out, cedar has it
+        self.degraded = False     # tier 2: ElevenLabs is out, the live voice has it
         self.stats = {"utterances": 0, "reconnects": 0, "keepalives": 0,
                       "fallbacks": {}, "audio_chunks": 0, "audio_bytes": 0,
                       "first_audio_ms": [], "tags_dropped": 0}
@@ -1061,7 +1061,7 @@ class DialogueSession:
             await self._fail(SYNTH_ERROR, utt.rid)
 
     async def _fail(self, cause: str, rid):
-        """TIER 2. Count it, and hand the drive back to cedar if it keeps up."""
+        """TIER 2. Count it, and hand the drive back to her own voice if it keeps up."""
         self._note_fallback(cause)
         self._consecutive_failures += 1
         if (self._consecutive_failures >= config.ELEVENLABS_FAILURES_BEFORE_CEDAR
@@ -1071,7 +1071,7 @@ class DialogueSession:
                   f"goes back to {config.OPENAI_REALTIME_VOICE} for this drive",
                   flush=True)
             await self._emit("fallback", {
-                "tier": "cedar", "cause": SERVICE_DOWN, "rid": rid,
+                "tier": "live_voice", "cause": SERVICE_DOWN, "rid": rid,
                 "after": self._consecutive_failures,
                 "voice": config.OPENAI_REALTIME_VOICE})
 

@@ -1,8 +1,28 @@
 # RIO's voice — ElevenLabs, with GPT-Realtime still doing the thinking
 
-**Status:** implemented, measured against the real models and the real service.
-The playback half runs in a browser and has not been driven in a car yet; see
-*What is unproven* at the end.
+**Status: DORMANT.** RIO's voice is the live session's own again —
+`VOICE_BACKEND=openai_realtime`, voice `marin`, speech to speech. See
+`docs/realtime_conversation.md`, which is the current path.
+
+> **Dormant is not deleted, and the distinction is the whole reason this
+> document is still here.** The ElevenLabs path is kept whole and still
+> compiles. It is one env var from being RIO's voice again
+> (`VOICE_BACKEND=elevenlabs` and a restart), and under the active backend it
+> is still the **second tier of the deterministic fallback ladder**: a nav
+> callout, a health announcement or a headway line that the live session will
+> not start speaking within `REALTIME_SPEAK_TIMEOUT_MS` is synthesised by
+> `/nav/voice`, `/headway_voice` or `/vehicle/health/voice` instead. A warning
+> in a slightly different voice is a much smaller thing than a warning that
+> does not arrive.
+>
+> So "nothing on the active path reaches ElevenLabs" means exactly that and
+> not "nothing anywhere". Everything below describes what happens when this
+> backend is selected, and all of it is still true when it is.
+
+Everything in this document about **her ears** — the detector, the
+transcription, the tools, the escalation, the barge-in policy and the arbiter —
+is unchanged and current under either backend, with one correction: the
+transcriber is `gpt-transcribe` now, not `whisper-1`.
 
 ---
 
@@ -12,9 +32,14 @@ The playback half runs in a browser and has not been driven in a car yet; see
 |---|---|---|
 | hearing | the live session, continuously | **unchanged** |
 | thinking | `gpt-realtime-2.1` | **unchanged** |
-| speaking | the same session, in `cedar` | ElevenLabs `eleven_multilingual_v2`, voice `weA4Q36twV5kwSaTEL0Q` |
+| speaking | the same session, in its own voice | ElevenLabs `eleven_multilingual_v2`, voice `weA4Q36twV5kwSaTEL0Q` |
 | deterministic lines | dictated into the live session | ElevenLabs `eleven_flash_v2_5`, **same voice id** |
-| pre-rendered clips | rendered in `cedar` | re-rendered on `eleven_multilingual_v2`, **same voice id** |
+| pre-rendered clips | rendered in the live voice | re-rendered on `eleven_multilingual_v2`, **same voice id** |
+
+*(This table reads forwards into the ElevenLabs backend. Selecting
+`openai_realtime` reads it backwards: the clips are re-rendered in `marin`,
+which is what `python -m tools.render_alerts --force` does, and the
+deterministic lines go back to being dictated.)*
 
 > **The conversation model was v3 first, and v3 was wrong.** The voice is a
 > professional clone, and a clone is trained against a set of base models. This
@@ -140,13 +165,13 @@ python -m tools.voice_latency --turns 10
 
 | path | p50 | p95 | model's first word (p50) | **synthesis** p50 / p95 |
 |---|---|---|---|---|
-| `cedar` (the session speaks for itself) | 594 ms | 733 ms | — (inside the model) | — |
+| the session speaking for itself | 594 ms | 733 ms | — (inside the model) | — |
 | **`elevenlabs_v2`** (multi-context socket) | **699 ms** | 879 ms | 278 ms | **491 / 536 ms** |
 | `elevenlabs_v3` (dialogue socket) | 912 ms | 1286 ms | 547 ms | 366 / 433 ms |
 | `elevenlabs_flash` (the per-utterance fallback) | 599 ms | 885 ms | 296 ms | 336 / 353 ms |
 | pre-rendered clip | 0 ms | 0 ms | — | — |
 
-**v2 costs +105 ms against cedar at the median.**
+**v2 costs +105 ms against the live session at the median.**
 
 **Read the synthesis column, not the end-to-end one, when comparing the three
 ElevenLabs rows.** They ran against the same GPT and got different luck from
@@ -202,12 +227,12 @@ the same mouth as a conversation; under this backend that is already true
 without dictating anything, and dictating into a text-mode session would
 produce a warning as text, spoken through a socket built for prosody — slower,
 out of band, and for nothing. `REALTIME_SPEECH_ENABLED` is still there and
-still governs the cedar backend; the mint payload reports `speech_enabled:
+still governs the openai_realtime backend; the mint payload reports `speech_enabled:
 false` and `rio_speak.js` falls through to the TTS endpoints, which cost
 nothing to reach and are 200 ms away.
 
 Clips are re-rendered with `python -m tools.render_alerts --force`, verified by
-transcribing the finished MP3 with Whisper and re-rendering if it does not
+transcribing the finished MP3 (with `OPENAI_STT_MODEL`) and re-rendering if it does not
 match, and recorded in `static/audio/rendered.json` — which `tools/preflight`
 compares against the configured voice, so "the clips are in RIO's voice" is a
 check rather than a claim.
@@ -313,16 +338,16 @@ refused identically, and the drive spends itself reconnecting once per
 sentence. So a capacity refusal **parks** the dialogue socket for
 `ELEVENLABS_CAPACITY_BACKOFF_S` (60), runs every utterance on flash meanwhile,
 logs it once, and quietly asks for a seat again when the back-off expires. It
-is not counted as the service being down and never reaches cedar: a full pool
+is not counted as the service being down and never reaches tier 2: a full pool
 costs prosody, not speech.
 
 **Tier 2 — the service is gone.** After
 `ELEVENLABS_FAILURES_BEFORE_CEDAR` (2) consecutive utterances where neither the
 socket nor flash produced anything, RIO takes her own voice back mid-drive: the
-session is switched to audio output with `cedar` named, and it stays there.
+session is switched to audio output with `OPENAI_REALTIME_VOICE` named, and it stays there.
 One-way and sticky, because a voice that alternates between two people while
 the network alternates is worse than either of them and the driver has no way
-to interpret it. If the relay will not open at all, the drive starts on cedar
+to interpret it. If the relay will not open at all, the drive starts on the live voice
 and never leaves.
 
 Every fallback is logged with its cause, to stdout and into the drive's own
@@ -345,7 +370,7 @@ VOICE_BACKEND=elevenlabs                          # elevenlabs | openai_realtime
 ELEVENLABS_VOICE_ID=weA4Q36twV5kwSaTEL0Q
 ELEVENLABS_MODEL_CONVERSATION=eleven_multilingual_v2
 ELEVENLABS_API_KEY=sk_...                         # never leaves the server
-OPENAI_REALTIME_VOICE=cedar                       # what tier 2 falls back to
+OPENAI_REALTIME_VOICE=marin                       # what tier 2 falls back to
 ```
 
 The conversation model is the only setting that chooses a transport: name an
@@ -585,6 +610,7 @@ That test opens sessions until the service refuses, then drives a car through
 it: the connection succeeds, the first utterance falls back to flash and is
 recorded as a full pool rather than a dropped socket, the socket is parked
 rather than reconnected, the second utterance goes straight to flash without
-asking again, and the drive keeps RIO's own voice instead of reaching for
-cedar. It briefly uses every dialogue seat the account has, so it is behind its
+asking again, and the drive keeps the cloned voice instead of handing
+the drive back to the live session. It briefly uses every dialogue seat the
+account has, so it is behind its
 own flag rather than in the ordinary `--live` run.

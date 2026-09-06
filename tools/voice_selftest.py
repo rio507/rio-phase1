@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -85,7 +86,8 @@ def run_session():
     # session that stops noticing the driver.
     audio_in = cfg["audio"]["input"]
     ok(audio_in["transcription"]["model"] == config.OPENAI_STT_MODEL,
-       "audio input is untouched: the same Whisper transcribes the driver")
+       f"audio input is untouched: the one transcriber "
+       f"({config.OPENAI_STT_MODEL}) still hears the driver")
     td = audio_in["turn_detection"]
     ok(td == realtime.turn_detection(),
        f"...and the same turn detector, whichever it is ({td['type']}) — the "
@@ -95,18 +97,19 @@ def run_session():
     ok(td["interrupt_response"] is False,
        "...and interruption is still the browser's decision, not the server's")
     ok(cfg["audio"]["output"]["voice"] == config.OPENAI_REALTIME_VOICE,
-       f"cedar is still named ({config.OPENAI_REALTIME_VOICE}), so the tier-2 "
-       "fallback is a modality switch and not a first-time configuration")
+       f"the voice is named ({config.OPENAI_REALTIME_VOICE}) whatever the "
+       "modality, so the tier-2 fallback is a modality switch and not a "
+       "first-time configuration")
     ok(int(cfg["max_output_tokens"]) == int(config.REALTIME_MAX_RESPONSE_TOKENS),
        "the ceiling on a spoken answer is unchanged")
 
     # What travels to the browser with the session.
-    payload_keys = ("voice_backend", "cedar_voice", "voice_sample_rate",
+    payload_keys = ("voice_backend", "live_voice", "voice_sample_rate",
                     "output_modalities", "speech_enabled")
     src = Path(REPO / "realtime.py").read_text()
     ok(all(f'"{k}"' in src for k in payload_keys),
-       "the mint payload carries the backend, the cedar voice and the sample "
-       "rate, so the page holds no copy of any of them")
+       "the mint payload carries the backend, the voice and the sample rate, "
+       "so the page holds no copy of any of them")
 
 
 def run_dictation_policy():
@@ -342,9 +345,17 @@ def run_scene_gate():
        "and look() takes it")
 
     # A camera answer has a ceiling, at the API rather than in the prompt.
-    ok(config.REALTIME_LOOK_ANSWER_MAX_TOKENS
-       and config.REALTIME_LOOK_ANSWER_MAX_TOKENS <= 120,
-       f"a camera answer is capped at {config.REALTIME_LOOK_ANSWER_MAX_TOKENS} "
+    cap = config.look_answer_max_tokens()
+    # The ceiling is in the units the SESSION is billed in, and those differ by
+    # backend: 60 text tokens is two short sentences, 60 audio tokens is
+    # twenty-six characters. Both are checked as "two short sentences", which
+    # is the thing the number is for.
+    ok(cap == (60 if config.VOICE_BACKEND == "elevenlabs" else 240),
+       f"the camera-answer cap is in the units this backend is billed in "
+       f"({cap} under {config.VOICE_BACKEND})")
+    ok(cap
+       and cap <= 300,
+       f"a camera answer is capped at {cap} "
        "tokens — measured at 23 words median and 44 at p95 against "
        "instructions asking for one sentence")
     ok("max_output_tokens: lookAnswerMaxTokens" in js,
@@ -356,9 +367,18 @@ def run_scene_gate():
     ok("CALL IT FIRST AND SAY NOTHING IN FRONT OF IT" in inst,
        "she is told to call the camera before speaking, not after — words "
        "composed before the call are words the driver waits through")
-    ok("Say a holding line first" in inst,
+    # STALE SINCE THE INSTRUCTION TRIM, and red ever since: this asked for the
+    # literal "Say a holding line first", which the rewrite in 3008250 replaced
+    # with "with a holding line in front of it that is TRUE" without touching
+    # the check. The RULE never went anywhere -- only the sentence carrying it
+    # did -- so the check now asks about the rule, which is the thing that
+    # would actually be worth a failure.
+    ok(re.search(r"holding line in front of it", inst),
        "...while the research tool, which really does take seconds, keeps its "
        "holding line")
+    ok("that is TRUE" in inst,
+       "and the holding line has to be true — 'let me look that up' while she "
+       "looks it up, not a noise to fill the wait")
 
 
 def run_persona():
@@ -861,7 +881,7 @@ async def run_fallbacks():
         await s.close()
     finally:
         vd.api_key = real
-    cedar = [d for k, d in events if k == "fallback" and d.get("tier") == "cedar"]
+    cedar = [d for k, d in events if k == "fallback" and d.get("tier") == "live_voice"]
     ok(degraded, "with ElevenLabs refusing everything, the session gives up on "
                  "it rather than retrying into silence for the rest of a drive")
     ok(cedar, "and says so, once, with a cause "

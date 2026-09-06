@@ -1,49 +1,49 @@
 {
   "clips": {
     "back_off": {
-      "at": 1788474432.4,
-      "backend": "elevenlabs",
-      "bytes": 28884,
-      "model": "eleven_multilingual_v2",
-      "sha1": "be72f25f983e",
-      "voice": "weA4Q36twV5kwSaTEL0Q"
+      "at": 1788724589.9,
+      "backend": "openai_realtime",
+      "bytes": 14565,
+      "model": "gpt-realtime-2.1",
+      "sha1": "5674a5a1532f",
+      "voice": "marin"
     },
     "tire_critical": {
-      "at": 1788474432.4,
-      "backend": "elevenlabs",
-      "bytes": 103280,
-      "model": "eleven_multilingual_v2",
-      "sha1": "cc9939a1491f",
-      "voice": "weA4Q36twV5kwSaTEL0Q"
+      "at": 1788724589.9,
+      "backend": "openai_realtime",
+      "bytes": 43773,
+      "model": "gpt-realtime-2.1",
+      "sha1": "2f5f521eb23c",
+      "voice": "marin"
     },
     "tire_sensor_lost": {
-      "at": 1788474432.4,
-      "backend": "elevenlabs",
-      "bytes": 125432,
-      "model": "eleven_multilingual_v2",
-      "sha1": "a9c120581ad5",
-      "voice": "weA4Q36twV5kwSaTEL0Q"
+      "at": 1788724589.9,
+      "backend": "openai_realtime",
+      "bytes": 46077,
+      "model": "gpt-realtime-2.1",
+      "sha1": "0bf978ca5f9b",
+      "voice": "marin"
     },
     "too_close": {
-      "at": 1788474432.4,
-      "backend": "elevenlabs",
-      "bytes": 25958,
-      "model": "eleven_multilingual_v2",
-      "sha1": "d47a87480ea9",
-      "voice": "weA4Q36twV5kwSaTEL0Q"
+      "at": 1788724589.9,
+      "backend": "openai_realtime",
+      "bytes": 14061,
+      "model": "gpt-realtime-2.1",
+      "sha1": "f4191bb88283",
+      "voice": "marin"
     },
     "watch_distance": {
-      "at": 1788474432.4,
-      "backend": "elevenlabs",
-      "bytes": 27212,
-      "model": "eleven_multilingual_v2",
-      "sha1": "03e16312641b",
-      "voice": "weA4Q36twV5kwSaTEL0Q"
+      "at": 1788724589.9,
+      "backend": "openai_realtime",
+      "bytes": 13269,
+      "model": "gpt-realtime-2.1",
+      "sha1": "52c607109523",
+      "voice": "marin"
     }
   },
   "voice": {
-    "backend": "elevenlabs",
-    "model": "eleven_multilingual_v2",
-    "voice": "weA4Q36twV5kwSaTEL0Q"
+    "backend": "openai_realtime",
+    "model": "gpt-realtime-2.1",
+    "voice": "marin"
   }
 }
