@@ -339,8 +339,31 @@
      video element promotes only that element, so the canvas -- a sibling --
      is left behind on the normal page and the overlay vanishes. Promoting the
      container takes the canvas along. */
-  #camfull {
+  /* The top-right stack. Two things want that corner -- the fullscreen button
+     and the source badge -- and hand-picked `top` offsets for the second one
+     only hold while the first one is exactly the height it was on the desk
+     browser it was measured in. iOS Safari renders the button taller (its own
+     font floor, and a text-size adjustment the page does not control) and the
+     badge landed on top of it. A flex column cannot collide with itself: the
+     badge is placed by the button's real height, whatever that turns out to
+     be, on every browser. */
+  .cam-tr {
     position: absolute; top: 8px; right: 8px; z-index: 4;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
+    max-width: 62%;
+    /* Only the button is a target; the badge must not eat taps meant for the
+       picture underneath it. */
+    pointer-events: none;
+  }
+  #camfull {
+    position: static; pointer-events: auto;
+    /* The page-wide 60px button floor is for things a driver aims at at
+       speed. This is a corner affordance on top of the picture, and 60px of
+       it was both out of proportion and half the reason the badge below
+       collided with it. 44px is the iOS touch minimum and it stays a real
+       target. */
+    display: flex; align-items: center;
+    min-height: 44px;
     padding: 5px 9px;
     font-family: var(--font-mono); font-size: 9.5px;
     letter-spacing: 0.2em; text-transform: uppercase;
@@ -435,10 +458,11 @@
      the two answer different questions ("is a drive running" vs "of what") and
      both have to be readable at a glance. */
   .cam-source {
-    /* Top RIGHT, under the fullscreen button. The left column is taken: the
-       LIVE badge and the headway HUD both live there and already shuffle
-       around each other when a drive starts. */
-    position: absolute; top: 36px; right: 8px; z-index: 3;
+    /* Top RIGHT, under the fullscreen button -- as a sibling row in .cam-tr,
+       so "under" is a fact of the layout rather than a 36px guess. The left
+       column is taken: the LIVE badge and the headway HUD both live there and
+       already shuffle around each other when a drive starts. */
+    position: static;
     display: flex; align-items: center; gap: 6px;
     padding: 4px 9px; border-radius: 4px;
     background: rgba(2, 3, 8, 0.72);
@@ -447,7 +471,7 @@
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
     color: var(--text-dim);
-    max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .cam-source.src-camera { border-left-color: var(--blue); color: var(--text); }
   /* Amber, like everything else on this page that means "not the normal
@@ -1295,13 +1319,46 @@
 
   /* ---------- hold to talk ---------- */
 
+  /* The control carries its own state, and the state is the first thing a
+     driver reads off it: a coloured dot, one word for where the session is
+     (idle / listening / speaking), and -- only while a session is open -- a
+     second line saying what a tap does now. `data-state` on the button is the
+     single switch; every rule below hangs off it. */
+  .mic-dot {
+    flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--text-dimmer);
+    box-shadow: 0 0 8px currentColor;
+  }
+  .mic-text {
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    min-width: 0;
+  }
+  .mic-label { display: block; }
+  .mic-hint {
+    display: none;
+    font-family: var(--font-mono); font-weight: 400;
+    font-size: 9.5px; letter-spacing: 0.16em;
+    color: var(--text-dim);
+  }
+  /* Only shown when a tap does something other than what the label says. */
+  #mic[data-state="listening"] .mic-hint,
+  #mic[data-state="speaking"] .mic-hint,
+  #mic[data-state="connecting"] .mic-hint { display: block; }
+
+  #mic[data-state="idle"] .mic-dot      { background: var(--text-dimmer); box-shadow: none; }
+  #mic[data-state="connecting"] .mic-dot { background: var(--amber); animation: livepulse 1.2s ease-in-out infinite; }
+  #mic[data-state="listening"] .mic-dot  { background: var(--green); animation: livepulse 1.6s ease-in-out infinite; }
+  #mic[data-state="speaking"] .mic-dot   { background: var(--blue);  animation: livepulse 0.9s ease-in-out infinite; }
+  #mic[data-state="recording"] .mic-dot  { background: var(--red);   animation: livepulse 1.2s ease-in-out infinite; }
+
   /* Idle/desk layout: the control lives at the foot of the VOICE LAYER column,
      full panel width, sized as a comfortable target without stealing a whole
      band across the page. The drive-mode override further down is the one that
      matters at speed and is deliberately left untouched by this placement. */
   #micbar { margin-top: 12px; }
   #mic {
-    display: block; width: 100%;
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%;
     min-height: 90px;
     padding: 14px 20px; margin: 0;
     font-weight: 600; font-size: 18px;
@@ -1314,34 +1371,102 @@
     transition: background 120ms linear, box-shadow 120ms linear, border-color 120ms linear;
   }
   #mic:hover { background: var(--surface-hover); }
-  #mic.recording {
+  /* Hold-to-talk, mid-recording: the loudest thing on the page, because
+     something is being captured right now. */
+  #mic.recording, #mic[data-state="recording"] {
     color: #ffe4e4;
     border-color: var(--red);
     background: rgba(255,107,107,0.10);
     box-shadow: 0 0 18px rgba(255,107,107,0.62), inset 0 0 32px rgba(255,107,107,0.12);
   }
+  /* An open live session. Deliberately not the recording red: the driver is
+     not being recorded into a clip, they are in a conversation, and the one
+     thing a tap does here is end it. */
+  #mic[data-state="listening"], #mic[data-state="speaking"] {
+    color: #d8fff2;
+    border-color: var(--green);
+    background: rgba(110,231,199,0.08);
+    box-shadow: 0 0 16px rgba(110,231,199,0.45), inset 0 0 28px rgba(110,231,199,0.08);
+  }
+  #mic[data-state="speaking"] {
+    color: var(--accent-bright);
+    border-color: var(--blue);
+    background: rgba(95,179,232,0.10);
+    box-shadow: 0 0 16px rgba(95,179,232,0.55), inset 0 0 28px rgba(95,179,232,0.10);
+  }
 
-  /* While driving the mic leaves the Voice Layer column entirely and pins to the
-     bottom of the viewport so it can be hit without looking, regardless of how
-     far the columns have scrolled. position:fixed lifts it out of the column's
-     flow, so the in-column placement above costs the drive-safe target nothing.
-     A driver must never have to aim at a small button at speed. */
-  body.driving { padding-bottom: 46dvh; }
+  /* While driving the mic leaves the Voice Layer column entirely and pins to
+     the bottom of the viewport so it can be hit without looking, regardless of
+     how far the columns have scrolled. position:fixed lifts it out of the
+     column's flow, so the in-column placement above costs the drive-safe
+     target nothing.
+
+     IT IS A BUTTON, NOT A PANEL. It used to be 42dvh of full-width viewport,
+     which on a phone in portrait is most of the screen: the camera box -- the
+     one thing on this page a driver is actually looking at -- was underneath
+     it, and fullscreening the feed did not help, because a fixed element at
+     this z-index paints over a pseudo-fullscreen wrap at the same one. A big
+     target is worth having; it is not worth the picture. So: bottom-RIGHT
+     corner, sized as a comfortable thumb target and no larger, clear of the
+     feed at every scroll position (the camera box sits at the top of the
+     document and can only ever move further up as the page scrolls).
+
+     #micbar is now only a positioner and takes no taps of its own -- an
+     invisible full-width strip that swallows them is the same bug in a
+     cheaper costume. */
+  body.driving {
+    /* Room under the last column for the floating control, plus the home
+       indicator on a phone. */
+    padding-bottom: calc(104px + env(safe-area-inset-bottom, 0px));
+  }
   body.driving #micbar {
-    position: fixed; left: 0; right: 0; bottom: 0;
-    margin: 0; padding: 8px 12px;
-    background: linear-gradient(180deg, rgba(2,3,8,0) 0%, rgba(2,3,8,0.92) 22%);
+    position: fixed; left: auto; right: 0; bottom: 0; width: auto;
+    margin: 0; background: none;
+    pointer-events: none;
     z-index: 9999;
+    /* Clears the home indicator and the rounded corner on iOS; falls back to
+       a plain 14px gutter everywhere else. */
+    padding: 0 14px 14px 0;
+    padding-right: max(14px, env(safe-area-inset-right, 0px));
+    padding-bottom: max(14px, env(safe-area-inset-bottom, 0px));
   }
   body.driving #mic {
-    font-size: 30px; font-weight: 700;
-    height: 42vh;   /* fallback */
-    height: 42dvh;  /* honours iOS Safari's dynamic toolbars */
-    min-height: 40vh;
+    pointer-events: auto;
+    width: auto; min-width: 168px; max-width: min(72vw, 300px);
+    min-height: 64px; height: auto;
+    padding: 12px 20px;
+    font-size: 17px; font-weight: 700; letter-spacing: 0.14em;
+    /* Legible over whatever the feed is showing if the two ever do meet --
+       fullscreen, where the picture is the whole screen and the control has
+       nowhere else to be. */
+    background: rgba(4,7,14,0.92);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 0 14px rgba(95,179,232,0.42), 0 6px 22px rgba(0,0,0,0.55);
   }
+  body.driving #mic[data-state="listening"],
+  body.driving #mic[data-state="speaking"],
+  body.driving #mic[data-state="recording"] { background: rgba(4,7,14,0.92); }
+
+  /* Landscape phone: same control, shorter, so it eats less of a 375px-tall
+     viewport. Still above the 44px iOS touch-target floor by a wide margin. */
   @media (orientation: landscape) and (max-height: 480px) {
-    body.driving #mic { height: 46vh; height: 46dvh; min-height: 40vh; font-size: 26px; }
+    body.driving { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+    body.driving #mic {
+      min-height: 56px; padding: 10px 16px; font-size: 15px; min-width: 148px;
+    }
     body.driving .hud-header { display: none; }
+    /* A 16:9 box across a 844px-wide viewport is 475px tall -- taller than the
+       screen. The "the feed is above the control and can only scroll upward"
+       argument does not hold here: the box crosses the whole viewport, so a
+       corner-anchored control would meet it somewhere in the scroll. So the
+       control gets a column of its own and the picture keeps the rest. Two
+       disjoint columns cannot overlap at any scroll offset, which is a
+       stronger guarantee than any offset that has to be re-measured. */
+    body.driving .cam-wrap:not(.pseudo-full) {
+      margin-right: max(196px, calc(env(safe-area-inset-right, 0px) + 196px));
+    }
+    /* Fullscreen is the one place the picture is meant to be everything. */
+    body.driving .cam-wrap:fullscreen { margin-right: 0; }
   }
 
   @supports (padding: max(0px)) {
@@ -1410,13 +1535,18 @@
              style="position:absolute; left:0; top:0; width:2px; height:2px;
                     opacity:0.01; pointer-events:none; z-index:0;"></video>
       <canvas id="overlay"></canvas>
-      <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
+      <!-- One stack, top-right: the fullscreen button and, directly beneath
+           it, the source badge. See .cam-tr in the stylesheet for why these
+           are no longer two independently positioned corners. -->
+      <div class="cam-tr">
+        <button id="camfull" type="button" title="Fullscreen the camera box">Full</button>
+        <!-- WHICH PICTURE. The bug this replaces was invisible: the clip stayed
+             on screen while the frames came from the phone's front camera, and
+             nothing said so. -->
+        <div id="camsource" class="cam-source src-camera">REAR CAM</div>
+      </div>
       <div class="cam-badge">Live</div>
       <div class="cam-nosignal">No Signal</div>
-      <!-- WHICH PICTURE. The bug this replaces was invisible: the clip stayed
-           on screen while the frames came from the phone's front camera, and
-           nothing said so. -->
-      <div id="camsource" class="cam-source src-camera">REAR CAM</div>
       <div id="headwayhud" class="hw-UNKNOWN">
         <span class="hw-band" id="hwband">Standby</span>
         <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
@@ -1603,10 +1733,22 @@
       <audio id="player" controls autoplay playsinline></audio>
     </div>
 
-    <!-- Idle placement only. body.driving fixes this to the bottom of the
-         viewport as the large drive-safe target; see #micbar in the stylesheet. -->
+    <!-- Idle placement only. body.driving lifts this out of the column and
+         pins it to the bottom of the viewport; see #micbar in the stylesheet.
+         The control never covers the camera box in either placement.
+
+         The dot and the two lines are set by setMicState() and by nothing
+         else -- a control whose caption is written from six places drifts out
+         of step with the session it is supposed to be describing. -->
     <div id="micbar">
-      <button id="mic">Hold to talk</button>
+      <button id="mic" type="button" data-state="idle"
+              aria-label="Start a conversation with RIO">
+        <span class="mic-dot" aria-hidden="true"></span>
+        <span class="mic-text">
+          <span class="mic-label" id="miclabel">Talk to RIO</span>
+          <span class="mic-hint" id="michint" aria-hidden="true"></span>
+        </span>
+      </button>
     </div>
   </section>
 
@@ -2002,6 +2144,41 @@ document.addEventListener('DOMContentLoaded', () => {
 <script>
 document.addEventListener('DOMContentLoaded', () => {
 const micBtn = document.getElementById('mic');
+
+/* ---- what the talk control says --------------------------------------
+   One function, one switch. The caption used to be assigned from six places
+   and the red "recording" class from four more, which is how the control
+   ended up saying "End conversation" in hold-to-talk red while the session
+   underneath it was listening. `data-state` is what the stylesheet reads; the
+   label is the state in one word, and the hint only appears when a tap does
+   something the label does not already say. */
+const MIC_STATES = {
+  idle:       { label: 'Talk to RIO',     hint: '', aria: 'Start a conversation with RIO' },
+  hold:       { label: 'Hold to talk',    hint: '', aria: 'Hold to talk to RIO' },
+  recording:  { label: 'Release to send', hint: '', aria: 'Recording — release to send' },
+  connecting: { label: 'Connecting…',     hint: 'stand by', aria: 'Connecting to RIO' },
+  listening:  { label: 'Listening',       hint: 'tap to end', aria: 'RIO is listening — tap to end the conversation' },
+  speaking:   { label: 'Speaking',        hint: 'tap to end', aria: 'RIO is speaking — tap to end the conversation' },
+};
+
+function setMicState(state) {
+  const spec = MIC_STATES[state] || MIC_STATES.idle;
+  if (!micBtn) return;
+  micBtn.dataset.state = MIC_STATES[state] ? state : 'idle';
+  // The old class is kept in step for anything still keying off it.
+  micBtn.classList.toggle('recording', state === 'recording');
+  micBtn.setAttribute('aria-label', spec.aria);
+  const label = document.getElementById('miclabel');
+  const hint = document.getElementById('michint');
+  if (label) label.textContent = spec.label;
+  if (hint) hint.textContent = spec.hint;
+}
+
+// The layout selftest drives the control through the real function rather
+// than restating its captions -- a test that writes its own labels cannot
+// catch a label going wrong.
+if (window.RIO && RIO.ui) RIO.ui.talkState = setMicState;
+
 const frameBtn = document.getElementById('frame');
 const player = document.getElementById('player');
 const obs = document.getElementById('observation');
@@ -2075,15 +2252,13 @@ async function startRec() {
     }
   };
   recorder.start();
-  micBtn.classList.add('recording');
-  micBtn.textContent = 'Release to send';
+  setMicState('recording');
   RIO.ui.voice('listening');
 }
 function stopRec() {
   if (recorder && recorder.state === 'recording') {
     recorder.stop();
-    micBtn.classList.remove('recording');
-    micBtn.textContent = 'Hold to talk';
+    setMicState('hold');
     RIO.ui.voice('idle');
   }
 }
@@ -2176,8 +2351,7 @@ async function toggleLive() {
     live.stop();
     live = null;
     stopLiveFrames();
-    micBtn.textContent = 'Talk to RIO';
-    micBtn.classList.remove('recording');
+    setMicState('idle');
     RIO.ui.voice('idle');
     return;
   }
@@ -2220,7 +2394,7 @@ function reportLive(ev) {
 }
 
   liveBusy = true;
-  micBtn.textContent = 'Connecting…';
+  setMicState('connecting');
   try {
     live = await RIO.realtime.connect({
       arbiter: RIO.speech,
@@ -2228,8 +2402,10 @@ function reportLive(ev) {
       element: player,
       onEvent: (ev) => {
         if (ev.type === 'LIVE_TRANSCRIPT' && ev.transcript) RIO.ui.driver(ev.transcript);
-        else if (ev.type === 'LIVE_RESPONSE_START') RIO.ui.voice('speaking');
-        else if (ev.type === 'LIVE_RESPONSE_END') RIO.ui.voice('listening');
+        // The control follows the session, not the other way round: whatever
+        // the ring in column 4 is showing, the button in the corner shows too.
+        else if (ev.type === 'LIVE_RESPONSE_START') { RIO.ui.voice('speaking'); setMicState('speaking'); }
+        else if (ev.type === 'LIVE_RESPONSE_END') { RIO.ui.voice('listening'); setMicState('listening'); }
         else if (ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
         else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
         else if (ev.type === 'LIVE_RESUME') {
@@ -2240,8 +2416,7 @@ function reportLive(ev) {
         reportLive(ev);
       },
     });
-    micBtn.textContent = 'End conversation';
-    micBtn.classList.add('recording');
+    setMicState('listening');
     RIO.ui.voice('listening');
     // Give her something to see. A drive already does; this covers the case
     // where the driver just wants to talk.
@@ -2254,8 +2429,7 @@ function reportLive(ev) {
     liveMode = false;
     live = null;
     stopLiveFrames();
-    micBtn.textContent = 'Hold to talk';
-    micBtn.classList.remove('recording');
+    setMicState('hold');
     obs.textContent = 'Live conversation unavailable (' +
       (e && e.message ? e.message : e) + ') — hold to talk instead.';
     console.warn('[live] falling back to hold-to-talk:', e);
@@ -2264,7 +2438,7 @@ function reportLive(ev) {
   }
 }
 
-if (micBtn) micBtn.textContent = 'Talk to RIO';
+setMicState('idle');
 
 micBtn.addEventListener('mousedown', () => { if (liveMode) toggleLive(); else startRec(); });
 micBtn.addEventListener('mouseup', () => { if (!liveMode) stopRec(); });
