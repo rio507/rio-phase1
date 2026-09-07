@@ -331,6 +331,29 @@ def _visual_key(session_id):
     return session_id or "default"
 
 
+def _frame_origin(session_id, source):
+    """WHO IS TAKING THESE PICTURES, as one string on every frame.
+
+    "<session key>:<source>" for a page that says what it is looking through,
+    and "api:<source>" for everything else -- a bench, a curl, an acceptance
+    harness pushing a demo clip through the same endpoint. The distinction is
+    the whole point: those frames land in the keyless ring, and an answer built
+    from them must never be served to a drive that has its own camera.
+
+    `source` is the page's own word for what it is showing (camera / clip /
+    none), which is also what the badge over the picture says. A clip taking
+    over from a camera is a different origin and empties the ring, because the
+    six seconds behind it are of a different road.
+    """
+    kind = str(source or "unknown").strip().lower()[:16] or "unknown"
+    if kind not in ("camera", "clip", "upload", "none", "unknown"):
+        kind = "unknown"
+    if not session_id:
+        # No session id at all: nothing here is a drive, so it is the API.
+        return f"api:{kind}"
+    return f"{session_id}:{kind}"
+
+
 def _route_and_prepare(transcript: str, session_id: str):
     """Classify the utterance and, if it is visual, build the turn. -> (route, va).
 
@@ -1001,6 +1024,11 @@ async def headway_frame_endpoint(
     v_host: str = Form(default=None),
     v_host_age_s: str = Form(default=None),
     frame_t: str = Form(default=None),
+    # WHAT THE PAGE IS LOOKING THROUGH, in its own words: camera, clip, none.
+    # Stamped onto every frame that is retained, so an answer can be checked
+    # against the source it came from. Absent -- a bench, a curl, a harness --
+    # and the frame is marked as the API's rather than any session's.
+    source: str = Form(default=None),
 ):
     """One live headway frame: track -> depth -> filter -> band -> voice.
 
@@ -1053,7 +1081,8 @@ async def headway_frame_endpoint(
     # long — see framebuf.py.
     if config.VISUAL_QA_ENABLED:
         try:
-            framebuf.get_ring(_visual_key(session_id)).push(image_bytes, result)
+            framebuf.get_ring(_visual_key(session_id)).push(
+                image_bytes, result, origin=_frame_origin(session_id, source))
         except Exception as e:
             # Losing a frame from the buffer costs a better answer later. It
             # must never cost the headway frame that has already been computed.

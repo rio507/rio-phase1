@@ -40,20 +40,76 @@ Re-version this file whenever the bible is updated.
 # path still exists and is still correct, it is just no longer the only one.
 import persona   # noqa: E402  (the banned-word list, and the lint that enforces it)
 
-OBSERVER_PROMPT = """You are the eyes of RIO, an in-car assistant, and what you write is SPOKEN ALOUD to the driver as her own words. Write the one sentence she would say if the driver asked what's out there.
+# THE EXAMPLES ARE THE HAZARD, and they are kept here as data because of it.
+#
+# They used to sit in the prompt as four bare sentences under "this is her
+# rhythm". Measured against the shipped prompt on this GPU: a hand, a black
+# frame, random noise and a road all came back with the FIRST one, word for
+# word. The model was not describing the frame at all -- it was completing the
+# pattern, and the pattern's first item is a valid-looking answer. A phone
+# pointed at a desk was told "open freeway, light traffic, dry hills", and
+# because that line passes persona.lint() it was spoken directly, as her.
+#
+# So the examples are now shown as PAIRS -- what was out of the windscreen, and
+# what she said about it -- which cannot be copied into an answer without
+# copying something obviously wrong with it. And they are exported, so
+# is_prompt_example() can refuse any observation that comes back as one anyway.
+# The prompt is the fix; the guard is what makes it a rule rather than a hope.
+OBSERVER_EXAMPLES = (
+    "Open freeway, light traffic — dry hills both sides",
+    "Two lanes into town, wet road, brake lights ahead",
+    "Quiet street, parked cars both sides, nobody about",
+    "Motorway opening out, sun low behind the ridge",
+)
+
+OBSERVER_PROMPT = """You are the eyes of RIO, an in-car assistant, and what you write is SPOKEN ALOUD to the driver as her own words. Write the one sentence she would say about WHAT IS IN THIS FRAME.
+
+Look at the frame first. Every word you write has to be something you can point at in it. If the frame does not show a road, do not write about a road — write what is actually in front of the camera.
 
 One short sentence. Twelve words at most. No full stop needed.
 
 She is looking through a windscreen, not describing a photograph. Never write "I see", "I notice", "the image", "there is", "appears to be", or anything about a picture, a camera or a frame.
 
-Name what is actually there and what matters about it — the road, the traffic, the light, the land. Specific beats general, and a dash between two halves is her rhythm:
+Name what is actually there and what matters about it — the road, the traffic, the light, the land. Specific beats general, and a dash between two halves is her rhythm. Four frames and what she said about each:
 
-  Open freeway, light traffic — dry hills both sides
-  Two lanes into town, wet road, brake lights ahead
-  Quiet street, parked cars both sides, nobody about
-  Motorway opening out, sun low behind the ridge
+  frame: three lanes, hills either side, few cars -> Open freeway, light traffic — dry hills both sides
+  frame: town street in rain, queue of cars -> Two lanes into town, wet road, brake lights ahead
+  frame: residential road, cars at the kerb, empty -> Quiet street, parked cars both sides, nobody about
+  frame: dual carriageway at dusk, ridge ahead -> Motorway opening out, sun low behind the ridge
 
-No greeting, no offer, no question, no commentary. If the road is unremarkable, say that plainly and stop. One sentence only."""
+Those are four other frames. They are not answers to this one, and none of their words may appear in yours unless they are in the frame you were given.
+
+If the frame is too dark, too blurred or too close to make out, say that plainly — "can't make much out" is a true answer and a road you cannot see is not.
+
+No greeting, no offer, no question, no commentary. One sentence only."""
+
+
+def _normalise(text: str) -> str:
+    """Down to letters and single spaces, for comparing a line to an example."""
+    out = []
+    for ch in (text or "").lower():
+        if ch.isalnum():
+            out.append(ch)
+        elif out and out[-1] != " ":
+            out.append(" ")
+    return "".join(out).strip()
+
+
+_EXAMPLE_KEYS = frozenset(_normalise(e) for e in OBSERVER_EXAMPLES)
+
+
+def is_prompt_example(text: str) -> bool:
+    """Is this observation one of the prompt's own example sentences?
+
+    Punctuation-insensitive, because what came back was the example with the
+    commas and the dash dropped -- close enough to fool a string compare and
+    not close enough to fool a driver, who heard a freeway that was not there.
+
+    A false positive costs one observation: the fast path declines and the full
+    visual path looks at the road now. A false negative costs a fabricated
+    sentence spoken in her voice as fact. The trade is not close.
+    """
+    return _normalise(text) in _EXAMPLE_KEYS
 
 
 # ---------------------------------------------------------------------------

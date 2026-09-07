@@ -61,6 +61,13 @@
     try { if (root.RIO && root.RIO.output) root.RIO.output.unlock(); } catch (e) {}
     try {
       audio.muted = true;
+      // Nothing is loaded on this element yet (every line sets its own src),
+      // so there is no contents to leak -- but it is primed on silence
+      // explicitly, so it stays true when that changes. See RIO.silentAudioUrl.
+      if (root.RIO && root.RIO.silentAudioUrl) {
+        audio.src = root.RIO.silentAudioUrl();
+        audio.load();
+      }
       var p = audio.play();
       if (p && p.then) {
         p.then(function () { audio.pause(); audio.currentTime = 0; audio.muted = false; })

@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
-from rio_prompts import OBSERVER_PROMPT
+from rio_prompts import OBSERVER_PROMPT, is_prompt_example
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -35,6 +35,12 @@ _last_observation = ""
 # subsystem exists to prevent.
 _last_observed_at = 0.0
 _last_observed_frame = None
+# Observations refused because the model returned one of the prompt's own
+# examples instead of looking. Counted rather than silent: a number that starts
+# climbing after a prompt edit is the first sign the eyes have stopped working,
+# and it is otherwise invisible -- the sentence it produces is well-formed,
+# in her register, and completely made up.
+_parroted = 0
 
 
 # Where the weights go. Pinned rather than "auto".
@@ -115,6 +121,20 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         text = _processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
+        # THE MODEL DID NOT LOOK. It completed the prompt's example list
+        # instead, which is a sentence about a road that is not there and which
+        # reads as a perfectly good answer -- it was written to. Refused here,
+        # at the one place every consumer goes through, rather than by each of
+        # them separately: an empty string is a thing every caller already
+        # handles (it means "no observation"), and the honest slow path picks
+        # it up. See rio_prompts.is_prompt_example for the measurement.
+        if is_prompt_example(text):
+            global _parroted
+            _parroted += 1
+            if _parroted in (1, 10, 100):
+                print(f"[vision] observation refused -- prompt example verbatim "
+                      f"({_parroted} so far): {text!r}", flush=True)
+            return ""
         _last_observation = text
         _last_observed_at = time.time()
         _last_observed_frame = frame_id
@@ -148,6 +168,12 @@ def warm() -> None:
             _model.generate(**inputs, max_new_tokens=1, do_sample=False)
         except Exception as e:
             print("[vision] warm inference skipped:", e)
+
+
+def parroted() -> int:
+    """How many observations were refused as prompt examples. 0 is the only
+    healthy value; anything else means the model is not reading the frame."""
+    return _parroted
 
 
 def get_observation() -> str:

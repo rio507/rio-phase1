@@ -56,6 +56,12 @@ class RingFrame:
     objects: list                 # headway.live's `scene_objects` for this frame
     ego: dict
     quality: "scene_mod.FrameQuality"
+    # WHO TOOK THIS PICTURE. "<session key>:<source>" for a page that declared
+    # itself, "api:<source>" for anything posting frames without one -- a
+    # bench, a curl, an acceptance harness feeding a demo clip. It travels with
+    # the frame so an answer built from it can be checked against the session
+    # that is asking. See the origin note on FrameRing.
+    origin: str = "api:unknown"
     _decoded: object = field(default=None, repr=False)
 
     @property
@@ -116,9 +122,17 @@ class FrameRing:
         self._seq = 0
         self.tracker = scene_mod.SceneTracker()
         self.n_pushed = 0
+        # WHOSE ROAD IS IN HERE. Set by the first push and enforced on every
+        # one after it: a push from a different producer means the pictures in
+        # this buffer are of somewhere else, so the buffer is emptied before it
+        # takes the new one. Two producers' frames must never be adjacent in
+        # one ring -- a question answered from the seam gets a frame selector
+        # choosing between two different roads on sharpness.
+        self.origin = None
 
     # -- writing -------------------------------------------------------------
-    def push(self, jpeg: bytes, result: dict) -> Optional[RingFrame]:
+    def push(self, jpeg: bytes, result: dict,
+             origin: str = "api:unknown") -> Optional[RingFrame]:
         """Retain one frame, given the /headway_frame result that describes it.
 
         Called from the request handler AFTER the frame has been processed, so
@@ -130,6 +144,15 @@ class FrameRing:
         objects = result.get("scene_objects") or []
         img = result.get("image") or {}
         t = float(result.get("t") or 0.0)
+        origin = str(origin or "api:unknown")
+        with self._lock:
+            changed = self.origin is not None and self.origin != origin
+        if changed:
+            # A different camera, a clip taking over from a camera, or a
+            # harness posting into a key a drive was using. Whatever is in here
+            # is of a different place; keep none of it.
+            self.reset()
+        self.origin = origin
         self._seq += 1
         rf = RingFrame(
             frame_id=f"f{self._seq:06d}",
@@ -141,6 +164,7 @@ class FrameRing:
             objects=objects,
             ego=scene_mod.ego_from_result(result),
             quality=scene_mod.quality_from_result(result),
+            origin=origin,
         )
         with self._lock:
             self._frames.append(rf)
@@ -192,6 +216,10 @@ class FrameRing:
             "span_s": round(fs[-1].wall_t - fs[0].wall_t, 2) if len(fs) > 1 else 0.0,
             "bytes": sum(len(f.jpeg) for f in fs),
             "oldest_age_s": round(fs[0].age_s, 2) if fs else None,
+            # Whose frames these are. Read by the observer and by look(), and
+            # worth showing here too: "the ring has frames" and "the ring has
+            # THIS session's frames" are different facts.
+            "origin": self.origin,
         }
 
 

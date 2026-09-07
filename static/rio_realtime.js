@@ -618,6 +618,12 @@
                         muted, nothing was cancelled, and the answer carried on.
                         On a desk this is always zero -- the gate is off. */
                      echo_suppressed: 0,
+                     /* Dictations abandoned on their budget whose response
+                        turned up anyway and was killed before it could read
+                        the line a second voice was already reading. The number
+                        that must be equal to `dictation_failures` from the
+                        timeout branch: every disowned line accounted for. */
+                     orphans_silenced: 0,
                      /* ...and the ones held over her opening syllable and then
                         allowed through, because the speech was still going. A
                         real interruption, a fifth of a second late. */
@@ -824,6 +830,12 @@
      * the abandoned line -- and the recovery response asked for immediately
      * after it is the conversation and must still claim the mouth normally. */
     var orphanOutOfBand = 0;
+    /* ...and whether that orphan must also be SILENCED rather than merely not
+       counted. An abandoned dictation has already been replaced by another
+       voice saying the same words; an abandoned direct line has not, and its
+       audio is the answer. Same mechanism, opposite conclusion about the
+       speaker, so they are two flags and not one. */
+    var silenceOrphan = false;
     var verbatimInstruction = cfg.verbatimInstruction ||
       'Read the text below out loud, exactly as written, word for word. ' +
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
@@ -1002,6 +1014,20 @@
           && String(responseId || '').indexOf('direct:') !== 0) {
         orphanOutOfBand--;
         markOutOfBand(responseId);
+        if (silenceOrphan) {
+          /* The line this response was going to read is already being read by
+             something else. Cancel it BY ID -- the bare cancel that ran when
+             it was abandoned had no response to name -- and mute what is
+             already in flight, which is the same pair of moves a barge-in
+             makes and for the same reason: what has left the speaker cannot be
+             recalled, but the next 20 ms can. */
+          silenceOrphan = false;
+          counters.orphans_silenced++;
+          try { send({ type: 'response.cancel', response_id: responseId }); }
+          catch (e) {}
+          try { audio.mute(); } catch (e) {}
+          emit('LIVE_ORPHAN_SILENCED', { response_id: responseId });
+        }
         return;
       }
       /* A NEW ANSWER WHILE THE LAST ONE IS STILL BEING HEARD.
@@ -1953,6 +1979,14 @@
               // A warning or a vetted line, arriving after whatever was
               // tracking it gave up. Not the conversation, so not a cut-off
               // answer and not a failed one.
+              //
+              // ...and if it was a DISOWNED one, the element was muted while
+              // it died. Give the mouth back here: every other path unmutes on
+              // its way in, but a session left muted by a response nobody owns
+              // is a drive with no RIO, and the cost of being sure is a line.
+              if (!dictation && !speaking && !stopped) {
+                try { audio.unmute(); } catch (e) {}
+              }
               finishResponse(ev.response.id);
               break;
             }
@@ -2108,8 +2142,26 @@
             responseId: null, transcript: '', onStart: opts.onStart, timer: null,
           };
           dictation.timer = setTimeout(function () {
-            // Never heard it start. Give up on the live voice for this line;
-            // a warning that arrives late has stopped being a warning.
+            /* NEVER HEARD IT START -- AND IT IS STILL COMING.
+             *
+             * This is the two-voices bug. The budget expires, this gives up,
+             * rio_speak.js catches the rejection and synthesises the line
+             * instead; and then the response we asked for arrives anyway,
+             * because a bare `response.cancel` cancels the ACTIVE response and
+             * at this moment there is not one yet -- the create is still in
+             * flight. It lands, belongs to nobody, claims the mouth as an
+             * ordinary answer, and reads the turn out in her voice over the
+             * top of the synthesiser reading the same turn. Measured on a
+             * phone: both voices, same sentence, on the same junction.
+             *
+             * So the line is not merely abandoned, it is DISOWNED: the next
+             * unclaimed response is recorded as this one's, cancelled by id
+             * the moment it exists, and muted until it is gone. Exactly one
+             * mouth per utterance, and it is the one that got there. */
+            if (dictation && !dictation.responseId) {
+              orphanOutOfBand++;
+              silenceOrphan = true;
+            }
             try { send({ type: 'response.cancel' }); } catch (e) {}
             finishDictation('timeout');
           }, opts.timeoutMs || speakTimeoutMs);

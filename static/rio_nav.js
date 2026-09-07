@@ -182,14 +182,34 @@
     // inside a real user gesture, and EVERY element needs its own. A clip that
     // was never unlocked is a turn call that is silent at the junction, which
     // is the one failure this whole path exists to prevent.
+    /* PRIMED ON SILENCE, NEVER ON THE TURN CALL ITSELF.
+       Muting an element and playing its real contents to unlock it was audible
+       on iOS -- the audio session switches route at that moment and the front
+       of the file gets out. On this path that is a turn instruction announced
+       at the kerb because a route was attached, which is worse than the safety
+       clip at Start Drive that made it visible. See RIO.silentAudioUrl. */
     function unlockOne(a) {
+      var real = a.getAttribute('src') || '';
       try {
         a.muted = true;
+        if (root.RIO && root.RIO.silentAudioUrl) {
+          a.src = root.RIO.silentAudioUrl();
+          // Assigning .src does not unload the file already on the element;
+          // load() does. Without it the element can still start the turn call
+          // it was holding. See primeSilently in index.html.
+          a.load();
+        }
+        var restore = function () {
+          try {
+            a.pause();
+            a.muted = false;
+            if (real) { a.src = real; a.load(); }
+            else { a.removeAttribute('src'); }
+          } catch (e) { a.muted = false; }
+        };
         var p = a.play();
-        if (p && p.then) {
-          p.then(function () { a.pause(); a.currentTime = 0; a.muted = false; })
-           .catch(function () { a.muted = false; });
-        } else { a.muted = false; }
+        if (p && p.then) p.then(restore).catch(restore);
+        else restore();
       } catch (e) { a.muted = false; }
     }
 

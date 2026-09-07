@@ -1863,6 +1863,24 @@ window.RIO = (function () {
       return path + (path.includes('?') ? '&' : '?') + 'session_id=' + encodeURIComponent(sessionId);
     },
 
+    /* A few bytes of silence, as a URL. The ONLY thing an element may be
+       given to play inside an unlock gesture.
+
+       iOS will not play an element from a timer until that element has been
+       played once inside a real tap, so every warning element has to be
+       started during the tap. What it must not be started ON is its own
+       contents: `muted = true` before `play()` looked like enough and is not
+       — the audio session is switching route at that exact moment, and what
+       the driver hears is the front of a safety clip at Start Drive. That was
+       this bug: a prerecorded warning, played by the priming, on a drive where
+       the server had asked for nothing (250 frames, every band UNKNOWN, not
+       one speak).
+
+       So priming plays silence and nothing else. The real file goes back on
+       the element afterwards, and the element stays unlocked — the permission
+       belongs to the element, not to what was in it. */
+    silentAudioUrl() { return silentWavUrl(); },
+
     // --- audio gesture unlock (call from inside a tap handler) ---
     unlockAudio(player) {
       if (unlocked) return;
@@ -3076,18 +3094,40 @@ document.addEventListener('DOMContentLoaded', () => {
     // The shared output wants the same gesture these elements do.
     try { if (window.RIO && RIO.output) RIO.output.unlock(); } catch (e) {}
     const els = CLIP_IDS.map(id => clips[id]).concat([tts]);
-    els.forEach(a => {
-      try {
-        a.muted = true;
-        const p = a.play();
-        if (p && p.then) {
-          p.then(() => { a.pause(); a.currentTime = 0; a.muted = false; })
-           .catch(() => { a.muted = false; });
-        } else {
-          a.pause(); a.currentTime = 0; a.muted = false;
-        }
-      } catch (e) { a.muted = false; }
-    });
+    els.forEach(a => primeSilently(a));
+  }
+
+  /* Unlock one element without ever rendering its contents.
+     See RIO.silentAudioUrl for why muting the real file is not enough. */
+  function primeSilently(a) {
+    const real = a.getAttribute('src') || '';
+    try {
+      a.muted = true;
+      a.src = RIO.silentAudioUrl();
+      /* AND load() IT, which is the half that is easy to leave out and does
+         not look missing. Assigning .src does not unload what the element is
+         already holding — `currentSrc` still names the mp3, and a play() in
+         that window can start the clip that was already decoded. Measured in
+         headless Chromium: three of four primed elements were still pointing
+         at their warning file at the instant play() was called. load() aborts
+         it and commits the silence. */
+      a.load();
+      const restore = () => {
+        try {
+          a.pause();
+          a.muted = false;
+          // Put the warning back and let it preload again. A clip that has to
+          // be re-fetched at the junction is the thing preloading exists to
+          // prevent, so this happens now, at Start Drive, with minutes to
+          // spare — not when the line is needed.
+          if (real) { a.src = real; a.load(); }
+          else { a.removeAttribute('src'); }
+        } catch (e) { a.muted = false; }
+      };
+      const p = a.play();
+      if (p && p.then) p.then(restore).catch(restore);
+      else restore();
+    } catch (e) { a.muted = false; }
   }
 
   /* Play one element to completion. The elements are shared and long-lived, so
@@ -3293,9 +3333,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (opts.frameT !== undefined && opts.frameT !== null) {
       fd.append('frame_t', String(opts.frameT));
     }
+    /* WHAT THIS PICTURE IS OF, said out loud on every frame. The server stamps
+       it onto the retained frame, and the observer will not serve a sentence
+       about one source to a question asked of another — the bug being closed
+       is a phone pointed at a hand being told about a freeway. Same word the
+       badge over the picture shows; see RIO.source. */
+    try { fd.append('source', RIO.source.kind()); } catch (e) {}
     const r = await fetch(RIO.url('/headway_frame'), { method: 'POST', body: fd });
     const j = await r.json();
     if (!j || j.ok === false) return j;
+    framesSeen++;
     paintHud(j);
     // WHEN this result describes, handed to the overlay with it. frameT is the
     // clip position the frame came from (replay); capturedAt is the wall clock
@@ -3308,8 +3355,39 @@ document.addEventListener('DOMContentLoaded', () => {
         capturedAt: (opts.capturedAt === undefined) ? null : opts.capturedAt,
       });
     }
-    if (j.speak) speak(j.speak);
+    if (j.speak && monitorReady(j)) speak(j.speak);
     return j;
+  }
+
+  /* NOTHING SPEAKS BEFORE THE MONITOR CAN SEE.
+   *
+   * The server already refuses to produce a line without a band, a lead and
+   * confidence (headway/live_policy._decide_voice, and the drive that started
+   * this went 250 frames with every band UNKNOWN and not one speak). This is
+   * the same rule stated on the other side of the wire, where the audio
+   * actually plays: a warning is a claim about a measurement, and a claim made
+   * before the first measurement is not a warning, it is a noise at the kerb.
+   *
+   * Two conditions, both about state rather than about time:
+   *   - a band that is a real band. UNKNOWN and SUPPRESSED_LOW_SPEED both mean
+   *     "cannot judge this", and a line chosen under either is not evidence.
+   *   - enough frames for a filter to exist at all. The first frame of a drive
+   *     initialises the tracker; a band entered on it has been confirmed
+   *     against nothing.
+   */
+  const MONITOR_WARMUP_FRAMES = 3;
+  /* This module's own count, deliberately not the drive panel's `hwFrames`:
+     that one lives in another script block and counts what was SENT. What has
+     to be true here is that this monitor has come BACK with results. */
+  let framesSeen = 0;
+  function monitorReady(j) {
+    if (!j) return false;
+    const band = j.band || 'UNKNOWN';
+    if (band === 'UNKNOWN' || band === 'SUPPRESSED_LOW_SPEED' || band === 'LOST') {
+      return false;
+    }
+    if (framesSeen < MONITOR_WARMUP_FRAMES) return false;
+    return true;
   }
 
   /* Resolve on the next frame the video element actually presents. Falls back
@@ -3356,6 +3434,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function resetSession() {
+    // The tracker starts again, so the warm-up does too: the frames counted
+    // before a reset were measured against a filter that no longer exists.
+    framesSeen = 0;
     try {
       await fetch(RIO.url('/headway_reset'), { method: 'POST' });
     } catch (e) { /* a stale tracker is recoverable; a failed reset is not fatal */ }

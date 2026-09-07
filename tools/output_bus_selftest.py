@@ -1,4 +1,4 @@
-"""The shared output, in a real browser.
+"""The page's audio, in a real browser: the shared output, and the unlock.
 
     python -m tools.output_bus_selftest
     python -m tools.output_bus_selftest --url http://127.0.0.1:8888/
@@ -19,6 +19,16 @@ failure than the echo it was built to fix, and it is invisible from node.
 Headless Chromium is not an iPhone and cannot demonstrate iOS echo
 cancellation. What it demonstrates is that the mechanism runs, which is the
 part that can silently break.
+
+The second half is the Start Drive unlock. iOS will not play an element from a
+timer until that element has been played once inside a tap, so every warning
+element is started during the Start Drive tap -- and it used to be started on
+its OWN CONTENTS, muted. On a phone that is audible: the audio session is
+switching route at that instant and the front of the file gets out, so pressing
+Start Drive played a prerecorded safety clip on a drive where the server had
+asked for nothing (250 frames, every band UNKNOWN, not one speak, in the
+session that reported it). Priming plays silence now, and this asserts it by
+watching every play() the unlock makes.
 
 Requires playwright (`pip install playwright && playwright install chromium`).
 """
@@ -114,6 +124,118 @@ async (url) => {
 """
 
 
+# Every play() the page makes, with what was loaded at the moment it was made.
+# Installed before the unlock so the unlock's own calls are the ones recorded.
+SPY = """
+() => {
+  window.__plays = [];
+  window.__primed = [];          // the elements themselves, to inspect after
+  const proto = HTMLMediaElement.prototype;
+  const real = proto.play;
+  proto.play = function () {
+    window.__plays.push({
+      id: this.id || '',
+      src: String(this.src || ''),
+      // What the element is ACTUALLY about to render. Assigning .src does not
+      // unload the previous resource -- this is the field that catches a
+      // priming call that is still holding the warning it was meant to skip.
+      current: String(this.currentSrc || ''),
+      // 0 = HAVE_NOTHING: load() has reset the element and dropped whatever it
+      // was holding, so nothing already decoded can start. This is the field
+      // that actually settles it -- `currentSrc` lags behind load() by a task
+      // in Chromium and reports the old file for an instant after it has
+      // already been abandoned.
+      ready: this.readyState,
+      muted: !!this.muted,
+      volume: this.volume,
+    });
+    window.__primed.push(this);
+    return real.apply(this, arguments);
+  };
+  return true;
+}
+"""
+
+# The Start Drive tap, minus the camera and the session: the unlock is the part
+# under test and it is the first thing that tap does.
+UNLOCK_WARNINGS = """
+async () => {
+  if (!(window.RIO && RIO.headway && RIO.headway.unlock)) {
+    return { error: 'RIO.headway.unlock is not exposed' };
+  }
+  RIO.headway.unlock();
+  if (window.RIO.nav && RIO.nav.unlock) { try { RIO.nav.unlock(); } catch (e) {} }
+  await new Promise(r => setTimeout(r, 400));
+  return { plays: window.__plays };
+}
+"""
+
+# ...and afterwards the elements must be holding their real files again, ready
+# to fire with no network in the path.
+# The warning clips are `new Audio(...)` and are never in the document, so the
+# only handle on them is the one the spy kept.
+CLIP_STATE = """
+() => (window.__primed || []).map(a => ({
+  id: a.id || '',
+  src: String(a.src || ''),
+  current: String(a.currentSrc || ''),
+  ready: a.readyState,
+}))
+"""
+
+
+def run_unlock(page):
+    section("Start Drive primes on silence, never on a warning")
+    page.evaluate(SPY)
+    r = page.evaluate(UNLOCK_WARNINGS)
+    ok(not r.get("error"), f"the warning unlock runs ({r.get('error')})")
+    if r.get("error"):
+        return
+    plays = r.get("plays") or []
+    ok(len(plays) > 0,
+       f"the unlock does play elements — that is what unlocks them ({len(plays)})")
+
+    named = [p for p in plays
+             if "/static/audio/" in (p.get("src") or "") or
+             (p.get("src") or "").endswith(".mp3")]
+    ok(not named,
+       "not one primed element was asked to play a warning file"
+       + ("" if not named else
+          " — asked for: " + ", ".join(sorted({p["src"].split("/")[-1]
+                                               for p in named}))))
+
+    silent = [p for p in plays if p.get("src", "").startswith("blob:")
+              or "data:audio" in p.get("src", "")]
+    ok(len(silent) == len(plays),
+       f"every primed element was given the silent buffer ({len(silent)} of "
+       f"{len(plays)})")
+
+    # The one that decides whether a warning can actually be heard: with the
+    # element reset to HAVE_NOTHING there is no decoded clip left in it to
+    # start, whatever currentSrc still says for the next task.
+    holding = [p for p in plays if (p.get("ready") or 0) != 0]
+    ok(not holding,
+       "and every one was reset to HAVE_NOTHING first, so there was no "
+       "decoded warning left in it to escape"
+       + ("" if not holding else
+          " — readyState " + ", ".join(str(p.get("ready")) for p in holding)
+          + " on " + ", ".join(sorted({(p.get("current") or "?").split("/")[-1]
+                                       for p in holding}))))
+
+    # And the files are back on the elements afterwards: a clip that has to be
+    # re-fetched at the junction is what preloading exists to prevent.
+    after = page.evaluate(CLIP_STATE)
+    restored = [a for a in after if "/static/audio/" in (a.get("src") or "")]
+    ok(len(restored) >= 3,
+       f"the warning files are back on their elements afterwards "
+       f"({len(restored)} holding a clip)")
+    ok(all(a.get("ready", 0) >= 1 for a in restored),
+       "and have loaded again, so firing one is still a play() with no "
+       "network in its path")
+    ok(all(not (a.get("src") or "").startswith("blob:") for a in after),
+       "and no element was left holding the silent buffer")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8888/")
@@ -205,6 +327,8 @@ def main():
         ok(r["missed"] == 0, "with no fallback to the element")
         ok(r["element_src"] == "",
            "and the element was never given a src at all")
+
+        run_unlock(page)
 
         ok(not errors, "no uncaught page errors" +
            ("" if not errors else ": " + "; ".join(errors[:3])))

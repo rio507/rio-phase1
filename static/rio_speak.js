@@ -44,6 +44,13 @@
   'use strict';
 
   var stats = { dictated: 0, tts: 0, clip: 0, silent: 0, last: null,
+              /* ONE UTTERANCE, ONE MOUTH. `doubled` counts lines where a
+                 second mouth started after the first had already begun
+                 speaking -- the phone bug where ElevenLabs read the turn call
+                 while the live session was reading the same turn call. It is
+                 an invariant, not a statistic: anything but 0 is two voices in
+                 the car, and tools/one_voice_selftest.js asserts it. */
+              doubled: 0,
               // Lines that went out through the shared output rather than
               // through their own element -- i.e. the ones a phone's echo
               // canceller had a reference for. See static/rio_output.js.
@@ -226,6 +233,12 @@
                root.RIO.realtime.active() : null;
     var dictate = !!(text() && live && live.speak &&
                      (!live.speechEnabled || live.speechEnabled(opts.channel)));
+    /* Did her voice actually open its mouth for this line? Set from the
+       session's own onStart, which fires when the dictated response starts
+       producing audio -- not when it was asked for. The difference between
+       those two moments is the whole of this bug. */
+    var dictationStarted = false;
+    function noteDictationStart() { dictationStarted = true; }
 
     function text() { return (opts.text || '').trim(); }
 
@@ -250,6 +263,18 @@
 
     function fallback(reason) {
       if (stopped) return Promise.resolve();
+      /* THE ONE CASE THIS MUST REFUSE. Dictation that never started can be
+         replaced; dictation that HAS started is already coming out of the
+         speaker, and synthesising the same sentence underneath it is the
+         two-voices bug. The controller disowns and silences an abandoned line
+         (see the orphan branch in rio_realtime.js), so reaching here with
+         `dictationStarted` set means that silencing did not work -- counted
+         loudly rather than played. */
+      if (dictationStarted) {
+        stats.doubled++;
+        record('silent');
+        return Promise.resolve();
+      }
       if (opts.ttsUrl) {
         record('tts');
         current = fetchBlobAudio(element, opts.ttsUrl);
@@ -298,7 +323,8 @@
       return current.play().catch(function (e) {
         if (stopped) return;
         if (dictate) {
-          return live.speak(text(), { timeoutMs: budget() })
+          return live.speak(text(), { timeoutMs: budget(),
+                                      onStart: noteDictationStart })
             .then(function (r) { record('dictated'); return r; })
             .catch(function (err) { return fallback(err && err.message); });
         }
@@ -311,7 +337,8 @@
         if (stopped) return Promise.resolve();
         if (opts.clipFirst && opts.clipUrl) return clipThenMouth();
         if (!dictate) return fallback('no_session');
-        return live.speak(text(), { timeoutMs: budget() })
+        return live.speak(text(), { timeoutMs: budget(),
+                                    onStart: noteDictationStart })
           .then(function (r) { record('dictated'); return r; })
           .catch(function (e) {
             // Dictation did not start in time, the session went away, or it was
@@ -334,7 +361,7 @@
     stats: function () { return stats; },
     reset: function () {
       stats.dictated = stats.tts = stats.clip = stats.silent = 0;
-      stats.bus = stats.bus_missed = 0;
+      stats.bus = stats.bus_missed = stats.doubled = 0;
       stats.last = null;
     },
   };

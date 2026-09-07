@@ -62,7 +62,7 @@ def _clean(text: str) -> str:
     return t.rstrip(".").strip()
 
 
-def _record(text, frame):
+def _record(text, frame, key=None):
     # IS THIS SPEAKABLE AS HER? Decided when the line is written rather than
     # when a driver is waiting for it, and stored — the answer is a property of
     # the sentence and does not change with time the way freshness does.
@@ -82,6 +82,12 @@ def _record(text, frame):
         "frame_wall_t": getattr(frame, "wall_t", None),
         "frame_id": getattr(frame, "frame_id", None),
         "frame_age_s": round(getattr(frame, "age_s", 0.0) or 0.0, 2),
+        # WHOSE FRAME THIS DESCRIBES. Carried on the record because the record
+        # outlives the frame: without it, "the observer has something to say"
+        # and "the observer has something to say about YOUR road" are the same
+        # question, and they are not. See serve_to() and look().
+        "origin": getattr(frame, "origin", None),
+        "session_key": str(key) if key else None,
     }
 
 
@@ -135,8 +141,11 @@ def _tick(key, state):
         return False
     text = _clean(vision.observe(jpeg, frame_id=getattr(frame, "frame_id", None)))
     if not text:
+        # Includes the case where the model returned one of its own prompt's
+        # examples: vision refuses those outright. Nothing is recorded, so
+        # look() finds nothing and the honest path answers instead.
         return False
-    rec = _record(text, frame)
+    rec = _record(text, frame, key)
     with _lock:
         state["record"] = rec
         state["n"] += 1
@@ -230,18 +239,56 @@ def cached(session_key: str) -> dict:
     return rec
 
 
-def fresh(session_key: str, max_age_s: float = None) -> dict:
-    """The observation IF it is still true. -> {} when it is not.
+def serve_to(rec: dict, session_key: str) -> bool:
+    """May THIS session be told THIS observation? Two questions, both hard no.
 
-    The only question this module exists to answer, and the reason the record
-    carries a timestamp at all. Age is measured from the FRAME, not from the
-    observation: Qwen taking 400 ms to describe a picture does not make the
-    picture newer, and it is the picture the driver is being told about.
+    IS IT ABOUT THIS SESSION'S ROAD. The record names the frame's origin --
+    "<session key>:<source>" -- so an observation may only be served to the
+    session whose key it names. A drive is never told about the keyless ring,
+    and a keyless page is never told about a drive.
+
+    IS IT FROM A REAL SOURCE. `api:` frames are posted by something that is not
+    a browser looking through a windscreen: a bench, a curl, an acceptance
+    harness feeding a demo clip through the same endpoint. Those may satisfy a
+    keyless API caller asking about the frames it just posted, and they may
+    never satisfy a live session -- a driver asking what is out there gets an
+    answer about their own camera or gets told there is nothing to see.
+
+    An unstamped record (nothing has pushed a frame since this ran, or an older
+    ring) fails both: unknown provenance is not provenance.
+    """
+    if not rec:
+        return False
+    origin = rec.get("origin")
+    if not origin:
+        return False
+    key = str(session_key or "default")
+    owner = str(origin).split(":", 1)[0]
+    if owner == "api":
+        # Only the keyless caller may be answered from keyless frames.
+        return key == "default"
+    return owner == key
+
+
+def fresh(session_key: str, max_age_s: float = None) -> dict:
+    """The observation IF it is still true, AND if it is this session's. -> {}
+
+    Two refusals, and they fail the same way on purpose -- an empty dict, which
+    every caller already reads as "no observation" and answers honestly from.
+
+    WHEN. Age is measured from the FRAME, not from the observation: Qwen taking
+    400 ms to describe a picture does not make the picture newer, and it is the
+    picture the driver is being told about.
+
+    WHOSE. See serve_to(). A record is a sentence about somebody's road, and
+    which somebody is not something a timestamp can answer.
     """
     if max_age_s is None:
         max_age_s = config.OBSERVER_FRESH_S
     rec = cached(session_key)
     if not rec or not rec.get("text"):
+        return {}
+    if not serve_to(rec, session_key):
         return {}
     wall = rec.get("frame_wall_t")
     age = (time.time() - wall) if wall else rec.get("age_s")
@@ -279,6 +326,10 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
     frame = ring.latest() if ring is not None else None
     if frame is None or (frame.age_s or 0) > float(max_age_s):
         return {}
+    # ...and it has to be this session's frame. Describing it now rather than a
+    # second ago does not make somebody else's road this driver's.
+    if not serve_to({"origin": getattr(frame, "origin", None)}, key):
+        return {}
     with _lock:
         st = _sessions.get(key)
     if st is None:
@@ -297,10 +348,12 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
         return {}
     if not text:
         return {}
-    rec = _record(text, frame)
+    rec = _record(text, frame, key)
     with _lock:
         st["record"] = rec
         st["n"] += 1
+    if not serve_to(rec, key):
+        return {}
     out = dict(rec)
     out["age_s"] = round(time.time() - (rec.get("frame_wall_t") or rec["at"]), 2)
     out["on_demand"] = True
@@ -314,6 +367,14 @@ def status() -> dict:
                       "held": st.get("hold", 0),
                       "idle_s": round(time.time() - st["last_used"], 1),
                       "has_record": bool(st.get("record")),
+                      # WHAT it is holding and WHICH FRAME it came from. Added
+                      # while chasing an answer about a freeway served to a
+                      # phone pointed at a desk: "the observer has a record"
+                      # and "the record is about this session's road" are
+                      # different facts, and only the first one was visible.
+                      "text": (st.get("record") or {}).get("text", "")[:80],
+                      "frame_id": (st.get("record") or {}).get("frame_id"),
+                      "origin": (st.get("record") or {}).get("origin"),
                       # How often the running description came out in a voice
                       # that is not hers, and so could not be spoken without
                       # her composing over it.
