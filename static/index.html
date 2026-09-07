@@ -1872,6 +1872,13 @@ window.RIO = (function () {
         const p = player.play();
         if (p && p.catch) p.catch(() => {});
       } catch (e) { /* non-fatal: falls back to the controls */ }
+      /* ...and the shared output, which needs the same gesture for the same
+         reason and one more besides: its loopback ends at an <audio> element
+         that iOS will not start outside a tap either. Failing here is not
+         fatal — every caller keeps the element path it already had. */
+      try {
+        if (window.RIO && RIO.output) RIO.output.unlock();
+      } catch (e) { /* the bus stays down; audio still plays the old way */ }
     },
     playReply(player, blob) {
       const old = player.src;
@@ -2370,6 +2377,11 @@ const LIVE_REPORTED = {
   LIVE_RESUME: 'resumed',
   LIVE_RESUME_SKIPPED: 'resume_skipped',
   LIVE_BARGE_ABSORBED: 'blips_absorbed',
+  // The detector fired on RIO's own voice and the echo gate refused it. On a
+  // phone this is the number that used to be false_barge_in, which is the
+  // whole point of reporting it: the fix is visible in /realtime/cutoffs as
+  // one tally going up while the other goes to zero.
+  LIVE_ECHO_SUPPRESSED: 'echo_suppressed',
 };
 
 function reportLive(ev) {
@@ -2387,6 +2399,10 @@ function reportLive(ev) {
           detail: ev.detail || null,
           said_chars: ev.said_chars === undefined ? null : ev.said_chars,
           by: ev.by || null,
+          // What the meter saw, when the meter is why this is being reported.
+          mic_db: ev.mic_db === undefined ? null : ev.mic_db,
+          out_db: ev.out_db === undefined ? null : ev.out_db,
+          margin_db: ev.margin_db === undefined ? null : ev.margin_db,
         },
       }),
     }).catch(() => {});
@@ -3057,6 +3073,8 @@ document.addEventListener('DOMContentLoaded', () => {
   function unlock() {
     if (unlocked) return;
     unlocked = true;
+    // The shared output wants the same gesture these elements do.
+    try { if (window.RIO && RIO.output) RIO.output.unlock(); } catch (e) {}
     const els = CLIP_IDS.map(id => clips[id]).concat([tts]);
     els.forEach(a => {
       try {
@@ -4372,6 +4390,10 @@ document.addEventListener('DOMContentLoaded', () => {
      the page was served from /static/index.html instead of "/". */
   window.RIO_MAPS_KEY = "__GOOGLE_MAPS_API_KEY__";
 </script>
+<!-- The shared output. Loaded before anything that speaks, because both the
+     synthesiser sink and rio_speak.js ask it for a mouth and fall back to
+     their own elements if it is not there. -->
+<script src="/static/rio_output.js"></script>
 <script src="/static/rio_speech.js"></script>
 <script src="/static/rio_voice_eleven.js"></script>
 <script src="/static/rio_realtime.js"></script>

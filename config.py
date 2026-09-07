@@ -517,6 +517,69 @@ REALTIME_VAD_SILENCE_MS = 700
 # grows.
 REALTIME_BARGE_SUSTAIN_MS = 300
 
+# ---------------------------------------------------------------------------
+# ...AND THE SAME GATE ON A PHONE, WHICH IS A DIFFERENT ROOM
+# ---------------------------------------------------------------------------
+# A laptop puts RIO's voice a foot from a microphone that is behind an echo
+# canceller with a reference signal for everything it plays. A phone on a mount
+# puts her voice out of a loudspeaker eight inches from the microphone, at
+# driving volume, and — this is the part that is not obvious — only SOME of
+# what she says goes out through a renderer the canceller can subtract.
+#
+# The audit is `node tools/echo_barge_probe.js`: the live session's own voice
+# arrives as a WebRTC track and is cancelled; every deterministic line that
+# falls back to the synthesiser, every pre-rendered clip, and the whole
+# ElevenLabs path are ordinary media playback, which the canceller has no
+# reference for. Those come back into the microphone at full level, the turn
+# detector upstream calls them speech, and RIO interrupts herself. Measured
+# with the shipped 300 ms gate and nobody in the car: five answers, five
+# false barge-ins.
+#
+# Three separate changes, because echo is separable from speech in three
+# different ways and no one of them is enough on its own:
+#
+#   SUSTAIN. Echo tracks her voice, so it stops when she pauses — which real
+#   speech does not do on her schedule. 600 ms is longer than the gaps between
+#   her own words and shorter than any interruption a driver actually makes:
+#   somebody who means to cut in says at least a word, and a word is 300-600 ms
+#   before the space after it.
+#
+#   ONSET GUARD. The detector fires hardest at the START of an utterance --
+#   the canceller has not converged, the level jumps, and the first syllable is
+#   the loudest thing in the cabin. The first 400 ms of any RIO utterance is
+#   therefore the least trustworthy evidence of a driver there is. NOT
+#   discarded: deferred. If the speech is still going when the guard expires it
+#   is treated as a barge-in from that moment, so a driver who talks over her
+#   opening word still stops her — a fifth of a second later than before.
+#
+#   LEVEL MARGIN. The one test that separates echo from a person on physics
+#   rather than on timing: echo cannot be louder than what produced it. The
+#   page measures the microphone and the audio it is rendering, and requires
+#   the microphone to beat the output by this margin before a cut-off is
+#   allowed to cost an answer. 6 dB is a factor of two in amplitude — comfortably
+#   above what leaks back through a loudspeaker and comfortably below a driver
+#   speaking up to be heard over her.
+#
+# ALL THREE ARE ZERO/UNCHANGED ON DESKTOP. The desk case works, is tested, and
+# is not what broke; a phone is the exception and pays for itself.
+REALTIME_BARGE_SUSTAIN_MS_TOUCH = 600
+
+# The opening of her utterance, during which the detector is not believed on
+# its own. Desktop keeps none: nothing there produces an onset transient the
+# canceller cannot handle.
+REALTIME_BARGE_ONSET_GUARD_MS = 0
+REALTIME_BARGE_ONSET_GUARD_MS_TOUCH = 400
+
+# How far the microphone has to beat the rendered output, in dB, before speech
+# during her turn is allowed to cancel an answer. 0 disables the test, which is
+# the desktop setting: there, the canceller has already done this job.
+REALTIME_BARGE_ECHO_MARGIN_DB = 0
+REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH = 6
+
+# Below this the output is not loud enough to be echoing anything, so the level
+# test is skipped and the gate behaves exactly as it does on a desk. dBFS.
+REALTIME_BARGE_ECHO_FLOOR_DB = -50
+
 # After a cancel, how long to wait for a transcript before concluding there was
 # never anyone there. A real interruption produces one: the words are already
 # in the input buffer and transcription follows within a beat. Silence past

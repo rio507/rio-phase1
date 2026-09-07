@@ -613,6 +613,15 @@
                      // The single most useful number here -- every one of
                      // these used to be a lost answer.
                      blips_absorbed: 0,
+                     /* Detector firings the echo gate refused outright: the
+                        microphone never beat the loudspeaker, so nothing was
+                        muted, nothing was cancelled, and the answer carried on.
+                        On a desk this is always zero -- the gate is off. */
+                     echo_suppressed: 0,
+                     /* ...and the ones held over her opening syllable and then
+                        allowed through, because the speech was still going. A
+                        real interruption, a fifth of a second late. */
+                     onset_deferred: 0,
                      resumed: 0, resume_skipped: 0, resume_failures: 0,
                      // Utterances the sink could not speak in the voice it was
                      // meant to, and the one time a drive gave up on it.
@@ -711,6 +720,63 @@
 
     var bargeSustainMs = cfg.bargeSustainMs || 300;
     var bargeConfirmMs = cfg.bargeConfirmMs || 1500;
+
+    /* ---- THE ECHO GATE, and why the desk does not have one -----------------
+     *
+     * On a phone, RIO comes out of a loudspeaker eight inches from the
+     * microphone, and only part of what she says goes out through a renderer
+     * the platform's echo canceller has a reference for (see
+     * tools/echo_barge_probe.js, which reads the paths out of the source).
+     * Everything else returns to the microphone at full level, the turn
+     * detector upstream calls it speech, and she interrupts herself. Measured
+     * before this existed: five long answers into an empty car, five answers
+     * cut off.
+     *
+     * Three tests, and each one separates echo from a person differently:
+     *
+     *   onsetGuardMs   the opening of her utterance is when the canceller has
+     *                  least to work with and the level jumps hardest, so the
+     *                  detector is not believed alone there. DEFERRED, never
+     *                  discarded: if the speech is still going when the guard
+     *                  expires it becomes a barge-in from that moment, so a
+     *                  driver who cuts in on her first word still stops her.
+     *   sustain        echo stops when she pauses. A person does not pause on
+     *                  her schedule.
+     *   echoMarginDb   physics, not timing: echo cannot be louder than what
+     *                  produced it. The microphone has to beat the audio being
+     *                  rendered by this margin before a cut-off is allowed to
+     *                  cost an answer.
+     *
+     * All three are ZERO on a desk, where the numbers are the ones they always
+     * were and the behaviour is byte for byte what it was. `levels` is the
+     * page's meter -- {mic, out} in dBFS -- and its absence disables the level
+     * test rather than blocking anything: no meter is not evidence of echo. */
+    var bargeOnsetGuardMs = cfg.bargeOnsetGuardMs || 0;
+    var bargeEchoMarginDb = cfg.bargeEchoMarginDb || 0;
+    /* Below this the output is not loud enough to be echoing anything and the
+       level test is skipped entirely. */
+    var bargeEchoFloorDb = (cfg.bargeEchoFloorDb === undefined ||
+                            cfg.bargeEchoFloorDb === null)
+      ? -50 : cfg.bargeEchoFloorDb;
+    var levels = (typeof cfg.levels === 'function') ? cfg.levels : null;
+    /* How often the margin is re-read while a barge-in is pending. Fast enough
+       that a 300 ms window is sampled several times, cheap enough to leave
+       running -- one analyser read per tick. */
+    var LEVEL_POLL_MS = 40;
+    var levelTimer = null;
+    /* The loudest the microphone got over the audio, across the pending
+       window. A peak rather than an average: a driver's first syllable is the
+       evidence, and averaging it against the silence around it is how a real
+       interruption gets called echo. */
+    var peakMargin = null;
+    var lastLevels = null;
+    /* The decision held over her opening syllable, waiting to see whether the
+       thing that fired the detector is still there when the guard expires. */
+    var onsetHold = null;
+    /* What the detector currently says: between speech_started and
+       speech_stopped. The onset hold and the echo watch both need to know
+       whether there is still something going on to decide about. */
+    var speechActive = false;
     var maxResumes = (cfg.maxResumes === undefined || cfg.maxResumes === null)
       ? 1 : cfg.maxResumes;
     var resumeInstruction = cfg.resumeInstruction ||
@@ -825,6 +891,7 @@
     }
 
     function clearBarge() {
+      stopEchoWatch();
       if (!pendingBarge) return;
       if (pendingBarge.timer) clearTimeout(pendingBarge.timer);
       if (pendingBarge.confirm) clearTimeout(pendingBarge.confirm);
@@ -981,7 +1048,10 @@
         endResponse(speaking.responseId);
       }
       var entry = { responseId: responseId, resolve: null, cancelled: false,
-                    direct: !!opts.direct };
+                    direct: !!opts.direct,
+                    // For the onset guard: when the response opened, and (set
+                    // on the first transcript delta) when she began speaking.
+                    startedAt: Date.now(), audioAt: 0 };
       speaking = entry;
       counters.responses++;
       partial = '';
@@ -1185,6 +1255,12 @@
       if (responseId && speaking.responseId && speaking.responseId !== responseId) return;
       var entry = speaking;
       speaking = null;
+      /* Nothing held over an utterance outlives the utterance. A guard still
+         counting down against a response that is over would fire bargeIn()
+         into the next one, at whatever point of ITS opening it happened to
+         land. */
+      clearOnsetHold();
+      stopEchoWatch();
       if (entry.resolve) entry.resolve();          // the arbiter marks it spoken
     }
 
@@ -1218,6 +1294,100 @@
      * network hop away from the microphone, on the first sample that crossed a
      * threshold, with nothing available to check the guess against.
      */
+    /* ---- the meter, and what it is allowed to conclude --------------------
+     *
+     * `levels()` is the page's own measurement of two things it is the only
+     * place that can measure: what the microphone is hearing, and what this
+     * page is rendering to the speaker, both in dBFS. The controller does no
+     * audio work of its own -- it asks, and it is prepared to be told nothing.
+     *
+     * ABSENCE IS NOT EVIDENCE. No meter, a meter that throws, an output below
+     * the floor: all of them mean the level test has nothing to say, and the
+     * gate behaves exactly as it did before any of this. The test can only
+     * ever SUPPRESS a barge-in it is confident about; it can never cause one.
+     */
+    function readLevels() {
+      if (!levels) return null;
+      var v;
+      try { v = levels(); } catch (e) { return null; }
+      if (!v || typeof v.mic !== 'number' || typeof v.out !== 'number') return null;
+      if (!isFinite(v.mic) || !isFinite(v.out)) return null;
+      lastLevels = v;
+      return v;
+    }
+
+    /* Is the microphone hearing the room, or the loudspeaker?
+     *
+     * PEAK, NOT AVERAGE, and the choice matters. A driver's interruption is a
+     * syllable followed by more of them, and the evidence is the loudest
+     * instant; averaging it against the quiet either side is exactly how a
+     * real interruption gets mistaken for echo. So the margin is tracked as a
+     * running maximum over the firing, and once it has been beaten it stays
+     * beaten. */
+    function echoShaped() {
+      if (!bargeEchoMarginDb) return false;         // desk: the test is off
+      var v = readLevels();
+      if (!v) return false;                         // no meter: say nothing
+      if (v.out < bargeEchoFloorDb) return false;   // too quiet to be echoing
+      var margin = v.mic - v.out;
+      if (peakMargin === null || margin > peakMargin) peakMargin = margin;
+      return peakMargin < bargeEchoMarginDb;
+    }
+
+    /* Suppressed, but still listening. The detector fires once per utterance,
+       so a firing dismissed as echo must not close the door on the driver who
+       starts talking 200 ms into it -- there will be no second speech_started
+       to reconsider. This keeps reading the meter for as long as the detector
+       says something is going on, and hands control back to bargeIn() the
+       moment the microphone beats the loudspeaker. */
+    function startEchoWatch(rid) {
+      if (levelTimer || !levels || !bargeEchoMarginDb) return;
+      levelTimer = setInterval(function () {
+        if (stopped || !speechActive || !speaking || speaking.responseId !== rid) {
+          stopEchoWatch();
+          return;
+        }
+        if (!echoShaped()) {              // it is a person after all
+          stopEchoWatch();
+          bargeIn();
+        }
+      }, LEVEL_POLL_MS);
+    }
+
+    /* The same meter, read for a different reason: while the sustain gate is
+       open, nothing is being decided tick by tick -- the readings are being
+       ACCUMULATED, so that when the gate closes there is a whole window of
+       evidence rather than the one sample that happened to coincide with the
+       detector firing. */
+    function startPendingWatch() {
+      if (levelTimer || !levels || !bargeEchoMarginDb) return;
+      levelTimer = setInterval(function () {
+        if (stopped || !pendingBarge) { stopEchoWatch(); return; }
+        echoShaped();
+      }, LEVEL_POLL_MS);
+    }
+
+    function stopEchoWatch() {
+      if (levelTimer) { clearInterval(levelTimer); levelTimer = null; }
+    }
+
+    /* How much of her opening is left. Anchored on the first evidence that she
+       is actually producing speech for this response rather than on the moment
+       the response opened: between those two is a tool call, a reasoning pass
+       and a network hop, and a guard measured from the wrong one of them is
+       either useless or a gag. */
+    function onsetRemaining() {
+      if (!bargeOnsetGuardMs || !speaking) return 0;
+      var began = speaking.audioAt || speaking.startedAt || 0;
+      if (!began) return 0;
+      var left = bargeOnsetGuardMs - (Date.now() - began);
+      return left > 0 ? left : 0;
+    }
+
+    function clearOnsetHold() {
+      if (onsetHold) { clearTimeout(onsetHold); onsetHold = null; }
+    }
+
     function bargeIn() {
       counters.barge_ins++;
       /* A DICTATION IS NOT YIELDED. A gap warning, a turn or a tire fault is
@@ -1231,6 +1401,54 @@
         emit('LIVE_BARGE_IN', { during: 'dictation', yielded: false });
         return;
       }
+
+      /* HER OPENING SYLLABLE IS THE WORST EVIDENCE THERE IS. The canceller has
+         not converged, the level steps from nothing to driving volume, and on
+         a phone that step is the single most reliable way to make the detector
+         fire on her. So the decision is HELD for the rest of the guard rather
+         than taken -- and then taken anyway, from that moment, if whatever
+         fired the detector is still going. A driver who talks over her first
+         word still stops her; they stop her a fifth of a second later. */
+      var onsetLeft = onsetRemaining();
+      if (onsetLeft > 0 && speaking && !pendingBarge) {
+        if (!onsetHold) {
+          var heldFor = speaking.responseId;
+          emit('LIVE_BARGE_DEFERRED', { response_id: heldFor,
+                                        guard_ms: bargeOnsetGuardMs,
+                                        holding_ms: Math.round(onsetLeft) });
+          onsetHold = setTimeout(function () {
+            onsetHold = null;
+            if (stopped || !speechActive) return;
+            if (!speaking || speaking.responseId !== heldFor) return;
+            counters.onset_deferred++;
+            bargeIn();                   // past the guard: decide it properly
+          }, onsetLeft);
+        }
+        return;
+      }
+
+      /* ...AND IS THE MICROPHONE EVEN LOUDER THAN THE SPEAKER? Echo cannot be
+         louder than what produced it. This is the one test in the whole gate
+         that does not depend on timing, and it is the reason a phone can now
+         tell "she is talking" from "somebody is talking over her" at all. */
+      peakMargin = null;
+      if (echoShaped()) {
+        counters.echo_suppressed++;
+        var rid0 = speaking ? speaking.responseId : null;
+        emit('LIVE_ECHO_SUPPRESSED', {
+          response_id: rid0,
+          mic_db: lastLevels ? Math.round(lastLevels.mic * 10) / 10 : null,
+          out_db: lastLevels ? Math.round(lastLevels.out * 10) / 10 : null,
+          margin_db: peakMargin === null ? null : Math.round(peakMargin * 10) / 10,
+          required_db: bargeEchoMarginDb,
+          reason: 'level_margin',
+        });
+        // Nothing muted, nothing cancelled, and the meter stays on it.
+        startEchoWatch(rid0);
+        return;
+      }
+      stopEchoWatch();
+
       audio.mute();                      // instant, always, undoable
       if (!speaking || pendingBarge) {
         emit('LIVE_BARGE_IN', { response_id: speaking ? speaking.responseId : null });
@@ -1240,9 +1458,32 @@
       emit('LIVE_BARGE_IN', { response_id: rid });
       pendingBarge = { responseId: rid, cancelled: false, timer: null,
                        confirm: null, said: '', direct: !!speaking.direct };
+      startPendingWatch();
       pendingBarge.timer = setTimeout(function () {
         if (!pendingBarge) return;
         pendingBarge.timer = null;
+        /* THE WHOLE WINDOW, NOT THE FIRST SAMPLE. The gate has been open for
+           bargeSustainMs and the meter has been read all through it. If the
+           microphone never once beat the loudspeaker in that time, the thing
+           that has been going on for 600 ms is her: unmute her and let the
+           answer finish. This is the case the first read cannot decide -- an
+           utterance that had not reached the speaker yet when the detector
+           fired. */
+        if (bargeEchoMarginDb && peakMargin !== null &&
+            peakMargin < bargeEchoMarginDb) {
+          counters.echo_suppressed++;
+          emit('LIVE_ECHO_SUPPRESSED', {
+            response_id: rid,
+            margin_db: Math.round(peakMargin * 10) / 10,
+            required_db: bargeEchoMarginDb,
+            reason: 'level_margin_sustained',
+          });
+          clearBarge();
+          try { send({ type: 'input_audio_buffer.clear' }); } catch (e) {}
+          if (speaking && !speaking.cancelled && !stopped) audio.unmute();
+          startEchoWatch(rid);
+          return;
+        }
         pendingBarge.cancelled = true;
         pendingBarge.said = saidSoFar();
         // Sustained past the gate: stop generating and hand back the mouth.
@@ -1288,6 +1529,24 @@
      * silence past it really is silence.
      */
     function speechStopped() {
+      speechActive = false;
+      stopEchoWatch();
+      /* A firing that never got past her opening syllable, and has now stopped
+         on its own. That is the shape of echo and it cost nothing: no mute, no
+         cancel, no gap in the answer. Counted where the other suppressions are
+         counted, because the question it answers is the same one -- how often
+         is the detector firing on her. */
+      if (onsetHold) {
+        clearOnsetHold();
+        counters.echo_suppressed++;
+        emit('LIVE_ECHO_SUPPRESSED', {
+          response_id: speaking ? speaking.responseId : null,
+          reason: 'onset_guard',
+          guard_ms: bargeOnsetGuardMs,
+        });
+        try { send({ type: 'input_audio_buffer.clear' }); } catch (e) {}
+        return;
+      }
       if (!pendingBarge) return;
       if (!pendingBarge.cancelled) {
         clearBarge();
@@ -1742,6 +2001,16 @@
             if ((!dictation || dictation.responseId !== ev.response_id)
                 && (!directSpeech || directSpeech.realId !== ev.response_id)) {
               partial += (ev.delta || '');
+              /* WHEN SHE ACTUALLY STARTED TALKING, which is not when the
+                 response opened: a tool call and a reasoning pass sit between
+                 those two and the onset guard measured from the wrong one is
+                 either spent before she makes a sound or still running a
+                 second into her answer. The first transcript delta is the
+                 earliest evidence that audio is on its way out. */
+              if (speaking && speaking.responseId === ev.response_id
+                  && !speaking.audioAt) {
+                speaking.audioAt = Date.now();
+              }
             }
             break;
           case 'response.output_audio_transcript.done':
@@ -1758,6 +2027,7 @@
           case 'input_audio_buffer.speech_started':
             // Whatever was last transcribed is about the turn before this one.
             transcriptFresh = false;
+            speechActive = true;
             bargeIn();
             break;
           case 'input_audio_buffer.speech_stopped':
@@ -1996,6 +2266,8 @@
          block every conversational reply for the rest of the drive. */
       stop: function () {
         stopped = true;
+        clearOnsetHold();
+        stopEchoWatch();
         audio.mute();
         clearBarge();
         pendingResume = null;
@@ -2032,7 +2304,16 @@
           said_so_far: saidSoFar(),
           policy: { barge_sustain_ms: bargeSustainMs,
                     barge_confirm_ms: bargeConfirmMs,
+                    // The phone half of the gate. All three are 0 on a desk,
+                    // which is the fastest way to answer "is this machine
+                    // running the touch numbers or the desktop ones".
+                    barge_onset_guard_ms: bargeOnsetGuardMs,
+                    barge_echo_margin_db: bargeEchoMarginDb,
+                    barge_echo_floor_db: bargeEchoFloorDb,
+                    echo_meter: !!levels,
                     max_resumes: maxResumes },
+          // What the meter last read, for a panel that wants to show it.
+          levels: lastLevels,
           // Which tools the session is carrying right now, and why. `null`
           // rather than `[]` when the session did not hand the schemas over:
           // "this controller was never told" and "this session has no tools"
@@ -2048,6 +2329,91 @@
   /* ---------------------------------------------------------------------
      The wiring. Everything below needs a browser.
      --------------------------------------------------------------------- */
+  /* WHICH COLUMN OF THE INTERRUPTION POLICY THIS MACHINE IS IN.
+   *
+   * Decided here and not on the server, and that is not a style preference: a
+   * User-Agent is a guess, and a guess that puts a driver's phone in the
+   * desktop column is the exact bug the touch column exists to fix. The
+   * browser knows. A coarse pointer or a real multi-touch digitiser is a
+   * device whose speaker and microphone are two inches apart.
+   *
+   * Wrong in the safe direction on a touchscreen laptop: it would get the
+   * phone numbers, which cost a fifth of a second on an interruption nobody
+   * would notice, and it does not cost an answer. */
+  function isTouchDevice() {
+    try {
+      var nav = root.navigator || {};
+      if ((nav.maxTouchPoints || 0) > 1) return true;
+      if (root.matchMedia && root.matchMedia('(pointer: coarse)').matches) return true;
+      if (root.matchMedia && root.matchMedia('(hover: none)').matches) return true;
+    } catch (e) { /* a browser that cannot answer is a desk */ }
+    return false;
+  }
+
+  /* THE METER THE ECHO GATE READS.
+   *
+   * Two numbers in dBFS: what the microphone is hearing, and what this page is
+   * rendering. Both are measured here because both are facts about audio the
+   * controller has no way to reach -- it gets a function and a promise not to
+   * be given nonsense.
+   *
+   * The output figure is the LOUDER of two things, because RIO speaks through
+   * two of them: the live session's own voice, which arrives as a remote
+   * WebRTC track, and everything else, which goes through the shared output
+   * bus (clips, TTS, the synthesiser). Taking the max is the right reading of
+   * "how loud is this page right now" -- whichever mouth is open is the one
+   * the microphone is hearing.
+   *
+   * Returns null for anything it cannot measure, and null means the gate has
+   * no level evidence rather than that there is no echo. */
+  function makeMeter(ctxIn, micStream, remoteStream) {
+    var C = root.AudioContext || root.webkitAudioContext;
+    if (!C) return null;
+    var ctx = ctxIn;
+    if (!ctx) { try { ctx = new C(); } catch (e) { return null; } }
+    var buf = null;
+    function analyserFor(stream) {
+      if (!stream) return null;
+      try {
+        var src = ctx.createMediaStreamSource(stream);
+        var an = ctx.createAnalyser();
+        an.fftSize = 1024;
+        an.smoothingTimeConstant = 0.2;
+        src.connect(an);
+        // Deliberately NOT connected onward. An analyser is a tap, and a tap
+        // that reaches the speaker is a feedback loop.
+        return an;
+      } catch (e) { return null; }
+    }
+    var micAn = analyserFor(micStream);
+    var outAn = analyserFor(remoteStream);
+    if (!micAn) return null;
+    function db(an) {
+      if (!an) return -100;
+      var n = an.fftSize;
+      if (!buf || buf.length !== n) buf = new Float32Array(n);
+      try {
+        if (!an.getFloatTimeDomainData) return -100;
+        an.getFloatTimeDomainData(buf);
+      } catch (e) { return -100; }
+      var sum = 0;
+      for (var i = 0; i < n; i++) sum += buf[i] * buf[i];
+      var rms = Math.sqrt(sum / n);
+      if (!(rms > 0)) return -100;
+      var v = 20 * Math.log10(rms);
+      return v < -100 ? -100 : v;
+    }
+    return function () {
+      var busDb = -100;
+      try {
+        var o = root.RIO && root.RIO.output;
+        if (o && o.level) busDb = o.level();
+      } catch (e) { busDb = -100; }
+      var trackDb = db(outAn);
+      return { mic: db(micAn), out: Math.max(busDb, trackDb) };
+    };
+  }
+
   function connect(opts) {
     opts = opts || {};
     // The shared watch, subscribed to rather than started: rio_nav.js reads the
@@ -2074,14 +2440,48 @@
         return navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS });
       })
       .then(function (mic) {
+        var touch = isTouchDevice();
+        var barge = (touch ? session.barge_touch : session.barge_desktop) || {};
+        var meter = null;
+        /* Built once, from the microphone that was just opened and the remote
+           track when it arrives. Failing is allowed and is not reported as an
+           error: a session with no meter is a session with the desk gate,
+           which is what every session had until now. */
+        function armMeter() {
+          if (meter) return;
+          if (!barge.echo_margin_db) return;      // desk: nothing to measure
+          var shared = null;
+          try {
+            var o = root.RIO && root.RIO.output;
+            if (o && o.context) shared = o.context();
+          } catch (e) { shared = null; }
+          meter = makeMeter(shared, mic, remoteStream);
+          if (opts.onEvent) {
+            try {
+              opts.onEvent({ type: 'LIVE_ECHO_METER', ok: !!meter,
+                             device: touch ? 'touch' : 'desktop',
+                             margin_db: barge.echo_margin_db,
+                             onset_guard_ms: barge.onset_guard_ms,
+                             sustain_ms: barge.sustain_ms });
+            } catch (e) {}
+          }
+        }
         var pc = new RTCPeerConnection();
         var channel = pc.createDataChannel('oai-events');
         mic.getTracks().forEach(function (t) { pc.addTrack(t, mic); });
 
+        /* THE ONE PATH iOS COULD ALREADY CANCEL. A remote MediaStream on an
+           element is rendered by the same WebRTC stack that owns the capture,
+           so it IS the reference the canceller subtracts. Everything else RIO
+           says goes through RIO.output for the same reason. */
+        var remoteStream = null;
         pc.ontrack = function (e) {
-          element.srcObject = e.streams[0];
+          remoteStream = e.streams[0];
+          element.srcObject = remoteStream;
           var p = element.play();
           if (p && p.catch) p.catch(function () {});
+          // The meter cannot be built until there is something to measure.
+          armMeter();
         };
 
         /* WHICH MOUTH, AND HOW IT CAN CHANGE MID-DRIVE
@@ -2142,8 +2542,20 @@
           // the session exactly as the dictation policy is. The browser holds
           // no numbers of its own to drift from the ones the tests check.
           resumeInstruction: session.resume_instruction,
-          bargeSustainMs: session.barge_sustain_ms,
           bargeConfirmMs: session.barge_confirm_ms,
+          /* THE PHONE COLUMN OR THE DESK COLUMN. Both travel with the session
+             (config.py decides them, realtime.mint_client_secret sends them)
+             and the machine picks its own — see isTouchDevice. The fallback to
+             the flat barge_sustain_ms is what an older server sends, and it is
+             the desktop behaviour, unchanged. */
+          bargeSustainMs: barge.sustain_ms || session.barge_sustain_ms,
+          bargeOnsetGuardMs: barge.onset_guard_ms || 0,
+          bargeEchoMarginDb: barge.echo_margin_db || 0,
+          bargeEchoFloorDb: session.barge_echo_floor_db,
+          /* The meter is installed later, when there is a remote track to
+             measure; until then the level test has no evidence and the gate
+             behaves as it does on a desk. */
+          levels: function () { return meter ? meter() : null; },
           maxResumes: session.max_resumes,
           send: function (obj) {
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));

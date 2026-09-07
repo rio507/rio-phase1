@@ -43,7 +43,27 @@
 (function (root) {
   'use strict';
 
-  var stats = { dictated: 0, tts: 0, clip: 0, silent: 0, last: null };
+  var stats = { dictated: 0, tts: 0, clip: 0, silent: 0, last: null,
+              // Lines that went out through the shared output rather than
+              // through their own element -- i.e. the ones a phone's echo
+              // canceller had a reference for. See static/rio_output.js.
+              bus: 0, bus_missed: 0 };
+
+  /* THE SHARED OUTPUT, IF THERE IS ONE.
+   *
+   * Every line below is played twice over in the source: once through
+   * RIO.output, which routes it back through a peer connection so iOS can
+   * cancel it, and once through the <audio> element that has always played it.
+   * The second one is not dead code and must never become dead code -- it is
+   * what plays the warning when the bus is down, the context is suspended, the
+   * clip will not decode, or the browser has no Web Audio at all.
+   *
+   * The rule everywhere in this file: the bus is TRIED, the element is
+   * GUARANTEED. */
+  function bus() {
+    var o = root.RIO && root.RIO.output;
+    return (o && o.ready && o.ready()) ? o : null;
+  }
 
   function fetchBlobAudio(element, url) {
     var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
@@ -69,6 +89,26 @@
           })
           .then(function (blob) {
             if (stopped) return;
+            var b = bus();
+            if (b) {
+              /* Same bytes, decoded and played on the shared output. If it
+                 throws -- a codec the context will not decode, a context that
+                 suspended between the check and the play -- the element below
+                 still has the blob and still plays it. */
+              var viaBus = b.playBlob(blob);
+              release = function () { viaBus.abort(); };
+              return viaBus.play().then(function () {
+                stats.bus++;
+              }, function () {
+                stats.bus_missed++;
+                if (b.noteFallback) b.noteFallback();
+                return playBlobOnElement(blob);
+              });
+            }
+            stats.bus_missed++;
+            return playBlobOnElement(blob);
+
+            function playBlobOnElement(blob) {
             return new Promise(function (resolve, reject) {
               var objUrl = URL.createObjectURL(blob);
               var settled = false;
@@ -87,6 +127,7 @@
               var p = element.play();
               if (p && p.catch) p.catch(function (e) { done(reject, e); });
             });
+            }
           });
       },
     };
@@ -106,14 +147,38 @@
     var release = null;
     var held = !!(url && element && element.src
                   && element.src.indexOf(url) >= 0);
+    /* THE BUS IS ALSO A PRELOAD. RIO.output decodes each clip once and keeps
+       the buffer, so "the fast path is a decoded buffer and a play() call"
+       stays exactly as true through the shared output as it was through a
+       preloaded element -- and the first play of a clip the bus has not seen
+       falls back to the element, which HAS preloaded it. Nothing waits on a
+       network either way. */
+    var viaBus = null;
     return {
       abort: function () {
         stopped = true;
+        if (viaBus) { try { viaBus.abort(); } catch (e) {} }
         try { element.pause(); } catch (e) {}
         if (release) { release(); release = null; }
       },
       play: function () {
         if (stopped) return Promise.resolve();
+        var b = bus();
+        if (b) {
+          viaBus = b.playUrl(url);
+          return viaBus.play().then(function () {
+            stats.bus++;
+          }, function () {
+            stats.bus_missed++;
+            if (b.noteFallback) b.noteFallback();
+            viaBus = null;
+            return onElement();
+          });
+        }
+        stats.bus_missed++;
+        return onElement();
+
+        function onElement() {
         return new Promise(function (resolve, reject) {
           var settled = false;
           var done = function (fn, arg) {
@@ -131,6 +196,7 @@
           var p = element.play();
           if (p && p.catch) p.catch(function (e) { done(reject, e); });
         });
+        }
       },
     };
   }
@@ -268,6 +334,7 @@
     stats: function () { return stats; },
     reset: function () {
       stats.dictated = stats.tts = stats.clip = stats.silent = 0;
+      stats.bus = stats.bus_missed = 0;
       stats.last = null;
     },
   };

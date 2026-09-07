@@ -196,6 +196,8 @@
     function unlock() {
       if (unlocked) return;
       unlocked = true;
+      // The shared output wants the same gesture every element here does.
+      try { if (root.RIO && root.RIO.output) root.RIO.output.unlock(); } catch (e) {}
       unlockOne(navAudio);
       Object.keys(clipEls).forEach(function (id) { unlockOne(clipEls[id]); });
     }

@@ -58,6 +58,7 @@
   function unlock() {
     if (unlocked) return;
     unlocked = true;
+    try { if (root.RIO && root.RIO.output) root.RIO.output.unlock(); } catch (e) {}
     try {
       audio.muted = true;
       var p = audio.play();

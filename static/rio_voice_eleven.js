@@ -86,6 +86,11 @@
     var ws = null;
     var ctx = null;
     var gain = null;
+    /* Is this voice going out through the shared output (and so through the
+       platform's echo canceller), or straight at the speaker? Reported on
+       state() because "why is she interrupting herself" is a question about
+       exactly this. */
+    var routedToBus = false;
     var ready = false;
     var closed = false;
     var sampleRate = cfg.sampleRate || 24000;
@@ -111,18 +116,40 @@
 
     function now() { return ctx ? ctx.currentTime : 0; }
 
+    /* WHERE THE VOICE ENDS UP, and it is no longer ctx.destination by default.
+     *
+     * Rendering straight to the destination is ordinary Web Audio playback,
+     * which Safari's echo canceller has no reference signal for: on a phone
+     * this path was RIO's whole voice returning to her own microphone. The
+     * shared output in rio_output.js routes everything back through a peer
+     * connection so the canceller does see it, and it also owns the ONE
+     * AudioContext this page should have -- two contexts on iOS is two audio
+     * units and the second one is not covered by anything.
+     *
+     * The fallback is the old behaviour exactly: no bus, no Web Audio on the
+     * bus, or a bus that has not come up yet, and this renders where it always
+     * did. An echoing voice is a bug; a silent one is a drive with no RIO. */
     function makeContext() {
       if (ctx) return ctx;
+      var out = null;
       if (cfg.context) {
         ctx = (typeof cfg.context === 'function') ? cfg.context() : cfg.context;
       } else {
-        var C = root.AudioContext || root.webkitAudioContext;
-        if (!C) return null;
-        ctx = new C();
+        var shared = root.RIO && root.RIO.output;
+        if (shared && shared.context) {
+          try { ctx = shared.context(); } catch (e) { ctx = null; }
+          if (ctx) { try { out = shared.node(); } catch (e) { out = null; } }
+        }
+        if (!ctx) {
+          var C = root.AudioContext || root.webkitAudioContext;
+          if (!C) return null;
+          ctx = new C();
+        }
       }
       gain = ctx.createGain();
       gain.gain.value = 0;
-      gain.connect(ctx.destination);
+      gain.connect(out || ctx.destination);
+      routedToBus = !!out;
       return ctx;
     }
 
@@ -355,6 +382,7 @@
       state: function () {
         return { ready: ready, muted: muted, rid: current ? current.rid : null,
                  queued: queue.length, next_at: nextAt, now: now(),
+                 routed_to_bus: routedToBus,
                  stats: stats };
       },
 
@@ -362,7 +390,13 @@
         closed = true;
         stopAll();
         try { if (ws) ws.close(); } catch (e) {}
-        try { if (ctx && ctx.close && !cfg.context) ctx.close(); } catch (e) {}
+        /* NOT the shared context. Closing it would take every other voice on
+           the page down with this one -- the clips, the warnings and the turn
+           calls all render on it now. Only a context this sink opened for
+           itself is a context this sink may close. */
+        try {
+          if (ctx && ctx.close && !cfg.context && !routedToBus) ctx.close();
+        } catch (e) {}
       },
     };
     return sink;

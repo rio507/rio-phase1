@@ -813,6 +813,12 @@ _CUTOFF_CAUSES = ("false_barge_in", "barge_in", "preempted",
 _cutoff_lock = threading.Lock()
 _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
                   "resumed": 0, "resume_skipped": 0, "blips_absorbed": 0,
+                  # Detector firings the echo gate refused to act on at all --
+                  # her own voice, on a phone, not costing an answer. Counted
+                  # separately from blips_absorbed because they are different
+                  # facts: an absorbed blip fired the gate and stopped short of
+                  # cancelling, and one of these never got that far.
+                  "echo_suppressed": 0,
                   "recent": []}
 _CUTOFF_RECENT_MAX = 50
 
@@ -823,11 +829,13 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
         if kind == "cutoff":
             c = cause if cause in _CUTOFF_CAUSES else "other"
             _cutoffs["tally"][c] += 1
-        elif kind in ("resumed", "resume_skipped", "blips_absorbed"):
+        elif kind in ("resumed", "resume_skipped", "blips_absorbed",
+                      "echo_suppressed"):
             _cutoffs[kind] += 1
         rec = {"t": round(time.time(), 3), "kind": kind, "cause": cause}
         rec.update({k: v for k, v in (detail or {}).items()
-                    if k in ("response_id", "reason", "detail", "said_chars", "by")})
+                    if k in ("response_id", "reason", "detail", "said_chars",
+                             "by", "mic_db", "out_db", "margin_db", "device")})
         _cutoffs["recent"].append(rec)
         if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
             _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]
@@ -844,6 +852,9 @@ def cutoff_tally() -> dict:
             # Under the old behaviour every one of these was a lost answer, so
             # this is the number that says whether the fix is doing anything.
             "blips_absorbed": _cutoffs["blips_absorbed"],
+            # ...and the ones that never reached the gate, because the level
+            # test said the microphone was hearing the loudspeaker.
+            "echo_suppressed": _cutoffs["echo_suppressed"],
             "resumed": _cutoffs["resumed"],
             "resume_skipped": _cutoffs["resume_skipped"],
             "recent": list(_cutoffs["recent"]),
@@ -854,6 +865,12 @@ def cutoff_tally() -> dict:
                 "barge_sustain_ms": config.REALTIME_BARGE_SUSTAIN_MS,
                 "barge_confirm_ms": config.REALTIME_BARGE_CONFIRM_MS,
                 "max_resumes": config.REALTIME_MAX_RESUMES,
+                # What a phone runs instead. Reported here because "she keeps
+                # cutting out" is asked about a device, and the answer depends
+                # on which column that device was in.
+                "barge_sustain_ms_touch": config.REALTIME_BARGE_SUSTAIN_MS_TOUCH,
+                "barge_onset_guard_ms_touch": config.REALTIME_BARGE_ONSET_GUARD_MS_TOUCH,
+                "barge_echo_margin_db_touch": config.REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH,
                 "server_interrupt_response": False,
             },
         }
@@ -865,6 +882,7 @@ def reset_cutoffs() -> None:
         _cutoffs["resumed"] = 0
         _cutoffs["resume_skipped"] = 0
         _cutoffs["blips_absorbed"] = 0
+        _cutoffs["echo_suppressed"] = 0
         _cutoffs["recent"] = []
 
 
@@ -1099,6 +1117,24 @@ def mint_client_secret() -> dict:
         "barge_sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS),
         "barge_confirm_ms": int(config.REALTIME_BARGE_CONFIRM_MS),
         "max_resumes": int(config.REALTIME_MAX_RESUMES),
+        # BOTH COLUMNS, AND THE PAGE PICKS ITS OWN. The device is a fact the
+        # browser holds and the server does not: a User-Agent is a guess, and a
+        # guess that puts a driver's phone in the desktop column is the bug
+        # this whole block exists to fix. So the policy travels complete and
+        # rio_realtime.js resolves it against the machine it is actually
+        # running on. See the touch notes in config.py for why a phone needs
+        # different numbers at all.
+        "barge_touch": {
+            "sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS_TOUCH),
+            "onset_guard_ms": int(config.REALTIME_BARGE_ONSET_GUARD_MS_TOUCH),
+            "echo_margin_db": float(config.REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH),
+        },
+        "barge_desktop": {
+            "sustain_ms": int(config.REALTIME_BARGE_SUSTAIN_MS),
+            "onset_guard_ms": int(config.REALTIME_BARGE_ONSET_GUARD_MS),
+            "echo_margin_db": float(config.REALTIME_BARGE_ECHO_MARGIN_DB),
+        },
+        "barge_echo_floor_db": float(config.REALTIME_BARGE_ECHO_FLOOR_DB),
         # DICTATION IS A PROPERTY OF THE openai_realtime BACKEND, and it is
         # what makes ONE VOICE EVERYWHERE true on it.
         #
