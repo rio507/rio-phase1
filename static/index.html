@@ -507,6 +507,13 @@
      correct behaviour in rain and at night, not a fault to alarm about. */
   #headwayhud b.hw-lanesrc.src-ufld   { color: var(--blue); }
   #headwayhud b.hw-lanesrc.src-static { color: var(--text-dimmer); }
+  #headwayhud b.hw-speedsrc            { font-size: 0.85em; opacity: .8; margin-left: 4px; }
+  #headwayhud b.hw-speedsrc.src-obd    { color: var(--blue); }
+  #headwayhud b.hw-speedsrc.src-gps    { color: var(--text-dimmer); }
+  /* Coasted or disagreeing: amber, because "wider margins" is a state the
+     driver should be able to see without being alarmed by it. */
+  #headwayhud b.hw-speedsrc.degraded   { color: var(--amber, #ffb84d); }
+  #headwayhud b.hw-speedsrc.src-none   { color: var(--amber, #ffb84d); }
 
   /* One class per band. The colour IS the warning at a glance, so it drives the
      rail, the label and the glow together. */
@@ -518,6 +525,11 @@
   #headwayhud.hw-UNSAFE .hw-band { color: var(--red); }
   #headwayhud.hw-SUPPRESSED .hw-band,
   #headwayhud.hw-UNKNOWN .hw-band { color: var(--text-dimmer); }
+  /* Amber rather than dim: "Bad Range" is not a quiet state like Low Speed, it
+     is the system telling the driver it does not believe its own measurement,
+     and that is worth noticing. */
+  #headwayhud.hw-IMPLAUSIBLE      { border-left-color: var(--amber); }
+  #headwayhud.hw-IMPLAUSIBLE .hw-band { color: var(--amber); }
 
   .speed-row {
     display: flex; align-items: stretch; gap: 8px;
@@ -1550,7 +1562,15 @@
       <div id="headwayhud" class="hw-UNKNOWN">
         <span class="hw-band" id="hwband">Standby</span>
         <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
-        <span class="hw-line"><i>Gap</i> <b id="hwgap">--</b> &middot; <i>V</i> <b id="hwspeed">--</b></span>
+        <!-- The speed, and WHERE IT CAME FROM. The band above is a claim
+             about gap over speed, so which speed answered is part of reading
+             it: OBD when the car has a bus worth reading, GPS otherwise, "GPS
+             held" while a fix that went quiet is being coasted, "no speed"
+             when there is nothing. "· wide" says the margins were widened for
+             an uncertain speed rather than the warnings being switched off,
+             which is the difference the driver is entitled to see. -->
+        <span class="hw-line"><i>Gap</i> <b id="hwgap">--</b> &middot; <i>V</i> <b id="hwspeed">--</b>
+          <b id="hwspeedsrc" class="hw-speedsrc">--</b></span>
         <!-- Which corridor the lead was validated against this frame. UFLD =
              built from detected lane paint, STATIC = the fixed trapezoid
              fallback. Shown because "the system is degraded but still running"
@@ -3074,6 +3094,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const elTrend = document.getElementById('hwtrend');
   const elGap = document.getElementById('hwgap');
   const elSpeed = document.getElementById('hwspeed');
+  const elSpeedSrc = document.getElementById('hwspeedsrc');
   const elLanes = document.getElementById('hwlanes');
   const toggle = document.getElementById('headway');
   const speedInput = document.getElementById('speedval');
@@ -3327,6 +3348,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const BAND_LABEL = {
     NORMAL: 'Normal', GETTING_UNSAFE: 'Getting Unsafe', UNSAFE: 'Unsafe',
     SUPPRESSED: 'Low Speed', UNKNOWN: 'No Speed',
+    // Not a flavour of "No Speed", and the HUD must not read as though it
+    // were: there IS a speed and there IS a range, and the two do not go
+    // together. See headway/live_policy.IMPLAUSIBLE.
+    IMPLAUSIBLE: 'Bad Range',
+  };
+
+  /* WHICH SPEED THE BAND RESTS ON, said on the HUD rather than inferred from
+     it. The punch list asks for the priority to be visible — OBD when there is
+     a car under it, GPS otherwise, the last known speed for a bounded coast
+     after that — because "degraded" is a thing the driver is entitled to know
+     about a warning system before it goes quiet on them. */
+  const SPEED_SOURCE_LABEL = {
+    obd: 'OBD', gps: 'GPS', gps_coasted: 'GPS held', none: 'no speed',
   };
 
   function paintHud(j) {
@@ -3342,8 +3376,27 @@ document.addEventListener('DOMContentLoaded', () => {
     // not a small gap, and this HUD showed -66.8 m once.
     const gap = (j && typeof j.distance_m === 'number') ? j.distance_m : null;
     elGap.textContent = (gap !== null && gap >= 0) ? gap.toFixed(1) + ' m' : '--';
-    const s = speed();
-    elSpeed.textContent = (s.v === null) ? '--' : s.v.toFixed(1) + ' m/s';
+    /* THE SERVER'S ANSWER, NOT THE PAGE'S GUESS. The page knows what the
+       phone's GPS said; only the server knows whether an OBD bus outranked it,
+       whether the fix was stale enough to be coasted, and whether the two
+       disagreed. Showing the local number here would have the HUD confidently
+       reporting a speed the warning was not computed from. The local value is
+       the fallback for a result that predates this field. */
+    const sp = (j && j.speed) || null;
+    const local = speed();
+    const shown = sp ? sp.v_ms : (local.v === null ? null : local.v);
+    elSpeed.textContent = (shown === null || shown === undefined)
+      ? '--' : shown.toFixed(1) + ' m/s';
+    if (elSpeedSrc) {
+      const src = sp ? (SPEED_SOURCE_LABEL[sp.source] || sp.source) : local.source;
+      elSpeedSrc.textContent = src + (sp && sp.degraded ? ' · wide' : '');
+      elSpeedSrc.className = 'hw-speedsrc src-' + (sp ? sp.source : 'none')
+        + (sp && sp.degraded ? ' degraded' : '');
+      elSpeedSrc.title = sp
+        ? ('speed source: ' + sp.source + ' (' + sp.reason + ')'
+           + (sp.degraded ? ' — margins widened, not silenced' : ''))
+        : 'speed source: the page\'s own GPS';
+    }
     if (elLanes) {
       const src = (j && j.corridor_source) === 'ufld' ? 'ufld' : 'static';
       const conf = (j && typeof j.lane_conf === 'number') ? j.lane_conf : null;
@@ -3361,6 +3414,7 @@ document.addEventListener('DOMContentLoaded', () => {
     elBand.textContent = 'Standby';
     elTau.textContent = '--'; elTrend.textContent = '--';
     elGap.textContent = '--'; elSpeed.textContent = '--';
+    if (elSpeedSrc) { elSpeedSrc.textContent = '--'; elSpeedSrc.className = 'hw-speedsrc'; }
     if (elLanes) { elLanes.textContent = '--'; elLanes.className = 'hw-lanesrc'; }
   }
 
@@ -3436,7 +3490,12 @@ document.addEventListener('DOMContentLoaded', () => {
   function monitorReady(j) {
     if (!j) return false;
     const band = j.band || 'UNKNOWN';
-    if (band === 'UNKNOWN' || band === 'SUPPRESSED_LOW_SPEED' || band === 'LOST') {
+    if (band === 'UNKNOWN' || band === 'SUPPRESSED_LOW_SPEED' || band === 'LOST'
+        || band === 'IMPLAUSIBLE') {
+      // IMPLAUSIBLE is here for the same reason the other three are: it is a
+      // band that means "this cannot be judged", and a line chosen under one
+      // of those is not evidence. The server already refuses to produce a
+      // speak on it; this is the same rule stated where the audio plays.
       return false;
     }
     if (framesSeen < MONITOR_WARMUP_FRAMES) return false;

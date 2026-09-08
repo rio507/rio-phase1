@@ -180,6 +180,8 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "speak": result.get("speak"),
         "voice_reason": result.get("voice_reason"),
         "voice_line": result.get("voice_line"),
+        "speed_degraded": result.get("speed_degraded"),
+        "tau_bias_s": result.get("tau_bias_s"),
         "confidence": result.get("confidence"),
         "depth_conf": result.get("depth_conf"),
         "track_quality": result.get("track_quality"),
@@ -189,6 +191,17 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "track_lost": result.get("track_lost"),
         "v_host": result.get("v_host"),
         "v_host_stale": result.get("v_host_stale"),
+        # WHERE THE DENOMINATOR OF TAU CAME FROM. Every band is a claim about
+        # gap over speed, and a log that records the band but not which speed
+        # answered cannot be used to check one. OBD, GPS, a coasted last-known
+        # fix, or nothing -- with the reason, and whether the bands were
+        # widened for it. See headway/speed.py.
+        "speed": result.get("speed"),
+        # How far a lost lead may be coasted at THIS speed. It used to be a
+        # constant, so it was not worth logging; it is 0.6 s at freeway speed
+        # and 2.5 s at a crawl now, and it decides both the reported gap and
+        # the confidence decay.
+        "coast_budget_s": result.get("coast_budget_s"),
         # HOW OLD THE PICTURE WAS WHEN THE DETECTOR FINISHED WITH IT, and the
         # three places that age was spent: on the wire, waiting for a worker,
         # then in the models.

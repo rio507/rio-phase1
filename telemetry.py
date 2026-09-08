@@ -888,6 +888,47 @@ def _headline(rows: List[dict], any_reading: bool) -> Tuple[str, str]:
 # The one thing app.py calls
 # ---------------------------------------------------------------------------
 
+MPH_TO_MS = 0.44704
+
+
+def road_speed_ms() -> Optional[dict]:
+    """The car's own road speed, in m/s, with its age and its provenance.
+
+    A pure read: no trend ring, no runtime clock, no insight frame. It is
+    called at the frame rate by headway/speed.py and must not make the
+    dashboard's 1 Hz statistics depend on how fast a camera is running.
+
+    Returns None when there is no road speed to be had, which is a different
+    answer from zero and is treated as one everywhere downstream: 0 m/s is a
+    car at a red light, and None is a car nobody is measuring.
+
+    WHY IT READS THE PROVIDER RATHER THAN snapshot(). The normalised row drops
+    `at`, and an OBD speed with no age is not a speed a warning may rest on --
+    a bridge that stopped reporting three minutes ago would go on saying
+    "0 mph" and would silence every gap warning on a moving car. The freshness
+    is the point, so this reads the SensorReading, which carries it.
+    """
+    now = time.time()
+    for p in _providers:
+        try:
+            if not p.available():
+                continue
+            for r in (p.read() or []):
+                if r.id != "vehicle_speed" or r.value is None or not r.ok:
+                    continue
+                at = r.at if r.at else now
+                return {"v_ms": float(r.value) * MPH_TO_MS,
+                        "mph": float(r.value),
+                        "age_s": max(0.0, now - float(at)),
+                        "source": _source_name,
+                        "provider": p.name}
+        except Exception:
+            # A provider that throws has nothing to say about speed this tick.
+            # It must never take the frame loop with it.
+            continue
+    return None
+
+
 def snapshot(record: bool = True) -> dict:
     """Everything the Vehicle Health column renders, in the shape it renders it.
 

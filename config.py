@@ -1002,6 +1002,130 @@ HEADWAY_WS_IDLE_TIMEOUT_S = 30.0
 
 
 # ---------------------------------------------------------------------------
+# Live headway policy — every tunable the live drive loop reads
+# (docs/live_headway_v3.md; item 2 of the first real-drive punch list)
+# ---------------------------------------------------------------------------
+# PROVISIONAL prototype values, and the warning_logic_v2.md header still
+# applies verbatim: "These are engineering starting points for shadow-mode
+# tuning -- NOT validated safety thresholds. Do not represent them as such
+# anywhere, ever."
+#
+# They lived in headway/live_policy.py's own PROVISIONAL block until the first
+# real drive, and they are here now for the reason the punch list gives: a
+# threshold that decides whether a car speaks is a threshold that has to be
+# readable, diffable and settable in one place, next to the navigation timing
+# and the transport tuning that are already here.
+#
+# headway/live_policy.py imports these and holds no numbers of its own.
+
+# --- band entry, in TIME HEADWAY -------------------------------------------
+# gap / own speed. The two-second rule, which is the rule because it is the one
+# quantity that means the same thing at 15 mph and at 65: 20 m behind a car is
+# a comfortable gap in town and a second and a bit on a freeway.
+HEADWAY_TAU_GETTING_UNSAFE_S = 3.0
+HEADWAY_TAU_UNSAFE_S = 2.0
+# Leaving a worse band needs tau > entry + this. Exit only; entry is the bare
+# threshold.
+HEADWAY_TAU_HYSTERESIS_S = 0.2
+
+# --- the speed floor --------------------------------------------------------
+# Below this, tau = d/v explodes and a 4 m gap in a car park reads as "getting
+# unsafe". Creeping in traffic is not danger, and this is the line that says so.
+# 5 m/s is 11 mph.
+HEADWAY_MIN_COACH_SPEED_MS = 5.0
+
+# --- the physical floor, and it is a MEASUREMENT veto -----------------------
+# A time headway below this, at a speed above the floor above, is not a
+# following distance. It is a claim that the car has been a fraction of a
+# second behind a vehicle at road speed, and has been for as long as the claim
+# has stood.
+#
+# THE FIRST REAL DRIVE IS THE ARGUMENT. Session 06af3214: gap p50 3.9 m,
+# tau p50 0.28 s, 706 frames (36% of the drive) reporting a lead under 6 m
+# while doing over 10 m/s, and FIFTEEN of the twenty-two warnings RIO actually
+# spoke were about a gap of 3.3-4.7 m at 6-24 m/s. 3.7 m at 20 m/s is 0.19 s.
+# Nobody drives at 0.19 s for twenty seconds; the reading was wrong, and it was
+# wrong for over a third of the drive.
+#
+# The root cause is upstream of this file and is recorded here because this
+# gate is a symptom filter and should be read as one: the phone was in
+# PORTRAIT, so the lower half of every frame is dashboard and hood, and the
+# offending lead boxes span the full frame width down to the bottom edge
+# (e.g. [0.5, 244.2, 480.0, 639.5] on a 480x640 frame). headway/plausibility.py
+# deliberately does not apply its NEAR bound to a vertically truncated box --
+# for a good reason, because a genuinely close car is truncated too -- so the
+# one check that would have caught it was switched off exactly where it was
+# needed. Fixing that belongs to the detector and membership layer.
+#
+# What this floor does is refuse to SPEAK on such a reading. 0.35 s is below
+# human reaction time: a gap that small at road speed is either a collision
+# already in progress, in which case a sentence is not the intervention, or a
+# measurement that has been falsified by the car not having crashed.
+HEADWAY_TAU_IMPLAUSIBLE_S = 0.35
+
+# --- TTC, the urgent trigger ------------------------------------------------
+# v2 §1/§9: time to contact under this WITH the gap collapsing is urgent from
+# any band, cooldown or not. It was computed on every frame of the first real
+# drive, logged on every frame, and never reached the policy at all -- tick()
+# was not given it. 41 frames of that drive had TTC under 2.5 s.
+HEADWAY_TTC_URGENT_S = 2.5
+
+# --- speed sources: OBD > GPS > coasted GPS > none --------------------------
+# Only a source that is a CAR may outrank the phone. The mock and the
+# simulation are development paths that happily report 0 mph while parked at a
+# desk, and letting one of those beat a live GPS fix would silence every
+# warning on a real drive -- the exact opposite of what the priority is for.
+HEADWAY_OBD_SPEED_SOURCES = ("live_obd", "live_holley", "replay")
+# An OBD reading older than this is not a speed.
+HEADWAY_OBD_SPEED_MAX_AGE_S = 1.5
+# ...and one this far from the GPS fix is a disagreement rather than a better
+# number. Both are then distrusted: the drive continues DEGRADED on the GPS
+# value with widened margins, rather than on a bus reading nobody can check.
+HEADWAY_SPEED_DISAGREEMENT_MS = 8.0
+
+# A GPS fix older than this is not a speed either...
+HEADWAY_V_HOST_STALE_S = 2.0
+# ...but it is not nothing. Between STALE and this, the last speed is COASTED
+# and the drive continues with widened margins -- see the bias below. A car's
+# speed does not change much in eight seconds, and going silent because the sky
+# went quiet under a bridge is how a driver learns to ignore the system.
+HEADWAY_V_HOST_COAST_S = 8.0
+
+# --- degraded: WIDER, NEVER QUIETER -----------------------------------------
+# Added to both band thresholds while the speed is coasted or the sources
+# disagree. A speed we are less sure of is a reason to give the driver more
+# room, not less -- the same argument navigation already makes with
+# NAV_GPS_DEGRADED_BIAS_S, and the same direction.
+HEADWAY_DEGRADED_TAU_BIAS_S = 0.75
+# The confidence floor is relaxed by this much while degraded, for the same
+# reason: the alternative to a slightly-less-certain warning is no warning.
+HEADWAY_DEGRADED_CONF_RELIEF = 0.05
+
+# --- coasting a lost lead, scaled by speed ----------------------------------
+# The old rule was a flat 1.0 s, which is 30 m of road at 30 m/s and 5 m at
+# 5 m/s -- the same number meaning two completely different things. It is a
+# DISTANCE budget now, converted to seconds against the speed of the moment,
+# and clamped so it never becomes absurd at either end.
+HEADWAY_COAST_DISTANCE_M = 18.0
+HEADWAY_COAST_MIN_S = 0.6
+HEADWAY_COAST_MAX_S = 2.5
+
+# --- temporal confirmation --------------------------------------------------
+HEADWAY_CONFIRM_S = 0.5
+HEADWAY_CONFIRM_TOLERANCE_S = 0.1
+HEADWAY_MIN_CONFIRM_FRAMES = 2
+HEADWAY_CONFIRM_DOWN_S = 1.0
+
+# --- voice cooldowns --------------------------------------------------------
+HEADWAY_COOLDOWN_CALM_S = 30.0
+HEADWAY_COOLDOWN_UNSAFE_S = 15.0
+HEADWAY_GENUINE_CLEAR_S = 10.0
+HEADWAY_ESCALATE_AFTER_S = 5.0
+
+# --- deferred band entries --------------------------------------------------
+HEADWAY_PENDING_ENTRY_MAX_S = 3.0
+
+# ---------------------------------------------------------------------------
 # Visual conversation (docs/visual_qa.md)
 # ---------------------------------------------------------------------------
 VISUAL_QA_ENABLED = True

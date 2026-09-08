@@ -672,8 +672,35 @@ def run_firewall():
 
     for mod in FORBIDDEN:
         check(mod not in imported, f"live_policy.py does not import {mod!r}")
-    check(imported <= {"math", "state"}, "live_policy.py imports only math + state",
+    # `config` joined this set when the punch list moved the thresholds out of
+    # this module's PROVISIONAL block. It does not weaken the firewall, and the
+    # check below is what makes that a proof rather than an assurance: config
+    # is a module of literals evaluated at import, and every name live_policy
+    # reads from it is asserted to be a plain number or a tuple of strings.
+    # There is no callable, no object and no dict on that surface, so there is
+    # nothing there through which a model output could arrive.
+    check(imported <= {"math", "state", "config"},
+          "live_policy.py imports only math + state + config",
           f"imports: {sorted(imported)}")
+
+    import config as _cfg
+    read_from_config = sorted({
+        n.attr for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+        and n.value.id == "config"})
+    check(bool(read_from_config), "live_policy.py does read its numbers from config",
+          f"{len(read_from_config)} names")
+    bad = []
+    for name in read_from_config:
+        v = getattr(_cfg, name, None)
+        ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+        if not ok and isinstance(v, tuple):
+            ok = all(isinstance(x, str) for x in v)
+        if not ok:
+            bad.append((name, type(v).__name__))
+    check(not bad,
+          "every config name live_policy reads is a constant, not an object",
+          f"offenders: {bad}" if bad else f"{len(read_from_config)} names, all literal")
 
     calls = [n.func.id for n in ast.walk(tree)
              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
@@ -1028,12 +1055,339 @@ def run_detector():
           "recall on vulnerable road users is worth more than a clean box count")
 
 
+# ===========================================================================
+# S. Speed-aware safety alerts (punch-list item 2)
+#
+# Everything here is about the DENOMINATOR of tau. The band ladder has always
+# been expressed in time headway; what the first real drive showed is that the
+# speed the ladder divides by was never resolved, never scaled anything else,
+# and had exactly two states -- fresh, or silence.
+# ===========================================================================
+def _gap_to_tau(gap_m, v_ms):
+    """The two-second rule, arithmetic. gap / speed, and nothing else."""
+    return gap_m / v_ms
+
+
+def run_speed():
+    head("S -- speed-aware alerts (item 2)")
+
+    # -- S1 the same gap is a different band at a different speed ----------
+    #
+    # THE WHOLE POINT OF TIME HEADWAY, asserted rather than assumed. 30 m
+    # behind a car is a relaxed gap at 15 mph and a red-tier warning at 65,
+    # and a system expressed in metres cannot tell those apart.
+    head("S1 -- the same gap, two speeds, two bands")
+    GAP_M = 30.0
+    V_15MPH = 6.706      # 15 mph
+    V_65MPH = 29.058     # 65 mph
+    tau_slow = _gap_to_tau(GAP_M, V_15MPH)     # 4.47 s
+    tau_fast = _gap_to_tau(GAP_M, V_65MPH)     # 1.03 s
+
+    p_slow = P.LivePolicy()
+    slow = drive(p_slow, [(tau_slow, v2.STABLE, GOOD_CONF, V_15MPH)] * 6)
+    p_fast = P.LivePolicy()
+    fast = drive(p_fast, [(tau_fast, v2.STABLE, GOOD_CONF, V_65MPH)] * 6)
+
+    check(slow[-1]["band"] == P.NORMAL,
+          f"{GAP_M:.0f} m at 15 mph is NORMAL",
+          f"tau={tau_slow:.2f}s band={slow[-1]['band']}")
+    check(fast[-1]["band"] == P.UNSAFE,
+          f"{GAP_M:.0f} m at 65 mph is UNSAFE",
+          f"tau={tau_fast:.2f}s band={fast[-1]['band']}")
+    check(slow[-1]["band"] != fast[-1]["band"],
+          "one gap, two speeds, two different bands")
+    check(not spoken_lines(slow), "...and the slow one says nothing at all")
+    check(bool(spoken_lines(fast)), "...while the fast one speaks")
+
+    # And the boundary is where the arithmetic says it is, not where a metre
+    # threshold would put it: the gap that is exactly 2.0 s at 65 mph is
+    # 58.1 m, and the same 58.1 m at 15 mph is 8.7 s of headway.
+    edge_m = P.TAU_ENTER_UNSAFE * V_65MPH
+    p_edge = P.LivePolicy()
+    edge = drive(p_edge, [(_gap_to_tau(edge_m - 1.0, V_65MPH), v2.STABLE,
+                           GOOD_CONF, V_65MPH)] * 6)
+    check(edge[-1]["band"] == P.UNSAFE,
+          f"a metre inside the 2.0 s line at 65 mph ({edge_m:.0f} m) is UNSAFE")
+    p_edge2 = P.LivePolicy()
+    edge2 = drive(p_edge2, [(_gap_to_tau(edge_m - 1.0, V_15MPH), v2.STABLE,
+                             GOOD_CONF, V_15MPH)] * 6)
+    check(edge2[-1]["band"] == P.NORMAL,
+          f"...and the same {edge_m:.0f} m at 15 mph is NORMAL")
+
+    # -- S2 stationary produces no gap warning -----------------------------
+    #
+    # Creeping in traffic is not danger. A 3 m gap at 0.4 m/s is a tau of 7.5 s
+    # by arithmetic and a queue by every other measure, and the speed floor is
+    # what stops the arithmetic being believed.
+    head("S2 -- stationary and creeping say nothing")
+    for label, v, gap in (("stopped dead", 0.0, 3.0),
+                          ("creeping", 0.4, 3.0),
+                          ("car-park pace", 2.0, 4.0),
+                          ("just under the floor", P.V_MIN_COACH - 0.1, 5.0)):
+        p = P.LivePolicy()
+        # tau is computed the same way live.py computes it, floor and all, so
+        # the test cannot pass by feeding the policy a tau it would never see.
+        tau = v2.compute_tau(gap, v)
+        recs = drive(p, [(tau, v2.SHRINKING_FAST if hasattr(v2, "SHRINKING_FAST")
+                          else v2.RAPIDLY_SHRINKING, GOOD_CONF, v)] * 8)
+        check(all(r["band"] == P.SUPPRESSED for r in recs),
+              f"{label} ({v} m/s, {gap} m gap) stays SUPPRESSED")
+        check(not spoken_lines(recs),
+              f"...and speaks not once, even with the gap collapsing")
+        check(all(r["voice_reason"] == P.R_LOW_SPEED for r in recs),
+              "...for the recorded reason 'suppressed_by_low_speed'")
+
+    # A stationary car with an urgent TTC is still silent: the trigger is
+    # reached through the band gates, and SUPPRESSED returns before it.
+    p = P.LivePolicy()
+    recs = drive(p, [(v2.compute_tau(2.0, 0.0), v2.RAPIDLY_SHRINKING,
+                      GOOD_CONF, 0.0)] * 8)
+    check(not spoken_lines(recs),
+          "a stationary car does not get a TTC warning either")
+
+    # -- S3 a degraded speed WIDENS, it does not silence -------------------
+    head("S3 -- degraded speed widens the margins rather than silencing")
+
+    # 2.6 s of headway: inside GETTING_UNSAFE either way, so it is not the
+    # test. 3.4 s is: NORMAL on a trusted speed, and inside the widened amber
+    # band on a coasted one.
+    TAU_ONLY_WIDE_CATCHES = P.TAU_ENTER_GETTING_UNSAFE + 0.4   # 3.4
+    check(TAU_ONLY_WIDE_CATCHES < P.TAU_ENTER_GETTING_UNSAFE + P.DEGRADED_TAU_BIAS_S,
+          "the test tau sits between the normal and the widened amber edge")
+
+    p_ok = P.LivePolicy()
+    ok = [p_ok.tick(tau=TAU_ONLY_WIDE_CATCHES, v2_trend=v2.STABLE,
+                    confidence=GOOD_CONF, v_host=20.0, v_host_stale=False,
+                    t=0.5 * (i + 1), since_reset_s=99.0, speed_degraded=False)
+          for i in range(6)]
+    p_deg = P.LivePolicy()
+    deg = [p_deg.tick(tau=TAU_ONLY_WIDE_CATCHES, v2_trend=v2.STABLE,
+                      confidence=GOOD_CONF, v_host=20.0, v_host_stale=False,
+                      t=0.5 * (i + 1), since_reset_s=99.0, speed_degraded=True)
+           for i in range(6)]
+    check(ok[-1]["band"] == P.NORMAL,
+          f"tau {TAU_ONLY_WIDE_CATCHES} s on a trusted speed is NORMAL")
+    check(deg[-1]["band"] == P.GETTING_UNSAFE,
+          "...and on a degraded speed the same tau is GETTING_UNSAFE")
+    check(bool([r for r in deg if r.get("speak")]),
+          "the degraded drive SPEAKS where the trusted one had nothing to say")
+    check(deg[-1]["tau_bias_s"] == P.DEGRADED_TAU_BIAS_S,
+          "the widening is reported on the frame, not left to be inferred")
+
+    # The confidence floor is relaxed in the same direction.
+    weak = P.CONF_FLOOR - P.DEGRADED_CONF_RELIEF / 2.0
+    p_ok2 = P.LivePolicy()
+    ok2 = [p_ok2.tick(tau=1.0, v2_trend=v2.STABLE, confidence=weak,
+                      v_host=20.0, v_host_stale=False, t=0.5 * (i + 1),
+                      since_reset_s=99.0, speed_degraded=False)
+           for i in range(6)]
+    p_deg2 = P.LivePolicy()
+    deg2 = [p_deg2.tick(tau=1.0, v2_trend=v2.STABLE, confidence=weak,
+                        v_host=20.0, v_host_stale=False, t=0.5 * (i + 1),
+                        since_reset_s=99.0, speed_degraded=True)
+            for i in range(6)]
+    check(all(r["voice_reason"] == P.R_CONFIDENCE for r in ok2 if r["band_entered"]),
+          "a marginal confidence suppresses on a trusted speed")
+    check(bool([r for r in deg2 if r.get("speak")]),
+          "...and is let through on a degraded one, because the alternative "
+          "to a less-certain warning is no warning")
+
+    # AND THE DIRECTION IS ONE-WAY. Nothing a degraded speed does may make RIO
+    # quieter than a trusted one would have been.
+    for tau in (0.5, 1.0, 1.9, 2.5, 3.1, 4.0, 8.0):
+        b_ok = P.classify_tau(tau, None, 0.0)
+        b_deg = P.classify_tau(tau, None, P.DEGRADED_TAU_BIAS_S)
+        check(P._SEV[b_deg] >= P._SEV[b_ok],
+              f"tau {tau}: degraded is never a calmer band than trusted",
+              f"{b_ok} -> {b_deg}")
+
+    # -- S4 the speed source priority --------------------------------------
+    head("S4 -- OBD > GPS > coasted > nothing")
+    import config
+    from . import speed as speed_mod
+
+    def obd(v_mph, age=0.1, source="live_obd"):
+        return lambda: {"v_ms": v_mph * 0.44704, "mph": v_mph, "age_s": age,
+                        "source": source, "provider": source}
+
+    r = speed_mod.SpeedResolver(obd_reader=obd(45.0))
+    fix = r.resolve(18.0, 0.1, 1.0)
+    check(fix.source == speed_mod.OBD and abs(fix.v_ms - 20.117) < 0.01,
+          "a live OBD bus outranks a fresh GPS fix", fix.to_log())
+
+    # THE MOCK MUST NOT. It reports 0 mph at a desk, and an unconditional
+    # OBD-first rule would put a moving car into SUPPRESSED and speak once in
+    # a whole drive.
+    r = speed_mod.SpeedResolver(obd_reader=obd(0.0, source="mock_holley"))
+    fix = r.resolve(20.0, 0.1, 1.0)
+    check(fix.source == speed_mod.GPS and fix.v_ms == 20.0,
+          "the mock telemetry source does NOT outrank a real GPS fix",
+          fix.to_log())
+    check("mock_holley" not in tuple(config.HEADWAY_OBD_SPEED_SOURCES),
+          "...because only sources that are a car are on the OBD list")
+
+    # A bus that stopped reporting is not a speed.
+    r = speed_mod.SpeedResolver(obd_reader=obd(0.0, age=30.0))
+    fix = r.resolve(20.0, 0.1, 1.0)
+    check(fix.source == speed_mod.GPS,
+          "a stale OBD reading falls through to GPS rather than reading 0")
+
+    # Two sources that cannot both be right: neither wins outright.
+    r = speed_mod.SpeedResolver(obd_reader=obd(5.0))
+    fix = r.resolve(25.0, 0.1, 1.0)
+    check(fix.source == speed_mod.GPS and fix.degraded,
+          "OBD and GPS disagreeing continues on GPS, DEGRADED",
+          fix.to_log())
+
+    # The coast, and its end.
+    r = speed_mod.SpeedResolver()
+    r.resolve(22.0, 0.1, 10.0)
+    mid = r.resolve(None, None, 14.0)
+    check(mid.source == speed_mod.COASTED and mid.v_ms == 22.0 and mid.degraded,
+          "a fix that goes quiet is coasted, degraded, not silenced",
+          mid.to_log())
+    late = r.resolve(None, None, 10.0 + config.HEADWAY_V_HOST_COAST_S + 1.0)
+    check(late.source == speed_mod.NONE and not late.known,
+          "...and past the coast window it becomes no speed at all")
+
+    # A stale-but-present GPS fix takes the same path.
+    r = speed_mod.SpeedResolver()
+    r.resolve(22.0, 0.1, 10.0)
+    stale = r.resolve(22.0, config.HEADWAY_V_HOST_STALE_S + 1.0, 12.0)
+    check(stale.source == speed_mod.COASTED,
+          "a fix older than the staleness limit is coasted, not trusted")
+
+    # Nothing, ever: the only case that is genuinely silent.
+    r = speed_mod.SpeedResolver()
+    none = r.resolve(None, None, 1.0)
+    check(none.source == speed_mod.NONE, "no fix at all is no speed")
+    p = P.LivePolicy()
+    recs = [p.tick(tau=float("inf"), v2_trend=v2.STABLE, confidence=GOOD_CONF,
+                   v_host=None, v_host_stale=True, t=0.5 * (i + 1),
+                   since_reset_s=99.0, speed_degraded=True) for i in range(6)]
+    check(all(r["band"] == P.UNKNOWN for r in recs),
+          "...and no speed at all is UNKNOWN, which is the one silent state")
+
+    # -- S5 TTC is a trigger again -----------------------------------------
+    head("S5 -- TTC is urgent from any band")
+    # 4 s of headway is NORMAL. Closing hard at 4 s of headway is two seconds
+    # from a collision, and the band machine has nothing to say about it.
+    p = P.LivePolicy()
+    calm = [p.tick(tau=4.0, v2_trend=v2.STABLE, confidence=GOOD_CONF,
+                   v_host=25.0, v_host_stale=False, t=0.5 * (i + 1),
+                   since_reset_s=99.0, ttc=None) for i in range(4)]
+    check(all(r["band"] == P.NORMAL for r in calm) and not [r for r in calm if r["speak"]],
+          "4 s of headway, stable, is NORMAL and silent")
+    urgent = p.tick(tau=4.0, v2_trend=v2.RAPIDLY_SHRINKING, confidence=GOOD_CONF,
+                    v_host=25.0, v_host_stale=False, t=3.0, since_reset_s=99.0,
+                    ttc=P.TTC_URGENT_S - 0.5)
+    check(urgent["speak"] is not None and urgent["speak"]["line"] == P.LINE_BACK_OFF,
+          "...and the same headway with TTC under the threshold speaks, from NORMAL",
+          urgent["voice_reason"])
+    check(urgent["voice_reason"] == P.R_TTC_URGENT,
+          "the reason recorded is the TTC trigger, not a band entry")
+    again = p.tick(tau=4.0, v2_trend=v2.RAPIDLY_SHRINKING, confidence=GOOD_CONF,
+                   v_host=25.0, v_host_stale=False, t=3.5, since_reset_s=99.0,
+                   ttc=P.TTC_URGENT_S - 0.6)
+    check(again["speak"] is None,
+          "...once per occupancy: it is a trigger, not a siren")
+    # A TTC above the threshold is not a trigger, however fast the gap closes.
+    p2 = P.LivePolicy()
+    not_urgent = [p2.tick(tau=4.0, v2_trend=v2.RAPIDLY_SHRINKING,
+                          confidence=GOOD_CONF, v_host=25.0, v_host_stale=False,
+                          t=0.5 * (i + 1), since_reset_s=99.0,
+                          ttc=P.TTC_URGENT_S + 2.0) for i in range(6)]
+    check(not [r for r in not_urgent if r["speak"]],
+          "a comfortable TTC triggers nothing, whatever the trend says")
+
+    # -- S6 the physical floor ---------------------------------------------
+    #
+    # THE FIRST REAL DRIVE, REPLAYED. gap 3.7 m at 20.7 m/s, held for hundreds
+    # of frames, and fifteen of the twenty-two warnings that were spoken.
+    head("S6 -- a headway that cannot be one is refused")
+    tau_drive = _gap_to_tau(3.7, 20.7)          # 0.179 s
+    p = P.LivePolicy()
+    recs = drive(p, [(tau_drive, v2.STABLE, 0.97, 20.7)] * 40)
+    check(all(r["band"] == P.IMPLAUSIBLE for r in recs),
+          f"3.7 m at 20.7 m/s (tau {tau_drive:.3f} s) is IMPLAUSIBLE, not UNSAFE")
+    check(not spoken_lines(recs),
+          "...and 40 frames of it produce not one warning "
+          "(the drive produced fifteen)")
+    check(all(r["voice_reason"] == P.R_IMPLAUSIBLE for r in recs),
+          "...with the reason recorded, so the upstream fix can be tracked")
+
+    # It is a MEASUREMENT veto and only that: the same gap at a speed where it
+    # is an ordinary thing to see is judged normally.
+    p = P.LivePolicy()
+    park = drive(p, [(v2.compute_tau(3.7, 1.5), v2.STABLE, 0.97, 1.5)] * 8)
+    check(all(r["band"] == P.SUPPRESSED for r in park),
+          "the same 3.7 m at walking pace is ordinary, and reads SUPPRESSED")
+
+    # And a genuinely tight-but-possible headway is still warned about.
+    p = P.LivePolicy()
+    tight = drive(p, [(P.TAU_IMPLAUSIBLE_S + 0.25, v2.STABLE, 0.97, 20.0)] * 8)
+    check(any(r["band"] == P.UNSAFE for r in tight),
+          "a tight but survivable headway is still UNSAFE")
+    check(bool(spoken_lines(tight)), "...and is still spoken about")
+
+    # -- S7 coast scales with speed ----------------------------------------
+    head("S7 -- coasting a lost lead is a distance, not a duration")
+    fast_budget = P.coast_budget_s(30.0)
+    slow_budget = P.coast_budget_s(7.0)
+    check(fast_budget < slow_budget,
+          "a lost lead is coasted for less time at speed than at a crawl",
+          f"30 m/s -> {fast_budget:.2f}s, 7 m/s -> {slow_budget:.2f}s")
+    check(abs(fast_budget * 30.0 - slow_budget * 7.0) < 5.0
+          or fast_budget == config.HEADWAY_COAST_MIN_S
+          or slow_budget == config.HEADWAY_COAST_MAX_S,
+          "...because what is held constant is metres of road, within the clamps")
+    check(config.HEADWAY_COAST_MIN_S <= P.coast_budget_s(200.0)
+          <= config.HEADWAY_COAST_MAX_S,
+          "an absurd speed still lands inside the clamps")
+    check(P.coast_budget_s(None) == v2.MAX_COAST_S,
+          "no speed at all falls back to the v2 constant")
+
+    # -- S8 the thresholds live in config ----------------------------------
+    head("S8 -- every threshold is in config.py")
+    for name, cfg_name in (("TAU_ENTER_GETTING_UNSAFE", "HEADWAY_TAU_GETTING_UNSAFE_S"),
+                           ("TAU_ENTER_UNSAFE", "HEADWAY_TAU_UNSAFE_S"),
+                           ("HYST_S", "HEADWAY_TAU_HYSTERESIS_S"),
+                           ("V_MIN_COACH", "HEADWAY_MIN_COACH_SPEED_MS"),
+                           ("V_HOST_STALE_S", "HEADWAY_V_HOST_STALE_S"),
+                           ("TAU_IMPLAUSIBLE_S", "HEADWAY_TAU_IMPLAUSIBLE_S"),
+                           ("TTC_URGENT_S", "HEADWAY_TTC_URGENT_S"),
+                           ("DEGRADED_TAU_BIAS_S", "HEADWAY_DEGRADED_TAU_BIAS_S"),
+                           ("DEGRADED_CONF_RELIEF", "HEADWAY_DEGRADED_CONF_RELIEF"),
+                           ("CONFIRM_S", "HEADWAY_CONFIRM_S"),
+                           ("COOLDOWN_CALM_S", "HEADWAY_COOLDOWN_CALM_S"),
+                           ("COOLDOWN_UNSAFE_S", "HEADWAY_COOLDOWN_UNSAFE_S"),
+                           ("GENUINE_CLEAR_S", "HEADWAY_GENUINE_CLEAR_S"),
+                           ("ESCALATE_AFTER_S", "HEADWAY_ESCALATE_AFTER_S"),
+                           ("PENDING_ENTRY_MAX_S", "HEADWAY_PENDING_ENTRY_MAX_S")):
+        check(getattr(P, name) == getattr(config, cfg_name),
+              f"live_policy.{name} is config.{cfg_name}")
+
+    # -- S9 determinism ----------------------------------------------------
+    head("S9 -- the same frames give the same answer, every time")
+    script = [(4.0, v2.STABLE), (2.8, v2.SHRINKING), (2.8, v2.SHRINKING),
+              (1.6, v2.RAPIDLY_SHRINKING), (1.6, v2.RAPIDLY_SHRINKING),
+              (1.2, v2.RAPIDLY_SHRINKING), (5.0, v2.INCREASING)]
+    runs = []
+    for _ in range(5):
+        p = P.LivePolicy()
+        runs.append([(r["band"], r["voice_reason"],
+                      (r["speak"] or {}).get("line")) for r in drive(p, script)])
+    check(all(r == runs[0] for r in runs),
+          "five runs of the same script are byte-identical")
+
+
 def main():
     print("=" * 70)
     print("RIO live headway (v3) — verification")
     print("=" * 70)
     run_pipeline()
     run_policy()
+    run_speed()
     run_firewall()
     run_lanes()
     run_detector()

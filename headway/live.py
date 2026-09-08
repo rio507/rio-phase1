@@ -45,6 +45,7 @@ from . import detect as detect_mod
 from . import lanes as lanes_mod
 from . import plausibility as plaus_mod
 from . import live_policy as policy_mod
+from . import speed as speed_mod
 from . import membership as member_mod
 from . import state as v2
 from .filter import HeadwayFilter
@@ -218,6 +219,14 @@ class LiveSession:
 
         self.kf = HeadwayFilter()
         self.policy = LivePolicy()
+        # WHICH SPEED THE WARNING RESTS ON. OBD when the car has a bus worth
+        # reading, the phone's GPS otherwise, the last known speed for a
+        # bounded coast after that, and nothing at all only when there is
+        # genuinely nothing. See headway/speed.py -- the resolver holds the
+        # last believed speed, so it belongs to the session and is reset with
+        # it.
+        self.speed = speed_mod.SpeedResolver(
+            obd_reader=speed_mod.default_obd_reader())
 
         self.corridor = None        # this frame's corridor: LaneCorridor or EgoCorridor
         self.base_corridor = None   # the static trapezoid, always kept as fallback
@@ -319,11 +328,18 @@ class LiveSession:
         dt = self._advance_clock(frame_t)
         t = self.t
 
-        # --- speed validity (spec §4). Decided here, applied in the policy. ---
-        stale = (v_host is None
-                 or not math.isfinite(float(v_host))
-                 or (v_host_age_s is not None
-                     and float(v_host_age_s) > policy_mod.V_HOST_STALE_S))
+        # --- which speed, and how much of it to trust (item 2) ------------
+        #
+        # This used to be one boolean computed from the phone's fix alone.
+        # It is a resolution across three sources now, and `stale` keeps its
+        # old meaning exactly -- "there is no speed here" -- so every branch
+        # downstream that reads it still reads the same thing. What is new is
+        # that a fix which has merely gone quiet no longer lands in that
+        # branch: it is coasted, marked degraded, and every margin widens.
+        fix = self.speed.resolve(v_host, v_host_age_s, t)
+        v_speed = fix.v_ms
+        stale = not fix.known
+        speed_degraded = fix.degraded
 
         # --- lanes: ego-lane geometry for this frame's corridor -------------
         lane_result = None
@@ -556,9 +572,14 @@ class LiveSession:
         # gap: no measurement in over MAX_COAST_S means no gap, not a stale one.
         # The client renders a missing gap as "--", which is true, rather than
         # as a number, which is not.
-        gap_m, gap_invalid = report_gap(d, snap["coast_age"])
+        # HOW LONG A LOST LEAD MAY BE COASTED IS A DISTANCE, NOT A DURATION.
+        # A flat 1.0 s was 30 m of road at 30 m/s and 5 m at 5 m/s, which is one
+        # number meaning two entirely different things. See
+        # live_policy.coast_budget_s.
+        coast_budget = policy_mod.coast_budget_s(v_speed)
+        gap_m, gap_invalid = report_gap(d, snap["coast_age"], coast_budget)
 
-        v_for_tau = 0.0 if stale else float(v_host)
+        v_for_tau = 0.0 if stale else float(v_speed)
         tau = v2.compute_tau(d, v_for_tau) if not stale else float("inf")
         ttc = v2.compute_ttc(d, d_dot)
 
@@ -573,14 +594,23 @@ class LiveSession:
         confidence = v2.compute_confidence(valid_ratio, var_norm, quality,
                                            anchor_age, snap["coast_age"],
                                            lane_conf=lane_conf,
-                                           corridor_source=self.corridor.source)
+                                           corridor_source=self.corridor.source,
+                                           max_coast_s=coast_budget)
 
         # --- policy --------------------------------------------------------
         tick = self.policy.tick(
             tau=tau, v2_trend=self.trend, confidence=confidence,
-            v_host=(None if stale else float(v_host)), v_host_stale=stale,
+            v_host=(None if stale else float(v_speed)), v_host_stale=stale,
             t=t, since_reset_s=(t - self.reset_t),
             new_lead=snap["new_lead"], track_lost=(box is None),
+            # TTC WAS COMPUTED ON EVERY FRAME OF THE FIRST REAL DRIVE AND
+            # REACHED NOTHING. It was logged 511 times, 41 of them under the
+            # urgent threshold, and tick() had no parameter to take it. v2
+            # §1/§9 has always said it is urgent from any band; this is the
+            # line that makes that true in the live loop.
+            ttc=ttc,
+            speed_degraded=speed_degraded,
+            speed_source=fix.source,
         )
 
         # --- per-object record for the conversation path ---------------------
@@ -669,6 +699,12 @@ class LiveSession:
             "speak": tick["speak"],
             "voice_reason": tick["voice_reason"],
             "voice_line": tick["voice_line"],
+            # The policy's own account of the speed it judged on, alongside the
+            # resolver's under "speed" below. They must agree; keeping both is
+            # what lets a review notice if they ever stop.
+            "speed_source": tick.get("speed_source"),
+            "speed_degraded": tick.get("speed_degraded"),
+            "tau_bias_s": tick.get("tau_bias_s"),
 
             "confidence": _round(confidence, 3),
             "depth_conf": _round(depth_conf, 3),
@@ -680,8 +716,13 @@ class LiveSession:
             "coast_age_s": _round(snap["coast_age"], 3),
             "track_lost": box is None,
 
-            "v_host": _round(v_host, 3) if v_host is not None else None,
+            "v_host": _round(v_speed, 3) if v_speed is not None else None,
             "v_host_stale": bool(stale),
+            # Where the denominator of tau came from, and how far it was
+            # trusted. Every band is a claim about gap/speed, so a log that
+            # does not say which speed cannot be used to check one.
+            "speed": fix.to_log(),
+            "coast_budget_s": _round(coast_budget, 3),
 
             "corridor": [[round(float(x), 1), round(float(y), 1)]
                          for x, y in self.corridor.polygon()],

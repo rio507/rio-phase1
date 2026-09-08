@@ -338,7 +338,8 @@ def anchor_freshness(anchor_age_s: float) -> float:
 
 def compute_confidence(depth_valid_ratio, roi_variance_norm, track_quality,
                        anchor_age_s, coast_age=0.0,
-                       lane_conf=None, corridor_source="static") -> float:
+                       lane_conf=None, corridor_source="static",
+                       max_coast_s=None) -> float:
     """v2 §8 confidence: a weighted SUM.
 
         .30*depth_valid_ratio + .30*(1 - roi_variance_norm)
@@ -371,7 +372,13 @@ def compute_confidence(depth_valid_ratio, roi_variance_norm, track_quality,
     if corridor_source == "ufld" and lane_conf is not None:
         base += CONF_LANE_BONUS * _clip01(lane_conf)
 
-    coast = max(0.0, 1.0 - float(coast_age) / MAX_COAST_S)
+    # The coast decay's denominator is SPEED-SCALED in the live loop
+    # (live_policy.coast_budget_s): eighteen metres of road is as far as a
+    # vehicle may be extrapolated, which is 0.6 s at freeway speed and 2.5 s at
+    # a crawl. Callers that pass nothing get MAX_COAST_S, which is the offline
+    # v2 behaviour and is what headway/selftest.py's 109 checks assert.
+    budget = float(max_coast_s) if max_coast_s else MAX_COAST_S
+    coast = max(0.0, 1.0 - float(coast_age) / budget)
     return _clip01(base * coast)
 
 
