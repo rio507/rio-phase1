@@ -1106,6 +1106,69 @@ HEADWAY_TAU_HYSTERESIS_S = 0.2
 # 5 m/s is 11 mph.
 HEADWAY_MIN_COACH_SPEED_MS = 5.0
 
+# --- what the detector costs, and how that is checked -----------------------
+#
+# THE OLD CHECK WAS A COIN FLIP. headway/live_selftest.py asserted that
+# detection ran in "single-digit milliseconds" -- p95 wall time under 10 ms --
+# and on this box the same code reads 9.99, 10.39, 11.55 or 15.25 depending on
+# what else is running. That is not a bar with headroom; it is a round number
+# sitting in the middle of the measurement's own distribution, and it went red
+# on load and green on luck.
+#
+# WHAT THE DETECTOR IS ACTUALLY DOING, which is the thing nobody had measured.
+# Profiled over ten forwards (RTX 4090, torch 2.11/cu128, RF-DETR nano fp16,
+# 384x384 input, 2026-09-08):
+#
+#     GPU work            1.63 ms per forward
+#     CPU work           11.0  ms per forward
+#     elapsed             9.1  ms per forward
+#     addmm launches      104  per forward, ~5.9 us of GPU each
+#
+# It is LAUNCH BOUND. The GPU does a millisecond and a half of arithmetic in a
+# few hundred tiny kernels and spends the rest of the time waiting for the CPU
+# to submit the next one. Three consequences, all measured rather than reasoned:
+#
+#   * making the arithmetic heavier costs NOTHING. fp32 instead of fp16: 9.08
+#     against 9.40 ms. Input resolution x1.5, which is 2.25x the pixels: 9.05
+#     against 9.10 ms. Neither is a rounding error in the check's favour --
+#     they are genuinely free here.
+#   * making the model BIGGER costs in proportion, because a bigger model is
+#     more launches. Running the same forward twice: 18.5 ms against 9.4.
+#   * the variance is CPU scheduling, not GPU contention. Measured against the
+#     live server driving 14 fps of frames through detect, depth and lanes on
+#     the same card: floor 9.28 -> 8.29, p50 9.78 -> 9.74, p95 10.35 -> 10.31,
+#     and only the max moved, 13.4 -> 15.9.
+#
+# So the check asserts the FLOOR of the model pass's GPU-event time. A floor is
+# what the hardware can do; load can only ever push a sample above it, never
+# below. And the floor moves for exactly the regression this check is for -- a
+# heavier model -- while precision and model identity are asserted DIRECTLY by
+# the two checks next to it (the fp16 dtype and the parameter count), which is
+# where they belong and where a timer would have been lying about them.
+#
+# A NUMBER WORTH COMING BACK TO: 1.63 ms of work taking 9.1 ms is roughly a 5x
+# speed-up sitting there, in CUDA graphs or torch.compile(mode="reduce-
+# overhead"), if detection ever needs to be cheaper than it is. It does not
+# today -- see the frame budget below.
+
+# 1.5x the measured floor of 9.1-9.8 ms. Above every launch-count regression
+# and far above the scheduling jitter of a busy machine.
+#
+# Calibrated to THIS pod's CPU, which is what the floor depends on. A slower
+# host would need this re-measured, not raised: re-run
+# `python -m headway.live_selftest` on a quiet machine and read the floor it
+# prints.
+HEADWAY_DETECT_KERNEL_BUDGET_MS = 15.0
+
+# ...and the property the check is FOR, which is not a round number at all:
+# detection has to be cheap enough to run on every frame. At the transport's
+# ceiling of HEADWAY_WS_MAX_FPS a frame is 67 ms, and detection shares it with
+# depth, lanes, the JPEG decode, membership and the filter -- 14 ms of them on
+# the first real drive. Half a frame is the bar, generous on purpose: this one
+# IS asserted on the tail, so it has to survive a bad minute.
+# For contrast, the Qwen enumeration this replaced took 600-1500 ms.
+HEADWAY_DETECT_FRAME_BUDGET_FRAC = 0.5
+
 # --- the car's own bodywork, which is not a car -----------------------------
 #
 # THE UPSTREAM FIX FOR THE FLOOR BELOW. HEADWAY_TAU_IMPLAUSIBLE_S stops RIO

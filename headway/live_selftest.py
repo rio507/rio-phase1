@@ -991,23 +991,116 @@ def run_detector():
     if frame is None:
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 
-    for _ in range(5):
-        D.detect(frame)
+    # -- WHAT THIS MEASURES, AND WHY IT IS NOT WALL-CLOCK p95 ----------------
+    #
+    # This check used to assert p95 wall time under 10 ms and called it "single
+    # digit milliseconds". On this box the same code reads 9.99, 10.39, 11.55
+    # or 15.25 depending on what else is running -- so it went red on load and
+    # green on luck, which is the one thing a test may not do. The bar was not
+    # a measured baseline with headroom; it was a round number sitting in the
+    # middle of the measurement's own distribution.
+    #
+    # Two things changed, and the second one only after profiling the thing.
+    #
+    # THE MEASUREMENT. `timing_ms.forward` is the model pass's GPU-event time
+    # now, not a wall clock around an asynchronous launch that returned in
+    # 0.4 ms while the GPU spent 9.8.
+    #
+    # THE STATISTIC: the floor, not the tail. Profiled, the detector turns out
+    # to be LAUNCH BOUND -- 1.63 ms of GPU arithmetic per forward, spread over
+    # ~104 tiny addmm launches, against 11 ms of CPU. The GPU spends most of
+    # the pass waiting to be fed. So the variance this check kept tripping over
+    # was CPU scheduling, and the floor is what the machine can do when nothing
+    # is in its way. Load can push a sample above the floor; nothing can push
+    # one below it.
+    #
+    # WHAT THIS THEREFORE CATCHES, AND WHAT IT DOES NOT. Measured, not assumed:
+    #
+    #     the same forward run twice   9.4 -> 18.5 ms    caught
+    #     fp32 instead of fp16         9.4 ->  9.1 ms    NOT caught
+    #     input resolution x1.5        9.1 ->  9.1 ms    NOT caught
+    #
+    # A launch-bound model does not care how heavy the arithmetic is, so a
+    # timer cannot see precision or input size. Those two are asserted directly
+    # by the checks a few lines above -- the fp16 dtype and the parameter count
+    # -- which is where they belong, and where a timing bar would have been
+    # quietly lying about them.
+    #
+    # p10 rather than min, deliberately: the minimum of a short run is one
+    # sample and can be a fluke of the clock. p10 of sixty is a floor.
+    import config
+
+    N = 60
+    for _ in range(15):
+        D.detect(frame)      # warm the clocks, not just the caches
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    times = []
-    for _ in range(30):
+
+    kernel, wall = [], []
+    for _ in range(N):
         t0 = time.perf_counter()
-        D.detect(frame)
+        r = D.detect(frame)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1000.0)
-    times.sort()
-    p50, p95 = times[len(times) // 2], times[int(len(times) * 0.95)]
-    # The whole justification for retiring Qwen: single-digit milliseconds, so
-    # detection can run on every frame instead of being rationed.
-    check(p95 < 10.0, "detection is single-digit ms — the point of the swap",
-          f"p50 {p50:.2f} ms, p95 {p95:.2f} ms (Qwen enumeration was 600-1500 ms)")
+        wall.append((time.perf_counter() - t0) * 1000.0)
+        kernel.append(r["timing_ms"]["forward"])
+
+    def _pct(v, q):
+        v = sorted(v)
+        return v[min(len(v) - 1, int(round((len(v) - 1) * q)))]
+
+    k_floor, k_p50, k_p95 = _pct(kernel, 0.10), _pct(kernel, 0.50), _pct(kernel, 0.95)
+    w_floor, w_p50, w_p95 = _pct(wall, 0.10), _pct(wall, 0.50), _pct(wall, 0.95)
+    w_max = max(wall)
+
+    print(f"    forward GPU kernel  p10 {k_floor:.2f}  p50 {k_p50:.2f}  "
+          f"p95 {k_p95:.2f}  max {max(kernel):.2f} ms")
+    print(f"    whole detect() wall p10 {w_floor:.2f}  p50 {w_p50:.2f}  "
+          f"p95 {w_p95:.2f}  max {w_max:.2f} ms")
+    # Said out loud rather than left to be inferred from a red check: a run
+    # whose tail is far above its floor was sharing the machine with something.
+    # This is information, never a failure.
+    busy = max(k_p95 / max(k_floor, 1e-6), w_p95 / max(w_floor, 1e-6))
+    if busy > 1.4:
+        print(f"    (the machine was busy: the tail is {busy:.1f}x the floor. "
+              f"Not a regression — the floor is what is asserted, and it is "
+              f"the one statistic load cannot move.)")
+
+    if torch.cuda.is_available():
+        check(k_floor < config.HEADWAY_DETECT_KERNEL_BUDGET_MS,
+              "the detector's own GPU time is still what it was measured at",
+              f"floor {k_floor:.2f} ms against a budget of "
+              f"{config.HEADWAY_DETECT_KERNEL_BUDGET_MS:.0f} — 1.5x the "
+              f"measured 9.1-9.8 ms baseline. A model with more layers in it "
+              f"doubles this; a busy machine does not move it at all")
+    else:
+        print("    [SKIP] no CUDA — kernel time is not measurable here")
+
+    # ...and the property the whole check exists for, which the kernel time
+    # alone cannot speak to: the WHOLE call has to fit in a frame, including
+    # the preprocess, the postprocess and the Python gate. A slow NMS added to
+    # the gate would be invisible to the check above and caught by this one.
+    #
+    # ON THE FLOOR AGAIN, and this one was learned the hard way: the first
+    # version of this line asserted p95 and was a second flake in a new place.
+    # Measured, with 64 spinning processes on a 13.6-core container -- a
+    # contention factor of 4.7x on a pure-CPU yardstick:
+    #
+    #     kernel floor    9.72 -> 9.85 ms   (+1.3%)
+    #     wall p95       12.27 -> 94.97 ms  (+674%)
+    #
+    # A launch-bound model on a starved CPU is almost entirely the CPU's
+    # problem, so its tail is a measurement of the machine and not of the code.
+    # The floor is the code. What detection costs on a real drive is a question
+    # the drive log answers rather than this one: `timing_ms.detect` was 9.1 ms
+    # at p50 on session 06af3214, with depth, lanes and the rest running.
+    frame_budget_ms = 1000.0 / config.HEADWAY_WS_MAX_FPS
+    detect_budget_ms = frame_budget_ms * config.HEADWAY_DETECT_FRAME_BUDGET_FRAC
+    check(w_floor < detect_budget_ms,
+          "and the whole call still fits in a live frame with room to spare",
+          f"floor {w_floor:.2f} ms of a {detect_budget_ms:.0f} ms share of a "
+          f"{frame_budget_ms:.0f} ms frame — the Qwen enumeration this "
+          f"replaced took 600-1500 ms")
 
     r = D.detect(frame)
     # det is (label, box, score, info) -- indexed rather than unpacked so a

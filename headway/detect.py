@@ -576,6 +576,26 @@ def _preprocess(frame_bgr):
     return t.to(_dtype)
 
 
+# One pair of CUDA events, reused. Creating two per frame at 15 fps is
+# allocation for nothing, and `_lock` already serialises every forward pass, so
+# a shared pair cannot be recorded by two calls at once.
+#
+# `enable_timing=True` is what makes elapsed_time work; without it an event is
+# only a synchronisation marker.
+_events = None
+
+
+def _forward_events():
+    """The event pair to bracket the model pass with, or (None, None) on CPU."""
+    global _events
+    if not torch.cuda.is_available():
+        return None, None
+    if _events is None:
+        _events = (torch.cuda.Event(enable_timing=True),
+                   torch.cuda.Event(enable_timing=True))
+    return _events
+
+
 def detect(frame, score_min: float = None, variant: str = None,
            dedupe: bool = True) -> dict:
     """Detect road users in one BGR frame.
@@ -597,15 +617,30 @@ def detect(frame, score_min: float = None, variant: str = None,
                     predate it read the first three fields and are unaffected.
         n_duplicates_dropped  how many boxes were suppressed as duplicates
         n_small_rejected      how many failed the size/score floor
-        timing_ms   forward / postprocess / total
+        timing_ms   forward / postprocess / total, in milliseconds.
+
+                    `forward` is the GPU KERNEL time of the model pass,
+                    measured with CUDA events -- not the wall clock around the
+                    call. It used to be the wall clock, and on this hardware
+                    that reported 0.4 ms for 9.8 ms of work: a CUDA launch
+                    returns the instant the kernels are queued, so what was
+                    being timed was the queueing. The number is read after the
+                    `.cpu()` below, which has already synchronised past both
+                    events, so this costs nothing.
     """
     t0 = time.perf_counter()
     _ensure_loaded(variant)
     h, w = frame.shape[:2]
 
+    ev0, ev1 = _forward_events()
     with _lock:
         with torch.inference_mode():
-            out = _model(_preprocess(frame))
+            x = _preprocess(frame)
+            if ev0 is not None:
+                ev0.record()
+            out = _model(x)
+            if ev1 is not None:
+                ev1.record()
             if isinstance(out, tuple):
                 out = {"pred_boxes": out[0], "pred_logits": out[1]}
             t_fwd = time.perf_counter()
@@ -613,14 +648,26 @@ def detect(frame, score_min: float = None, variant: str = None,
             res = _postproc({"pred_logits": out["pred_logits"].float(),
                              "pred_boxes": out["pred_boxes"].float()},
                             target_sizes=sizes)[0]
+        # This is the synchronisation point for the whole pass, which is why
+        # the events above can be read straight after it.
         scores = res["scores"].detach().cpu().numpy()
         labels = res["labels"].detach().cpu().numpy()
         boxes = res["boxes"].detach().cpu().numpy()
+        fwd_ms = None
+        if ev0 is not None:
+            try:
+                fwd_ms = ev0.elapsed_time(ev1)
+            except Exception:
+                # A device that cannot time itself is not a reason to fail a
+                # frame. The field goes to the wall-clock meaning it had.
+                fwd_ms = None
 
     raw, n_bonnet = raw_boxes(scores, labels, boxes, w, h)
     out = gate(raw, dedupe=dedupe, score_min=score_min)
     out["n_bonnet_rejected"] = n_bonnet
     t_end = time.perf_counter()
+    if fwd_ms is None:
+        fwd_ms = (t_fwd - t0) * 1000
 
     out.update({
         # Everything the model proposed that is a road user and is not the
@@ -631,7 +678,8 @@ def detect(frame, score_min: float = None, variant: str = None,
         "raw": raw,
         "image": {"w": w, "h": h},
         "timing_ms": {
-            "forward": round((t_fwd - t0) * 1000, 2),
+            # GPU kernel time of the model pass. See the docstring.
+            "forward": round(fwd_ms, 2),
             "post": round((t_end - t_fwd) * 1000, 2),
             "total": round((t_end - t0) * 1000, 2),
         },
