@@ -180,11 +180,18 @@ section('normal navigation — no vision at all');
   ok(arrived.length === 1 && r.events[r.events.length - 1].type === 'NAV_ARRIVED',
      'arrival fires exactly once, last');
 
+  // Eight, not seven. "Almost there." is a line the server has always written
+  // on every ARRIVE maneuver and nothing could ever say: rio_navplan's ARRIVE
+  // branch only ever considered the arrival call itself. The first real drive
+  // is what found that whole branch was unreachable — see the note on
+  // onArrived — and enabling the early line for ARRIVE came with the fix.
   ok(r.spoken.join(' | ') ===
      'Left turn coming up. | Take the next left onto Lincoln Boulevard. | Left here. | ' +
      'Right turn coming up. | Take the next right onto Fell Street. | Right here. | ' +
-     'Your destination is on the right.',
-     'the whole drive is seven lines: prepare, instruct, confirm, twice, then arrival');
+     'Almost there. | Your destination is on the right.',
+     'the whole drive is eight lines: prepare, instruct, confirm, twice, '
+     + 'then almost-there and arrival');
+  if (process.env.NAV_DEBUG) console.log('    SPOKEN:', JSON.stringify(r.spoken, null, 1));
   ok(!r.spoken.some(t => /\d/.test(t)),
      'not one of them is a distance countdown — no "in 300 meters" anywhere');
 

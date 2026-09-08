@@ -2210,6 +2210,49 @@ NAV_STATIONARY_SPEED_MS = 0.7
 # --- speech windows (§12) ---------------------------------------------------
 # Three OPPORTUNITIES, not three mandatory calls. RIO is a passenger who tells
 # you about the turn, not a GPS that counts down to it.
+# --- when a fix stops arriving, and what the tracker does about it ----------
+#
+# THE FIRST REAL DRIVE IS THE ARGUMENT FOR ALL THREE OF THESE. On session
+# a2da65cd the browser's single watchPosition delivered a fix at nav clock
+# 49.06 and the next one at 261.53 -- 212 SECONDS with no position update --
+# while the page went on posting headway frames at 3.9 per second throughout,
+# so it was demonstrably alive. On 7e76d316 fixes arrived roughly every six
+# seconds, tripping the five-second staleness timer three times in nineteen.
+# Not one turn was called on either drive, and no speech was ever queued and
+# dropped: NAV_SPEECH_EXPIRED and NAV_SPEECH_INVALIDATED are zero across every
+# drive in the log. Nothing reached the arbiter, because the speech planner is
+# driven by NAV_PROGRESS and the tracker emits NAV_PROGRESS only when a fix
+# arrives.
+
+# How long the BROWSER waits for a fix before tearing down the geolocation
+# watch and starting a new one. Shorter than the tracker's staleness timeout so
+# the recovery is already under way by the time the tracker notices.
+#
+# A watch that has gone quiet on iOS does not report an error and does not
+# recover on its own; nothing in the old page watched for it, and its error
+# callback neither logged nor re-armed.
+NAV_GPS_WATCHDOG_S = 4.0
+# ...and how many times, before this page accepts that the radio is not coming
+# back and stops churning the battery.
+NAV_GPS_WATCHDOG_MAX_REARMS = 8
+# On the third re-arm and after, high accuracy is dropped. A coarse fix every
+# second is worth more to a route tracker than a precise one that never comes,
+# and enableHighAccuracy is the setting most often implicated when an iOS watch
+# stalls.
+NAV_GPS_WATCHDOG_COARSE_AFTER = 2
+
+# How long the TRACKER dead-reckons along the route after fixes stop.
+#
+# The route is already in hand and following it needs no help -- that was
+# always the argument for tracking client-side, and it was only ever half
+# implemented: the tracker kept its state but stopped SAYING anything. Inside
+# this window it advances along the polyline from the last fix at the last
+# known speed and goes on making calls, marked coasted, with every margin
+# widened. It does NOT pass maneuvers or arrive on invented progress -- a
+# junction is passed when a real fix says so, because coasting past a turn the
+# driver never took is worse than a late call.
+NAV_GPS_COAST_MAX_S = 20.0
+
 NAV_EARLY_GUIDANCE_S = 25.0         # "Right turn coming up."      (optional)
 NAV_ANCHOR_ACQUISITION_S = 11.0     # start looking for the landmark
 NAV_CONTEXT_CALL_S = 6.0            # "Turn right by the Shell station."
@@ -2219,6 +2262,21 @@ NAV_NEAR_TURN_S = 2.5               # "Right here."                (only if need
 NAV_MIN_CALL_DISTANCE_M = 20.0
 NAV_MAX_CALL_DISTANCE_M = 400.0
 NAV_EARLY_MAX_DISTANCE_M = 900.0
+
+# --- distance floors: what makes a slow approach still get warning distance --
+#
+# The three calls above are timed in SECONDS TO THE TURN, which is the right
+# unit and is already speed-scaled: 25 s is 750 m at 30 m/s and 250 m at 10.
+# What it is not is what a driver expects in town, where every other navigation
+# system calls a turn at a fixed distance and 6 s at 10 m/s is sixty metres.
+#
+# Measured on session 06af3214: the primary call for m0 went out at 47 m and
+# 5.0 s, at 10.4 m/s. That is inside the junction. These floors fire whichever
+# comes first, so at speed the time term still leads and in town the distance
+# term does -- which is exactly how a conventional turn-by-turn behaves.
+NAV_EARLY_DISTANCE_M = 300.0        # "...coming up"       at 300 m if not sooner
+NAV_PRIMARY_DISTANCE_M = 130.0      # the instruction      at 130 m if not sooner
+NAV_IMMINENT_DISTANCE_M = 35.0      # "Left here."         at 35 m if not sooner
 # Below this, time-to-maneuver stops meaning anything: at 0.2 m/s every
 # maneuver is hours away and nothing is ever said, including the turn being
 # crept towards in traffic. A floor for the arithmetic, not a claimed speed.

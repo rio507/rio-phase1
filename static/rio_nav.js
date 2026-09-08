@@ -520,13 +520,23 @@
 
     /* GPS staleness is the ABSENCE of fixes, so something has to run when
        nothing arrives. One second, and it does nothing else. */
+    /* ...and the tick DOES SOMETHING NOW. It used to be able to change the GPS
+       state and nothing else, which is why a quiet radio was a silent
+       navigation system: the speech planner is driven by NAV_PROGRESS and
+       position() was the only thing that emitted one. tick() dead-reckons
+       along the route inside its coast window and emits progress from there,
+       so the turns keep being called while the fix is being recovered.
+
+       Twice a second rather than once. The coast is an extrapolation and the
+       calls it makes are timed against a junction; a one-second granularity
+       puts up to a second of error into "Left here". */
     setInterval(function () {
       if (!tracker) return;
       clockS = sim.timer ? clockS : nowS();
       var before = tracker.state().gps_state;
       tracker.tick(clockS);
       if (tracker.state().gps_state !== before) paintStates();
-    }, 1000);
+    }, 500);
 
     function attach(r) {
       route = r;
@@ -557,6 +567,16 @@
       status('Route set · ' + (r.destination.display_name || r.destination.formatted_address));
       // Tracking needs fixes whether or not a drive is running, and the watch
       // is shared, so asking for it twice is free.
+      //
+      // The watchdog's numbers travel with the route like every other timing
+      // value, so how long the page waits for a fix before rebuilding the
+      // watch is tuned in config.py and reaches the car with the next route.
+      // See the note on startWatch in index.html for why that watchdog exists:
+      // two hundred and twelve seconds of a real drive with no fix and no turn
+      // called, on a page that was demonstrably alive throughout.
+      if (RIO.headway && RIO.headway.configureWatch) {
+        RIO.headway.configureWatch(r.timing);
+      }
       if (RIO.headway && RIO.headway.startWatch) RIO.headway.startWatch();
       // A fix already in hand starts tracking immediately rather than at the
       // next GPS tick, so a route set 200 m from a turn announces it now.

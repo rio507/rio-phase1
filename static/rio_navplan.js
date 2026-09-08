@@ -5,12 +5,26 @@
  * geometry and it cannot alter navigation truth: every sentence it can produce
  * was written by the server at route load and arrives in the route payload.
  *
- * THREE OPPORTUNITIES, NOT THREE ANNOUNCEMENTS
- * --------------------------------------------
- *   EARLY     ~25 s out   "Right turn coming up."      optional, no camera
- *   PRIMARY   ~6 s out    "Turn right by the Shell station."
- *                         ...or "Take the next right." when there is no anchor
- *   IMMINENT  ~2.5 s out  "Right here."                only when it adds something
+ * FOUR OPPORTUNITIES, NOT FOUR ANNOUNCEMENTS
+ * ------------------------------------------
+ *   EARLY     ~25 s or 300 m   "Right turn coming up."  optional, no camera
+ *   PRIMARY   ~6 s or 130 m    "Turn right by the Shell station."
+ *                              ...or "Take the next right." with no anchor
+ *   IMMINENT  ~2.5 s or 35 m   "Right here."      only when it adds something
+ *   ARRIVAL   at the kerb      "You've arrived at 2411 Lincoln Blvd."
+ *
+ * Each is "whichever comes first": the second is the right unit and is already
+ * speed-scaled, and the metre floor is what stops a slow approach in town
+ * being called from inside the junction. Session 06af3214's primary call for
+ * m0 went out at 47 m.
+ *
+ * THE ARRIVAL CALL COULD NOT FIRE AT ALL until the first real drive found it.
+ * The tracker emits NAV_ARRIVED and RETURNS, before any NAV_PROGRESS for the
+ * ARRIVE maneuver -- and this file's only path to the arrival sentence was
+ * inside onProgress. So the route's own "You've arrived at 2411 Lincoln Blvd."
+ * was written by the server, carried to the browser, and unreachable. On that
+ * drive NAV_ARRIVED fired at t=600.2 and nothing was said. There is an
+ * onArrived handler now.
  *
  * The primary call REPLACES distance narration. RIO does not say "Turn right in
  * 200 feet" and then "Turn right by the Shell" — the second sentence is the
@@ -69,6 +83,16 @@
     min_call_distance_m: 20.0,
     max_call_distance_m: 400.0,
     early_max_distance_m: 900.0,
+    /* DISTANCE FLOORS, so a slow approach still gets warning distance.
+       The three calls are timed in seconds to the turn, which is the right
+       unit and is already speed-scaled -- 25 s is 750 m at 30 m/s. What it is
+       not is what a driver expects in town: 6 s at 10 m/s is sixty metres, and
+       measured on session 06af3214 the primary call for m0 went out at 47 m
+       and 5.0 s. These fire whichever comes first, so at speed the time term
+       leads and in town the distance term does. */
+    early_distance_m: 300.0,
+    primary_distance_m: 130.0,
+    imminent_distance_m: 35.0,
     gps_degraded_bias_s: 2.0,
     stationary_speed_ms: 0.7,
     duplicate_instruction_cooldown_s: 8.0,
@@ -152,9 +176,19 @@
 
     function bias() {
       var st = tracker && tracker.state ? tracker.state() : null;
-      // GPS degraded near a maneuver: speak EARLIER, never later. A fix we do
-      // not trust is a reason to give the driver more room, not less.
-      return (st && st.gps_state === 'GPS_DEGRADED') ? opt.gps_degraded_bias_s : 0;
+      if (!st) return 0;
+      /* GPS degraded near a maneuver: speak EARLIER, never later. A fix we do
+         not trust is a reason to give the driver more room, not less.
+
+         GPS_STALE gets the same widening, and that is a change the first real
+         drive forced. A stale fix used to mean the planner was not ticked at
+         all -- the tracker only emitted progress when a fix arrived -- so
+         "what should we say while stale" had no answer because nothing was
+         being said. The tracker dead-reckons now (rio_navcore.tick), so the
+         question is live, and the answer is the same one degraded gets: room,
+         not silence. */
+      return (st.gps_state === 'GPS_DEGRADED' || st.gps_state === 'GPS_STALE')
+        ? opt.gps_degraded_bias_s : 0;
     }
 
     /* --- the anchor ------------------------------------------------------ */
@@ -264,7 +298,8 @@
       return Math.round((ttl[callType] || 5.0) * 1000);
     }
 
-    function speak(man, callType, text, anchor, snapshot) {
+    function speak(man, callType, text, anchor, snapshot, o) {
+      o = o || {};
       if (!text) return false;
       // Duplicate suppression: the same sentence twice inside the cooldown is
       // RIO repeating itself, which reads as a fault even when it is not.
@@ -304,6 +339,11 @@
         if (stopped) return false;
         if (candidate.route_generation !== activeGeneration()) return false;
         if (clock > candidate.expires_at) return false;
+        // Arrival is exempt from the rest, and only arrival. See arrivalCall:
+        // once the tracker has arrived there is no active maneuver for the
+        // other three questions to be about, and asking them would drop the
+        // one line the whole route was for.
+        if (o.arrival) return true;
         if (!tracker) return true;
         var active = tracker.maneuver ? tracker.maneuver() : null;
         if (!active || active.id !== candidate.maneuver_id) return false;
@@ -357,6 +397,45 @@
       return true;
     }
 
+    /* THE ARRIVAL SENTENCE, and the one thing about it that is different.
+     *
+     * Its validity cannot ask "is this still the active maneuver", because by
+     * the time the tracker says ARRIVED there is no active maneuver -- manIdx
+     * has run off the end, tracker.maneuver() is null, and the ordinary
+     * valid() would drop the line at dequeue every single time. So the
+     * arrival call is validated on the two things that still mean something:
+     * the drive has not been stopped, and this is still the route we are on.
+     */
+    function arrivalCall(man, snapshot) {
+      var b = book(man.id);
+      if (b.called[CALL.ARRIVAL]) return false;
+      var text = (man.speech && (man.speech.arrival || man.speech.primary)) || null;
+      if (!text) return false;
+      b.called[CALL.ARRIVAL] = true;
+      return speak(man, CALL.ARRIVAL, text, null, snapshot || {
+        tta_s: 0, to_maneuver_m: 0, gps_state: null, speed_ms: null
+      }, { arrival: true });
+    }
+
+    /* The tracker has decided the drive is over. It emits NAV_ARRIVED and
+     * RETURNS, before any progress event for the ARRIVE maneuver -- so until
+     * this existed, the arrival sentence was written by the server, carried to
+     * the browser in the route, and unreachable by any path. Measured: session
+     * 06af3214, NAV_ARRIVED at t=600.2, nothing spoken. */
+    function onArrived() {
+      var list = route.maneuvers || [];
+      var man = null;
+      for (var i = list.length - 1; i >= 0; i--) {
+        if (list[i].type === 'ARRIVE') { man = list[i]; break; }
+      }
+      // A route with no ARRIVE maneuver still arrives; the last maneuver's
+      // arrival line is the sentence, if the server wrote one.
+      if (!man && list.length) man = list[list.length - 1];
+      if (!man) return;
+      arrivalCall(man, { tta_s: 0, to_maneuver_m: 0,
+                         gps_state: null, speed_ms: null });
+    }
+
     /* --- the tick --------------------------------------------------------- */
     function onProgress(ev) {
       if (stopped) return;
@@ -374,14 +453,21 @@
       var stationary = (ev.speed_ms || 0) < opt.stationary_speed_ms;
 
       if (man.type === 'ARRIVE') {
+        // "Almost there." A real sentence the server writes on every ARRIVE
+        // maneuver, which nothing had ever been able to say: this branch only
+        // ever considered the arrival call.
+        if (!b.called[CALL.EARLY] && man.speech && man.speech.early &&
+            (tta <= opt.early_guidance_s + bs || dist <= opt.early_distance_m) &&
+            tta > opt.context_call_s + bs &&
+            dist <= opt.early_max_distance_m && !stationary) {
+          b.called[CALL.EARLY] = true;
+          speak(man, CALL.EARLY, man.speech.early, null, snapshot);
+        }
         // Arrival gets one call, and the side comes from the provider or is
         // simply not said. There is no camera path to this sentence.
         if (!b.called[CALL.ARRIVAL] &&
             (tta <= opt.context_call_s + bs || dist <= opt.min_call_distance_m)) {
-          b.called[CALL.ARRIVAL] = true;
-          speak(man, CALL.ARRIVAL,
-                (man.speech && (man.speech.arrival || man.speech.primary)) || null,
-                null, snapshot);
+          arrivalCall(man, snapshot);
         }
         return;
       }
@@ -390,7 +476,8 @@
       // window. A preparation line for a turn that is already imminent is
       // noise on top of the instruction that matters.
       if (!b.called[CALL.EARLY] && man.speech && man.speech.early &&
-          tta <= opt.early_guidance_s + bs && tta > opt.context_call_s + bs &&
+          (tta <= opt.early_guidance_s + bs || dist <= opt.early_distance_m) &&
+          tta > opt.context_call_s + bs &&
           dist <= opt.early_max_distance_m && !stationary) {
         b.called[CALL.EARLY] = true;
         speak(man, CALL.EARLY, man.speech.early, null, snapshot);
@@ -408,7 +495,7 @@
       // valid; with the canonical sentence otherwise, which is not a fallback
       // in any apologetic sense: it is a complete instruction.
       if (!b.called[CALL.PRIMARY] &&
-          (tta <= opt.context_call_s + bs || dist <= opt.min_call_distance_m) &&
+          (tta <= opt.context_call_s + bs || dist <= opt.primary_distance_m) &&
           dist <= opt.max_call_distance_m) {
         if (tta <= opt.primary_min_lead_s + bs) {
           // Too late to begin a full instruction: say the short line at the
@@ -446,7 +533,7 @@
       // second of each other, and two instructions stacked back to back is
       // RIO talking over itself.
       if (!b.called[CALL.IMMINENT] && man.speech && man.speech.imminent &&
-          (tta <= opt.near_turn_s + bs || dist <= opt.min_call_distance_m)) {
+          (tta <= opt.near_turn_s + bs || dist <= opt.imminent_distance_m)) {
         b.called[CALL.IMMINENT] = true;
         var stacked = (b.primarySpokenAt !== undefined) &&
                       (clock - b.primarySpokenAt) < opt.imminent_min_gap_s;
@@ -465,6 +552,7 @@
       if (!tracker || !tracker.onEvent) return;
       tracker.onEvent(function (ev) {
         if (ev.type === 'NAV_PROGRESS') onProgress(ev);
+        else if (ev.type === 'NAV_ARRIVED') onArrived();
         else if (ev.type === 'NAV_MANEUVER_PASSED') {
           var b = perMan[ev.maneuver_id];
           if (b && b.context !== CTX.CALLED) { b.context = CTX.EXPIRED; b.anchor = null; }
@@ -483,6 +571,7 @@
       /* Exposed for the dashboard and for tests; the planner drives itself
          from the tracker's events. */
       onProgress: onProgress,
+      onArrived: onArrived,
       stop: function () { stopped = true; },
       contextState: function (maneuverId) {
         var b = perMan[maneuverId];

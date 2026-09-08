@@ -27,6 +27,33 @@
  * cause a reroute. Rerouting because the sky went quiet under a bridge is how
  * a navigation system loses a driver's trust in one move.
  *
+ * A QUIET RADIO IS NOT A SILENT TURN
+ * ----------------------------------
+ * This file's whole reason for being client-side is that following a route
+ * needs no help once the route is in hand. That was only ever half true here:
+ * the tracker kept its state when fixes stopped, and stopped SAYING anything,
+ * because NAV_PROGRESS -- the one event the speech planner listens to -- was
+ * emitted only from position().
+ *
+ * The first real drive is the proof. Session a2da65cd: a fix at nav clock
+ * 49.06, the next at 261.53, TWO HUNDRED AND TWELVE SECONDS apart, while the
+ * page went on posting headway frames at 3.9 per second the whole way, so it
+ * was plainly alive. Session 7e76d316: fixes roughly every six seconds,
+ * tripping the five-second staleness timer three times in nineteen. Not one
+ * turn was called on either drive. And nothing was queued and dropped either
+ * -- NAV_SPEECH_EXPIRED and NAV_SPEECH_INVALIDATED are zero across every drive
+ * in the log -- so it was never validity, never a rate limit, never the echo
+ * gate. The planner simply was not ticked.
+ *
+ * So tick() DEAD-RECKONS. Inside gps_coast_max_s of the last fix it advances
+ * along the polyline at the last known speed and emits NAV_PROGRESS marked
+ * `coasted`, which keeps every announcement running with the margins widened
+ * (GPS_DEGRADED already speaks earlier; see rio_navplan.bias). What it does
+ * NOT do on invented progress is pass a maneuver or arrive: a junction is
+ * behind us when a real fix says so, because coasting past a turn the driver
+ * never took is worse than a late call. The coasted position is discarded the
+ * moment a real fix lands.
+ *
  * No DOM, no fetch, no audio. It takes positions and emits events, which is
  * what lets tools/nav_selftest.js drive an entire simulated journey under node
  * against the code that ships.
@@ -54,6 +81,7 @@
      config.py and reaches the car with the next route. */
   var DEFAULTS = {
     gps_stale_timeout_s: 5.0,
+    gps_coast_max_s: 20.0,
     gps_accuracy_limit_m: 30.0,
     gps_degraded_bias_s: 2.0,
     off_route_distance_m: 45.0,
@@ -145,6 +173,14 @@
     var heading = null, headingSource = 'none';
     var lastSelected = null;
     var nowT = 0;
+    /* Dead reckoning. Deliberately NOT `along`: a coasted position is a guess,
+       and letting it into the monotonic progress variable would mean a real
+       fix arriving afterwards could be rejected as a rewind against a place
+       the car was never measured at. `coastAlong` is thrown away by the next
+       real fix. */
+    var coastAlong = null;
+    var coastFrom = 0;
+    var coasting = false;
 
     function emit(type, payload) {
       var ev = { t: nowT, route_id: route.route_id, generation_id: route.generation_id };
@@ -296,6 +332,56 @@
       return m;
     }
 
+    /* ONE PROGRESS EMIT, used by a real fix and by a coasted tick alike.
+     *
+     * `at` is where the car is taken to be along the route -- the projection
+     * for a fix, the dead-reckoned estimate for a coast. Everything else is
+     * identical, which is the point: the speech planner cannot tell the two
+     * apart except by the `coasted` flag, and it does not need to. What it
+     * needs is to be ticked at all, which it was not. */
+    function progress(o) {
+      o = o || {};
+      var at = (o.at === undefined || o.at === null) ? along : o.at;
+      var man = selectManeuver();
+      if (!man) return null;
+      var remaining = man.along_m - at;
+      var vEff = Math.max(opt.speed_floor_ms, speed || 0);
+      var tta = remaining / vEff;
+      var next = stateFor(remaining, tta);
+      /* A COASTED TICK MAY NOT EXECUTE A MANEUVER. It may take one as far as
+         IMMINENT -- which is what makes "Left here." happen under a bridge --
+         and no further, because EXECUTING is a claim that the car is AT the
+         junction and only a fix can make that claim. */
+      if (o.coasted && MAN_RANK[next] > MAN_RANK[IMMINENT]) next = IMMINENT;
+      if (MAN_RANK[next] > MAN_RANK[man.state]) man.state = next;
+
+      emit(E.PROGRESS, {
+        along_m: Math.round(at * 10) / 10,
+        remaining_m: Math.round((routeLen - at) * 10) / 10,
+        off_route_m: Math.round((o.offM === undefined ? lastOffM : o.offM) * 10) / 10,
+        route_state: routeState, gps_state: gpsState,
+        maneuver_id: man.id, maneuver_type: man.type, direction: man.direction,
+        instruction: man.instruction, road_name: man.road_name,
+        maneuver_state: man.state,
+        to_maneuver_m: Math.round(remaining * 10) / 10,
+        tta_s: Math.round(tta * 10) / 10,
+        speed_ms: speed === null ? null : Math.round(speed * 100) / 100,
+        speed_source: speedSource,
+        heading_deg: heading === null ? null : Math.round(heading * 10) / 10,
+        heading_source: headingSource,
+        rewound: !!o.rewound,
+        // WHETHER THIS IS A MEASUREMENT OR AN EXTRAPOLATION, said out loud on
+        // every progress event so a drive log can be read without guessing.
+        coasted: !!o.coasted,
+        coast_age_s: o.coasted ? Math.round((nowT - lastFixT) * 10) / 10 : 0,
+        eta_epoch: route.eta_epoch
+      });
+
+      return { along_m: at, maneuver: man, to_maneuver_m: remaining,
+               tta_s: tta, maneuver_state: man.state, gps_state: gpsState,
+               route_state: routeState, coasted: !!o.coasted };
+    }
+
     function api() {
       return {
         route: route,
@@ -309,9 +395,42 @@
         tick: function (t) {
           if (typeof t === 'number') nowT = t;
           if (stopped || arrived) return gpsState;
-          if (lastFixT !== null && (nowT - lastFixT) > opt.gps_stale_timeout_s) {
-            setGps(GPS_STALE, 'no_fix_' + Math.round(nowT - lastFixT) + 's');
+          if (lastFixT === null) return gpsState;
+          var quiet = nowT - lastFixT;
+          if (quiet > opt.gps_stale_timeout_s) {
+            setGps(GPS_STALE, 'no_fix_' + Math.round(quiet) + 's');
           }
+
+          /* --- dead reckoning ------------------------------------------
+             Only while there is something to reckon WITH: a route, a speed
+             worth extrapolating, and a fix recent enough that eighteen
+             seconds of guessing is still about the same road. Outside any of
+             those the tracker goes quiet, which is the old behaviour and the
+             right one -- a guess with nothing under it is worse than silence.
+
+             Note what this does not touch. `along` is untouched, so the next
+             real fix projects against a measured position and cannot be
+             rejected as a rewind against an invented one. `manIdx` is
+             untouched, so nothing is passed. `arrived` is untouched, so the
+             drive cannot end on an extrapolation. */
+          if (quiet <= opt.gps_stale_timeout_s) return gpsState;
+          if (quiet > opt.gps_coast_max_s) {
+            coasting = false;
+            coastAlong = null;
+            return gpsState;
+          }
+          if (speed === null || speed <= opt.stationary_speed_ms) return gpsState;
+          if (routeState === OFF_ROUTE_CONFIRMED) return gpsState;
+
+          if (!coasting) {
+            coasting = true;
+            coastAlong = along;
+            coastFrom = lastFixT;
+          }
+          var advance = speed * (nowT - coastFrom);
+          coastFrom = nowT;
+          coastAlong = Math.min(routeLen, coastAlong + advance);
+          progress({ at: coastAlong, coasted: true });
           return gpsState;
         },
 
@@ -320,6 +439,9 @@
           if (stopped || arrived || !points.length || !fix) return null;
           nowT = (typeof fix.t === 'number') ? fix.t : nowT;
           lastFixT = nowT;
+          // A measurement supersedes every guess made since the last one.
+          coasting = false;
+          coastAlong = null;
 
           gpsFromFix(fix);
           var sp = speedFrom(fix);
@@ -409,33 +531,7 @@
             return { arrived: true };
           }
 
-          var man = selectManeuver();
-          var remaining = man.along_m - along;
-          var vEff = Math.max(opt.speed_floor_ms, sp.v);
-          var tta = remaining / vEff;
-          var next = stateFor(remaining, tta);
-          if (MAN_RANK[next] > MAN_RANK[man.state]) man.state = next;
-
-          emit(E.PROGRESS, {
-            along_m: Math.round(along * 10) / 10,
-            remaining_m: Math.round((routeLen - along) * 10) / 10,
-            off_route_m: Math.round(pr.offM * 10) / 10,
-            route_state: routeState, gps_state: gpsState,
-            maneuver_id: man.id, maneuver_type: man.type, direction: man.direction,
-            instruction: man.instruction, road_name: man.road_name,
-            maneuver_state: man.state,
-            to_maneuver_m: Math.round(remaining * 10) / 10,
-            tta_s: Math.round(tta * 10) / 10,
-            speed_ms: Math.round(sp.v * 100) / 100, speed_source: sp.src,
-            heading_deg: heading === null ? null : Math.round(heading * 10) / 10,
-            heading_source: headingSource,
-            rewound: rewound,
-            eta_epoch: route.eta_epoch
-          });
-
-          return { along_m: along, maneuver: man, to_maneuver_m: remaining,
-                   tta_s: tta, maneuver_state: man.state, gps_state: gpsState,
-                   route_state: routeState };
+          return progress({ offM: pr.offM, rewound: rewound, coasted: false });
         },
 
         /* Position on the geometry at a given distance along it — the
@@ -533,7 +629,9 @@
             route_state: routeState, off_route_m: lastOffM,
             speed_ms: speed, speed_source: speedSource,
             heading_deg: heading, heading_source: headingSource,
-            arrived: arrived, stopped: stopped
+            arrived: arrived, stopped: stopped,
+            coasting: coasting,
+            fix_age_s: lastFixT === null ? null : Math.round((nowT - lastFixT) * 10) / 10
           };
         },
 

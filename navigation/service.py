@@ -302,6 +302,10 @@ def timing_config() -> dict:
     """
     return {
         "gps_stale_timeout_s": config.NAV_GPS_STALE_TIMEOUT_S,
+        "gps_coast_max_s": config.NAV_GPS_COAST_MAX_S,
+        "gps_watchdog_s": config.NAV_GPS_WATCHDOG_S,
+        "gps_watchdog_max_rearms": config.NAV_GPS_WATCHDOG_MAX_REARMS,
+        "gps_watchdog_coarse_after": config.NAV_GPS_WATCHDOG_COARSE_AFTER,
         "gps_accuracy_limit_m": config.NAV_GPS_ACCURACY_LIMIT_M,
         "gps_degraded_bias_s": config.NAV_GPS_DEGRADED_BIAS_S,
         "off_route_distance_m": config.NAV_OFF_ROUTE_DISTANCE_M,
@@ -323,6 +327,9 @@ def timing_config() -> dict:
         "min_call_distance_m": config.NAV_MIN_CALL_DISTANCE_M,
         "max_call_distance_m": config.NAV_MAX_CALL_DISTANCE_M,
         "early_max_distance_m": config.NAV_EARLY_MAX_DISTANCE_M,
+        "early_distance_m": config.NAV_EARLY_DISTANCE_M,
+        "primary_distance_m": config.NAV_PRIMARY_DISTANCE_M,
+        "imminent_distance_m": config.NAV_IMMINENT_DISTANCE_M,
         "speed_floor_ms": config.NAV_SPEED_FLOOR_MS,
         "speed_nominal_ms": config.NAV_SPEED_NOMINAL_MS,
         "duplicate_instruction_cooldown_s": config.NAV_DUPLICATE_INSTRUCTION_COOLDOWN_S,

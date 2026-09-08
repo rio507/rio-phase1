@@ -3278,11 +3278,72 @@ document.addEventListener('DOMContentLoaded', () => {
      fixes subscribes here. */
   const posSubs = [];
 
-  function startWatch() {
-    if (watchId !== null || !navigator.geolocation) return;
+  /* ---------------- the watchdog -----------------------------------------
+   *
+   * THE CAUSE OF THE TURNS NOT BEING CALLED, and it is here rather than
+   * anywhere in navigation.
+   *
+   * The speech planner is driven by NAV_PROGRESS, and the tracker emitted
+   * NAV_PROGRESS only when a fix arrived. So a watch that stops delivering is
+   * a navigation system that stops speaking, silently, with every other part
+   * of it working perfectly.
+   *
+   * Session a2da65cd, on a phone: the last fix reached the tracker at nav
+   * clock 49.06 and the next at 261.53. TWO HUNDRED AND TWELVE SECONDS with
+   * no position update, while this same page went on posting headway frames
+   * at 3.9 per second the entire time -- 230 of them in the last minute alone
+   * -- so it was not backgrounded, not frozen, and not disconnected. Session
+   * 7e76d316: fixes roughly every six seconds, tripping the tracker's
+   * five-second staleness timer three times in nineteen. Neither drive called
+   * a single turn, and neither queued a line that was then dropped:
+   * NAV_SPEECH_EXPIRED and NAV_SPEECH_INVALIDATED are zero across every drive
+   * in the log. Nothing ever reached the arbiter.
+   *
+   * There was nothing here to notice any of it. One watchPosition for the life
+   * of the page, and an error callback that set gpsSpeed to null and returned
+   * -- it did not log, it did not re-arm, and it did not tell navigation. A
+   * watch that has gone quiet on iOS does not report an error at all and does
+   * not recover on its own.
+   *
+   * So: a timer that watches the watch. No fix inside the budget and the
+   * subscription is torn down and rebuilt, which is the only recovery that
+   * works. Every re-arm goes into the drive's log, because "she stopped
+   * calling the turns" is a sentence about a drive and has to be answerable
+   * from the drive. And after two attempts high accuracy is dropped: a coarse
+   * fix every second is worth more to a route tracker than a precise one that
+   * never comes, and enableHighAccuracy is what is most often implicated when
+   * an iOS watch stalls.
+   *
+   * The tracker no longer depends on any of this working, either -- it
+   * dead-reckons along the route for twenty seconds (rio_navcore.tick) and
+   * keeps calling turns with widened margins. Belt and braces, deliberately:
+   * this recovers the fix, that survives the gap while it is being recovered.
+   */
+  let watchdogTimer = null;
+  let rearms = 0;
+  let lastFixAt = 0;
+  let gpsErrors = 0;
+
+  // Fallbacks only. The real values arrive with the route in `timing`, exactly
+  // as the tracker's do; RIO.nav hands them over when a route attaches.
+  let watchCfg = { watchdog_s: 4.0, max_rearms: 8, coarse_after: 2 };
+
+  function noteGps(tag, detail) {
+    try {
+      if (!RIO.driving) return;
+      fetch(RIO.url('/session/mark')
+            + '&tag=' + encodeURIComponent(tag)
+            + '&note=' + encodeURIComponent(JSON.stringify(detail || {}).slice(0, 400)),
+            { method: 'POST' }).catch(() => {});
+    } catch (e) {}
+  }
+
+  function armWatch(coarse) {
     try {
       watchId = navigator.geolocation.watchPosition(
         pos => {
+          rearms = 0;                     // it is delivering again
+          lastFixAt = performance.now();
           // coords.speed is null on most desktops and on the first fixes of a
           // phone; null is passed through as "no speed", never coerced to 0.
           gpsSpeed = (pos.coords && typeof pos.coords.speed === 'number'
@@ -3293,16 +3354,78 @@ document.addEventListener('DOMContentLoaded', () => {
             try { fn(pos); } catch (e) { /* a subscriber must not break the watch */ }
           }
         },
-        () => { gpsSpeed = null; paintHint(); },
-        { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+        err => {
+          /* IT USED TO DO NEITHER OF THESE. A geolocation error was one
+             assignment and a repaint, so a drive whose radio had failed looked
+             exactly like a drive whose radio was fine and whose car was
+             parked. */
+          gpsErrors++;
+          gpsSpeed = null;
+          paintHint();
+          noteGps('gps_error', { code: err && err.code,
+                                 message: (err && err.message || '').slice(0, 120),
+                                 n: gpsErrors });
+        },
+        { enableHighAccuracy: !coarse, maximumAge: 1000, timeout: 10000 }
       );
     } catch (e) { watchId = null; }
   }
 
+  function rearmWatch() {
+    const quiet = (performance.now() - lastFixAt) / 1000;
+    rearms++;
+    const coarse = rearms > watchCfg.coarse_after;
+    noteGps('gps_watch_rearm', { quiet_s: Math.round(quiet * 10) / 10,
+                                 attempt: rearms, coarse: coarse });
+    // Torn down and rebuilt, not merely re-requested: a stalled watch does not
+    // start delivering again because it was asked twice.
+    try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
+    watchId = null;
+    armWatch(coarse);
+  }
+
+  function startWatchdog() {
+    if (watchdogTimer !== null) return;
+    watchdogTimer = setInterval(() => {
+      if (watchId === null) return;
+      const quiet = (performance.now() - lastFixAt) / 1000;
+      if (quiet < watchCfg.watchdog_s) return;
+      if (rearms >= watchCfg.max_rearms) {
+        // The radio is not coming back. Churning it further costs battery and
+        // buys nothing; the tracker's dead reckoning is what is holding the
+        // drive up by now, and it says so in the HUD.
+        return;
+      }
+      rearmWatch();
+    }, 1000);
+  }
+
+  function startWatch() {
+    if (watchId !== null || !navigator.geolocation) return;
+    rearms = 0;
+    gpsErrors = 0;
+    lastFixAt = performance.now();
+    armWatch(false);
+    startWatchdog();
+  }
+
   function stopWatch() {
+    if (watchdogTimer !== null) { clearInterval(watchdogTimer); watchdogTimer = null; }
     if (watchId === null) return;
     try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
     watchId = null;
+  }
+
+  /* The watchdog's own numbers come from the route, like every other timing
+     value the browser uses. Called by rio_nav.js when a route attaches. */
+  function configureWatch(timing) {
+    if (!timing) return;
+    if (typeof timing.gps_watchdog_s === 'number')
+      watchCfg.watchdog_s = timing.gps_watchdog_s;
+    if (typeof timing.gps_watchdog_max_rearms === 'number')
+      watchCfg.max_rearms = timing.gps_watchdog_max_rearms;
+    if (typeof timing.gps_watchdog_coarse_after === 'number')
+      watchCfg.coarse_after = timing.gps_watchdog_coarse_after;
   }
 
   function manualSpeed() {
@@ -3923,6 +4046,14 @@ document.addEventListener('DOMContentLoaded', () => {
     unlock: unlock,
     startWatch: startWatch,
     stopWatch: stopWatch,
+    configureWatch: configureWatch,
+    /* What the radio has been doing, for the panel and for a drive review:
+       how long since the last fix, how many times the watch had to be rebuilt,
+       how many errors it reported. */
+    gpsHealth: () => ({
+      fix_age_s: Math.round((performance.now() - lastFixAt) / 100) / 10,
+      rearms: rearms, errors: gpsErrors, watching: watchId !== null,
+    }),
     // Subscribe to the shared position watch (navigation uses this).
     onPosition: fn => { if (typeof fn === 'function') posSubs.push(fn); },
     speed: speed,
