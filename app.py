@@ -303,7 +303,15 @@ def health():
             # it is supposed to have. Never "error" — if this handler runs at
             # all, the server is answering.
             "readiness": "ok" if not degraded else "degraded",
-            "degraded": degraded}
+            "degraded": degraded,
+            # WHICH DETECTOR THIS PROCESS IS ACTUALLY RUNNING. Not a health
+            # question -- eager is a perfectly good answer and is the one the
+            # car has been driven on -- but it IS the first thing to ask when a
+            # frame time looks unfamiliar, and it must be answerable without
+            # reading a log that has scrolled. `active: false` with a `reason`
+            # is the compiled model having been offered and refused; see
+            # headway/detect.adopt_accel.
+            "detector_accel": headway_detect.accel_status()}
 
 
 # Most recent completed talk turn, for the dashboard to pick up after playback.

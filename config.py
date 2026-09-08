@@ -1169,6 +1169,140 @@ HEADWAY_DETECT_KERNEL_BUDGET_MS = 15.0
 # For contrast, the Qwen enumeration this replaced took 600-1500 ms.
 HEADWAY_DETECT_FRAME_BUDGET_FRAC = 0.5
 
+# --- making the detector cheap enough for a Jetson --------------------------
+#
+# JETSON PREP, NOT A POD NEED. On this box detection is 11.8 ms of a 67 ms
+# frame and nothing is waiting on it. On an Orin the same model has perhaps a
+# fifth of the launch throughput and a CPU that is doing the camera and the
+# radio as well -- and the profile above says this model's cost is almost
+# entirely launch overhead, which is exactly the cost that gets worse on a
+# smaller CPU. So the work happens here, on hardware where it can be measured
+# against a known-good answer, rather than on the target where a regression
+# would look like the target being slow.
+#
+# AND ONLY THE DETECTOR. The same question was asked of depth and lanes and
+# answered no, by measurement (`tools/accel_verify.py --profile-all`):
+#
+#     detect   elapsed 10.30 ms   GPU 3.25 ms   2940 aten calls   3.2x  LAUNCH BOUND
+#     depth    elapsed  7.47 ms   GPU 9.85 ms   1477 aten calls   0.8x  gpu bound
+#     lanes    elapsed  2.78 ms   GPU 2.70 ms    403 aten calls   1.0x  gpu bound
+#
+# CUDA graphs remove launch overhead and nothing else. Depth and lanes have
+# essentially none to remove -- their GPUs are already saturated and
+# overlapping their own kernels -- so compiling them would buy nothing and
+# would still be paid for with a numeric tolerance against the eager path.
+#
+# WHAT IT IS. torch.compile(mode="reduce-overhead") -- Inductor codegen plus
+# CUDA graphs. Measured on an RTX 4090, RF-DETR nano fp16, 384x384:
+#
+#     eager           floor 9.6 ms
+#     compiled        floor 3.1 ms      3.15x
+#     compile cost    ~7 s, once, at warm-up
+#
+# WHAT WAS TRIED AND REJECTED:
+#
+#   a raw torch.cuda.CUDAGraph capture would be bit-for-bit identical, and it
+#   cannot be captured: rfdetr's transformer builds `spatial_shapes` with
+#   torch.as_tensor(<python list>, device=cuda) on every forward, and an
+#   unpinned host-to-device copy is not capturable. Making it capturable means
+#   patching a vendored library's internals in the path that decides when to
+#   warn a driver, and that is a worse trade than a measured tolerance.
+#
+#   torch.compile(backend="cudagraphs") IS bit-for-bit identical -- and worth
+#   1.09x, because dynamo graph-breaks on those same calls and the graph ends
+#   up in fragments.
+#
+#   forcing fp32 accumulation (allow_fp16_reduced_precision_reduction=False)
+#   does not close the numeric gap: 4.219 against 4.213. The difference is
+#   Inductor's kernels and reduction orders, not GEMM accumulation.
+#
+# SO IT IS A TOLERANCE, AND THE TOLERANCE IS ON THE DETECTIONS. The compiled
+# model's raw tensors differ by up to 4.21 on pred_logits -- 300 queries x 91
+# classes of mostly junk at large negative logits, where that is nothing. What
+# is checked instead is what the rest of the system actually receives: the
+# gated detections, after the confidence gate, the size floor, the
+# ego-structure gate and duplicate suppression. Same count, same labels, and
+# boxes and scores inside the two numbers below.
+#
+# "auto" compiles at warm-up, runs that comparison on real frames, and adopts
+# the compiled model ONLY if it passes -- so the default is on only where the
+# identity check passes, on the machine it is actually running on. Anything
+# that throws, at any point, leaves the eager model in place.
+#   auto | on | off        ("on" skips the check; for a bench, not for a drive)
+HEADWAY_DETECT_ACCEL = "auto"
+
+# THE TOLERANCE, AND THE UNITS IT IS IN. Two of them, because two different
+# things are being bounded, and the first attempt at this got both wrong.
+#
+# Attempt one was 0.25 absolute pixels. It failed on a 215x102 px car in a
+# 1282-wide frame, by 0.626 px -- and absolute pixels turned out to be the
+# wrong unit entirely: the model emits NORMALISED coordinates and the
+# postprocess multiplies by the frame size, so a pixel bound charges a large
+# frame for arithmetic it did not do.
+#
+# Measured over 411 detections on 180 real-road frames, three clips, four frame
+# sizes (tools/accel_verify.py):
+#
+#                                     p50       p95       p99       max
+#     absolute px                  0.0195    0.0782    0.4688    0.7812
+#     fraction of frame width      3.1e-5    9.2e-5    5.2e-4    9.8e-4
+#     fraction of the box's
+#       SMALLER dimension          5.4e-4    2.2e-3    8.7e-3    2.3e-2
+#
+# 1. OF FRAME WIDTH is where the error lives, so it is the sensitive detector
+#    of DRIFT -- a compiled model that started diverging would move this first.
+#    3e-3 is about three times the largest disagreement seen. (An earlier
+#    1e-3 sat at 98% of budget on the very corpus it was set from, which is
+#    not a tolerance, it is a flake with a decimal point.)
+HEADWAY_ACCEL_MAX_BOX_DELTA_FRAC = 0.003
+
+# 2. OF THE BOX ITSELF is what bounds BEHAVIOUR, and it is a different question.
+#    The worst case measured was 0.47 px on a 20x101 box -- 2.3% of its width --
+#    and it is narrow boxes, not big frames, where a sub-pixel shift means
+#    something. Every downstream consumer of a box reads a fraction of it:
+#    membership is the fraction of the bottom edge inside the lane polygon,
+#    plausibility divides by the pixel height, the depth ROI is a median over
+#    its interior. Bounding the shift to 5% of the box's smaller side bounds
+#    all of them to 5%, which is a third of the 0.15 hysteresis band between
+#    MEMBER_ENTER_FRAC and MEMBER_EXIT_FRAC -- so no membership decision can
+#    turn on it. Roughly twice what was observed.
+HEADWAY_ACCEL_MAX_BOX_DELTA_OF_BOX = 0.05
+
+# Scores: observed max disagreement 0.008, so this is ~2.5x. It does not need
+# to be tight, because the thing it might otherwise let through -- a detection
+# crossing a class gate and appearing or vanishing -- is caught by the count
+# check below, which has no tolerance at all.
+HEADWAY_ACCEL_MAX_SCORE_DELTA = 0.02
+#
+# AND THE DISCRETE OUTCOMES HAVE NO TOLERANCE. A detection appearing or
+# vanishing, or the `confirmed` flag flipping -- which is the size floor, the
+# thing that decides whether a range may be claimed for a box at all -- fail
+# the check outright, because no distance in pixels describes either of them.
+# Measured: zero of 411 detections flipped `confirmed`.
+#
+# THE ONE LABEL EXCEPTION, and it was measured rather than assumed. Two of the
+# 411 disagreed: `bus` 0.3797 against `truck` 0.3795, and `bus` 0.3794 against
+# `truck` 0.3789. detect.EXCLUSIVE_LABELS already exists because car, truck,
+# bus and motorcycle are competing readings of ONE object, and duplicate
+# suppression keeps whichever scored higher. So the eager model was asked again
+# with the frame nudged invisibly -- one grey level up, one down, re-encoded at
+# JPEG q95 and q92, shifted a single pixel:
+#
+#     EAGER ITSELF ANSWERED DIFFERENTLY ON FIVE OF SIX PERTURBATIONS.
+#
+# Requiring a compiled model to reproduce a tie-break the eager model loses to
+# a one-grey-level change is requiring bit-identity. So an exclusive-label
+# disagreement inside the score tolerance is allowed and counted; every other
+# label disagreement fails.
+
+# How many real frames the runtime check uses before adopting the compiled
+# model. Small on purpose: it runs at warm-up, on the critical path to a drive
+# being able to start, and tools/accel_verify.py is where the broad sweep
+# lives. Eight frames at three sizes is enough to catch a compile that has
+# gone wrong, which is what this is for -- the broad question was answered
+# offline.
+HEADWAY_ACCEL_VERIFY_FRAMES = 8
+
 # --- the car's own bodywork, which is not a car -----------------------------
 #
 # THE UPSTREAM FIX FOR THE FLOOR BELOW. HEADWAY_TAU_IMPLAUSIBLE_S stops RIO

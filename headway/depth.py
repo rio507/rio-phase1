@@ -147,6 +147,18 @@ def frame_trust(frame: np.ndarray):
     }
 
 
+# NOT COMPILED, AND THAT WAS MEASURED. headway/detect.py runs its model
+# through torch.compile because it is launch bound -- 3.25 ms of GPU arithmetic
+# inside 10.30 ms of elapsed time, a ratio of 3.2x, which is almost all waiting
+# for the CPU to submit kernels. This model is not: 9.85 ms of GPU work in
+# 7.47 ms of elapsed time, a ratio of 0.8x, which is a GPU that is already
+# saturated and overlapping its own kernels.
+#
+# CUDA graphs remove launch overhead and nothing else, so there is nothing here
+# for them to remove -- and the compile would be paid for with a numeric
+# tolerance against the eager path for no speed at all. Re-measure with
+# `python3 tools/accel_verify.py --profile-all` if the model or the input
+# resolution ever changes.
 def depth_map(frame: np.ndarray) -> np.ndarray:
     """BGR uint8 HxWx3 frame -> HxW float32 array of metres, same H/W as input.
 

@@ -543,6 +543,12 @@ def _preprocess(frame_bgr):
     return t[:, :, -TRAIN_HEIGHT:, :].to(_dtype)    # bottom crop
 
 
+# NOT COMPILED, AND THAT WAS MEASURED. Same question as depth.py, same answer:
+# 2.70 ms of GPU work in 2.78 ms of elapsed time, a ratio of 1.0x. This is a
+# GPU-bound model and CUDA graphs only remove launch overhead, of which it has
+# essentially none. headway/detect.py is the one that is launch bound (3.2x)
+# and the only one compiled. `tools/accel_verify.py --profile-all` re-measures
+# all three.
 def detect_lanes(frame, weights_path: str = None) -> dict:
     """Detect lanes in one BGR frame.
 

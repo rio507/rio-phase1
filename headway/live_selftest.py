@@ -1669,6 +1669,189 @@ def run_ego_structure():
               f"{mod.__name__.split('.')[-1]}.{name} is config.{cfg_name}")
 
 
+# ===========================================================================
+# H. Acceleration — Jetson prep, and the guardrail that gates it
+#
+# The compiled detector is 2.75x faster and is NOT the same arithmetic. What
+# makes it safe to use is not the speed-up, it is that nothing adopts it
+# without checking, and that everything which can go wrong leaves the eager
+# model running. This is that, asserted.
+# ===========================================================================
+def run_accel():
+    import torch
+
+    head("H -- compiled detector (Jetson prep)")
+    if not detect_mod.available():
+        print("  [SKIP] no detector weights")
+        return
+    if not torch.cuda.is_available():
+        print("  [SKIP] no CUDA — acceleration is not applicable here")
+        return
+    import config
+
+    detect_mod._ensure_loaded()
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+    # -- H1 it is off unless it earns being on --------------------------
+    head("H1 -- nothing is adopted without being checked")
+    saved = config.HEADWAY_DETECT_ACCEL
+    try:
+        config.HEADWAY_DETECT_ACCEL = "off"
+        detect_mod.set_accel(False)
+        detect_mod.adopt_accel()
+        st = detect_mod.accel_status()
+        check(not st["active"] and "off" in (st["reason"] or ""),
+              "config can switch it off outright", st["reason"])
+
+        # NO CORPUS, NO ADOPTION. "auto" means "on if verified", and a claim
+        # that cannot be verified has not been verified.
+        config.HEADWAY_DETECT_ACCEL = "auto"
+        real_frames = detect_mod._accel_frames
+        detect_mod._accel_frames = lambda n: []
+        detect_mod.set_accel(False)
+        detect_mod.adopt_accel()
+        st = detect_mod.accel_status()
+        check(not st["active"] and "verify" in (st["reason"] or ""),
+              "with no road clips to check against, it stays eager",
+              st["reason"])
+        detect_mod._accel_frames = real_frames
+
+        # -- H2 a compiled model that is WRONG is refused -----------------
+        head("H2 -- a model that sees a different road is refused")
+        real_compile = detect_mod._compile_model
+
+        def poisoned():
+            if not real_compile():
+                return False
+            inner = detect_mod._accel_model
+
+            class Off:
+                """Right shape, right labels, boxes 2% out. The failure this
+                whole guardrail exists for: plausible, quiet, and wrong."""
+
+                def __call__(self, x):
+                    o = dict(inner(x))
+                    o["pred_boxes"] = o["pred_boxes"] * 1.02
+                    return o
+
+            detect_mod._accel_model = Off()
+            return True
+
+        detect_mod._compile_model = poisoned
+        detect_mod._accel_model = None
+        detect_mod.set_accel(False)
+        adopted = detect_mod.adopt_accel()
+        st = detect_mod.accel_status()
+        check(not adopted and not st["active"],
+              "a compiled model whose boxes are 2% out is NOT adopted")
+        check("tolerance" in (st["reason"] or ""),
+              "...and the log says which tolerance it broke", st["reason"])
+        detect_mod._compile_model = real_compile
+        detect_mod._accel_model = None
+
+        # -- H3 the real one, and it must earn it fresh -------------------
+        head("H3 -- the real compiled model, checked against eager")
+        detect_mod.set_accel(False)
+        adopted = detect_mod.adopt_accel()
+        st = detect_mod.accel_status()
+        if not adopted:
+            check(False, "the compiled detector is adopted on this machine",
+                  f"NOT adopted: {st['reason']} — the drive runs eager, which "
+                  f"is safe, but the speed-up is not being had")
+            return
+        check(adopted and st["active"],
+              "the compiled detector is adopted",
+              f"{st['checked_frames']} real frames, boxes within "
+              f"{st['max_box_frac']} of frame width, scores within "
+              f"{st['max_score']} (compile {st['compile_s']}s)")
+        check(st["max_box_frac"] <= config.HEADWAY_ACCEL_MAX_BOX_DELTA_FRAC,
+              "...inside the frame-width tolerance it was measured against")
+        check(st["max_score"] <= config.HEADWAY_ACCEL_MAX_SCORE_DELTA,
+              "...and inside the score tolerance")
+
+        # -- H4 it is faster, which is the only reason to run it ----------
+        head("H4 -- and it is actually faster")
+        x = detect_mod._preprocess(frame)
+
+        def floor_of(fn, n=40):
+            with torch.inference_mode():
+                for _ in range(10):
+                    fn(x)
+                torch.cuda.synchronize()
+                v = []
+                for _ in range(n):
+                    e0 = torch.cuda.Event(enable_timing=True)
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    fn(x)
+                    e1.record()
+                    torch.cuda.synchronize()
+                    v.append(e0.elapsed_time(e1))
+            v.sort()
+            return v[len(v) // 10]
+
+        eager_floor = floor_of(lambda t: detect_mod._model(t))
+        accel_floor = floor_of(lambda t: detect_mod._accel_model(t))
+        speedup = eager_floor / max(accel_floor, 1e-9)
+        print(f"    eager floor {eager_floor:.2f} ms  compiled floor "
+              f"{accel_floor:.2f} ms  speedup {speedup:.2f}x")
+        check(speedup > 1.5,
+              "the compiled model is materially faster than eager",
+              f"{speedup:.2f}x — below 1.5 it is not worth the second code path")
+
+        # -- H5 every way out leads back to eager -------------------------
+        head("H5 -- every failure lands on the model the car was driven on")
+        old_res = detect_mod._resolution
+        try:
+            # A CUDA graph is captured for ONE shape. A different one must not
+            # trigger a multi-second recompile inside a live frame.
+            detect_mod._resolution = old_res + 32
+            r = detect_mod.detect(frame)
+            st = detect_mod.accel_status()
+            check(not st["active"] and "shape" in (st["reason"] or ""),
+                  "an input shape it was not compiled for falls back to eager",
+                  st["reason"])
+            check(isinstance(r, dict) and "detections" in r,
+                  "...and the frame is still detected on")
+        finally:
+            detect_mod._resolution = old_res
+
+        # A compiled model that starts throwing mid-drive.
+        detect_mod.set_accel(True)
+
+        class Boom:
+            def __call__(self, x):
+                raise RuntimeError("kernel exploded")
+
+        good = detect_mod._accel_model
+        detect_mod._accel_model = Boom()
+        r = detect_mod.detect(frame)
+        st = detect_mod.accel_status()
+        check(not st["active"] and "runtime" in (st["reason"] or ""),
+              "a compiled model that throws mid-drive is dropped, once",
+              st["reason"])
+        check(isinstance(r, dict) and "detections" in r,
+              "...and that very frame still produced detections")
+        detect_mod._accel_model = good
+
+        # -- H6 the numbers are in config ---------------------------------
+        head("H6 -- the tolerances are in config.py")
+        for name in ("HEADWAY_DETECT_ACCEL", "HEADWAY_ACCEL_MAX_BOX_DELTA_FRAC",
+                     "HEADWAY_ACCEL_MAX_BOX_DELTA_OF_BOX",
+                     "HEADWAY_ACCEL_MAX_SCORE_DELTA",
+                     "HEADWAY_ACCEL_VERIFY_FRAMES"):
+            check(hasattr(config, name), f"config.{name} exists")
+        check(config.HEADWAY_DETECT_ACCEL in ("auto", "on", "off"),
+              "and the mode is one of auto | on | off",
+              str(config.HEADWAY_DETECT_ACCEL))
+    finally:
+        config.HEADWAY_DETECT_ACCEL = saved
+        # Leave the process the way a drive would have it.
+        detect_mod._accel_model = None
+        detect_mod.set_accel(False)
+        detect_mod.adopt_accel()
+
+
 def main():
     print("=" * 70)
     print("RIO live headway (v3) — verification")
@@ -1680,6 +1863,7 @@ def main():
     run_lanes()
     run_detector()
     run_ego_structure()
+    run_accel()
 
     print("\n" + "=" * 70)
     total = len(PASS) + len(FAIL)
