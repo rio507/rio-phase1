@@ -2412,6 +2412,18 @@ async function toggleLive() {
  * live session is worse than no diagnostic. */
 const LIVE_REPORTED = {
   LIVE_CUTOFF: 'cutoff',
+  /* NEWEST WINS, in the drive's own record.
+   *
+   * "she answered the question before last" is a sentence about a drive, and
+   * until these existed the log had no way to say it. The first real drive's
+   * four `look` calls took 40.1, 12.9, 48.5 and 27.1 seconds each, and nothing
+   * anywhere recorded that a driver had asked again in the meantime. */
+  LIVE_TURN_SUPERSEDED: 'turn_superseded',
+  LIVE_TURN_COALESCED: 'turn_coalesced',
+  LIVE_TOOL_ABORTED: 'tool_aborted',
+  LIVE_TOOL_RESULT_DISCARDED: 'tool_result_discarded',
+  LIVE_DRIVER_COMMAND: 'driver_command',
+  LIVE_COMMAND_DONE: 'command_done',
   LIVE_RESUME: 'resumed',
   LIVE_RESUME_SKIPPED: 'resume_skipped',
   LIVE_BARGE_ABSORBED: 'blips_absorbed',
@@ -2441,6 +2453,21 @@ function reportLive(ev) {
           mic_db: ev.mic_db === undefined ? null : ev.mic_db,
           out_db: ev.out_db === undefined ? null : ev.out_db,
           margin_db: ev.margin_db === undefined ? null : ev.margin_db,
+          /* WHICH TURN, and what it displaced. A supersede is only readable
+             afterwards if the log says which question was dropped and which
+             one replaced it — "she answered the wrong one" is otherwise
+             indistinguishable from "she was slow". */
+          turn: ev.turn === undefined ? null : ev.turn,
+          now_turn: ev.now_turn === undefined ? null : ev.now_turn,
+          tool: ev.tool || null,
+          call_id: ev.call_id || null,
+          tools_aborted: ev.tools_aborted === undefined ? null : ev.tools_aborted,
+          took_ms: ev.took_ms === undefined ? null : ev.took_ms,
+          age_ms: ev.age_ms === undefined ? null : ev.age_ms,
+          gap_ms: ev.gap_ms === undefined ? null : ev.gap_ms,
+          command: ev.command || null,
+          superseded: ev.superseded || ev.first || null,
+          by: ev.by || ev.second || null,
         },
       }),
     }).catch(() => {});

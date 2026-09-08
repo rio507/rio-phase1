@@ -819,7 +819,16 @@ _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
                   # facts: an absorbed blip fired the gate and stopped short of
                   # cancelling, and one of these never got that far.
                   "echo_suppressed": 0,
+                  # NEWEST WINS (item 4). Not part of the cut-off tally: a
+                  # superseded turn is not a failure of an answer, it is an
+                  # answer correctly thrown away, and counting it as a cut-off
+                  # would make the fix look like the fault.
+                  "turns": {},
                   "recent": []}
+# The kinds the browser reports about turn arbitration. Kept next to the store
+# so adding one is an edit in a single place.
+_TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
+               "tool_result_discarded", "driver_command", "command_done")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -832,10 +841,24 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
         elif kind in ("resumed", "resume_skipped", "blips_absorbed",
                       "echo_suppressed"):
             _cutoffs[kind] += 1
+        elif kind in _TURN_KINDS:
+            # Counted rather than tallied as a cut-off: a supersede is not a
+            # failure of the answer, it is the answer being correctly thrown
+            # away, and putting it in the cut-off tally would make the fix look
+            # like the fault.
+            _cutoffs["turns"][kind] = _cutoffs["turns"].get(kind, 0) + 1
         rec = {"t": round(time.time(), 3), "kind": kind, "cause": cause}
         rec.update({k: v for k, v in (detail or {}).items()
                     if k in ("response_id", "reason", "detail", "said_chars",
-                             "by", "mic_db", "out_db", "margin_db", "device")})
+                             "by", "mic_db", "out_db", "margin_db", "device",
+                             # NEWEST WINS. Which turn was dropped, which one
+                             # replaced it, what it cost in tool calls, and how
+                             # old the answer would have been. Without these a
+                             # supersede is indistinguishable in the log from
+                             # RIO simply being slow.
+                             "turn", "now_turn", "tool", "call_id",
+                             "tools_aborted", "took_ms", "age_ms", "gap_ms",
+                             "command", "superseded")})
         _cutoffs["recent"].append(rec)
         if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
             _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]
@@ -852,6 +875,11 @@ def cutoff_tally() -> dict:
             # Under the old behaviour every one of these was a lost answer, so
             # this is the number that says whether the fix is doing anything.
             "blips_absorbed": _cutoffs["blips_absorbed"],
+            # How often the driver got in front of their own question, and what
+            # it cost. `turn_superseded` against `tool_result_discarded` is the
+            # pair worth reading: the second is how many stale answers were NOT
+            # spoken.
+            "turns": dict(_cutoffs["turns"]),
             # ...and the ones that never reached the gate, because the level
             # test said the microphone was hearing the loudspeaker.
             "echo_suppressed": _cutoffs["echo_suppressed"],
@@ -1135,6 +1163,20 @@ def mint_client_secret() -> dict:
             "echo_margin_db": float(config.REALTIME_BARGE_ECHO_MARGIN_DB),
         },
         "barge_echo_floor_db": float(config.REALTIME_BARGE_ECHO_FLOOR_DB),
+        # NEWEST WINS. The turn policy travels with the session for the same
+        # reason the barge policy does: config.py decides it, the browser holds
+        # no second copy, and tools/realtime_selftest.py checks the one copy.
+        #
+        # The commands are regular expressions matched against a WHOLE
+        # utterance -- see REALTIME_COMMAND_MAX_WORDS -- because "stop" inside
+        # "don't stop at the next light" is not a command.
+        "turn_policy": {
+            "commands": {k: list(v) for k, v in config.REALTIME_DRIVER_COMMANDS.items()},
+            "command_max_words": int(config.REALTIME_COMMAND_MAX_WORDS),
+            "coalesce_gap_ms": int(config.REALTIME_COALESCE_GAP_MS),
+            "coalesce_openers": list(config.REALTIME_COALESCE_OPENERS),
+            "coalesce_trailers": list(config.REALTIME_COALESCE_TRAILERS),
+        },
         # DICTATION IS A PROPERTY OF THE openai_realtime BACKEND, and it is
         # what makes ONE VOICE EVERYWHERE true on it.
         #

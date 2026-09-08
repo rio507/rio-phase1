@@ -31,6 +31,7 @@ and the one tool that ACTS rather than reports — starting a route because the
 driver asked to be taken somewhere (J).
 """
 import argparse
+import asyncio
 import contextlib
 import inspect
 import io
@@ -38,6 +39,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import sys
 import time
 from typing import Optional
@@ -918,18 +920,54 @@ def run_endpoints():
     finally:
         config.REALTIME_ENABLED = old
 
+    # The endpoint is a coroutine now: it races the tool against the client
+    # going away, which is how a superseded turn stops the server waiting on an
+    # answer nobody will hear. See app.realtime_tool_endpoint.
+    class _Req:
+        """A client that is still there. `disconnected=True` is the other test."""
+
+        def __init__(self, disconnected=False):
+            self._d = disconnected
+
+        async def is_disconnected(self):
+            return self._d
+
+    def _call(body, request=None):
+        return asyncio.run(app_mod.realtime_tool_endpoint(
+            request or _Req(), body, session_id=None))
+
     original = realtime._client
     try:
         _with_client(lambda kw: _Result("A lean condition."))
-        r = app_mod.realtime_tool_endpoint(
-            {"name": realtime.TOOL_NAME, "arguments": {"question": "P0171?"}},
-            session_id=None)
+        r = _call({"name": realtime.TOOL_NAME,
+                   "arguments": {"question": "P0171?"}})
         ok(r.get("ok") and "lean" in r.get("answer", "").lower(),
            "the tool endpoint runs the escalation and returns text")
 
-        r = app_mod.realtime_tool_endpoint({"name": "nope", "arguments": {}},
-                                           session_id=None)
+        r = _call({"name": "nope", "arguments": {}})
         ok(r.get("ok") is False, "and refuses a tool it does not have, calmly")
+
+        # SERVER-SIDE CANCELLATION, HONOURED. A driver who asks something else
+        # aborts the fetch; the connection drops; this end stops waiting.
+        #
+        # What it cannot do is kill a GPU pass already running -- Python has no
+        # way to interrupt a thread -- so the work finishes into nothing and is
+        # discarded. On the first real drive these calls ran 40.1, 12.9, 48.5
+        # and 27.1 seconds, and the cost being removed is the driver hearing
+        # the answer to a question they had already abandoned.
+        slow = threading.Event()
+        _with_client(lambda kw: (slow.wait(5.0), _Result("Too late."))[1])
+        t0 = time.time()
+        resp = _call({"name": realtime.TOOL_NAME,
+                      "arguments": {"question": "something slow"}},
+                     _Req(disconnected=True))
+        took = time.time() - t0
+        slow.set()
+        body = json.loads(bytes(resp.body).decode())
+        ok(getattr(resp, "status_code", None) == 499 and body.get("note") == "abandoned",
+           "a client that has gone away gets 499 and the tool is abandoned")
+        ok(took < 2.0,
+           f"...without waiting out the tool it abandoned ({took:.2f}s of a 5s call)")
     finally:
         realtime._client = original
 
@@ -3505,6 +3543,63 @@ def run_backend(live: bool = False):
        "...naming the backend, so the page holds no copy of the decision")
     ok(minted["speech_enabled"] is True,
        "...with dictation on, so nav, health and headway speak as her")
+
+    # --- NEWEST WINS: the turn policy travels, and the page's fallback copy
+    #     must not have drifted from it.
+    #
+    # rio_realtime.js carries TURN_DEFAULTS so a controller built before the
+    # session lands still has a policy. That is a fallback and not a second
+    # source of truth, and this is what keeps it honest: the shipped payload
+    # is checked against config.py here, and the JS defaults are checked
+    # against the shipped payload by eye in exactly one place, which is the
+    # file itself. Drift in the numbers that decide whether "stop navigation"
+    # ends a route is not a thing to find on a road.
+    tp = minted.get("turn_policy") or {}
+    ok(tp.get("command_max_words") == config.REALTIME_COMMAND_MAX_WORDS,
+       f"...and the command length cap ({tp.get('command_max_words')} words)")
+    ok(tp.get("coalesce_gap_ms") == config.REALTIME_COALESCE_GAP_MS,
+       f"...and the coalesce window ({tp.get('coalesce_gap_ms')} ms)")
+    ok(sorted(tp.get("commands") or {}) == sorted(config.REALTIME_DRIVER_COMMANDS),
+       f"...and every command kind ({', '.join(sorted(tp.get('commands') or {}))})")
+    bad_patterns = []
+    for kind, pats in (tp.get("commands") or {}).items():
+        if list(pats) != list(config.REALTIME_DRIVER_COMMANDS.get(kind, [])):
+            bad_patterns.append(kind)
+        for pat in pats:
+            try:
+                re.compile("^(please\\s+)?" + pat + "(\\s+please)?$")
+            except re.error as e:
+                bad_patterns.append(f"{kind}:{pat} ({e})")
+    ok(not bad_patterns,
+       "...with every pattern intact and compilable"
+       + (f" — offenders: {bad_patterns}" if bad_patterns else ""))
+
+    # THE FALSE POSITIVE THAT WOULD MAKE THIS UNUSABLE, checked against the
+    # patterns that actually ship rather than against a copy of them.
+    def _is_command(text):
+        t = text.lower().strip().rstrip(".!?,;:")
+        if len(t.split()) > config.REALTIME_COMMAND_MAX_WORDS:
+            return None
+        for kind, pats in config.REALTIME_DRIVER_COMMANDS.items():
+            for pat in pats:
+                if re.match("^(please\\s+)?" + pat + "(\\s+please)?$", t):
+                    return kind
+        return None
+
+    for phrase, expected in (
+            ("stop navigation", "stop_navigation"),
+            ("cancel the route", "stop_navigation"),
+            ("reroute", "reroute"),
+            ("stop", "silence"),
+            ("be quiet", "silence"),
+            ("please stop", "silence"),
+            ("don't stop at the next light, the turn is after it", None),
+            ("is there anywhere to stop for coffee", None),
+            ("what did you say about the route", None),
+            ("tell me about that building", None)):
+        got = _is_command(phrase)
+        ok(got == expected,
+           f"{phrase!r} -> {got!r} (expected {expected!r})")
 
     # The API ECHOES the transcription model back. A value it does not know is
     # a 400 at creation naming every value it does know, which is why this is

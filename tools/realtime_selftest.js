@@ -30,6 +30,34 @@ if (typeof global.atob !== 'function') {
   global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
 }
 
+/* AbortController, for the same reason and with the same caveat. Every browser
+   RIO runs in has had it for years; node 12, which is what is on this box, has
+   not. The page degrades without one -- a superseded tool result is still
+   discarded and still never spoken, it is only the HTTP request that cannot be
+   cancelled -- but the tests below are about the cancellation itself, so a
+   minimal one is installed rather than letting them quietly assert nothing. */
+if (typeof global.AbortController !== 'function') {
+  global.AbortController = class {
+    constructor() {
+      const listeners = [];
+      this.signal = {
+        aborted: false,
+        addEventListener: (t, fn) => { if (t === 'abort') listeners.push(fn); },
+        removeEventListener: (t, fn) => {
+          const i = listeners.indexOf(fn);
+          if (i >= 0) listeners.splice(i, 1);
+        },
+      };
+      this._fire = () => {
+        if (this.signal.aborted) return;
+        this.signal.aborted = true;
+        listeners.slice().forEach(fn => { try { fn(); } catch (e) {} });
+      };
+    }
+    abort() { this._fire(); }
+  };
+}
+
 const rt = require(path.join(__dirname, '..', 'static', 'rio_realtime.js'));
 const speech = require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
 // The real tracker, so the directions a test reads are computed the way the
@@ -91,6 +119,7 @@ function harness(opts) {
     resumeInstruction: 'RESUME>>',
     toolSchemas: opts.toolSchemas,
     conditionalTools: opts.conditionalTools,
+    turnPolicy: opts.turnPolicy,
   });
   return { arbiter, sent, events, audio, controller,
            types: () => sent.map(e => e.type),
@@ -3204,6 +3233,257 @@ section('text mode — she writes, and something else speaks');
     ok(h.controller.state().said_so_far === 'Back in my own voice.',
        'reading how far she got from her own transcript again');
   }
+}
+
+// ---------------------------------------------------------------------------
+section('newest wins — three quick questions');
+// ---------------------------------------------------------------------------
+/* THE DRIVE THIS IS ABOUT. Session 06af3214: four `look` calls taking 40.1,
+ * 12.9, 48.5 and 27.1 seconds, on a server whose /perceive took 52.6 s for one
+ * frame. Nothing could stop one of those, so the first question's answer came
+ * back whenever it came back, and asked the model to speak about it — over the
+ * top of the question the driver was actually waiting for.
+ *
+ * `slowTool` reproduces that: a tool that does not resolve until the test says
+ * so, holding an AbortController exactly as the real fetch does. */
+function slowTool() {
+  const calls = [];
+  const fn = (name, args, controller) => {
+    const call = { name, args, controller, aborted: false, resolve: null };
+    const p = new Promise((res) => { call.resolve = res; });
+    if (controller) {
+      controller.signal.addEventListener('abort', () => {
+        call.aborted = true;
+        const e = new Error('aborted');
+        e.name = 'AbortError';
+        call.resolve(Promise.reject(e));
+      });
+    }
+    calls.push(call);
+    return p;
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+function askAndCall(h, text, callId, rid) {
+  // The shape of a real turn: the driver speaks, the transcript lands, the
+  // model asks for a tool.
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: text });
+  if (rid) h.controller.handle({ type: 'response.created', response: { id: rid } });
+  if (callId) {
+    h.controller.handle({ type: 'response.function_call_arguments.done',
+                          name: 'look', call_id: callId,
+                          arguments: JSON.stringify({ question: text }) });
+  }
+}
+
+{
+  const tool = slowTool();
+  const h = harness({ tool });
+
+  askAndCall(h, 'What kind of car is that?', 'c1', 'r1');
+  await tick();
+  askAndCall(h, 'Where is the nearest petrol station?', 'c2', 'r2');
+  await tick();
+  askAndCall(h, 'How far to the turn?', 'c3', 'r3');
+  await tick();
+
+  ok(tool.calls.length === 3, 'three questions, three tool calls');
+  ok(tool.calls[0].aborted && tool.calls[1].aborted,
+     'the first two are ABORTED the moment the driver asks again');
+  ok(!tool.calls[2].aborted, 'and the one being waited for is not');
+
+  const superseded = h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED');
+  ok(superseded.length === 2, 'two supersedes, one per abandoned question');
+  ok(superseded.every(e => typeof e.superseded === 'string'),
+     'each one logs the question it dropped and the one that replaced it');
+  ok(h.events.filter(e => e.type === 'LIVE_TOOL_ABORTED').length === 2,
+     'every abort is logged too');
+
+  // Now the abandoned answers come back late, exactly as they did on the road.
+  tool.calls[0].resolve({ ok: true, speech: 'A silver estate car.',
+                          speak_directly: true, path: 'observer_direct' });
+  tool.calls[1].resolve({ ok: true, answer: 'A Shell, four hundred metres.' });
+  await settle();
+
+  const spoke = h.sent.filter(e => e.type === 'response.create');
+  ok(spoke.length === 0,
+     'NOT ONE of the stale answers asks for a response — no answer to a '
+     + 'superseded question is ever spoken');
+  const outputs = h.sent.filter(
+    e => e.type === 'conversation.item.create' &&
+         e.item && e.item.type === 'function_call_output');
+  ok(outputs.length === 2,
+     'the outputs still go back, so the conversation is not left malformed');
+  ok(outputs.every(o => /superseded/.test(o.item.output)),
+     '...saying what happened rather than pretending to be an answer');
+  ok(h.events.filter(e => e.type === 'LIVE_TOOL_RESULT_DISCARDED').length === 2,
+     'and the discard is counted — the number of stale answers NOT spoken');
+
+  // The live one is unaffected.
+  tool.calls[2].resolve({ ok: true, answer: 'Four hundred metres.' });
+  await settle();
+  ok(h.sent.filter(e => e.type === 'response.create').length === 1,
+     'the question the driver is actually waiting for is answered, once');
+
+  const c = h.controller.state().counters;
+  ok(c.turns_superseded === 2 && c.tools_aborted === 2
+     && c.tool_results_discarded === 2,
+     'the counters agree with the log');
+}
+
+// ---------------------------------------------------------------------------
+section('newest wins — a driver command preempts');
+// ---------------------------------------------------------------------------
+{
+  const tool = slowTool();
+  const h = harness({ tool });
+  /* A route that can actually be ended. `stop_navigation` is one of the
+     LOCAL_TOOLS the page answers itself, and it reaches RIO.nav.stopRoute --
+     so the check that "the route ends" is a check that the route ended, not
+     that an event was emitted about it. */
+  const stopped = [];
+  global.window = global.window || global;
+  const prevNav = (global.RIO && global.RIO.nav) || null;
+  global.RIO = global.RIO || {};
+  let routeRunning = true;
+  global.RIO.nav = {
+    stopRoute: (why) => {
+      stopped.push(why);
+      const was = routeRunning;
+      routeRunning = false;
+      return { was_navigating: was, destination: { display_name: 'The Grove' } };
+    },
+  };
+
+  askAndCall(h, 'Tell me about that building on the left.', 'c1', 'r1');
+  await tick();
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'That is the old' });
+
+  askAndCall(h, 'stop navigation', null, null);
+  await settle();
+
+  ok(tool.calls[0].aborted, 'the in-flight look is aborted mid-answer');
+  ok(h.sent.some(e => e.type === 'response.cancel'),
+     'the answer being spoken is cancelled');
+  const cmd = h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND');
+  ok(cmd.length === 1 && cmd[0].command === 'stop_navigation',
+     'the command is recognised as one, in the page, without a model turn');
+  const done = h.events.filter(e => e.type === 'LIVE_COMMAND_DONE');
+  ok(done.length === 1 && done[0].command === 'stop_navigation' && done[0].ok,
+     'and it is ACTED ON — the route is ended by the panel, not queued behind '
+     + 'a forty-second tool call');
+  ok(stopped.length === 1 && stopped[0] === 'voice' && routeRunning === false,
+     'THE ROUTE IS ACTUALLY OFF — RIO.nav.stopRoute was called, once, by voice');
+  ok(h.sent.some(e => e.type === 'conversation.item.create' && e.item
+                 && /stop_navigation/.test(JSON.stringify(e.item))),
+     'and the session is told, so the model does not stop it a second time');
+
+  // The abandoned answer, arriving after the command.
+  tool.calls[0].resolve({ ok: true, speech: 'It is the old post office.',
+                          speak_directly: true, path: 'observer_direct' });
+  await settle();
+  ok(h.sent.filter(e => e.type === 'response.create').length === 0,
+     'and the answer it was composing is dropped, not spoken over the command');
+  if (prevNav) global.RIO.nav = prevNav; else delete global.RIO.nav;
+}
+
+{
+  // "stop" on its own is a request for silence, and answering it with speech
+  // would be the wrong shape of obedience.
+  const h = harness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'The building on the left is' });
+  askAndCall(h, 'stop', null, null);
+  await settle();
+  const cmd = h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND');
+  ok(cmd.length === 1 && cmd[0].command === 'silence',
+     'a bare "stop" is a request for quiet');
+  ok(h.audio.muted, 'she goes quiet');
+  ok(h.sent.filter(e => e.type === 'response.create').length === 0,
+     'and does not answer it out loud');
+}
+
+{
+  // ...and a command must be a COMMAND. This is the false positive that would
+  // make the feature unusable.
+  const h = harness();
+  askAndCall(h, "Don't stop at the next light, the junction is just after it",
+             null, 'r1');
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 0,
+     '"don\'t stop at the next light" is not a command to stop navigating');
+  const h2 = harness();
+  askAndCall(h2, 'Is there anywhere to stop for coffee', null, 'r1');
+  await settle();
+  ok(h2.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 0,
+     '...and neither is asking where to stop for coffee');
+}
+
+// ---------------------------------------------------------------------------
+section('newest wins — a split utterance is one question');
+// ---------------------------------------------------------------------------
+{
+  /* Semantic VAD splits on a breath. "Is there a petrol station" / "near the
+     next exit" is one question, and superseding the first half with the second
+     would throw away the tool call for the question being asked — the same bug
+     as before, running backwards. */
+  const tool = slowTool();
+  const h = harness({ tool });
+
+  askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
+  await tick();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'near the next exit' });
+  await tick();
+
+  ok(!tool.calls[0].aborted,
+     'the tool call for the first half is NOT aborted — it is the same question');
+  const co = h.events.filter(e => e.type === 'LIVE_TURN_COALESCED');
+  ok(co.length === 1, 'the two fragments are logged as one turn');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 0,
+     'and nothing is superseded');
+  ok(h.controller.state().counters.turns_coalesced === 1,
+     'the counter says so too');
+
+  tool.calls[0].resolve({ ok: true, answer: 'A Shell, just past the slip road.' });
+  await settle();
+  ok(h.sent.filter(e => e.type === 'response.create').length === 1,
+     'and the answer to the whole question IS spoken');
+}
+
+{
+  // Two real questions in quick succession are still two questions.
+  const tool = slowTool();
+  const h = harness({ tool });
+  askAndCall(h, 'What is that building.', 'c1', 'r1');
+  await tick();
+  askAndCall(h, 'Where are we going?', null, 'r2');
+  await settle();
+  ok(tool.calls[0].aborted,
+     'a finished sentence followed by a new question is NOT a continuation');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 1,
+     '...it is a supersede');
+}
+
+{
+  // A long pause is a new question however it opens.
+  const tool = slowTool();
+  const h = harness({ turnPolicy: { coalesce_gap_ms: 1 }, tool });
+  askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
+  await settle(10);
+  askAndCall(h, 'near the next exit', null, 'r2');
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_COALESCED').length === 0,
+     'past the coalesce window the same words are a new turn');
 }
 
 const serverArg = process.argv.indexOf('--server');

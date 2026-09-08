@@ -795,7 +795,8 @@ def voice_status_endpoint():
 
 
 @app.post("/realtime/tool")
-def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
+async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
+                                 session_id: str = Query(default=None)):
     """The one tool the live session can call: think harder, or look it up.
 
     Runs here rather than in the browser for the obvious reason — the key — and
@@ -821,8 +822,46 @@ def realtime_tool_endpoint(body: dict = Body(...), session_id: str = Query(defau
     # for the same reason: Whisper's output lands in the browser, and the
     # visual fast path is a judgement about what was ASKED rather than about
     # the paraphrase the model relayed it as.
-    result = realtime.run_tool(name, args, session_key=_visual_key(session_id),
-                               where=where, spoken=body.get("spoken"))
+    # SERVER-SIDE CANCELLATION, HONOURED.
+    #
+    # The browser holds an AbortController per tool call and fires it the
+    # moment the driver asks something else; aborting the fetch drops the
+    # connection, and this is the end that notices. Two tasks race: the tool,
+    # and a watcher for the client going away.
+    #
+    # What this can and cannot do, stated plainly. It stops the SERVER waiting
+    # on an answer nobody will hear, releases the request, and writes the
+    # abandonment into the drive's log. It cannot kill a GPU pass that has
+    # already started -- Python has no way to interrupt a thread -- so that
+    # work finishes and its result is discarded. On the first real drive these
+    # calls ran 40.1, 12.9, 48.5 and 27.1 seconds; the cost being removed here
+    # is the driver hearing the answer to a question they abandoned, and the
+    # session spending a response on it.
+    work = asyncio.create_task(run_in_threadpool(
+        realtime.run_tool, name, args, _visual_key(session_id), where,
+        body.get("spoken")))
+
+    async def _abandoned():
+        while True:
+            if await request.is_disconnected():
+                return True
+            await asyncio.sleep(config.REALTIME_TOOL_DISCONNECT_POLL_S)
+
+    watcher = asyncio.create_task(_abandoned())
+    done, _pending = await asyncio.wait({work, watcher},
+                                        return_when=asyncio.FIRST_COMPLETED)
+    if work in done:
+        watcher.cancel()
+        result = work.result()
+    else:
+        # The driver moved on. The tool is left to finish into nothing.
+        work.add_done_callback(lambda t: t.exception())
+        sessions.log_live(session_id, "tool_abandoned", {
+            "tool": name,
+            "reason": "client_disconnected",
+            "note": "superseded by a newer driver turn; the result was discarded",
+        })
+        return JSONResponse({"ok": False, "note": "abandoned"}, status_code=499)
     logged = {"tool": name, "ok": bool(result.get("ok")),
               "took_ms": result.get("took_ms")}
     # WHICH PATH a visual answer took, in the drive's own record. The three are

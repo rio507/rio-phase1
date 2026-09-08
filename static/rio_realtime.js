@@ -647,7 +647,28 @@
                      // responses where a plain answer spends one, which is
                      // why "she only fails when she uses a tool" is the shape
                      // the driver sees. Retried once; counted either way.
-                     responses_failed: 0, responses_retried: 0 };
+                     responses_failed: 0, responses_retried: 0,
+                     /* NEWEST WINS -- the three numbers item 4 exists to make
+                        non-zero, and the one it exists to make small.
+
+                        turns_superseded  a driver asked again before the last
+                                          answer arrived, and the old one was
+                                          dropped rather than spoken.
+                        tools_aborted     tool calls belonging to those turns.
+                                          On the first real drive these would
+                                          have been four `look` calls of 40.1,
+                                          12.9, 48.5 and 27.1 seconds.
+                        turns_coalesced   fragments semantic VAD split that
+                                          were one question. Superseding these
+                                          would be the same bug backwards.
+                        commands_preempted  "stop navigation" acted on at once
+                                          instead of behind a 40 s tool call. */
+                     turns_superseded: 0, tools_aborted: 0,
+                     turns_coalesced: 0, commands_preempted: 0,
+                     // Tool results that came back for a turn nobody was
+                     // waiting for. Never spoken; the number that says how
+                     // often a stale answer WOULD have been.
+                     tool_results_discarded: 0 };
     var directs = 0;
 
     /* WHY EVERY ANSWER STOPPED. One counter per cause, because "she cuts out"
@@ -671,6 +692,9 @@
          other           the arbiter's watchdog, an error, a session ending. */
     var cutoffs = { false_barge_in: 0, barge_in: 0, preempted: 0,
                     token_cap: 0, transport: 0, other: 0 };
+    var now = (root.performance && root.performance.now)
+      ? function () { return root.performance.now(); }
+      : function () { return Date.now(); };
 
     var lastTranscript = '';
     /* What she has said so far in the response now playing, accumulated from
@@ -694,6 +718,191 @@
        one turn is asking the same question of the same empty budget. */
     var retryArmed = true;
     var turnSeq = 0;            // which driver turn is outstanding
+
+    /* ---- NEWEST WINS ------------------------------------------------------
+     *
+     * WHY THIS IS NOT TIDINESS. On the first real drive the four `look` calls
+     * took 40.1 s, 12.9 s, 48.5 s and 27.1 s -- the visual path went out to
+     * Qwen and one /perceive on that drive took 52.6 seconds. A driver does
+     * not wait forty seconds; they ask again. And until this existed the first
+     * question's tool call went on running, came back, and asked the model to
+     * speak about it -- an answer to a question two questions ago, arriving
+     * while the driver was waiting for the one they had just asked.
+     *
+     * Three things a new driver utterance now does, in this order:
+     *
+     *   1. decide whether it is a NEW turn at all. A fragment that continues
+     *      the last one inside the coalesce window is the same question, and
+     *      cancelling its own tool call would be this bug in the other
+     *      direction.
+     *   2. if it is new: cancel the response being generated, abort every tool
+     *      call belonging to an older turn, and drop anything conversational
+     *      still waiting for the mouth.
+     *   3. log it. Every supersede, every abort, every coalesce.
+     *
+     * A tool result that lands for a superseded turn is never spoken and never
+     * turned into a request for a response. The output is still handed back to
+     * the session -- a function call left with no output is a malformed
+     * conversation, and the next turn pays for it -- but it says what happened
+     * and asks for nothing.
+     */
+    var inflightTools = {};     // call_id -> {name, turn, controller, at}
+    var lastTurnAt = 0;         // when the last driver fragment landed
+    var lastTurnText = '';
+    /* Fallbacks only, and the same arrangement rio_navcore uses for its
+       timing: the real values live in config.py (REALTIME_DRIVER_COMMANDS,
+       REALTIME_COALESCE_*) and arrive with the session. These exist so a
+       controller built before the session payload lands, or by a test, still
+       has a policy rather than none -- and tools/realtime_selftest.py asserts
+       the shipped copy against config so the two cannot drift. */
+    var TURN_DEFAULTS = {
+      commands: {
+        stop_navigation: ['stop( the)? nav(igation)?', 'cancel( the)? nav(igation)?',
+                          'end( the)? nav(igation)?', 'stop( the)? route',
+                          'cancel( the)? route', 'stop navigating', 'stop guiding me'],
+        reroute: ['re-?route', 're-?calculate', 'find (me )?another way',
+                  'different route', 'new route'],
+        silence: ['stop', 'stop talking', 'be quiet', 'quiet', 'shut up',
+                  'never ?mind', 'forget it', 'cancel that'],
+      },
+      command_max_words: 5,
+      coalesce_gap_ms: 1500,
+      coalesce_openers: ['and', 'or', 'but', 'then', 'also', 'plus', 'so',
+                         'um', 'uh', 'er', 'like', 'actually', 'i mean', 'near',
+                         'next to', 'on', 'in', 'at', 'to', 'for', 'with', 'by',
+                         'from', 'about', 'around', 'over', 'under', 'after',
+                         'before', 'because', 'which', 'that', 'who', 'just'],
+      coalesce_trailers: ['and', 'or', 'but', 'the', 'a', 'an', 'of', 'to',
+                          'for', 'with', 'at', 'on', 'in', 'is', 'are', 'was',
+                          'were', 'near', 'by', 'from', 'that', 'like', 'about',
+                          'some', 'any', 'my', 'your', "it's", "there's"],
+    };
+    var turnPolicy = {};
+    for (var tk in TURN_DEFAULTS) turnPolicy[tk] = TURN_DEFAULTS[tk];
+    for (var tk2 in (cfg.turnPolicy || {})) turnPolicy[tk2] = cfg.turnPolicy[tk2];
+    var commandRes = null;      // lazily compiled from turnPolicy.commands
+
+    function policyList(name, fallback) {
+      var v = turnPolicy[name];
+      return (v && v.length) ? v : fallback;
+    }
+
+    /* A command is an utterance that is essentially NOTHING BUT the command.
+       Anchored, and length-capped, because "stop" inside "don't stop at the
+       next light" is not an instruction to end the route. */
+    function driverCommand(text) {
+      var t = (text || '').toLowerCase().trim()
+        .replace(/[.!?,;:]+$/g, '')
+        .replace(/^(hey |ok |okay |rio[,! ]*)+/g, '')
+        .trim();
+      if (!t) return null;
+      var maxWords = turnPolicy.command_max_words || 5;
+      if (t.split(/\s+/).length > maxWords) return null;
+      if (!commandRes) {
+        commandRes = [];
+        var src = turnPolicy.commands || {};
+        for (var kind in src) {
+          for (var i = 0; i < src[kind].length; i++) {
+            try {
+              commandRes.push({ kind: kind,
+                                re: new RegExp('^(please\\s+)?' + src[kind][i]
+                                               + '(\\s+please)?$') });
+            } catch (e) { /* a bad pattern must not break the session */ }
+          }
+        }
+      }
+      for (var j = 0; j < commandRes.length; j++) {
+        if (commandRes[j].re.test(t)) return commandRes[j].kind;
+      }
+      return null;
+    }
+
+    /* Is this fragment the back half of the last one?
+     *
+     * Semantic VAD splits an utterance the moment the driver breathes, and
+     * "is there a petrol station" / "near the next exit" is one question. Two
+     * signals, either of which is enough, both inside a short window: the new
+     * fragment opens like a continuation, or the old one ended unfinished. */
+    function isContinuation(prev, next, gapMs) {
+      if (!prev || !next) return false;
+      if (gapMs > (turnPolicy.coalesce_gap_ms || 1500)) return false;
+      var a = prev.toLowerCase().trim();
+      var b = next.toLowerCase().trim().replace(/^[,;\s]+/, '');
+      if (!a || !b) return false;
+      // A finished sentence followed by a question is two questions.
+      if (/[.!?]$/.test(a) && /^(what|where|when|who|why|how|is|are|can|could|do|does|did|will|would|should|tell|show|find|take|go|play|call)\b/.test(b)) {
+        return false;
+      }
+      var openers = policyList('coalesce_openers', ['and', 'or', 'but', 'then']);
+      for (var i = 0; i < openers.length; i++) {
+        if (b === openers[i] || b.indexOf(openers[i] + ' ') === 0) return true;
+      }
+      var tail = a.replace(/[.!?,;:]+$/, '').split(/\s+/).pop();
+      var trailers = policyList('coalesce_trailers', ['and', 'or', 'the', 'a']);
+      for (var j = 0; j < trailers.length; j++) {
+        if (tail === trailers[j]) return true;
+      }
+      return false;
+    }
+
+    /* Abort every tool call that belongs to a turn nobody is waiting for. */
+    function abortStaleTools(reason) {
+      var n = 0;
+      for (var id in inflightTools) {
+        var e = inflightTools[id];
+        if (e.turn >= turnSeq) continue;
+        n++;
+        e.aborted = true;
+        try { if (e.controller) e.controller.abort(); } catch (x) {}
+        counters.tools_aborted++;
+        emit('LIVE_TOOL_ABORTED', {
+          tool: e.name, call_id: id, turn: e.turn, now_turn: turnSeq,
+          reason: reason, age_ms: Math.round(now() - e.at),
+        });
+      }
+      return n;
+    }
+
+    /* Everything a superseded turn leaves behind.
+     *
+     * Returns false when there was nothing to supersede, which is the ordinary
+     * case for the first question of a conversation and for every question
+     * asked after RIO has finished answering the last one. Logging one there
+     * would make "she answered the wrong question" impossible to count,
+     * because the count would be "every turn". */
+    function supersedeTurn(reason, detail) {
+      var outstanding = false;
+      for (var k in inflightTools) {
+        if (inflightTools[k].turn < turnSeq) { outstanding = true; break; }
+      }
+      if (!outstanding && !(speaking && !speaking.cancelled)) return false;
+      var rid = speaking ? speaking.responseId : null;
+      var said = saidSoFar();
+      var aborted = abortStaleTools(reason);
+      // The response being generated is about the old question.
+      if (speaking && !speaking.cancelled) {
+        cancelGeneration();
+        if (rid) endResponse(rid);
+      } else {
+        // Nothing is playing, but a response may still be on its way from a
+        // create we have not seen `response.created` for yet.
+        try { send({ type: 'response.cancel' }); } catch (e) {}
+      }
+      // ...and anything conversational still queued for the mouth. A safety
+      // warning or a turn call is NOT dropped: those are about the road, not
+      // about the question.
+      try {
+        if (root.RIO && RIO.speech && RIO.speech.clear) RIO.speech.clear('convo');
+      } catch (e) {}
+      counters.turns_superseded++;
+      emit('LIVE_TURN_SUPERSEDED', {
+        turn: turnSeq, response_id: rid, said_chars: (said || '').length,
+        tools_aborted: aborted, reason: reason,
+        superseded: (detail && detail.previous || '').slice(0, 160),
+        by: (detail && detail.next || '').slice(0, 160),
+      });
+      return true;
+    }
     /* IS THE LAST TRANSCRIPT ABOUT THE QUESTION BEING ASKED NOW?
      *
      * Only until the driver opens their mouth again. `lastTranscript` is kept
@@ -1616,7 +1825,44 @@
         pendingResume = null;
         resumeChain = 0;
         retryArmed = true;
-        turnSeq++;
+
+        var at = now();
+        var gap = lastTurnAt ? (at - lastTurnAt) : Infinity;
+        var cmd = driverCommand(text);
+        var cont = !cmd && isContinuation(lastTurnText, text, gap);
+
+        if (cont) {
+          /* ONE QUESTION IN TWO BREATHS. The turn number does NOT advance, so
+             nothing belonging to it is aborted -- the tool call already
+             running is running for the question being asked. What IS cancelled
+             is the response the server created for half a question; both
+             fragments are already in the conversation, so the response that
+             follows this one answers the whole thing. */
+          counters.turns_coalesced++;
+          if (speaking && !speaking.cancelled) {
+            var rid0 = speaking.responseId;
+            cancelGeneration();
+            endResponse(rid0);
+          }
+          emit('LIVE_TURN_COALESCED', {
+            turn: turnSeq, gap_ms: Math.round(gap),
+            first: lastTurnText.slice(0, 160), second: text.slice(0, 160),
+          });
+          lastTurnText = (lastTurnText + ' ' + text).trim();
+          lastTurnAt = at;
+        } else {
+          var previous = lastTurnText;
+          turnSeq++;
+          lastTurnText = text;
+          lastTurnAt = at;
+          /* Anything outstanding belongs to the question before this one.
+             Superseding is unconditional: it costs a response that nobody is
+             waiting for, and NOT superseding costs an answer to the wrong
+             question, out loud, in a car. */
+          supersedeTurn(cmd ? 'driver_command' : 'new_utterance',
+                        { previous: previous, next: text });
+          if (cmd) driverCommandTurn(cmd, text);
+        }
       }
       if (!pendingBarge) return;
       var rid = pendingBarge.responseId;
@@ -1642,6 +1888,69 @@
       noteCutoff('false_barge_in', { response_id: rid, said: said,
                                     detail: 'empty transcript' });
       if (!wasDirect) { armResume('false_barge_in', said); tryResume(); }
+    }
+
+    /* A COMMAND IS ACTED ON, NOT QUEUED.
+     *
+     * supersedeTurn has already run by the time this is called, so the mouth
+     * is free and no tool call is still out. What is left is the difference
+     * between the two kinds:
+     *
+     *   silence   the driver asked for quiet. Answered by being quiet -- and
+     *             deliberately NOT by asking for a response, because replying
+     *             to "be quiet" with speech is the wrong shape of obedience.
+     *             The model is told, out of band, so the next thing said is
+     *             not a continuation of what was just cut off.
+     *
+     *   nav       stopping or replacing a route is teardown of objects that
+     *             only exist in this page, and the panel already owns both
+     *             (LOCAL_TOOLS). Doing it here rather than waiting for the
+     *             model to call the same function saves the round trip that
+     *             this whole item is about -- on the first real drive that
+     *             round trip queued behind tool calls of forty seconds.
+     *             The phrases are anchored whole-utterance matches with no
+     *             other meaning in a car; see config.REALTIME_DRIVER_COMMANDS.
+     */
+    function driverCommandTurn(kind, text) {
+      counters.commands_preempted++;
+      emit('LIVE_DRIVER_COMMAND', { command: kind, text: text.slice(0, 160),
+                                    turn: turnSeq });
+      if (kind === 'silence') {
+        try { audio.mute(); } catch (e) {}
+        try {
+          if (root.RIO && RIO.speech && RIO.speech.clear) RIO.speech.clear('convo');
+        } catch (e) {}
+        // Told, not asked. `conversation: none` would hide it from the
+        // history; this belongs IN the history, because "she stopped because I
+        // told her to" is context for the next thing she says.
+        try {
+          send({ type: 'conversation.item.create',
+                 item: { type: 'message', role: 'assistant',
+                         content: [{ type: 'output_text',
+                                     text: '(stopped at the driver\'s request)' }] } });
+        } catch (e) {}
+        return;
+      }
+      var toolName = (kind === 'reroute') ? 'reroute' : 'stop_navigation';
+      var fn = LOCAL_TOOLS[toolName];
+      if (!fn) return;
+      var result;
+      try { result = fn({}); } catch (e) { result = { ok: false, note: 'panel error' }; }
+      Promise.resolve(result).then(function (r) {
+        emit('LIVE_COMMAND_DONE', { command: kind, ok: !!(r && r.ok),
+                                    note: (r && r.note) || null });
+        // The session is told what the panel did, so the model does not call
+        // the same tool a second time and does not answer as though the route
+        // were still running.
+        try {
+          send({ type: 'conversation.item.create',
+                 item: { type: 'message', role: 'assistant',
+                         content: [{ type: 'output_text',
+                                     text: JSON.stringify({ command: kind,
+                                                            done: true,
+                                                            result: r || null }) }] } });
+        } catch (e) {}
+      });
     }
 
     function dictationStarted() {
@@ -1804,22 +2113,68 @@
 
     function toolCall(name, callId, argsJson) {
       counters.tool_calls++;
-      emit('LIVE_TOOL_CALL', { tool: name, call_id: callId });
+      emit('LIVE_TOOL_CALL', { tool: name, call_id: callId, turn: turnSeq });
       var args = argsJson;
       if (typeof argsJson === 'string') {
         try { args = JSON.parse(argsJson || '{}'); } catch (e) { args = {}; }
       }
+      /* WHICH QUESTION THIS CALL IS FOR, and a handle to stop it.
+       *
+       * The turn is captured now, at the moment the model asks for the tool,
+       * and checked again when the result lands. Everything between those two
+       * moments is where the first real drive spent up to 48 seconds. */
+      /* `aborted` is the flag that actually protects the driver, and it works
+         with or without an AbortController: a result marked aborted is never
+         spoken and never asks for a response. The controller is what
+         additionally stops the HTTP request and tells the server, and every
+         browser this runs in has had one for years. Where it is missing the
+         answer is still discarded; only the network call carries on. */
+      var entry = { name: name, turn: turnSeq, at: now(), aborted: false,
+                    controller: (typeof AbortController === 'function')
+                      ? new AbortController() : null };
+      inflightTools[callId] = entry;
+
       return Promise.resolve()
-        .then(function () { return runTool(name, args); })
+        .then(function () { return runTool(name, args, entry.controller); })
         .catch(function (e) {
-          // The server is unreachable, or refused. Not an error the driver
-          // hears about: RIO is told the tool did not work and carries on.
+          // The server is unreachable, refused, or this call was aborted
+          // because the driver asked something else. Not an error the driver
+          // hears about either way.
+          if (entry.aborted || (e && e.name === 'AbortError')) {
+            return { ok: false, note: 'superseded' };
+          }
           return { ok: false, note: 'unreachable' };
         })
         .then(function (result) {
+          delete inflightTools[callId];
           result = result || { ok: false, note: 'no result' };
-          if (!result.ok) counters.tool_failures++;
+          if (!result.ok && !entry.aborted) counters.tool_failures++;
           if (stopped) return result;
+
+          /* THE ANSWER TO A QUESTION NOBODY IS WAITING FOR.
+           *
+           * The output still goes back -- a function call left with no output
+           * is a malformed conversation and the NEXT turn pays for it -- but
+           * it says what happened, nothing is spoken, and no response is
+           * requested. This is the line that stops a forty-second-old answer
+           * arriving on top of the question the driver actually asked. */
+          if (entry.turn !== turnSeq) {
+            counters.tool_results_discarded++;
+            emit('LIVE_TOOL_RESULT_DISCARDED', {
+              tool: name, call_id: callId, turn: entry.turn, now_turn: turnSeq,
+              aborted: entry.aborted, took_ms: Math.round(now() - entry.at),
+            });
+            try {
+              send({ type: 'conversation.item.create',
+                     item: { type: 'function_call_output', call_id: callId,
+                             output: JSON.stringify({
+                               ok: false,
+                               note: 'superseded — the driver asked something '
+                                     + 'else before this came back' }) } });
+            } catch (e) {}
+            return result;
+          }
+
           send({
             type: 'conversation.item.create',
             item: {
@@ -2609,10 +2964,15 @@
              behaves as it does on a desk. */
           levels: function () { return meter ? meter() : null; },
           maxResumes: session.max_resumes,
+          /* NEWEST WINS. The commands that preempt, how long two fragments may
+             be apart and still be one question, and what a continuation looks
+             like — all decided in config.py and carried here with the session,
+             exactly as the barge and dictation policies are. */
+          turnPolicy: session.turn_policy,
           send: function (obj) {
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));
           },
-          tool: function (name, args) {
+          tool: function (name, args, controller) {
             // Answered in the page when the page is the source of truth;
             // everything else goes to the server, which holds the camera, the
             // vehicle context and the reasoning model.
@@ -2622,6 +2982,16 @@
             }
             return fetch(url('/realtime/tool'), {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
+              /* THE HANDLE THAT STOPS IT. One controller per tool call, held by
+                 the turn that asked for it; a new driver utterance aborts every
+                 controller belonging to an older turn. Aborting the fetch also
+                 drops the TCP connection, which is how the server finds out --
+                 /realtime/tool watches for it and stops waiting on work nobody
+                 is going to hear.
+
+                 On the first real drive these calls ran 40.1, 12.9, 48.5 and
+                 27.1 seconds. Nothing could stop one. */
+              signal: controller ? controller.signal : undefined,
               // `where` is the car's own fix. Only find_places reads it, but it
               // is attached to every call rather than to one, so a tool that
               // needs it later does not have to re-plumb this.

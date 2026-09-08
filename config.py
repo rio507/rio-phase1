@@ -593,6 +593,78 @@ REALTIME_BARGE_CONFIRM_MS = 1500
 # "as I was saying" is worse than stopping.
 REALTIME_MAX_RESUMES = 1
 
+# ---------------------------------------------------------------------------
+# Newest wins: superseding a turn (item 4 of the first real-drive punch list)
+# ---------------------------------------------------------------------------
+# WHY THIS IS URGENT AND NOT TIDINESS. On the first real drive the four `look`
+# tool calls took 40.1 s, 12.9 s, 48.5 s and 27.1 s -- the visual path went out
+# to Qwen and one /perceive on that drive took 52.6 seconds. A driver does not
+# wait 40 seconds. They ask again. And until now the first question's tool call
+# went on running, came back, and asked the model to speak about it.
+
+# THE COMMANDS THAT PREEMPT, and they are matched as WHOLE utterances.
+#
+# Anchored on purpose. "stop" inside "don't stop at the next light" is not a
+# command and must never be treated as one, so a command is an utterance that
+# is essentially nothing but the command. Two kinds:
+#
+#   nav       acted on in the page, immediately, without waiting for a model
+#             turn. These phrases have no other meaning in a car, and the
+#             alternative -- waiting for a round trip behind a 40-second tool
+#             call -- is the thing this item exists to fix.
+#   silence   stop talking. Answered by stopping, and by NOT asking for a
+#             response: replying to "be quiet" with speech is the wrong shape
+#             of obedience.
+REALTIME_DRIVER_COMMANDS = {
+    "stop_navigation": [
+        r"stop( the)? nav(igation)?", r"cancel( the)? nav(igation)?",
+        r"end( the)? nav(igation)?", r"stop( the)? route", r"cancel( the)? route",
+        r"stop navigating", r"stop guiding me",
+    ],
+    "reroute": [
+        r"re-?route", r"re-?calculate", r"find (me )?another way",
+        r"different route", r"new route",
+    ],
+    "silence": [
+        r"stop", r"stop talking", r"be quiet", r"quiet", r"shut up",
+        r"never ?mind", r"forget it", r"cancel that",
+    ],
+}
+# Anything longer than this is a sentence, not a command, whatever it contains.
+REALTIME_COMMAND_MAX_WORDS = 5
+
+# --- coalescing rapid-fire fragments ---------------------------------------
+# Semantic VAD splits an utterance the moment the driver breathes, and a driver
+# saying "is there a petrol station... near the next exit" is asking one
+# question. Superseding the first half with the second is technically correct
+# and practically the same bug in the other direction: it throws away the tool
+# call for the question being asked.
+#
+# So two fragments inside this window, WHERE THE TRANSCRIPT SHOWS CONTINUATION,
+# are one turn: no supersede, no abort, and the model answers both because both
+# are already in the conversation.
+REALTIME_COALESCE_GAP_MS = 1500
+# The second fragment continues the first if it opens with one of these...
+REALTIME_COALESCE_OPENERS = (
+    "and", "or", "but", "then", "also", "plus", "so", "um", "uh", "er",
+    "like", "actually", "i mean", "near", "next to", "on", "in", "at", "to",
+    "for", "with", "by", "from", "about", "around", "over", "under", "after",
+    "before", "because", "which", "that", "who", "just",
+)
+# ...or the first ends on one of these, which is a sentence that has not
+# finished being a sentence.
+REALTIME_COALESCE_TRAILERS = (
+    "and", "or", "but", "the", "a", "an", "of", "to", "for", "with", "at",
+    "on", "in", "is", "are", "was", "were", "near", "by", "from", "that",
+    "like", "about", "some", "any", "my", "your", "it's", "there's",
+)
+
+# How long a tool call may keep running for a turn that has been superseded.
+# Zero is the honest number on the client -- the AbortController fires at once
+# -- and this is the SERVER's grace: /realtime/tool watches for the client
+# going away and stops waiting on work nobody is going to hear about.
+REALTIME_TOOL_DISCONNECT_POLL_S = 0.25
+
 OPENAI_TEMPERATURE = 1
 # gpt-5.5 is a reasoning model: max_completion_tokens covers reasoning AND output.
 # At 120 the reasoning pass could eat the whole budget and RIO returned an empty
