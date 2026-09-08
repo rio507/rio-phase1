@@ -227,6 +227,9 @@ class LiveSession:
         # it.
         self.speed = speed_mod.SpeedResolver(
             obd_reader=speed_mod.default_obd_reader())
+        # Metres of road since this session began. The clock the static
+        # structure veto runs on -- see headway/membership.py.
+        self.host_m = 0.0
 
         self.corridor = None        # this frame's corridor: LaneCorridor or EgoCorridor
         self.base_corridor = None   # the static trapezoid, always kept as fallback
@@ -448,7 +451,12 @@ class LiveSession:
             d, conf, _ = depth_mod.roi_depth(depth_full, b)
             if not (np.isfinite(d) and conf > 0.2):
                 return None, "low_depth_conf"
-            verdict = plaus_mod.check(label, b, float(d), f_px, image_h=h)
+            # image_w as well as image_h: the width bound needs to know how
+            # wide the picture is before it will say anything, and a box that
+            # spans the whole of it is the car's own bonnet rather than a
+            # vehicle four metres ahead. See headway/plausibility.py.
+            verdict = plaus_mod.check(label, b, float(d), f_px,
+                                      image_h=h, image_w=w)
             if not verdict["ok"]:
                 self.n_range_refused += 1
                 return None, verdict["reason"]
@@ -457,9 +465,17 @@ class LiveSession:
         # Merge promotion needs real lane paint. Declaring a merge off the
         # trapezoid would be inventing the one event a driver is least able to
         # check against what they can see.
+        # THE ODOMETER, not the clock. membership's static-structure veto asks
+        # whether a box has moved while the CAR has, and twenty seconds at a
+        # red light is not evidence about anything. Integrated from the same
+        # resolved speed the bands rest on, so a session with no speed at all
+        # simply never accumulates and the veto stays inert.
+        if v_speed is not None and dt:
+            self.host_m += max(0.0, float(v_speed)) * min(float(dt), 2.0)
         promotions = self.candidates.evaluate(
             self.corridor, t, depth_fn=_range_of,
-            allow_merge=(self.corridor.source == "ufld"))
+            allow_merge=(self.corridor.source == "ufld"),
+            host_m=self.host_m)
         self.n_merge_promotions += len(promotions)
 
         lead_cand, member_info = self.candidates.select_lead(t)

@@ -37,6 +37,8 @@ from . import detect as detect_mod
 from . import lanes as lanes_mod
 from . import live as live_mod
 from . import live_policy as P
+from . import membership as member_mod
+from . import plausibility as plaus_mod
 from . import state as v2
 
 PASS, FAIL = [], []
@@ -1381,6 +1383,199 @@ def run_speed():
           "five runs of the same script are byte-identical")
 
 
+# ===========================================================================
+# G. The car this camera is bolted to (the upstream half of item 2)
+#
+# Every box below was OBSERVED, on session 06af3214, an iPhone on a real road.
+# The drive spent 584 frames -- 36% of ten minutes -- holding the phone's view
+# of the car's own bonnet and dashboard as the lead vehicle at 3.7 m while
+# doing 20 m/s, and spoke twelve warnings about it.
+#
+# Three gates in three layers, each with its own argument, checked here
+# together because what matters is that no ONE of them is load-bearing.
+# ===========================================================================
+
+# The real thing, on the frame size the drive actually ran at. x1 wanders by a
+# pixel or two between frames; nothing else about it moves at all.
+EGO_SLAB = (0.6, 308.0, 640.0, 478.0)
+EGO_W, EGO_H = 640, 480
+# ...and the two frames where its top edge sat within a pixel of the horizon,
+# which is where a fitted threshold would have let it through.
+EGO_SLAB_EDGE = (1.1, 240.3, 640.0, 476.4)
+# The portrait orientation, from the first seconds of the same drive, before
+# the phone was turned. Its top IS above the horizon, so the shape gate has no
+# opinion about it and the other two have to earn their keep.
+EGO_SLAB_PORTRAIT = (0.6, 244.2, 480.0, 639.5)
+EGO_PW, EGO_PH = 480, 640
+# A genuine lead from the same drive, 51 m ahead.
+REAL_LEAD = (241.4, 210.1, 268.0, 231.0)
+
+
+def _fpx(w):
+    import math as _m
+    from headway.anchor import HFOV_DEG
+    return (float(w) / 2.0) / _m.tan(_m.radians(HFOV_DEG) / 2.0)
+
+
+def run_ego_structure():
+    head("G -- the car this camera is bolted to")
+
+    # -- G1 shape: a full-width box that never rises above the horizon -------
+    head("G1 -- shape (headway/detect.py)")
+    check(detect_mod._is_ego_bonnet(*EGO_SLAB, EGO_W, EGO_H),
+          "the phone's bonnet-and-dashboard slab is rejected",
+          f"aspect {(EGO_SLAB[2]-EGO_SLAB[0])/(EGO_SLAB[3]-EGO_SLAB[1]):.1f} — "
+          "the old gate wanted 6.0 and let this through 584 times")
+    check(detect_mod._is_ego_bonnet(*EGO_SLAB_EDGE, EGO_W, EGO_H),
+          "...including the frames where its top sat ON the horizon",
+          "y1=240.3 against a horizon of 240.0 — a fitted threshold misses these")
+    check(detect_mod._is_ego_bonnet(2, 661, 1279, 720, 1280, 720),
+          "and the dashcam's thin strip still is too",
+          "the shape this gate was originally written for")
+
+    # THE FALSE REJECTION THAT WOULD MATTER MORE THAN THE BUG.
+    check(not detect_mod._is_ego_bonnet(100, 300, 1200, 719, 1280, 720),
+          "a genuinely close, TALL vehicle is NOT rejected",
+          "wide and tall is a lorry; wide and never above the horizon is our own car")
+    check(not detect_mod._is_ego_bonnet(0, 0, 1280, 720, 1280, 720),
+          "...nor is one so close it fills the frame",
+          "its top edge is at the top, which is what being a real object looks like")
+    check(not detect_mod._is_ego_bonnet(500, 600, 780, 720, 1280, 720),
+          "a normal vehicle touching the frame bottom is not rejected")
+    check(not detect_mod._is_ego_bonnet(*REAL_LEAD, EGO_W, EGO_H),
+          "and a real lead 51 m ahead is not touched")
+
+    # The horizon comes from the camera model, not from a constant.
+    check(abs(detect_mod.horizon_row(1280, 720) - 360.0) < 1e-6,
+          "the horizon is the camera model's, at the configured zero pitch",
+          "so a calibrated pitch moves this gate with the corridor")
+
+    # -- G2 arithmetic: a box that wide cannot be that far ------------------
+    head("G2 -- arithmetic (headway/plausibility.py)")
+    f = _fpx(EGO_W)
+    v = plaus_mod.check("car", list(EGO_SLAB), 3.7, f, image_h=EGO_H, image_w=EGO_W)
+    check(not v["ok"] and v["reason"] == "depth_too_far_for_box_width",
+          "3.7 m is refused for a box the full width of the frame",
+          f"the width allows at most {v['wide_max_m']} m")
+
+    # ...and the HEIGHT check on its own had no complaint. This is the whole
+    # reason the width bound had to be added.
+    vh = plaus_mod.check("car", list(EGO_SLAB), 3.7, f, image_h=EGO_H)
+    check(vh["ok"],
+          "while the height check alone accepts it, which is how it got through",
+          f"170 px of car is a window of {vh['window']} m, and 3.7 is inside it")
+
+    v = plaus_mod.check("car", list(EGO_SLAB_PORTRAIT), 3.7, _fpx(EGO_PW),
+                        image_h=EGO_PH, image_w=EGO_PW)
+    check(not v["ok"] and v["reason"] == "depth_too_far_for_box_width",
+          "the portrait slab is refused too, where the shape gate had no opinion")
+
+    # A vehicle that really IS filling the frame at two metres is believed.
+    v = plaus_mod.check("car", [0.0, 0.0, 640.0, 480.0], 1.8, f,
+                        image_h=EGO_H, image_w=EGO_W)
+    check(v["ok"], "a real vehicle genuinely 1.8 m ahead is still believed",
+          "the bound is a FAR bound; being close is not what it objects to")
+
+    # ...and the rule says nothing at all about anything narrower, which is
+    # what stops an uncalibrated focal length vetoing real traffic.
+    v = plaus_mod.check("car", list(REAL_LEAD), 51.0, f,
+                        image_h=EGO_H, image_w=EGO_W)
+    check(v["ok"] and v["wide_max_m"] is None,
+          "and it has NO OPINION about a lead 51 m ahead",
+          "a box width is a poor range estimator; only at full frame width is "
+          "it beyond argument")
+    check(plaus_mod.wide_box_max_range_m("car", list(REAL_LEAD), EGO_W, f) is None,
+          "...stated directly: not applicable below the width fraction")
+
+    # An old caller that passes no image_w gets the behaviour it had.
+    v = plaus_mod.check("car", list(EGO_SLAB), 3.7, f, image_h=EGO_H)
+    check(v["ok"] and v["wide_max_m"] is None,
+          "a caller that does not say how wide the frame is gets no width veto")
+
+    # -- G3 motion: the car moved and this did not -------------------------
+    head("G3 -- motion (headway/membership.py)")
+
+    def drive_box(cand, boxes, metres_per_frame, w=EGO_W, h=EGO_H):
+        host = 0.0
+        for b in boxes:
+            cand.box = tuple(float(x) for x in b)
+            cand.note_motion(host, w, h)
+            host += metres_per_frame
+        return cand
+
+    # The bonnet: 25 m of road, the box wandering by the pixel it really did.
+    c = member_mod.Candidate(1, EGO_SLAB, "car", 0.0)
+    drive_box(c, [(0.6 + 0.05 * (i % 3), 308.0, 640.0, 478.0) for i in range(20)], 1.5)
+    check(c.static, "twenty-five metres of road and the box did not move: static",
+          f"drift {c.static_drift} of frame width")
+    check(not c.eligible(999.0), "...so it may not hold the lead lock")
+
+    # A real lead, drifting the way a real lead does.
+    c = member_mod.Candidate(2, REAL_LEAD, "car", 0.0)
+    drive_box(c, [(241.4 + i * 0.7, 210.1, 268.0 + i * 0.7, 231.0 + i * 0.2)
+                  for i in range(20)], 1.5)
+    check(not c.static, "a lead that moves in the picture is not static",
+          f"drift {c.static_drift}")
+
+    # THE ONE REAL OBJECT THAT CAN HOLD STILL: a lead at a locked gap on a
+    # straight road. The bottom-edge requirement is what protects it.
+    c = member_mod.Candidate(3, REAL_LEAD, "car", 0.0)
+    drive_box(c, [REAL_LEAD] * 20, 1.5)
+    check(not c.static,
+          "a lead holding a perfectly steady gap mid-frame is NOT called static",
+          "it is not clipped by the bottom edge, and only bodywork is")
+
+    # Distance, not time. A minute at a red light proves nothing.
+    c = member_mod.Candidate(4, EGO_SLAB, "car", 0.0)
+    drive_box(c, [EGO_SLAB] * 40, 0.0)
+    check(not c.static, "standing still for forty frames proves nothing",
+          "the veto runs on the odometer, not the clock")
+
+    c = member_mod.Candidate(5, EGO_SLAB, "car", 0.0)
+    drive_box(c, [EGO_SLAB] * 8, 1.0)
+    check(not c.static, "and eight metres is not yet twenty")
+
+    # A candidate that WAS static and then moves clears at once.
+    c = member_mod.Candidate(6, EGO_SLAB, "car", 0.0)
+    drive_box(c, [EGO_SLAB] * 20, 1.5)
+    check(c.static, "a static candidate is flagged...")
+    drive_box(c, [(0.6, 308.0 - i * 8, 640.0, 478.0 - i * 8) for i in range(1, 10)], 1.5)
+    check(not c.static, "...and un-flagged the moment it moves",
+          "the veto is a live judgement, not a life sentence")
+
+    # No odometer at all leaves it inert.
+    c = member_mod.Candidate(7, EGO_SLAB, "car", 0.0)
+    for _ in range(30):
+        c.note_motion(None, EGO_W, EGO_H)
+    check(not c.static, "a session with no speed never accumulates and never vetoes")
+
+    # -- G4 the layers are independent -------------------------------------
+    head("G4 -- no single gate is load-bearing")
+    # The portrait slab: shape has no opinion, the other two do.
+    check(not detect_mod._is_ego_bonnet(*EGO_SLAB_PORTRAIT, EGO_PW, EGO_PH),
+          "the portrait slab passes the shape gate...")
+    pv = plaus_mod.check("car", list(EGO_SLAB_PORTRAIT), 3.7, _fpx(EGO_PW),
+                         image_h=EGO_PH, image_w=EGO_PW)
+    c = member_mod.Candidate(8, EGO_SLAB_PORTRAIT, "car", 0.0)
+    drive_box(c, [EGO_SLAB_PORTRAIT] * 20, 1.5, w=EGO_PW, h=EGO_PH)
+    check(not pv["ok"] and c.static,
+          "...and is caught by BOTH of the others",
+          "which is the point of having three")
+
+    # -- G5 the thresholds are in config ------------------------------------
+    head("G5 -- the thresholds are in config.py")
+    import config
+    for mod, name, cfg_name in (
+            (detect_mod, "SLAB_WIDTH_FRAC", "HEADWAY_EGO_SLAB_WIDTH_FRAC"),
+            (detect_mod, "SLAB_HORIZON_SLACK_FRAC",
+             "HEADWAY_EGO_SLAB_HORIZON_SLACK_FRAC"),
+            (plaus_mod, "WIDE_BOX_FRAC", "HEADWAY_WIDE_BOX_FRAC"),
+            (member_mod, "STATIC_TRAVEL_M", "HEADWAY_STATIC_TRAVEL_M"),
+            (member_mod, "STATIC_DRIFT_FRAC", "HEADWAY_STATIC_DRIFT_FRAC")):
+        check(getattr(mod, name) == getattr(config, cfg_name),
+              f"{mod.__name__.split('.')[-1]}.{name} is config.{cfg_name}")
+
+
 def main():
     print("=" * 70)
     print("RIO live headway (v3) — verification")
@@ -1391,6 +1586,7 @@ def main():
     run_firewall()
     run_lanes()
     run_detector()
+    run_ego_structure()
 
     print("\n" + "=" * 70)
     total = len(PASS) + len(FAIL)

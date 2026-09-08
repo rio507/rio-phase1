@@ -1263,12 +1263,31 @@ def test_membership_is_deterministic():
     # `tracker` is the shared motion-plausibility scorer, not a tracker
     # instance: membership scores detection-to-detection continuity with the
     # same function CSRT's quality used, so the two cannot drift apart.
-    check("membership.py imports only maths, collections, cv2, anchor, tracker",
-          imported <= {"math", "collections", "cv2", "anchor", "tracker"},
+    # `config` joined this set with the static-structure veto. It does not
+    # weaken the firewall, and the check below is what makes that a proof
+    # rather than an assurance: config is a module of literals evaluated at
+    # import, and every name membership reads from it is asserted to be a plain
+    # number or a bool. No callable, no object, no dict -- so there is nothing
+    # on that surface through which a model output could arrive.
+    check("membership.py imports only maths, collections, cv2, anchor, tracker, config",
+          imported <= {"math", "collections", "cv2", "anchor", "tracker", "config"},
           f"imports: {sorted(imported)}")
     for forbidden in ("time", "random", "torch", "transformers", "numpy"):
         check(f"membership.py does not import {forbidden!r}",
               forbidden not in imported, "membership is deterministic geometry")
+
+    import config as _cfg
+    read_from_config = sorted({
+        n.attr for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+        and n.value.id == "config"})
+    bad_cfg = [(n, type(getattr(_cfg, n, None)).__name__)
+               for n in read_from_config
+               if not isinstance(getattr(_cfg, n, None), (int, float, bool))]
+    check("every config name membership reads is a constant, not an object",
+          not bad_cfg,
+          f"offenders: {bad_cfg}" if bad_cfg
+          else f"{len(read_from_config)} names, all literal")
 
     src = _code_only(path).lower()
     for banned in ("qwen", "generate", "prompt", "llm"):

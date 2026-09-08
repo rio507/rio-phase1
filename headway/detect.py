@@ -46,6 +46,7 @@ training-time num_classes. The checkpoint is loaded STRICTLY, so a config that
 did not match the weights is an error rather than a silently half-random
 network -- verified at 0 missing / 0 unexpected keys.
 """
+import math
 import os
 import sys
 import threading
@@ -53,6 +54,8 @@ import time
 
 import numpy as np
 import torch
+
+import config
 
 from . import plausibility
 
@@ -151,30 +154,83 @@ CONTAIN_FRAC = 0.80     # ...or a small box mostly swallowed by a bigger one
 # suppressing one would delete a road user rather than a duplicate.
 EXCLUSIVE_LABELS = frozenset({"car", "truck", "bus", "motorcycle"})
 
-# --- the ego vehicle's own bonnet -------------------------------------------
-# A dashcam sees the host car's bonnet across the bottom of every frame, and
-# the detector will occasionally call it a car. Observed on the winding clip:
-# `car 0.40` at [2, 661, 1279, 720] -- full frame width, flush with the bottom
-# edge, aspect 21.6.
+# --- the ego vehicle's own bodywork ------------------------------------------
+# The camera looks out over the car it is in, and the detector will call what it
+# sees a car. This is the single most dangerous false positive available to this
+# system: it lands dead centre in the ego lane at essentially zero range, so it
+# wins lead selection outright and reads as a stationary object a couple of
+# metres ahead.
 #
-# This is the single most dangerous false positive available to this system: it
-# lands dead centre in the ego lane at essentially zero range, so it would win
-# lead selection outright and read as a stationary object one metre ahead. The
-# corridor's MIN_RANGE_M gate is a backstop that would probably catch it, but
-# "probably caught downstream" is not how this one should be handled.
+# TWO SHAPES, AND THE SECOND ONE COST A REAL DRIVE.
 #
-# The signature is unmistakable and nothing real shares it: a vehicle 3 m ahead
-# is wide but also TALL. The aspect bound is what separates them.
+# The first is what a windscreen-mounted dashcam sees: a thin strip of bonnet
+# across the bottom of the frame. Observed on the winding clip, `car 0.40` at
+# [2, 661, 1279, 720] -- full frame width, flush with the bottom edge, aspect
+# 21.6. The aspect bound was what separated it from a genuinely close vehicle,
+# which is wide but also TALL.
+#
+# The second is what a PHONE sees, and it is not thin. A phone sits higher and
+# further back, so the bonnet and the whole dashboard fill a deep band across
+# the bottom of the picture. Session 06af3214: `[0.6, 308, 640, 478]` on a
+# 640x480 frame, aspect 3.8, present on 584 frames -- 36% of a ten-minute drive
+# -- ranged at 3.7 m, holding the lead lock at 20 m/s, and the source of twelve
+# of the twenty-two warnings RIO spoke that day. It passed this gate because
+# 3.8 is not 6.
+#
+# So aspect is no longer the discriminator; the HORIZON is, and it is a
+# statement about geometry rather than a fitted number. A box spanning
+# essentially the whole frame width is, by the pinhole relation, about two
+# metres away -- and at two metres any vehicle is far taller than the frame, so
+# its box is clipped at the top and its top edge is at y=0. A full-width box
+# whose top edge never rises above the horizon is therefore not a vehicle. It
+# is the thing the camera is bolted to.
+#
+# Checked against the drive: this catches 579 of the 584 offending frames and
+# not one of the 295 frames carrying a genuine lead beyond 15 m. The remainder
+# are caught by the two independent gates downstream -- the width bound in
+# plausibility.py and the static-structure veto in membership.py.
 BONNET_BOTTOM_FRAC = 0.98    # box bottom is flush with the frame bottom
 BONNET_WIDTH_FRAC = 0.85     # ...spanning almost the whole frame
 BONNET_MIN_ASPECT = 6.0      # ...and far wider than it is tall
 
+# The second shape needs a stricter width, because it leans entirely on the
+# horizon argument and that argument is overwhelming at 0.95 and merely
+# suggestive at 0.85. See config.py.
+SLAB_WIDTH_FRAC = config.HEADWAY_EGO_SLAB_WIDTH_FRAC
+SLAB_HORIZON_SLACK_FRAC = config.HEADWAY_EGO_SLAB_HORIZON_SLACK_FRAC
+
+
+def horizon_row(w, h) -> float:
+    """The image row the horizon falls on, in pixels from the top.
+
+    Same camera model the corridor uses, imported rather than restated so there
+    is one of it: a ground point at infinite range projects to
+    v = cy - f*tan(pitch), which at the configured pitch of zero is simply the
+    middle of the frame. Imported lazily for the same reason plausibility.py
+    does it -- detect.py is loaded before the corridor exists.
+    """
+    from .anchor import CAMERA_PITCH_RAD, HFOV_DEG
+    f_px = (float(w) / 2.0) / math.tan(math.radians(HFOV_DEG) / 2.0)
+    return float(h) / 2.0 - f_px * math.tan(CAMERA_PITCH_RAD)
+
 
 def _is_ego_bonnet(x1, y1, x2, y2, w, h) -> bool:
+    """Is this box the car this camera is bolted to? Either shape counts."""
     bw, bh = x2 - x1, max(y2 - y1, 1e-6)
-    return (y2 >= BONNET_BOTTOM_FRAC * h
-            and bw >= BONNET_WIDTH_FRAC * w
-            and (bw / bh) >= BONNET_MIN_ASPECT)
+    if y2 < BONNET_BOTTOM_FRAC * h:
+        # Not flush with the bottom of the frame. Both shapes require it: the
+        # camera cannot see its own car anywhere else.
+        return False
+    # Shape one: wide and flat. A dashcam's strip of bonnet.
+    if bw >= BONNET_WIDTH_FRAC * w and (bw / bh) >= BONNET_MIN_ASPECT:
+        return True
+    # Shape two: wide and deep, and never rising above the horizon. A phone's
+    # view of the bonnet and the dashboard together.
+    if bw >= SLAB_WIDTH_FRAC * w:
+        top_limit = horizon_row(w, h) - SLAB_HORIZON_SLACK_FRAC * h
+        if y1 >= top_limit:
+            return True
+    return False
 
 
 def _iou(a, b):

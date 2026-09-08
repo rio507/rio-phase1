@@ -35,8 +35,84 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from headway import live_policy as P   # noqa: E402
-from headway import state as v2        # noqa: E402
+from headway import detect as detect_mod        # noqa: E402
+from headway import live_policy as P            # noqa: E402
+from headway import membership as member_mod    # noqa: E402
+from headway import plausibility as plaus_mod   # noqa: E402
+from headway import state as v2                 # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# THE GATES UPSTREAM OF THE POLICY.
+#
+# The policy replay below judges the tau it is handed. That is the right thing
+# for a policy change and the wrong thing for this one: the ego-structure gates
+# stop a box BECOMING the lead, so the frames they catch have no tau at all.
+#
+# The frame's pixels are gone -- a drive log keeps boxes, not pictures -- so
+# what is replayed here is the gates' judgement of the LOGGED LEAD BOX, which
+# is exactly the box each gate is given in the live loop. The shape and width
+# gates are then bit-for-bit the live decision. The motion gate is not quite:
+# it needs a per-candidate history and the log carries one box per frame, so it
+# is rebuilt per lead id from the logged boxes and the logged speed. That
+# reconstruction can only ever make the gate FIRE LESS than it does live, since
+# live it sees every candidate and not only the one that won.
+# ---------------------------------------------------------------------------
+def _frame_dims(box):
+    """The frame this box came from. The log does not carry image size.
+
+    Inferred from the box, which is safe here because every box in question is
+    clamped to the frame edge: a lead box reaching x=640 is on a 640-wide
+    frame. This drive ran portrait for its first seconds and landscape after.
+    """
+    return (640.0, 480.0) if round(box[2]) == 640 else (480.0, 640.0)
+
+
+def _focal(width_px):
+    from headway.anchor import HFOV_DEG
+    return (float(width_px) / 2.0) / math.tan(math.radians(HFOV_DEG) / 2.0)
+
+
+def static_frames(frames):
+    """Which (lead_id, t) the motion veto would have refused."""
+    runs = {}
+    for f in frames:
+        if f.get("lead_box") and f.get("lead_id") is not None:
+            runs.setdefault(f["lead_id"], []).append(f)
+    out = set()
+    for lid, seq in runs.items():
+        cand = member_mod.Candidate(lid, seq[0]["lead_box"], "car", seq[0]["t"])
+        host = 0.0
+        for i, f in enumerate(seq):
+            if i:
+                dt = min(max(_num(f.get("t"), 0.0) - _num(seq[i - 1].get("t"), 0.0), 0.0), 2.0)
+                host += _num(f.get("v_host"), 0.0) * dt
+            w, h = _frame_dims(f["lead_box"])
+            cand.box = tuple(float(v) for v in f["lead_box"])
+            cand.note_motion(host, w, h)
+            if cand.static:
+                out.add((lid, round(_num(f.get("t"), 0.0), 4)))
+    return out
+
+
+def gates_reject(frame, static_set):
+    """Which gate, if any, would have stopped this box being the lead."""
+    box = frame.get("lead_box")
+    if not box:
+        return None
+    w, h = _frame_dims(box)
+    x1, y1, x2, y2 = box
+    if detect_mod._is_ego_bonnet(x1, y1, x2, y2, w, h):
+        return "shape"
+    depth = _num(frame.get("distance_m"))
+    if depth is not None:
+        v = plaus_mod.check(frame.get("lead_label") or "car", box, depth,
+                            _focal(w), image_h=h, image_w=w)
+        if v["reason"] == "depth_too_far_for_box_width":
+            return "width"
+    if (frame.get("lead_id"), round(_num(frame.get("t"), 0.0), 4)) in static_set:
+        return "motion"
+    return None
 
 
 def load(path):
@@ -61,7 +137,7 @@ def _num(x, default=None):
     return f if math.isfinite(f) else default
 
 
-def replay(frames, mode):
+def replay(frames, mode, static_set=None):
     """mode: 'before' (the drive's policy) or 'after' (this checkout's).
 
     'before' is reconstructed by neutralising the two things this checkout
@@ -76,17 +152,20 @@ def replay(frames, mode):
         # and it is put back in the `finally` below.
         P.TAU_IMPLAUSIBLE_S = 0.0
     try:
-        return _replay(frames, mode)
+        return _replay(frames, mode, static_set)
     finally:
         P.TAU_IMPLAUSIBLE_S = floor
 
 
-def _replay(frames, mode):
+def _replay(frames, mode, static_set=None):
     pol = P.LivePolicy()
     last_reset_t = None
     spoken, reasons, bands = [], Counter(), Counter()
     agrees = disagrees = 0
     divergence = []
+    gated = Counter()
+    # Is the gap this frame reports inherited from a lead the gates refused?
+    ghost = False
 
     for f in frames:
         t = _num(f.get("t"), 0.0)
@@ -110,6 +189,35 @@ def _replay(frames, mode):
         kw = dict(tau=tau, v2_trend=trend, confidence=conf, v_host=v,
                   v_host_stale=stale, t=t, since_reset_s=since_reset,
                   new_lead=new_lead, track_lost=bool(f.get("track_lost")))
+
+        if mode == "after" and static_set is not None:
+            why = gates_reject(f, static_set)
+            if why:
+                # THE LEAD NEVER EXISTS ON THIS FRAME. Not a suppressed
+                # warning about a close car -- no car, no range, no tau. The
+                # same state the loop is already in whenever nothing eligible
+                # is in the corridor.
+                gated[why] += 1
+                ghost = True
+                kw["tau"] = float("inf")
+                kw["track_lost"] = True
+            elif f.get("lead_box"):
+                # A real box: whatever came before, we have a lead again.
+                ghost = False
+            elif ghost:
+                # AND THE GHOST OF ONE. A box-less frame still carrying a
+                # distance is the Kalman coasting the lead it had; if that lead
+                # was never admitted, there is nothing to coast.
+                #
+                # This is a MODEL of the filter rather than a replay of it --
+                # filter state is not in the log -- and it is the one place
+                # this tool infers rather than reads. It is stated here because
+                # it accounts for 428 of the frames in the table below, and a
+                # reader is entitled to know which ones were reasoned about.
+                gated["ghost_of_a_gated_lead"] += 1
+                kw["tau"] = float("inf")
+                kw["track_lost"] = True
+
         if mode == "after":
             # The drive's own frames carried no speed-source resolution -- the
             # resolver did not exist -- so the replay is run with the speed
@@ -141,7 +249,8 @@ def _replay(frames, mode):
                 "gap_m": f.get("distance_m"), "v": v, "ttc": ttc,
             })
     return {"spoken": spoken, "reasons": reasons, "bands": bands,
-            "agrees": agrees, "disagrees": disagrees, "divergence": divergence}
+            "agrees": agrees, "disagrees": disagrees, "divergence": divergence,
+            "gated": gated}
 
 
 def actually_spoke(frames):
@@ -201,8 +310,15 @@ def main():
     for d in before["divergence"]:
         print(f"     t={d[0]}: log said {d[1]!r}, replay says {d[2]!r}")
 
-    after = replay(frames, "after")
+    statics = static_frames(frames)
+    after = replay(frames, "after", static_set=statics)
     c_after = show("REPLAY through this checkout", after["spoken"])
+    if after["gated"]:
+        total = sum(after["gated"].values())
+        print(f"   {total} of {len(frames)} frames had their lead removed before "
+              f"the policy ever saw it:")
+        for k, n in after["gated"].most_common():
+            print(f"     {n:5d}  {k}")
 
     print("\n=== bands ===")
     keys = sorted(set(before["bands"]) | set(after["bands"]))

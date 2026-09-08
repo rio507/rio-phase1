@@ -29,6 +29,8 @@ lead -- is arithmetic on those boxes against the lane polygon. §1 unchanged.
 import math
 from collections import deque
 
+import config
+
 # --- membership, as a fraction of the box-bottom edge inside the lane -------
 # Asymmetric on purpose. A candidate must be substantially in the lane to be
 # adopted (0.40) but only marginally in it to be kept (0.25). A single
@@ -42,6 +44,45 @@ MEMBER_EXIT_FRAC = 0.25
 # clipped by a momentary lane-detection wobble, both satisfy the fraction test
 # for a frame or two and neither should take the lock.
 MEMBER_HOLD_S = 0.5
+
+# --- static structure: the car this camera is bolted to ----------------------
+#
+# THE GENERAL FORM OF A BUG THAT COST A REAL DRIVE. On session 06af3214 the
+# phone saw the car's own bonnet and dashboard as a `car` at 3.7 m, held the
+# lead lock with it for 584 frames -- 36% of a ten-minute drive -- and spoke
+# twelve warnings about it. detect.py refuses that box on its shape now and
+# plausibility.py refuses its range on arithmetic, and both of those are
+# statements about ONE FRAME. This is the statement about all of them, and it
+# is the one that generalises:
+#
+#   THE CAR DROVE TWENTY METRES AND THIS OBJECT DID NOT MOVE THREE PIXELS.
+#
+# Nothing on the road can do that. An object being approached grows; an object
+# being passed slides; an object holding station still breathes with the
+# camber, the steering and the suspension. Only something rigidly attached to
+# the camera holds still, and something rigidly attached to the camera is part
+# of the car.
+#
+# Measured across every tracked lead of that drive: every genuine road user
+# drifted at least 0.0041 of frame width over twenty metres of travel, and
+# every bonnet frame drifted at most 0.0044, median 0.0028. That is a real
+# separation but not a large one, so the rule carries a second requirement that
+# makes it safe rather than lucky -- the box must be clipped by the BOTTOM EDGE
+# of the frame. A lead vehicle at a locked gap on a straight motorway is the
+# one real object that can hold still in the picture, and it is never clipped
+# by the bottom edge unless it is close enough to touch.
+#
+# A veto, not a deletion: the candidate stays in the scene, stays drawn, and
+# keeps its range. It simply may not be the lead. Same discipline as
+# plausibility.py -- this module refuses to make a claim, it does not decide
+# that something is not there.
+STATIC_TRAVEL_M = config.HEADWAY_STATIC_TRAVEL_M
+STATIC_DRIFT_FRAC = config.HEADWAY_STATIC_DRIFT_FRAC
+STATIC_REQUIRE_BOTTOM_EDGE = config.HEADWAY_STATIC_REQUIRE_BOTTOM_EDGE
+# How close to the frame bottom counts as touching it. Two pixels, matching
+# plausibility.EDGE_PX: a box clamped to the frame lands exactly ON the edge.
+STATIC_EDGE_PX = 2.0
+
 
 # --- merge-in promotion -----------------------------------------------------
 # The deliberate exception. Everything above is built to make the lead lock
@@ -212,7 +253,8 @@ class Candidate:
                  "overlap", "history", "member", "member_since", "merge_promoted",
                  "merge_t", "merge_slope", "depths", "tracker", "lost",
                  "overlap_reason", "score", "quality", "n_detections",
-                 "confirmed", "vel_px", "range_reject")
+                 "confirmed", "vel_px", "range_reject",
+                 "motion", "static", "static_drift")
 
     def __init__(self, cid, box, label, t):
         self.id = cid
@@ -246,6 +288,14 @@ class Candidate:
         # the caller's depth_fn (live.py runs the plausibility check, which needs
         # camera geometry this module deliberately does not carry).
         self.range_reject = None
+        # WHERE THIS BOX HAS BEEN, indexed by how far the CAR has travelled
+        # rather than by time. Distance is the right clock for the question
+        # being asked -- a minute at a red light proves nothing about whether
+        # something is bolted to the bonnet, and twenty metres of road proves
+        # it completely. (host_m, cx, w, h).
+        self.motion = deque()
+        self.static = False
+        self.static_drift = None
         # v2 sec8's track_quality term. With RF-DETR the box comes from a fresh
         # detection every frame rather than from a correlation filter, but the
         # question the term asks is unchanged: does this box move like one
@@ -285,8 +335,57 @@ class Candidate:
     def member_age_s(self):
         return None if self.member_since is None else (self.last_seen - self.member_since)
 
+    def note_motion(self, host_m, image_w, image_h):
+        """One frame of box geometry against the odometer. Sets `static`.
+
+        Called on every candidate every frame. Cheap by construction: the
+        window is bounded by distance, so it holds a handful of samples at
+        motorway speed and empties itself at a standstill.
+        """
+        if host_m is None or image_w is None or not image_w:
+            return
+        x1, y1, x2, y2 = self.box
+        self.motion.append((float(host_m), (x1 + x2) / 2.0, x2 - x1, y2 - y1))
+        # Keep exactly enough history to span the window, and one sample more
+        # so the span is genuinely covered rather than nearly covered.
+        while len(self.motion) > 2 and (host_m - self.motion[1][0]) >= STATIC_TRAVEL_M:
+            self.motion.popleft()
+
+        span = host_m - self.motion[0][0]
+        if span < STATIC_TRAVEL_M or len(self.motion) < 3:
+            # Not enough road yet to say anything. Deliberately NOT sticky in
+            # the other direction either: a candidate that has moved clears the
+            # flag below on the same frame.
+            self.static = False
+            self.static_drift = None
+            return
+
+        cxs = [m[1] for m in self.motion]
+        ws = [m[2] for m in self.motion]
+        hs = [m[3] for m in self.motion]
+        drift = max(max(cxs) - min(cxs), max(ws) - min(ws),
+                    max(hs) - min(hs)) / float(image_w)
+        self.static_drift = round(drift, 5)
+        if drift >= STATIC_DRIFT_FRAC:
+            self.static = False
+            return
+        if STATIC_REQUIRE_BOTTOM_EDGE and image_h is not None:
+            # See the header: the bottom-edge requirement is what keeps this
+            # rule pointed at bodywork and away from a lead vehicle holding a
+            # steady gap on a straight road.
+            if y2 < float(image_h) - STATIC_EDGE_PX:
+                self.static = False
+                return
+        self.static = True
+
     def eligible(self, t):
         """May this candidate hold the lead lock?"""
+        # FIRST, and ahead of the merge exception. A merge promotion is an
+        # argument about a box that is MOVING into our lane, so a box that has
+        # not moved in twenty metres cannot have earned one -- and if it
+        # somehow did, being bolted to the car still disqualifies it.
+        if self.static:
+            return False
         if self.merge_promoted:
             return True
         return (self.member and self.member_since is not None
@@ -366,6 +465,12 @@ class Candidate:
             "w": self.overlap_reason if self.overlap_reason != "ok" else None,
             "cf": int(self.confirmed),
             "rr": self.range_reject,
+            # Bolted to the car: the box has not moved while the car has. `sd`
+            # is the drift that decided it, as a fraction of frame width, so a
+            # review can see how close to the line a call was rather than only
+            # which side of it landed.
+            "st": int(self.static),
+            "sd": self.static_drift,
         }
 
 
@@ -503,7 +608,8 @@ class CandidateSet:
         self._evict(t)
 
     # -- membership (fast loop) ----------------------------------------------
-    def evaluate(self, corridor, t, depth_fn=None, allow_merge=True):
+    def evaluate(self, corridor, t, depth_fn=None, allow_merge=True,
+                 host_m=None):
         """Recompute overlap, membership and merge promotion for every candidate.
 
         `depth_fn(box, label) -> metres or None` keeps this module free of the
@@ -516,14 +622,24 @@ class CandidateSet:
         `allow_merge` is False when the corridor is the trapezoid, since
         promoting a merge off guessed geometry would be inventing the one event
         the driver is least able to check.
+
+        `host_m` is how far the CAR has travelled since the session began --
+        the odometer, not the clock. It is what the static-structure veto is
+        measured against, because "has not moved in twenty metres of road" is a
+        claim about the road and "has not moved in twenty seconds" is a claim
+        about a red light. None leaves the veto inert, which is the right
+        behaviour for a caller that cannot say how far the car has gone.
         """
         t = float(t)
         promotions = []
+        image_w = getattr(corridor, "w", None)
+        image_h = getattr(corridor, "h", None)
         for cand in self.candidates.values():
             if cand.lost:
                 continue
             frac, info = bottom_edge_overlap(cand.box, corridor)
             cand.update_overlap(frac, info["reason"], t)
+            cand.note_motion(host_m, image_w, image_h)
             if depth_fn is not None:
                 out = depth_fn(cand.box, cand.label)
                 # (metres, reject_reason) from live.py; a bare number from any
@@ -572,6 +688,12 @@ class CandidateSet:
             "n_vulnerable": sum(1 for c in self.candidates.values()
                                 if c.label not in LEAD_LABELS and not c.lost),
             "n_uncorroborated": len(uncorroborated),
+            # Candidates refused the lead lock because they have not moved
+            # while the car has. On a windscreen-mounted phone this is the
+            # bonnet and the dashboard, every frame, and the number being
+            # non-zero is the fix working rather than a fault.
+            "n_static": sum(1 for c in self.candidates.values()
+                            if c.static and not c.lost),
         }
         if uncorroborated:
             info["uncorroborated"] = uncorroborated

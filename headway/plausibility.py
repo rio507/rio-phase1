@@ -38,6 +38,34 @@ reject exactly the vehicle that matters most. The far bound still holds for
 those (true height >= visible height => true range <= the far bound), so a
 truncated box is checked on the side where the inequality is still sound.
 
+AND THAT EXEMPTION IS WHERE A REAL DRIVE GOT THROUGH
+----------------------------------------------------
+Session 06af3214: a box at [0.6, 308, 640, 478] on a 640x480 frame -- the whole
+width of the picture, flush with the bottom -- labelled `car`, ranged by the
+depth model at 3.7 m, and held as the lead at 20 m/s for 584 frames. The height
+check had no complaint: 170 visible pixels of car is a window of 2.6 m to
+11.0 m, and 3.7 falls inside it. The box is the phone's view of the car's own
+bonnet and dashboard.
+
+The height was never going to catch that, because 170 px of "car" IS consistent
+with a car four metres ahead. The WIDTH is what is impossible: 640 px of car,
+at this focal length, is 1.6 metres away. Not 3.7.
+
+So the same argument the header makes about height is now made about width, in
+the direction where it is sound. Visible width <= true width always, so
+
+    true range = f * W_true / w_true_px  <=  f * W_max / w_visible_px
+
+is a FAR bound that holds whether the box is clipped or not.
+
+Applied narrowly, and the narrowness is the point. A box's width is a poor
+range estimator in general: the boxes are loose, HFOV_DEG is a guess pending
+Stage 2 calibration, and a genuine lead at 50 m would be falsely vetoed by it.
+At NEAR-FULL FRAME WIDTH it says something no calibration error can explain,
+and there it is allowed to speak. Measured on that drive: 583 of the 584
+offending frames vetoed, and the rule was not even applicable to any of the 295
+frames carrying a genuine lead beyond 15 m.
+
 TOLERANCE
 ---------
 TOL widens the window multiplicatively either side. It absorbs DA-V2's absolute
@@ -48,6 +76,8 @@ plausible readings. Every rejection it makes should be one a person looking at
 the frame would agree with.
 """
 import math
+
+import config
 
 # Real-world heights in metres, (min, max). A window rather than a point: the
 # check is only as tight as the class's genuine size spread, and pretending a
@@ -61,8 +91,26 @@ CLASS_HEIGHT_M = {
     "pedestrian": (1.20, 2.05),  # a child is in this range; a seated adult is not
 }
 
+# Real-world WIDTHS, same idea and the same caveat: a window, not a constant.
+# Only ever used as an upper bound (see wide_box_max_range_m), so what matters
+# is that the maximum is generous -- a wing-mirrored pickup, a lorry with its
+# load overhanging.
+CLASS_WIDTH_M = {
+    "car": (1.55, 2.10),        # city car .. wide-bodied SUV with mirrors
+    "truck": (2.20, 2.90),
+    "bus": (2.40, 2.90),
+    "motorcycle": (0.60, 1.10),
+    "cyclist": (0.50, 1.10),
+    "pedestrian": (0.40, 0.95),
+}
+
 # Multiplicative slack either side of the geometric window. See the header.
 TOL = 1.6
+
+# How much of the frame width a box must span before its WIDTH is allowed to
+# bound its range. See the header for why this is narrow on purpose, and
+# config.py for the drive that set it.
+WIDE_BOX_FRAC = config.HEADWAY_WIDE_BOX_FRAC
 
 # --- size floor -------------------------------------------------------------
 # A box shorter than this is past the range where anything downstream can use
@@ -117,6 +165,31 @@ def range_window(label, box, f_px, tol=TOL):
     return (f_px * h_min / h_px / tol, f_px * h_max / h_px * tol)
 
 
+def box_width_px(box):
+    return max(0.0, float(box[2]) - float(box[0]))
+
+
+def wide_box_max_range_m(label, box, image_w, f_px, tol=TOL,
+                         wide_frac=WIDE_BOX_FRAC):
+    """The furthest this box can possibly be, from its width. None if it does
+    not apply.
+
+    Returns None -- meaning "no opinion" -- unless the box spans `wide_frac` of
+    the frame. Everywhere else a box's width is too loose a measurement to veto
+    anything with, and saying nothing is the honest answer rather than a
+    generous bound nobody reads.
+    """
+    if image_w is None:
+        return None
+    w_px = box_width_px(box)
+    if w_px <= 0.0 or w_px < float(wide_frac) * float(image_w):
+        return None
+    dims = CLASS_WIDTH_M.get(str(label or "").lower())
+    if dims is None:
+        return None
+    return f_px * dims[1] / w_px * tol
+
+
 def implied_range_m(label, box, f_px):
     """Mid-window range: what this box's SIZE says its distance is.
 
@@ -128,7 +201,7 @@ def implied_range_m(label, box, f_px):
 
 
 def check(label, box, depth_m, f_px, image_h=None, tol=TOL,
-          confirm_min_px=CONFIRM_MIN_PX):
+          confirm_min_px=CONFIRM_MIN_PX, image_w=None):
     """Is `depth_m` a believable range for this box? -> verdict dict.
 
     Keys:
@@ -139,6 +212,8 @@ def check(label, box, depth_m, f_px, image_h=None, tol=TOL,
         implied_m     what the box's size says the range is
         window        (lo, hi) the depth had to fall inside
         truncated     was the near bound skipped because the box is clipped
+        wide_max_m    the furthest this box can be, from its WIDTH, when it is
+                      wide enough for that to mean anything. None otherwise.
 
     `ok` is False for a missing depth as well as an impossible one: both mean
     "no range you may put on the screen", and every caller wants that one
@@ -149,7 +224,7 @@ def check(label, box, depth_m, f_px, image_h=None, tol=TOL,
     out = {
         "ok": False, "reason": "", "confirmed": bool(confirmed),
         "h_px": round(h_px, 1), "implied_m": None, "window": None,
-        "truncated": False,
+        "truncated": False, "wide_max_m": None,
     }
 
     if depth_m is None or not math.isfinite(float(depth_m)) or float(depth_m) <= 0.0:
@@ -163,6 +238,21 @@ def check(label, box, depth_m, f_px, image_h=None, tol=TOL,
         # rather than a wrong one being argued about.
         out["reason"] = "below_size_floor"
         return out
+
+    # THE WIDTH BOUND, ASKED FIRST AND ANSWERED INDEPENDENTLY.
+    #
+    # Before the class-height window, because it does not need one: it is sound
+    # for a truncated box, for an unconfirmed box, and for a class whose height
+    # is not on record. On the drive that produced it, the box was `car`,
+    # confirmed and untruncated at the top -- it passed every one of those and
+    # was still the car's own bonnet.
+    wide_max = wide_box_max_range_m(label, box, image_w, f_px, tol=tol)
+    if wide_max is not None:
+        out["wide_max_m"] = round(wide_max, 2)
+        if depth_m > wide_max:
+            # A box this wide is about two metres away or it is not a vehicle.
+            out["reason"] = "depth_too_far_for_box_width"
+            return out
 
     win = range_window(label, box, f_px, tol=tol)
     if win is None:

@@ -1106,6 +1106,73 @@ HEADWAY_TAU_HYSTERESIS_S = 0.2
 # 5 m/s is 11 mph.
 HEADWAY_MIN_COACH_SPEED_MS = 5.0
 
+# --- the car's own bodywork, which is not a car -----------------------------
+#
+# THE UPSTREAM FIX FOR THE FLOOR BELOW. HEADWAY_TAU_IMPLAUSIBLE_S stops RIO
+# SPEAKING about a lead that cannot be there; these stop the lead existing.
+#
+# Session 06af3214, 584 frames of it: a box at [0.6, 308, 640, 478] on a
+# 640x480 frame -- the full width of the picture, flush with the bottom edge,
+# and its TOP edge 64% of the way down the image. Ranged at 3.7 m and held as
+# the lead at 20 m/s. It is the phone's view of the car's own bonnet and
+# dashboard, and it moved by two pixels in ten minutes of driving.
+#
+# detect.py already refused one shape of this -- the thin full-width strip a
+# windscreen dashcam sees, aspect 21.6. A phone sits higher and closer, so it
+# sees a much TALLER slice of the same bodywork, aspect 3.8, and sailed
+# through. Three independent gates now, in three layers, because each says
+# something different and any one of them can be wrong on a given frame:
+#
+#   shape      (detect.py)        a box spanning the whole frame whose top
+#                                 never rises above the horizon is not a
+#                                 vehicle: anything that wide is ~2 m away, and
+#                                 at 2 m a vehicle's roof is far above it.
+#   arithmetic (plausibility.py)  a box that wide CANNOT be as far away as the
+#                                 depth model says. The mirror of the height
+#                                 bound already there.
+#   motion     (membership.py)    the car drove twenty metres and this object
+#                                 did not move three pixels. Only something
+#                                 bolted to the camera can do that.
+
+# --- shape: the ego structure gate (headway/detect.py) ----------------------
+# How much of the frame width a box must span before the "top below the
+# horizon" argument is allowed to apply at all. Deliberately near-total: the
+# geometry is overwhelming at 0.95 and merely suggestive at 0.85, and the
+# existing wide-and-flat rule already covers the rest.
+HEADWAY_EGO_SLAB_WIDTH_FRAC = 0.95
+# ...and how far above the pinhole horizon the box's top edge may rise and
+# still count as bodywork. Zero: the test is "does not rise above the horizon
+# at all", which is what makes it a statement about geometry rather than a
+# fitted threshold.
+HEADWAY_EGO_SLAB_HORIZON_SLACK_FRAC = 0.0
+
+# --- arithmetic: the width bound (headway/plausibility.py) ------------------
+# Only applied to a box spanning this much of the frame. A box width is a poor
+# range estimator in general -- the boxes are loose, HFOV_DEG is uncalibrated,
+# and a car at 50 m would be falsely vetoed. At near-full width it says
+# something no calibration error can explain: 640 px of car is 1.6 m away, and
+# no amount of slack makes that 3.7.
+HEADWAY_WIDE_BOX_FRAC = 0.95
+
+# --- motion: the static structure veto (headway/membership.py) -------------
+# How far the CAR must travel before immobility means anything. Twenty metres,
+# because the claim being made is physical: over twenty metres of road, every
+# real object changes its size or its place in the picture, and only something
+# rigidly attached to the camera does not.
+HEADWAY_STATIC_TRAVEL_M = 20.0
+# How much the box may drift over that distance -- as a fraction of frame
+# width, so it is resolution-independent. Measured on the drive: every genuine
+# road user drifted at least 0.0041 of frame width over twenty metres, and
+# every bonnet frame drifted at most 0.0044 with a median of 0.0028. 0.004 sits
+# between them, and the bottom-edge requirement below is what makes the margin
+# safe rather than lucky.
+HEADWAY_STATIC_DRIFT_FRAC = 0.004
+# ...and it must be touching the bottom of the frame. This is what keeps the
+# rule pointed at the thing it was written for. A lead vehicle at a locked gap
+# on a straight road is the one real object that can hold still in the picture,
+# and it is never clipped by the bottom edge unless it is close enough to touch.
+HEADWAY_STATIC_REQUIRE_BOTTOM_EDGE = True
+
 # --- the physical floor, and it is a MEASUREMENT veto -----------------------
 # A time headway below this, at a speed above the floor above, is not a
 # following distance. It is a claim that the car has been a fraction of a
