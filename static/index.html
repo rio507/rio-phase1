@@ -2657,9 +2657,37 @@ document.addEventListener('DOMContentLoaded', () => {
         + 'Tap Start Drive to begin a new one.');
   }
 
-  // The headway loop. Same chained-timeout discipline as the perception loop,
-  // but the next delay is the cadence MINUS the time this frame took, so
-  // per-frame processing does not silently halve the frame rate.
+  /* THE HEADWAY FEED. A socket if the page can have one, the 4 fps POST loop
+     if it cannot.
+
+     The POST loop below is not dead code and is not deprecated: it is what
+     runs when rio_frames.js is absent, when a proxy strips the upgrade, or
+     when the socket has failed three times and this page has stopped asking.
+     A drive at 4 fps is a working drive; a drive with no picture is not. */
+  function startHeadway() {
+    if (!headwayOn()) return;
+    const stream = RIO.headway.startStream(feedEl, staleStop);
+    if (stream) {
+      // The panel's own counter still counts what came BACK, and now reads it
+      // off the transport rather than off a loop it no longer owns.
+      hwTimer = setInterval(() => {
+        if (!RIO.driving) return;
+        const st = RIO.headway.streamStats();
+        if (!st) return;
+        hwFrames = st.results;
+        const age = st.frame_age_ms && st.frame_age_ms.p50;
+        say('Drive active - ' + frames + ' perceive / ' + hwFrames + ' headway @ '
+            + st.fps + ' fps' + (age === null || age === undefined ? '' : ' - ' + age + ' ms old')
+            + ' - session ' + RIO.sessionId.slice(0, 8));
+      }, 1000);
+      return;
+    }
+    scheduleHeadway();
+  }
+
+  // The fallback headway loop. Same chained-timeout discipline as the
+  // perception loop, but the next delay is the cadence MINUS the time this
+  // frame took, so per-frame processing does not silently halve the frame rate.
   function scheduleHeadway(delayMs) {
     const cadence = (RIO.headway && RIO.headway.cadenceMs) || 500;
     hwTimer = setTimeout(async () => {
@@ -2754,7 +2782,7 @@ document.addEventListener('DOMContentLoaded', () => {
     RIO.ui.frameSent(0);
     say('Drive active - session ' + sid.slice(0, 8));
     schedule();
-    scheduleHeadway();
+    startHeadway();
     scheduleHeartbeat();
   }
 
@@ -2762,8 +2790,24 @@ document.addEventListener('DOMContentLoaded', () => {
     opts = opts || {};
     const sid = RIO.sessionId;
     if (timer) { clearTimeout(timer); timer = null; }
-    if (hwTimer) { clearTimeout(hwTimer); hwTimer = null; }
+    // hwTimer is a timeout on the fallback loop and an interval on the socket
+    // path. Browsers share one id space, but saying so out loud is cheaper
+    // than the day somebody splits them.
+    if (hwTimer) { clearTimeout(hwTimer); clearInterval(hwTimer); hwTimer = null; }
     if (hbTimer) { clearTimeout(hbTimer); hbTimer = null; }
+    /* The transport's own account of the drive, into the drive's own log,
+       before the session id is cleared. Frame age at p50/p90/p99, how many
+       frames were dropped rather than queued, and by whom. This is the number
+       the first real drive could not produce for any of its 1949 frames. */
+    const tstats = RIO.headway ? RIO.headway.stopStream() : null;
+    if (tstats && sid) {
+      try {
+        fetch('/session/mark?session_id=' + encodeURIComponent(sid)
+              + '&tag=frame_transport&note='
+              + encodeURIComponent(JSON.stringify(tstats).slice(0, 900)),
+              { method: 'POST' }).catch(() => {});
+      } catch (e) {}
+    }
     if (RIO.headway) { RIO.headway.stopWatch(); RIO.headway.resetHud(); }
 
     // Clear session first so in-flight captures stop tagging themselves.
@@ -3342,6 +3386,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const r = await fetch(RIO.url('/headway_frame'), { method: 'POST', body: fd });
     const j = await r.json();
     if (!j || j.ok === false) return j;
+    applyResult(j, opts);
+    return j;
+  }
+
+  /* WHAT A RESULT MEANS, in one place, whichever transport brought it.
+     Split out of sendFrame when the frame socket arrived: the socket delivers
+     results out of band, and two copies of "paint, draw, maybe speak" is two
+     places for the warning path to drift. */
+  function applyResult(j, opts) {
+    opts = opts || {};
     framesSeen++;
     paintHud(j);
     // WHEN this result describes, handed to the overlay with it. frameT is the
@@ -3356,7 +3410,6 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
     if (j.speak && monitorReady(j)) speak(j.speak);
-    return j;
   }
 
   /* NOTHING SPEAKS BEFORE THE MONITOR CAN SEE.
@@ -3748,10 +3801,66 @@ document.addEventListener('DOMContentLoaded', () => {
   apply();
   paintHint();
 
+  /* ---------------- the live stream --------------------------------------
+     One persistent socket for the whole drive, in place of one HTTP POST per
+     picture. rio_frames.js owns the pacing, the encode and the drop rule; this
+     owns what a result MEANS, which is the same function the POST path uses.
+
+     The socket is a transport change and nothing else. The results that come
+     back are the results /headway_frame returns, `applyResult` is the same
+     `applyResult`, and every warning is still decided server-side. */
+  let stream = null;
+
+  function startStream(elFn, onStale) {
+    if (stream) return stream;
+    if (!(window.RIO && RIO.frames)) return null;
+    const loc = window.location;
+    // Same origin, same session id, one scheme up. RIO.url is what puts the
+    // session on every other call and it is what puts it on this one.
+    const wsUrl = (loc.protocol === 'https:' ? 'wss://' : 'ws://')
+      + loc.host + RIO.url('/headway_ws');
+    stream = RIO.frames.create({
+      wsUrl: wsUrl,
+      postUrl: RIO.url('/headway_frame'),
+      element: elFn,
+      speed: speed,
+      source: () => { try { return RIO.source.kind(); } catch (e) { return 'camera'; } },
+      onResult: j => applyResult(j, { el: elFn() }),
+      onStale: onStale || (() => {}),
+      onEvent: (name, detail) => {
+        /* The transport's own bad news goes into the DRIVE's record, not only
+           into a console nobody has open in a car. "the picture froze for a
+           bit" is a sentence about a drive and has to be answerable from the
+           drive — which is exactly what the POST path could not do, and why
+           its 1949 frames left no trace of how old any of them were. */
+        if (!RIO.driving) return;
+        try {
+          fetch(RIO.url('/session/mark')
+                + '&tag=' + encodeURIComponent(name)
+                + '&note=' + encodeURIComponent(JSON.stringify(detail || {}).slice(0, 400)),
+                { method: 'POST' }).catch(() => {});
+        } catch (e) {}
+      },
+    });
+    stream.start();
+    return stream;
+  }
+
+  function stopStream() {
+    if (!stream) return null;
+    const s = stream.stats();
+    stream.stop();
+    stream = null;
+    return s;
+  }
+
   window.RIO = window.RIO || {};
   RIO.headway = {
     get enabled() { return enabled; },
     get videoRunning() { return videoRunning; },
+    startStream: startStream,
+    stopStream: stopStream,
+    streamStats: () => (stream ? stream.stats() : null),
     unlock: unlock,
     startWatch: startWatch,
     stopWatch: stopWatch,
@@ -4479,6 +4588,7 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_voice_eleven.js"></script>
 <script src="/static/rio_realtime.js"></script>
 <script src="/static/rio_speak.js"></script>
+<script src="/static/rio_frames.js"></script>
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>

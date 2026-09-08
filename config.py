@@ -901,6 +901,107 @@ HEADWAY_ALIGN_TOLERANCE_S = 1.0 / 24.0
 
 
 # ---------------------------------------------------------------------------
+# Live frame transport (item 1 of the first real-drive punch list)
+# ---------------------------------------------------------------------------
+# WHAT THE DRIVE LOG SAID, and it is the reason every number below exists.
+# Session 06af3214 (iPhone, 2026-09-08, 607.8 s, 1949 frames):
+#
+#   inter-frame arrival    p50 258 ms  p90 406 ms  p99 1503 ms   (3.88 fps p50)
+#   server processing      p50  23.6 ms  p90 33.5 ms
+#     decode 3.0 / lanes 3.0 / depth 6.8 / detect 9.1 / membership 1.2 / filter 0.3
+#   frames carrying a capture timestamp:   0 of 1949
+#
+# So the server was never the bottleneck -- it spent 24 ms on a frame that
+# arrived every 258 ms -- and the 250 ms floor in the page was the whole of the
+# frame rate. And the last line is the one that mattered most: with no
+# `frame_t` on any frame, the server could measure when a frame ARRIVED and
+# never how old it was, so "frame age at detection" -- the only number that
+# says whether a warning is about the road the car is on now -- was not a
+# number anybody had.
+#
+# Both are fixed here: the phone stamps every frame, and the transport stops
+# being one HTTP request per picture.
+
+# The WebSocket push. Falls back to the POST path (which is unchanged and still
+# the desk-testing path) when the socket will not open or drops.
+HEADWAY_WS_ENABLED = True
+
+# Adaptive capture rate, in frames per second. The floor is what the link is
+# allowed to drag the loop down to before frames start being dropped instead;
+# the ceiling is where extra frames stop buying anything the filter can use.
+HEADWAY_WS_MIN_FPS = 8.0
+HEADWAY_WS_MAX_FPS = 15.0
+HEADWAY_WS_START_FPS = 10.0
+
+# DROP, NEVER QUEUE. The single rule this transport exists to enforce.
+#
+# A queued frame is a frame that will be measured against a dt that has already
+# passed, and a warning computed from it is a warning about a road the car has
+# left. So there is exactly one frame in flight at a time and exactly one frame
+# waiting on the server, and a new capture that finds either slot occupied
+# REPLACES what is there rather than lining up behind it.
+#
+# This is the same argument the POST path already made with its non-blocking
+# per-session lock (see app.headway_frame_endpoint); the difference is that on
+# a socket the newest frame can evict the waiting one instead of being thrown
+# away itself, so the frame that gets processed is always the freshest one.
+# How many frames may be ON THE WIRE at once, and it is a PIPELINE DEPTH, not
+# a queue length -- the distinction is what keeps "never let frame age grow"
+# true at 8-15 fps.
+#
+# With one frame in flight the achievable rate is 1/(serialise + round trip),
+# and on the link the first drive was measured over -- 2.0 Mbit/s up, 60 ms RTT
+# -- that is about 4 fps whatever the capture loop asks for. Measured: frame
+# age held at 161 ms p50 and the stream ran at 3.85 fps with 182 captures
+# skipped. Frame age was excellent and the frame rate was the old one.
+#
+# So the depth is allowed to grow, and it is FRAME AGE that decides when. The
+# client raises it only while measured age sits well under target, and drops it
+# straight back to 1 the moment age crosses the ceiling. The server's slot is
+# unaffected: exactly one frame ever waits there, and a newer one evicts it.
+# Nothing accumulates on either side, which is the property that matters --
+# what grows is how much of the radio is kept busy, not how far behind the
+# picture is.
+HEADWAY_WS_MAX_INFLIGHT = 3
+# Bytes still unsent on the socket above which the next capture is skipped
+# outright. Roughly two frames at the byte budget below: past that the radio is
+# behind and adding a picture to the back of it only makes the next one older.
+HEADWAY_WS_BUFFER_LIMIT_BYTES = 120_000
+
+# Frame age (capture -> detection complete) the rate controller aims to keep
+# under. Above the ceiling it sheds frame rate and then quality; below the
+# floor it takes the rate back up.
+HEADWAY_WS_TARGET_AGE_MS = 220.0
+HEADWAY_WS_MAX_AGE_MS = 400.0
+
+# --- JPEG, tuned for a mobile uplink ----------------------------------------
+# The old path encoded at the camera's own resolution and a fixed q0.8, which
+# on this phone produced 71-90 KB per frame (measured off the /perceive events
+# of the same feed). At 4 fps that is ~2.6 Mbit/s of uplink for a picture the
+# detector runs on at a few hundred pixels a side, and at 15 fps it would be
+# ~10 Mbit/s -- more than an LTE uplink has. Downscaling first is what makes
+# the higher frame rate affordable at all.
+#
+# 640 on the long side is above every consumer of these frames: the detector
+# letterboxes to 560, the depth model to 518, the lane model to 800x320. So
+# this costs nothing that is measured and saves most of the bytes.
+HEADWAY_WS_MAX_SIDE_PX = 640
+HEADWAY_WS_JPEG_QUALITY = 0.62
+HEADWAY_WS_JPEG_QUALITY_MIN = 0.40
+HEADWAY_WS_JPEG_QUALITY_MAX = 0.78
+# The byte budget one frame is allowed. Quality walks between the bounds above
+# to hold this; at 12 fps it is ~2.3 Mbit/s, which is what a mobile uplink can
+# actually carry while a voice session is open on the same radio.
+HEADWAY_WS_TARGET_BYTES = 24_000
+
+# How long the socket may go without a frame before the server lets the session
+# go. Longer than any single stall the drive log showed (max 2.0 s) and shorter
+# than the session reaper, which is about a drive ending rather than a link
+# hiccupping.
+HEADWAY_WS_IDLE_TIMEOUT_S = 30.0
+
+
+# ---------------------------------------------------------------------------
 # Visual conversation (docs/visual_qa.md)
 # ---------------------------------------------------------------------------
 VISUAL_QA_ENABLED = True

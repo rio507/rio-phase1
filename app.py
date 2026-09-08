@@ -1,5 +1,6 @@
 
 
+import asyncio
 import base64
 import json
 import math
@@ -1024,6 +1025,13 @@ async def headway_frame_endpoint(
     v_host: str = Form(default=None),
     v_host_age_s: str = Form(default=None),
     frame_t: str = Form(default=None),
+    # WHEN THE PICTURE WAS TAKEN, in this server's clock. The socket path
+    # measures its own offset and stamps this on every frame; the POST path
+    # takes it too, so the two transports are measured with one ruler and the
+    # before/after is a comparison rather than an argument. Absent -- a bench,
+    # a curl, the old page -- and frame_age_ms is null, which is exactly what
+    # the first real drive's log carried for all 1949 of its frames.
+    cap_t: str = Form(default=None),
     # WHAT THE PAGE IS LOOKING THROUGH, in its own words: camera, clip, none.
     # Stamped onto every frame that is retained, so an answer can be checked
     # against the source it came from. Absent -- a bench, a curl, a harness --
@@ -1088,7 +1096,11 @@ async def headway_frame_endpoint(
             # must never cost the headway frame that has already been computed.
             print(f"[framebuf] push failed: {type(e).__name__}: {e}", flush=True)
 
-    sessions.log_headway(session_id, result, (time.time() - t0) * 1000)
+    done = time.time()
+    _cap = _opt_float(cap_t)
+    result["frame_age_ms"] = None if _cap is None else round((done - _cap) * 1000.0, 1)
+    result["server_ms"] = round((done - t0) * 1000.0, 1)
+    sessions.log_headway(session_id, result, (done - t0) * 1000.0)
     # Lane departure is logged, not spoken. It gets its own event kind so a
     # review pass can pull the handful of excursions out of a whole drive; see
     # sessions.log_lane_drift and the scope note in headway/lanes.py.
@@ -1100,6 +1112,275 @@ async def headway_frame_endpoint(
     if result.get("merge_promotions"):
         sessions.log_merge_promotion(session_id, result)
     return result
+
+
+# --- the live frame socket --------------------------------------------------
+#
+# WHY THIS EXISTS, in the drive log's own numbers. Session 06af3214, 607.8 s on
+# an iPhone: 1949 frames, arriving 258 ms apart at p50 against a 250 ms floor in
+# the page, while the server spent 23.6 ms on each of them. One HTTP request per
+# picture, four times a second, and the rest of the wall clock was the page
+# waiting for its own timer or for the radio.
+#
+# Three things change here and nothing else does. The pipeline behind
+# `session.process` is byte-for-byte the one the POST path calls.
+#
+#   ONE CONNECTION. No per-frame request line, no per-frame TLS record dance,
+#   no per-frame multipart envelope around a JPEG that is already a container.
+#
+#   THE FRAME CARRIES ITS OWN AGE. Every frame arrives stamped with the instant
+#   it was captured, already converted into this server's clock by the offset
+#   the socket measures (see the `ping` op). So `frame_age_ms` -- capture to
+#   detection complete -- is a measurement rather than an inference. On the POST
+#   path it was neither: zero of 1949 frames carried a timestamp at all, so the
+#   one number that says whether a warning is about the road the car is on now
+#   was not a number anybody had.
+#
+#   DROP, NEVER QUEUE. There is one slot for a waiting frame. A frame that
+#   arrives while another is being processed REPLACES whatever is waiting; the
+#   evicted one is counted and forgotten. That is stronger than the POST path's
+#   non-blocking lock, which dropped the NEW frame and went on with the old one
+#   -- here the newest picture always wins, which is the only version of "drop
+#   rather than queue" that stops frame age from growing.
+#
+# The socket sends no warnings and decides no policy: the result it returns is
+# the same dict /headway_frame returns, and the browser plays what it is told
+# exactly as before.
+
+
+class _WsFrame:
+    __slots__ = ("seq", "cap_t", "v_host", "v_host_age_s", "source", "jpeg", "recv_t")
+
+    def __init__(self, seq, cap_t, v_host, v_host_age_s, source, jpeg, recv_t):
+        self.seq = seq
+        self.cap_t = cap_t
+        self.v_host = v_host
+        self.v_host_age_s = v_host_age_s
+        self.source = source
+        self.jpeg = jpeg
+        self.recv_t = recv_t
+
+
+def _parse_ws_frame(buf: bytes, recv_t: float):
+    """One binary message -> a frame, or None if it is malformed.
+
+    Wire shape, deliberately trivial so the browser can build it with a
+    DataView and no library:
+
+        uint32be  header length
+        bytes     UTF-8 JSON header {seq, cap_t, v, va, src}
+        bytes     the JPEG
+
+    `cap_t` is the capture instant ALREADY IN THIS SERVER'S CLOCK -- the
+    browser applies the offset it measured with `ping` before sending. Doing
+    the conversion on the sending side is what keeps the age honest when the
+    two clocks disagree by seconds, which on a phone they routinely do.
+    """
+    if len(buf) < 4:
+        return None
+    hlen = int.from_bytes(buf[:4], "big")
+    if hlen <= 0 or 4 + hlen > len(buf):
+        return None
+    try:
+        head = json.loads(buf[4:4 + hlen].decode("utf-8"))
+    except Exception:
+        return None
+    jpeg = buf[4 + hlen:]
+    if not jpeg:
+        return None
+    return _WsFrame(
+        seq=int(head.get("seq") or 0),
+        cap_t=_opt_float(head.get("cap_t")),
+        v_host=_opt_float(head.get("v")),
+        v_host_age_s=_opt_float(head.get("va")),
+        source=(head.get("src") or None),
+        jpeg=jpeg,
+        recv_t=recv_t,
+    )
+
+
+def _headway_ws_tuning() -> dict:
+    """The transport's tuning, sent to the browser when the socket opens.
+
+    Travels with the connection exactly as navigation timing travels with a
+    route: config.py decides it and the browser holds no second copy to drift
+    from the one the tests check.
+    """
+    return {
+        "min_fps": config.HEADWAY_WS_MIN_FPS,
+        "max_fps": config.HEADWAY_WS_MAX_FPS,
+        "start_fps": config.HEADWAY_WS_START_FPS,
+        "target_age_ms": config.HEADWAY_WS_TARGET_AGE_MS,
+        "max_age_ms": config.HEADWAY_WS_MAX_AGE_MS,
+        "max_side_px": config.HEADWAY_WS_MAX_SIDE_PX,
+        "quality": config.HEADWAY_WS_JPEG_QUALITY,
+        "quality_min": config.HEADWAY_WS_JPEG_QUALITY_MIN,
+        "quality_max": config.HEADWAY_WS_JPEG_QUALITY_MAX,
+        "target_bytes": config.HEADWAY_WS_TARGET_BYTES,
+        "buffer_limit_bytes": config.HEADWAY_WS_BUFFER_LIMIT_BYTES,
+        "max_inflight": config.HEADWAY_WS_MAX_INFLIGHT,
+    }
+
+
+@app.websocket("/headway_ws")
+async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=None)):
+    await ws.accept()
+    key = session_id or "default"
+
+    await ws.send_text(json.dumps({
+        "op": "ready", "server_t": time.time(), "tuning": _headway_ws_tuning(),
+    }))
+
+    if not _warm_done.is_set():
+        await ws.send_text(json.dumps({"op": "warming"}))
+
+    # A socket tagged with a session this process has never heard of is a tab
+    # left open across a restart -- the same judgement /headway_frame makes on
+    # every frame, made once here instead.
+    if session_id and not sessions.touch(session_id):
+        await ws.send_text(json.dumps({"op": "stale", "reason": "unknown_session"}))
+        await ws.close()
+        return
+
+    # THE ONE SLOT. Not a queue, and the distinction is the whole point.
+    slot: list = [None]
+    ready = asyncio.Event()
+    closing = asyncio.Event()
+    stats = {"recv": 0, "processed": 0, "evicted": 0, "bytes": 0}
+
+    async def worker():
+        while not closing.is_set():
+            await ready.wait()
+            ready.clear()
+            if closing.is_set():
+                return
+            frame = slot[0]
+            slot[0] = None
+            if frame is None:
+                continue
+            if not _warm_done.is_set():
+                try:
+                    await ws.send_text(json.dumps({"op": "skip", "seq": frame.seq,
+                                                   "reason": "warming"}))
+                except Exception:
+                    return
+                continue
+            t0 = time.time()
+            session = headway_live.get_session(key, use_qwen=config.VISION_ENABLED)
+            # Still taken, and still non-blocking: this worker is serial by
+            # construction, so the lock can only be held by the POST path, and
+            # a frame that collides with one is dropped rather than queued for
+            # the same reason every other frame is.
+            if not session.lock.acquire(blocking=False):
+                stats["evicted"] += 1
+                continue
+            try:
+                result = await run_in_threadpool(
+                    session.process, frame.jpeg, frame.v_host, frame.v_host_age_s, None)
+            except Exception as e:
+                print(f"[headway.ws] frame failed: {e}", flush=True)
+                try:
+                    await ws.send_text(json.dumps({
+                        "op": "error", "seq": frame.seq,
+                        "error": f"{type(e).__name__}: {e}"}))
+                except Exception:
+                    return
+                continue
+            finally:
+                session.lock.release()
+
+            done = time.time()
+            stats["processed"] += 1
+            # THE NUMBER THIS WHOLE ENDPOINT IS FOR. Capture to detection
+            # complete, in one clock, with no inference in it.
+            age_ms = None if frame.cap_t is None else (done - frame.cap_t) * 1000.0
+            result["seq"] = frame.seq
+            result["frame_age_ms"] = None if age_ms is None else round(age_ms, 1)
+            # How that age was spent: on the wire, then waiting for the worker,
+            # then in the models. A slow drive is a different fix depending on
+            # which of the three grew.
+            result["transport_ms"] = (None if frame.cap_t is None
+                                      else round((frame.recv_t - frame.cap_t) * 1000.0, 1))
+            result["queue_ms"] = round((t0 - frame.recv_t) * 1000.0, 1)
+            result["server_ms"] = round((done - t0) * 1000.0, 1)
+            result["dropped"] = stats["evicted"]
+
+            if config.VISUAL_QA_ENABLED:
+                try:
+                    framebuf.get_ring(_visual_key(session_id)).push(
+                        frame.jpeg, result,
+                        origin=_frame_origin(session_id, frame.source))
+                except Exception as e:
+                    print(f"[framebuf] push failed: {type(e).__name__}: {e}", flush=True)
+
+            sessions.log_headway(session_id, result, (done - t0) * 1000.0)
+            if (result.get("lane_drift") or {}).get("drift"):
+                sessions.log_lane_drift(session_id, result)
+            if result.get("merge_promotions"):
+                sessions.log_merge_promotion(session_id, result)
+            try:
+                await ws.send_text(json.dumps(result))
+            except Exception:
+                return
+
+    task = asyncio.create_task(worker())
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if data is not None:
+                frame = _parse_ws_frame(data, time.time())
+                if frame is None:
+                    continue
+                stats["recv"] += 1
+                stats["bytes"] += len(frame.jpeg)
+                if session_id and not sessions.touch(session_id):
+                    await ws.send_text(json.dumps({"op": "stale",
+                                                   "reason": "unknown_session"}))
+                    break
+                # NEWEST WINS. An unprocessed frame in the slot is older than
+                # this one and describes a road the car has already driven, so
+                # it is replaced, counted and forgotten -- never queued behind.
+                if slot[0] is not None:
+                    stats["evicted"] += 1
+                slot[0] = frame
+                ready.set()
+                continue
+            text = msg.get("text")
+            if not text:
+                continue
+            try:
+                op = json.loads(text)
+            except Exception:
+                continue
+            if op.get("op") == "ping":
+                # Clock offset, measured rather than assumed. The browser sends
+                # its own clock, gets it back next to this server's, and halves
+                # the round trip -- which is what lets it stamp cap_t in a clock
+                # this process can subtract from time.time().
+                await ws.send_text(json.dumps({"op": "pong", "c": op.get("c"),
+                                               "s": time.time()}))
+            elif op.get("op") == "stats":
+                await ws.send_text(json.dumps({"op": "stats", **stats}))
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[headway.ws] socket error: {type(e).__name__}: {e}", flush=True)
+    finally:
+        closing.set()
+        ready.set()
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except Exception:
+            task.cancel()
+        if stats["recv"]:
+            sessions.log_live(session_id, "headway_ws_close", {
+                "received": stats["recv"], "processed": stats["processed"],
+                "dropped": stats["evicted"],
+                "mean_frame_bytes": round(stats["bytes"] / stats["recv"]),
+            })
 
 
 @app.post("/headway_reset")

@@ -189,6 +189,21 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "track_lost": result.get("track_lost"),
         "v_host": result.get("v_host"),
         "v_host_stale": result.get("v_host_stale"),
+        # HOW OLD THE PICTURE WAS WHEN THE DETECTOR FINISHED WITH IT, and the
+        # three places that age was spent: on the wire, waiting for a worker,
+        # then in the models.
+        #
+        # The first real drive had none of this. 1949 frames, not one of them
+        # carrying the instant it was taken, so the only latency in the file
+        # was how long the SERVER took -- 23.6 ms at p50, which was never the
+        # problem and could not have shown what was. A warning is a claim about
+        # a moment, and a log that cannot say which moment cannot be used to
+        # check the claim. Null here means the client sent no capture stamp,
+        # which is what the old page and any bare curl do.
+        "frame_age_ms": result.get("frame_age_ms"),
+        "transport_ms": result.get("transport_ms"),
+        "queue_ms": result.get("queue_ms"),
+        "server_ms": result.get("server_ms"),
         # Lane geometry: which corridor decided this frame, how sure the paint
         # was, and where in the lane the car sat. The polylines themselves are
         # dropped for the same reason the corridor polygon is -- four lanes of
