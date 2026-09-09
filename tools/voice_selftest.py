@@ -338,8 +338,15 @@ def run_scene_gate():
     js = Path(REPO / "static/rio_realtime.js").read_text()
     ok("spoken: controllerTranscript()" in js,
        "the panel sends the driver's own last transcript with every tool call")
-    app = Path(REPO / "app.py").read_text()
-    ok("spoken=body.get(\"spoken\")" in app,
+    # Asked of the CALL rather than of one spelling of it. This read
+    # `"spoken=body.get(\"spoken\")" in app` until app.py wrapped the argument
+    # onto its own line and passed it positionally -- the passthrough was
+    # fine and the assertion failed anyway. Whitespace is collapsed and the
+    # question is the one that matters: does the driver's transcript reach
+    # run_tool, however the call happens to be laid out.
+    app = re.sub(r"\s+", " ", Path(REPO / "app.py").read_text())
+    call = re.search(r"realtime\.run_tool,(.*?\))\)", app)
+    ok(call and 'body.get("spoken")' in call.group(1),
        "the server passes it through to the tool")
     ok("def look(question: str, session_key: str = \"default\",\n         spoken" in
        Path(REPO / "realtime.py").read_text(),

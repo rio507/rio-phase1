@@ -2912,9 +2912,15 @@ def run_fast_path():
     st = observer._sessions[key]
 
     now = time.time()
+    # STAMPED, because fresh() asks serve_to() whose road this is before it
+    # asks how old it is, and an unstamped record is refused as unknown
+    # provenance. Production puts "<session key>:<source>" on every record
+    # (see app._frame_origin); a fixture without it tests the refusal rather
+    # than the freshness rule below.
     st["record"] = {"text": "Cars ahead on a wet road.", "at": now,
                     "frame_wall_t": now - 0.4, "frame_id": "f1",
-                    "frame_age_s": 0.4}
+                    "frame_age_s": 0.4,
+                    "origin": f"{key}:camera", "session_key": key}
     hit = observer.fresh(key)
     ok(hit and hit["text"].startswith("Cars ahead"),
        f"a description of the road half a second ago is still the road "
@@ -2933,7 +2939,11 @@ def run_fast_path():
     # Age is measured from the FRAME, not from the observation: Qwen taking
     # 400 ms to describe a picture does not make the picture newer.
     st["record"] = {"text": "x", "at": time.time(),
-                    "frame_wall_t": time.time() - 30.0, "frame_id": "f2"}
+                    "frame_wall_t": time.time() - 30.0, "frame_id": "f2",
+                    # Stamped for the same reason: unstamped, this would be
+                    # refused for having no provenance and the check would
+                    # pass without ever testing the frame's clock.
+                    "origin": f"{key}:camera", "session_key": key}
     ok(observer.fresh(key) == {},
        "a fresh observation OF AN OLD FRAME is old — the frame's clock is the "
        "one the driver is being told about")
