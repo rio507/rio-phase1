@@ -2442,6 +2442,22 @@ function stopRec() {
    mid-word. That is not incidental: it is the only reason a continuously open
    microphone is safe to have in a car. */
 let live = null, liveMode = true, liveBusy = false;
+/* WHICH SESSION AN EVENT BELONGS TO.
+ *
+ * Ending a conversation is not instantaneous down in rio_realtime.js: stop()
+ * resolves the utterance that was in flight, the arbiter hands the mouth back,
+ * and LIVE_RESPONSE_END comes back out through emit() -- sometimes inside the
+ * stop() call, sometimes a tick later, because the path runs through the
+ * arbiter and one arm of it is a setTimeout. Either is fine for the session.
+ * Neither is fine for the CONTROL: the handler's job is "the button shows
+ * whatever the ring shows", and a late RESPONSE_END from a session that is
+ * over put the button back to Listening after the driver had ended it.
+ *
+ * So the handler carries the generation it was created for and does nothing
+ * to the screen once that generation is spent. Reporting is deliberately NOT
+ * gated -- a cut-off in a session's last half second is still a real cut-off
+ * and /realtime/cutoffs should hear about it. */
+let liveGen = 0;
 
 /* ---- frames for a live session ------------------------------------------
    THE MISSING LINK, and it was not the tool.
@@ -2509,18 +2525,26 @@ function stopLiveFrames() {
   liveFrames.feed = null;
 }
 
-async function toggleLive() {
-  if (liveBusy) return;
-  RIO.unlockAudio(player);
-  if (live) {
-    live.stop();
-    live = null;
-    stopLiveFrames();
-    stopBusWatch();
-    setMicState('idle');
-    RIO.ui.voice('idle');
-    return;
-  }
+/* MODULE SCOPE, and it has to be. Everything from here to the end of
+ * stopBusWatch() used to sit INSIDE toggleLive(), below that function's
+ * early-return branch for ending a conversation -- so the second tap on the
+ * talk control ran `stopBusWatch()` against a `let busWatch` that had not
+ * been evaluated yet in that call, and threw a TDZ ReferenceError before
+ * `setMicState('idle')` on the next line.
+ *
+ * What the driver saw: tap to end, and nothing ends. The button still says
+ * Listening, the ring is still green -- and because `live` had already been
+ * nulled two lines above the throw, the NEXT tap fell through to the connect
+ * path and opened a second concurrent session.
+ *
+ * The bus watch was also per-call, which is the other half of the same
+ * mistake: a fresh binding every invocation meant the previous session's
+ * 1s interval could never be cleared, so every conversation leaked one that
+ * went on posting LIVE_BUS_HEALTH for a session that was over.
+ *
+ * None of this block touches toggleLive's locals -- it reads RIO and nothing
+ * else -- so the only thing nesting it ever bought was the bug. */
+
 /* Every cut-off, every resume, every absorbed blip, to the server.
  *
  * The classification is made here because only here can it be made -- whether
@@ -2666,22 +2690,41 @@ function stopBusWatch() {
   busWatch = null;
 }
 
+async function toggleLive() {
+  if (liveBusy) return;
+  RIO.unlockAudio(player);
+  if (live) {
+    // Spend the generation FIRST, so anything stop() shakes loose on the way
+    // out is already disowned by the time it reaches the handler.
+    liveGen++;
+    live.stop();
+    live = null;
+    stopLiveFrames();
+    stopBusWatch();
+    setMicState('idle');
+    RIO.ui.voice('idle');
+    return;
+  }
+
   liveBusy = true;
   setMicState('connecting');
+  const gen = ++liveGen;
   try {
     live = await RIO.realtime.connect({
       arbiter: RIO.speech,
       url: RIO.url,
       element: player,
       onEvent: (ev) => {
-        if (ev.type === 'LIVE_TRANSCRIPT' && ev.transcript) RIO.ui.driver(ev.transcript);
+        // Still reported below whatever happens; only the screen is disowned.
+        const mine = (gen === liveGen);
+        if (mine && ev.type === 'LIVE_TRANSCRIPT' && ev.transcript) RIO.ui.driver(ev.transcript);
         // The control follows the session, not the other way round: whatever
         // the ring in column 4 is showing, the button in the corner shows too.
-        else if (ev.type === 'LIVE_RESPONSE_START') { RIO.ui.voice('speaking'); setMicState('speaking'); }
-        else if (ev.type === 'LIVE_RESPONSE_END') { RIO.ui.voice('listening'); setMicState('listening'); }
-        else if (ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
+        else if (mine && ev.type === 'LIVE_RESPONSE_START') { RIO.ui.voice('speaking'); setMicState('speaking'); }
+        else if (mine && ev.type === 'LIVE_RESPONSE_END') { RIO.ui.voice('listening'); setMicState('listening'); }
+        else if (mine && ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
         else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
-        else if (ev.type === 'LIVE_RESUME') {
+        else if (mine && ev.type === 'LIVE_RESUME') {
           // Say so on screen. An answer that finishes itself after a warning is
           // a good thing that looks like a glitch if it is never explained.
           obs.textContent = 'Picking up where she left off…';

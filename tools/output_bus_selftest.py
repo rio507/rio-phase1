@@ -184,6 +184,140 @@ CLIP_STATE = """
 """
 
 
+# ---------------------------------------------------------------------------
+# The bus watch, over a session's lifetime
+# ---------------------------------------------------------------------------
+# The watch that reads RIO.output.state() once a second is started when a live
+# conversation opens and stopped when it closes -- and for a long time it was
+# neither, because the whole block that declares it sat INSIDE toggleLive(),
+# below that function's early return for ending a conversation. The second tap
+# on the talk control ran stopBusWatch() against a `let busWatch` that had not
+# been evaluated yet in that call and threw a TDZ ReferenceError, one line
+# before setMicState('idle').
+#
+# Three things followed, and all three are asserted below:
+#
+#   1. the control never went back to idle -- it still said Listening, with a
+#      green ring, on a conversation that was over;
+#   2. `live` had already been nulled two lines above the throw, so the NEXT
+#      tap fell through to the connect path and opened a SECOND concurrent
+#      session, each with a bus watch of its own;
+#   3. no watch was ever cleared, so every conversation leaked a 1s interval
+#      that went on posting LIVE_BUS_HEALTH for a session that had ended.
+#
+# And one more that survived the hoist: a stopped session's tail events kept
+# driving the control. LIVE_RESPONSE_END comes back out of stop() through the
+# arbiter, sometimes synchronously and sometimes a tick later, and the late
+# arm put the button back to Listening after the driver had ended it.
+#
+# THE SESSION IS A STUB. RIO.realtime.connect is replaced before the first tap,
+# so this runs with no API key, no socket, no model and no audio -- and, more
+# importantly, no race: the "late tail event" is delivered by hand at the exact
+# moment that used to be a coin toss.
+SESSION_STUB = """
+() => {
+  window.__iv = [];
+  const si = window.setInterval, ci = window.clearInterval;
+  window.setInterval = function (fn, ms) {
+    const id = si.apply(this, arguments);
+    if (ms === 1000) window.__iv.push({ id: id, live: true });   // the bus watch
+    return id;
+  };
+  window.clearInterval = function (id) {
+    const r = window.__iv.find(x => x.id === id);
+    if (r) r.live = false;
+    return ci.apply(this, arguments);
+  };
+  window.__sessions = 0;
+  if (!(window.RIO && RIO.realtime && RIO.realtime.connect)) return false;
+  RIO.realtime.connect = async (opts) => {
+    window.__sessions++;
+    const s = { onEvent: opts.onEvent, stopped: false,
+                stop: function () { this.stopped = true; } };
+    window.__last = s;
+    return s;
+  };
+  return true;
+}
+"""
+
+TALK_STATE = """
+() => ({
+  mic: document.getElementById('mic').dataset.state,
+  ring: document.getElementById('voicering').className,
+  sessions: window.__sessions,
+  watches: window.__iv.length,
+  running: window.__iv.filter(r => r.live).length,
+})
+"""
+
+# The tail of a session that has already been ended, arriving late.
+LATE_TAIL = """
+() => {
+  if (!window.__last) return false;
+  window.__last.onEvent({ type: 'LIVE_RESPONSE_END', response_id: 'tail' });
+  window.__last.onEvent({ type: 'LIVE_RESPONSE_START', response_id: 'tail' });
+  return true;
+}
+"""
+
+
+def run_bus_watch(page, errors):
+    section("the bus watch starts and stops with the conversation")
+
+    if not page.evaluate(SESSION_STUB):
+        ok(False, "RIO.realtime.connect exists to be stubbed")
+        return
+
+    before = len(errors)
+
+    page.click("#mic")
+    page.wait_for_timeout(600)
+    r = page.evaluate(TALK_STATE)
+    ok(r["sessions"] == 1, f"one tap opens one session ({r['sessions']})")
+    ok(r["mic"] == "listening",
+       f"the control says the conversation is open (is {r['mic']!r})")
+    ok(r["running"] == 1,
+       f"and exactly one bus watch is running ({r['running']})")
+
+    page.click("#mic")
+    page.wait_for_timeout(400)
+    r = page.evaluate(TALK_STATE)
+    # The regression, asserted: this said 'listening' for as long as the
+    # declarations lived inside toggleLive().
+    ok(r["mic"] == "idle",
+       f"a second tap returns the control to idle (is {r['mic']!r})")
+    ok("listening" not in r["ring"] and "speaking" not in r["ring"],
+       f"and the ring goes with it (is {r['ring']!r})")
+    ok(r["running"] == 0,
+       f"the bus watch was cleared rather than left running ({r['running']})")
+    ok(len(errors) == before,
+       "ending a conversation throws nothing"
+       + ("" if len(errors) == before else ": " + "; ".join(errors[before:])))
+
+    ok(page.evaluate(LATE_TAIL), "the stopped session can still be poked")
+    page.wait_for_timeout(200)
+    r = page.evaluate(TALK_STATE)
+    ok(r["mic"] == "idle",
+       f"a stopped session's late RESPONSE_END does not reopen the control "
+       f"(is {r['mic']!r})")
+    ok("speaking" not in r["ring"],
+       f"nor put the ring back to speaking (is {r['ring']!r})")
+
+    page.click("#mic")
+    page.wait_for_timeout(600)
+    r = page.evaluate(TALK_STATE)
+    ok(r["sessions"] == 2,
+       f"tapping again opens the second session, not a third ({r['sessions']})")
+    ok(r["running"] == 1,
+       f"with one watch running, not one per conversation ever held "
+       f"({r['running']} of {r['watches']} started)")
+
+    # Leave the page as it was found.
+    page.click("#mic")
+    page.wait_for_timeout(300)
+
+
 def run_unlock(page):
     section("Start Drive primes on silence, never on a warning")
     page.evaluate(SPY)
@@ -329,6 +463,7 @@ def main():
            "and the element was never given a src at all")
 
         run_unlock(page)
+        run_bus_watch(page, errors)
 
         ok(not errors, "no uncaught page errors" +
            ("" if not errors else ": " + "; ".join(errors[:3])))
