@@ -2913,10 +2913,28 @@
        * is spoken, nothing enters the conversation the driver can hear, and
        * the cost is a single token per drive.
        *
-       * MEASURE IT BEFORE BELIEVING IT. The first-turn numbers above are
-       * highly variable -- one of the four was 829 ms, faster than some later
-       * turns -- so a warm that "looks better" over two runs has proved
-       * nothing. See the numbers in the commit that added this. */
+       * AND IT WAS MEASURED, AND IT DID NOT WORK. Three full runs with this
+       * in, against four without:
+       *
+       *     first-turn turn-end   before   829, 2482, 1846, 2311 ms
+       *                           after         2278, 1900, 1821 ms
+       *     later turns, both                     ~400-850 ms
+       *
+       * No improvement. The whole after-range sits inside the before-range,
+       * and the fastest first turn ever measured (829 ms) was WITHOUT this.
+       * First-turn first-audio did not move either: 3280/3979/3602/4844
+       * before, 4135/3195/3972 after.
+       *
+       * Which is what the paragraph above predicts -- the detector was never
+       * the thing this could reach. Kept because it is asked for, safe and
+       * cheap; it is a candidate for removal, not a fix. What would actually
+       * move the first turn is the semantic_vad/server_vad trade in
+       * config.py, and that is a judgement made from the passenger seat.
+       *
+       * The first-turn cost is also NOT the fixed warm-up it looks like: one
+       * of the seven measurements above is 829 ms, faster than several later
+       * turns. It is variance on the first utterance, which is exactly what
+       * semantic_vad is documented to be. */
       warmSession: function () {
         if (warmed) return false;
         warmed = true;
