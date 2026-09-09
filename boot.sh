@@ -10,6 +10,16 @@
 #
 #   bash /workspace/boot.sh
 #
+# JUST BOUNCING THE SERVER? Do not reach for pkill -- it kills the shell that
+# runs it, which is explained at length above rio_pids() below. Use:
+#
+#   bash /workspace/boot.sh restart     stop, start, wait for /health
+#   bash /workspace/boot.sh stop
+#   bash /workspace/boot.sh start
+#   bash /workspace/boot.sh status      pids, listener, /health
+#
+# Those touch nothing but the server: no apt, no pip, no weights, no preflight.
+#
 # RUN IT SO IT CANNOT BE HUNG UP ON. The torch step downloads ~3 GB and the
 # Qwen weights are 16 GB; if the terminal drops during either, SIGHUP kills this
 # script somewhere in the middle and leaves a PARTIALLY provisioned pod. Use
@@ -58,6 +68,149 @@ exec > >(tee -a "$BOOT_LOG") 2>&1
 printf '\n===== boot.sh %s (pid %s) =====\n' "$(date -Is)" "$$"
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# The server: find it, stop it, start it -- and the subcommands that do only
+# that, without re-provisioning the pod.
+# ---------------------------------------------------------------------------
+#
+#   bash boot.sh restart     stop the server, start it again, wait for /health
+#   bash boot.sh stop        stop it
+#   bash boot.sh start       start it (stops one first if it is already up)
+#   bash boot.sh status      what is running, and what /health says
+#   bash boot.sh             the full provision, as always
+#
+# WHY THIS EXISTS: `pkill -f "uvicorn app:app"` KILLS THE SHELL THAT RUNS IT.
+#
+# -f matches the pattern against the whole command line of every process, and
+# the shell running the pkill has that pattern on its own command line -- any
+# `bash -c '...'`, which is what every agent harness and every ssh one-liner
+# uses. So the shell matches itself, kills itself with SIGTERM (exit 144, which
+# is 128+15), and dies BEFORE it gets to the line that starts the replacement.
+# The pod is then left with nothing on :8888 and a caller that thinks it just
+# restarted the server.
+#
+# It is not hypothetical and it is not rare: it happened twice in one session on
+# 2026-09-09, and the second time was after knowing about the first. Checked on
+# this pod while writing this, `pgrep -f 'uvicorn app:app'` returned two pids --
+# the server, and the shell doing the asking.
+#
+# The fix is to stop matching on the command line alone. A shell is never the
+# server: keep only the candidates whose /proc/<pid>/comm is the interpreter
+# uvicorn actually runs as, and never the current shell.
+
+# Every RUNNING uvicorn for this app, one pid per line, and nothing that merely
+# mentions it.
+rio_pids() {
+    local pid comm
+    for pid in $(pgrep -f 'uvicorn app:app' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+        case "$comm" in
+            uvicorn|python|python3|python3.*) echo "$pid" ;;
+        esac
+    done
+}
+
+# The pids on one line, trimmed, or empty. Used for reporting only.
+rio_pidline() { rio_pids | tr '\n' ' ' | sed 's/ *$//'; }
+
+rio_stop() {
+    local pids i
+    pids=$(rio_pidline)
+    if [ -z "$pids" ]; then
+        echo "   no uvicorn running"
+        return 0
+    fi
+    echo "   stopping uvicorn: $pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    # It has a lifespan handler and an open port; give it time to let go of
+    # both rather than racing the next bind.
+    for i in $(seq 1 20); do
+        [ -z "$(rio_pids)" ] && break
+        sleep 0.5
+    done
+    pids=$(rio_pidline)
+    if [ -n "$pids" ]; then
+        echo "   still up after 10s — SIGKILL: $pids"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+rio_start() {
+    cd "$REPO"
+    # The log of the run you are restarting BECAUSE OF is the one thing you
+    # need after a crash, and `>` erases it. One generation back is enough.
+    [ -f "$REPO/uvicorn.log" ] && mv -f "$REPO/uvicorn.log" "$REPO/uvicorn.log.prev"
+    # setsid + nohup + </dev/null: the server has to outlive the shell that
+    # started it. A plain background job belongs to the caller's session, so an
+    # agent's `bash -c` wrapper exiting takes the server with it -- the other
+    # half of the failure this whole block is about.
+    #
+    # HF_HOME is passed EXPLICITLY rather than left to inheritance. This is the
+    # line people copy out of the log and re-run by hand, and a uvicorn started
+    # without HF_HOME re-downloads 16 GB of Qwen3-VL into a container layer that
+    # is about to disappear.
+    setsid env HF_HOME="$HF_HOME_DIR" nohup \
+        uvicorn app:app --host 0.0.0.0 --port "$PORT" \
+        > "$REPO/uvicorn.log" 2>&1 < /dev/null &
+    sleep 1
+    local pids
+    pids=$(rio_pidline)
+    if [ -z "$pids" ]; then
+        echo "   !! uvicorn did not come up — tail of uvicorn.log:"
+        tail -20 "$REPO/uvicorn.log"
+        return 1
+    fi
+    echo "   started: $pids (HF_HOME=$HF_HOME_DIR)"
+}
+
+# uvicorn answers /health well before the model is warm (vision warms on a
+# daemon thread), so this waits for the SERVER, not for readiness.
+rio_wait_healthy() {
+    local i
+    for i in $(seq 1 60); do
+        if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
+            echo "   up after ${i}s: $(curl -s "http://127.0.0.1:$PORT/health")"
+            return 0
+        fi
+        if [ "$i" -eq 60 ]; then
+            echo "   !! no response after 60s — tail of uvicorn.log:"
+            tail -20 "$REPO/uvicorn.log"
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+rio_status() {
+    local pids
+    pids=$(rio_pidline)
+    if [ -z "$pids" ]; then
+        echo "   uvicorn: not running"
+    else
+        echo "   uvicorn: $pids"
+    fi
+    echo "   :$PORT   $(ss -lntp 2>/dev/null | grep ":$PORT" || echo 'nothing listening')"
+    echo "   health:  $(curl -s -m 5 "http://127.0.0.1:$PORT/health" 2>/dev/null || echo 'no answer')"
+}
+
+# Dispatch before the provisioning traps below are installed: none of these
+# subcommands provisions anything, so none of them should abort saying the pod
+# is half-built.
+case "${1-}" in
+    restart) log "restarting uvicorn on :$PORT"; rio_stop; rio_start
+             log "health check"; rio_wait_healthy; exit $? ;;
+    stop)    log "stopping uvicorn"; rio_stop; exit 0 ;;
+    start)   log "starting uvicorn on :$PORT"; rio_stop; rio_start
+             log "health check"; rio_wait_healthy; exit $? ;;
+    status)  log "RIO on :$PORT"; rio_status; exit 0 ;;
+    "")      ;;
+    *)       echo "usage: bash boot.sh [restart|stop|start|status]" >&2; exit 2 ;;
+esac
 
 # `set -e` makes this script abort on the first failure, which is right -- but a
 # silent abort is how a half-provisioned pod happens. Say where it stopped, in
@@ -295,26 +448,19 @@ log "killing jupyter"
 pkill -f jupyter || echo "   no jupyter running"
 
 # Also clear any uvicorn from a previous run of this script, so a re-run doesn't
-# leave two servers fighting over the port.
-if pgrep -f "uvicorn app:app" >/dev/null; then
-    echo "   stopping existing uvicorn"
-    pkill -f "uvicorn app:app" || true
-    sleep 2
-fi
+# leave two servers fighting over the port. Through rio_stop, which is careful
+# about which processes it is allowed to kill -- see the block near the top.
+echo "   clearing any existing uvicorn"
+rio_stop
 
 # ---------------------------------------------------------------------------
 # 7. Launch RIO
 # ---------------------------------------------------------------------------
-# HF_HOME is passed EXPLICITLY rather than left to inheritance. It is exported
-# in step 1, so this process already has it -- but this is the line people copy
-# out of the log and re-run by hand after a crash, and a uvicorn started without
-# HF_HOME re-downloads 16 GB of Qwen3-VL into a container layer that is about to
-# disappear. Stating it here means the copied command is correct on its own.
+# One implementation, shared with `bash boot.sh restart` -- see rio_start near
+# the top for why it is setsid'd and why HF_HOME is stated rather than
+# inherited.
 log "launching uvicorn on :$PORT"
-cd "$REPO"
-HF_HOME="$HF_HOME_DIR" nohup uvicorn app:app --host 0.0.0.0 --port "$PORT" \
-    > "$REPO/uvicorn.log" 2>&1 &
-echo "   pid $! (HF_HOME=$HF_HOME_DIR)"
+rio_start
 
 # ---------------------------------------------------------------------------
 # 8. Health check
@@ -322,18 +468,7 @@ echo "   pid $! (HF_HOME=$HF_HOME_DIR)"
 # uvicorn reports ready before the model is warm (vision warms on a daemon
 # thread), so /health answers in a few seconds. 60s is generous headroom.
 log "health check"
-for i in $(seq 1 60); do
-    if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
-        echo "   up after ${i}s: $(curl -s http://127.0.0.1:$PORT/health)"
-        break
-    fi
-    if [ "$i" -eq 60 ]; then
-        echo "   !! no response after 60s — tail of uvicorn.log:"
-        tail -20 "$REPO/uvicorn.log"
-        exit 1
-    fi
-    sleep 1
-done
+rio_wait_healthy
 
 # Model warm runs in the background and takes ~40s more. Not fatal, just noted.
 echo "   (Qwen3-VL warm continues in background — watch: tail -f $REPO/uvicorn.log)"
