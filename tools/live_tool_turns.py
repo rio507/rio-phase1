@@ -647,7 +647,22 @@ def report_drive(turn, notes, t0):
         floor = {"early": config.NAV_EARLY_DISTANCE_M,
                  "primary": config.NAV_PRIMARY_DISTANCE_M,
                  "imminent": config.NAV_IMMINENT_DISTANCE_M}.get(c.get("call_type"))
+        # THE DISTANCE LIVES ON THE PLANNER'S EVENT, NOT THE ARBITER'S.
+        # The planner knows where the car was when it decided the call was
+        # due and puts to_maneuver_m on EARLY_GUIDANCE/NEAR_TURN/etc;
+        # NAV_SPEECH_SPOKEN is the arbiter saying it handed the line over and
+        # carries no position. `calls` prefers spoken, so the number has to be
+        # fetched back from the decision it belongs to -- paired on the
+        # maneuver AND the call type, because one maneuver has three calls.
         m = c.get("to_maneuver_m")
+        if m is None:
+            for q in planned:
+                if (q.get("maneuver_id") == c.get("maneuver_id")
+                        and q.get("call_type") == c.get("call_type")):
+                    m = q.get("to_maneuver_m")
+                    if c.get("tta_s") is None and q.get("tta_s") is not None:
+                        c = dict(c, tta_s=q.get("tta_s"))
+                    break
         where = ""
         if m is not None:
             where = f"  @ {float(m):6.1f} m"
