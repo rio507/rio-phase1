@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;padding:0;background:#08090b;}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,sans-serif;color:#e9ebee;-webkit-font-smoothing:antialiased;}
+  a{color:#6ea8ff;text-decoration:none;} a:hover{color:#9cc4ff;}
+  ::placeholder{color:#4d5560;}
+  input{outline:none;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.3;}}
+</style>
+</helmet>
+
+<div style="min-height:100vh;background:#08090b;display:flex;flex-direction:column;">
+
+  <header style="display:flex;align-items:center;justify-content:space-between;padding:0 28px;height:60px;border-bottom:1px solid rgba(255,255,255,0.06);flex:none;">
+    <div style="display:flex;align-items:center;gap:12px;">
+      <div style="width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#1b2a44,#0e1524);border:1px solid rgba(110,168,255,0.35);display:flex;align-items:center;justify-content:center;">
+        <div style="width:8px;height:8px;border-radius:2px;background:#6ea8ff;transform:rotate(45deg);"></div>
+      </div>
+      <div style="font-size:14px;font-weight:600;letter-spacing:0.02em;">Speed Suspects</div>
+      <div style="font-size:11px;color:#5a6270;font-family:'IBM Plex Mono',monospace;letter-spacing:0.12em;padding:3px 8px;border:1px solid rgba(255,255,255,0.08);border-radius:99px;">RIO</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:16px;">
+      <div style="display:flex;align-items:center;gap:7px;font-size:12px;color:#8b93a1;">
+        <span style="width:6px;height:6px;border-radius:50%;background:#3ddc84;animation:pulse 2.4s ease-in-out infinite;"></span>
+        Telemetry live
+      </div>
+      <div style="font-size:12px;color:#5a6270;">Radar Intercept Officer</div>
+    </div>
+  </header>
+
+  <div style="display:flex;flex-wrap:wrap;gap:16px;padding:16px 20px 24px;flex:1;align-items:flex-start;">
+
+    <!-- LEFT RAIL -->
+    <div style="display:flex;flex-direction:column;gap:12px;flex:1 1 260px;max-width:340px;min-width:240px;">
+
+      <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;">
+        <div style="font-size:12px;font-weight:600;letter-spacing:0.02em;margin-bottom:2px;">Drive</div>
+        <div style="font-size:11px;color:#5a6270;margin-bottom:14px;">Visual input · capture</div>
+        <div style="display:flex;background:#12151b;border-radius:9px;padding:3px;gap:3px;margin-bottom:12px;">
+          <button onClick="{{ setHeadway }}" style="{{ headwayTabStyle }}">Headway</button>
+          <button onClick="{{ setLayers }}" style="{{ layersTabStyle }}">Layers</button>
+        </div>
+        <button onClick="{{ toggleDrive }}" style="{{ driveBtnStyle }}" style-hover="filter:brightness(1.12);">{{ driveBtnLabel }}</button>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px;">
+          <button style="width:100%;padding:10px;border-radius:9px;background:transparent;border:1px solid rgba(255,255,255,0.1);color:#c6ccd6;font-size:12.5px;font-weight:500;cursor:pointer;font-family:inherit;" style-hover="border-color:rgba(255,255,255,0.22);color:#fff;">Send webcam frame</button>
+          <button style="width:100%;padding:10px;border-radius:9px;background:transparent;border:1px solid rgba(255,255,255,0.1);color:#c6ccd6;font-size:12.5px;font-weight:500;cursor:pointer;font-family:inherit;" style-hover="border-color:rgba(255,255,255,0.22);color:#fff;">Upload image or video</button>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+          <input placeholder="Speed override" style="flex:1;min-width:0;background:#12151b;border:1px solid rgba(255,255,255,0.08);border-radius:9px;padding:9px 12px;color:#e9ebee;font-size:12.5px;font-family:inherit;">
+          <div style="display:flex;align-items:center;padding:0 12px;background:#12151b;border:1px solid rgba(255,255,255,0.08);border-radius:9px;font-size:11px;color:#8b93a1;font-family:'IBM Plex Mono',monospace;">m/s</div>
+        </div>
+        <div style="font-size:10.5px;color:#4d5560;margin-top:8px;line-height:1.5;">No GPS speed — set an override to classify.</div>
+      </div>
+
+      <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;">
+        <div style="font-size:12px;font-weight:600;margin-bottom:2px;">Navigation</div>
+        <div style="font-size:11px;color:#5a6270;margin-bottom:14px;">Provider route · RIO context</div>
+        <div style="display:flex;align-items:center;gap:8px;background:#12151b;border-radius:9px;padding:10px 12px;margin-bottom:10px;">
+          <span style="width:6px;height:6px;border-radius:50%;background:#4d5560;"></span>
+          <span style="font-size:12px;color:#8b93a1;">No route set</span>
+        </div>
+        <input placeholder="Destination" style="width:100%;box-sizing:border-box;background:#12151b;border:1px solid rgba(255,255,255,0.08);border-radius:9px;padding:9px 12px;color:#e9ebee;font-size:12.5px;font-family:inherit;margin-bottom:8px;">
+        <div style="display:flex;gap:8px;">
+          <button style="flex:1;padding:9px;border-radius:9px;background:rgba(110,168,255,0.12);border:1px solid rgba(110,168,255,0.25);color:#9cc4ff;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;" style-hover="background:rgba(110,168,255,0.2);">Route</button>
+          <button style="flex:1;padding:9px;border-radius:9px;background:transparent;border:1px solid rgba(255,255,255,0.1);color:#8b93a1;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;" style-hover="color:#fff;">Clear</button>
+        </div>
+        <div style="height:120px;border-radius:10px;background:repeating-linear-gradient(45deg,#0f1116,#0f1116 8px,#111319 8px,#111319 16px);border:1px solid rgba(255,255,255,0.05);display:flex;align-items:center;justify-content:center;margin-top:12px;">
+          <span style="font-size:10.5px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.1em;">AWAITING ROUTE</span>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+          <button style="padding:9px 12px;border-radius:9px;background:transparent;border:1px solid rgba(255,255,255,0.1);color:#c6ccd6;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;white-space:nowrap;" style-hover="border-color:rgba(255,255,255,0.22);color:#fff;">Simulate drive</button>
+          <input value="30" style="width:44px;text-align:center;background:#12151b;border:1px solid rgba(255,255,255,0.08);border-radius:9px;color:#e9ebee;font-size:12.5px;font-family:'IBM Plex Mono',monospace;">
+          <input placeholder="Start point" style="flex:1;min-width:0;background:#12151b;border:1px solid rgba(255,255,255,0.08);border-radius:9px;padding:9px 12px;color:#e9ebee;font-size:12.5px;font-family:inherit;">
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER STAGE -->
+    <div style="display:flex;flex-direction:column;gap:16px;min-width:0;flex:3 1 480px;">
+
+      <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;overflow:hidden;">
+        <div style="aspect-ratio:16/8.2;background:radial-gradient(120% 100% at 50% 0%,#0e1118 0%,#090a0d 70%);position:relative;display:flex;align-items:center;justify-content:center;">
+          <div style="text-align:center;">
+            <div style="font-size:12px;color:#5a6270;font-family:'IBM Plex Mono',monospace;letter-spacing:0.22em;margin-bottom:8px;">STANDBY</div>
+            <div style="font-size:11px;color:#3a414c;font-family:'IBM Plex Mono',monospace;">NO SIGNAL</div>
+          </div>
+          <div style="position:absolute;top:14px;left:16px;right:16px;display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;pointer-events:none;">
+          <div style="display:flex;flex-wrap:wrap;gap:8px;">
+            <span style="font-size:10.5px;color:#8b93a1;background:rgba(13,15,19,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:99px;padding:4px 10px;font-family:'IBM Plex Mono',monospace;">T — · —</span>
+            <span style="font-size:10.5px;color:#8b93a1;background:rgba(13,15,19,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:99px;padding:4px 10px;font-family:'IBM Plex Mono',monospace;">GAP — · V —</span>
+            <span style="font-size:10.5px;color:#8b93a1;background:rgba(13,15,19,0.8);border:1px solid rgba(255,255,255,0.08);border-radius:99px;padding:4px 10px;font-family:'IBM Plex Mono',monospace;">LANES —</span>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;pointer-events:auto;">
+            <button style="font-size:10.5px;color:#c6ccd6;background:rgba(13,15,19,0.8);border:1px solid rgba(255,255,255,0.1);border-radius:99px;padding:4px 12px;cursor:pointer;font-family:inherit;" style-hover="color:#fff;border-color:rgba(255,255,255,0.25);">Rear cam</button>
+            <button style="font-size:10.5px;color:#c6ccd6;background:rgba(13,15,19,0.8);border:1px solid rgba(255,255,255,0.1);border-radius:99px;padding:4px 12px;cursor:pointer;font-family:inherit;" style-hover="color:#fff;border-color:rgba(255,255,255,0.25);">Full</button>
+          </div>
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;padding:12px 16px;border-top:1px solid rgba(255,255,255,0.05);">
+          <div style="display:flex;flex-wrap:wrap;gap:8px 20px;font-size:11px;color:#5a6270;font-family:'IBM Plex Mono',monospace;">
+            <span>FRAMES <span style="color:#c6ccd6;">0</span></span>
+            <span>LAST <span style="color:#c6ccd6;">--:--:--</span></span>
+            <span>SESSION <span style="color:#c6ccd6;">—</span></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:7px;font-size:11px;color:#8b93a1;">
+            <span style="width:6px;height:6px;border-radius:50%;background:#5a6270;"></span>
+            Status · {{ statusLabel }}
+          </div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;">
+        <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;display:flex;flex-direction:column;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:2px;">Perception</div>
+          <div style="font-size:11px;color:#5a6270;margin-bottom:14px;">Qwen2.5-VL-3B · seeing</div>
+          <div style="flex:1;background:#12151b;border-radius:10px;padding:14px;font-size:12.5px;color:#8b93a1;line-height:1.6;min-height:72px;">No observation yet.</div>
+          <div style="font-size:10.5px;color:#4d5560;margin-top:10px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.08em;">HISTORY · LAST 5</div>
+        </div>
+
+        <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;display:flex;flex-direction:column;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:2px;">RIO's dialogue</div>
+          <div style="font-size:11px;color:#5a6270;margin-bottom:14px;">GPT-5.5 · speaking</div>
+          <div style="display:flex;flex-direction:column;gap:8px;flex:1;">
+            <div style="background:#12151b;border-radius:10px;padding:12px 14px;">
+              <div style="font-size:10px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.1em;margin-bottom:4px;">DRIVER</div>
+              <div style="font-size:12.5px;color:#8b93a1;">Awaiting input.</div>
+            </div>
+            <div style="background:rgba(110,168,255,0.06);border:1px solid rgba(110,168,255,0.12);border-radius:10px;padding:12px 14px;">
+              <div style="font-size:10px;color:#6ea8ff;font-family:'IBM Plex Mono',monospace;letter-spacing:0.1em;margin-bottom:4px;">RIO</div>
+              <div style="font-size:12.5px;color:#c6ccd6;">Standing by.</div>
+            </div>
+          </div>
+          <div style="font-size:10.5px;color:#4d5560;margin-top:10px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.08em;">SESSION TRANSCRIPT</div>
+        </div>
+
+        <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;display:flex;flex-direction:column;align-items:center;">
+          <div style="align-self:stretch;">
+            <div style="font-size:12px;font-weight:600;margin-bottom:2px;">Voice layer</div>
+            <div style="font-size:11px;color:#5a6270;">ElevenLabs · narrator</div>
+          </div>
+          <div style="width:88px;height:88px;border-radius:50%;border:1px solid rgba(110,168,255,0.3);background:radial-gradient(circle at 50% 40%,rgba(110,168,255,0.12),transparent 70%);display:flex;align-items:center;justify-content:center;margin:18px 0;">
+            <span style="font-size:10px;color:#6ea8ff;font-family:'IBM Plex Mono',monospace;letter-spacing:0.2em;">IDLE</span>
+          </div>
+          <div style="display:flex;gap:8px;align-self:stretch;margin-bottom:12px;">
+            <div style="flex:1;background:#12151b;border-radius:10px;padding:10px 12px;">
+              <div style="font-size:9.5px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.1em;">ROUND TRIP</div>
+              <div style="font-size:13px;color:#c6ccd6;font-family:'IBM Plex Mono',monospace;margin-top:2px;">—</div>
+            </div>
+            <div style="flex:1;background:#12151b;border-radius:10px;padding:10px 12px;">
+              <div style="font-size:9.5px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.1em;">AUDIO</div>
+              <div style="font-size:13px;color:#c6ccd6;font-family:'IBM Plex Mono',monospace;margin-top:2px;">—</div>
+            </div>
+          </div>
+          <button style="align-self:stretch;padding:12px;border-radius:10px;background:#e9ebee;border:none;color:#0b0d10;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;" style-hover="background:#fff;">Talk to RIO</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: VEHICLE HEALTH -->
+    <div style="background:#0d0f13;border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:16px;flex:1 1 340px;max-width:420px;min-width:300px;">
+      <div>
+        <div style="font-size:12px;font-weight:600;margin-bottom:2px;">Vehicle health</div>
+        <div style="font-size:11px;color:#5a6270;">Holley Terminator X · live telemetry</div>
+      </div>
+
+      <div style="background:rgba(255,176,74,0.07);border:1px solid rgba(255,176,74,0.2);border-radius:10px;padding:12px 14px;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+          <span style="width:6px;height:6px;border-radius:50%;background:#ffb04a;animation:pulse 2s ease-in-out infinite;"></span>
+          <span style="font-size:11.5px;font-weight:600;color:#ffcb85;letter-spacing:0.04em;">Sensor not reporting</span>
+        </div>
+        <div style="display:flex;gap:18px;font-size:10.5px;color:#8b93a1;font-family:'IBM Plex Mono',monospace;">
+          <span>LINK <span style="color:#e9ebee;">Live</span></span>
+          <span>UPDATED <span style="color:#e9ebee;">04:59:44</span></span>
+          <span>RUNTIME <span style="color:#e9ebee;">00:15</span></span>
+        </div>
+      </div>
+
+      <div>
+        <sc-for list="{{ telemetryGroups }}" as="group" hint-placeholder-count="3">
+          <div style="margin-bottom:6px;">
+            <div style="font-size:10px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.14em;padding:8px 0 4px;">{{ group.label }}</div>
+            <sc-for list="{{ group.rows }}" as="row" hint-placeholder-count="4">
+              <div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
+                <span style="flex:1;font-size:12.5px;color:#c6ccd6;">{{ row.name }}</span>
+                <span style="font-size:13px;font-weight:500;font-family:'IBM Plex Mono',monospace;color:#e9ebee;">{{ row.value }}</span>
+                <span style="font-size:10px;color:#5a6270;font-family:'IBM Plex Mono',monospace;width:28px;">{{ row.unit }}</span>
+                <span style="{{ row.badgeStyle }}">{{ row.state }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+
+      <div>
+        <div style="font-size:10px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.14em;margin-bottom:8px;">VEHICLE INSIGHTS</div>
+        <sc-for list="{{ insights }}" as="ins" hint-placeholder-count="3">
+          <div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
+            <span style="color:#3ddc84;font-size:11px;line-height:1.6;">✓</span>
+            <div>
+              <div style="font-size:10px;color:#4d5560;font-family:'IBM Plex Mono',monospace;margin-bottom:2px;">{{ ins.time }}</div>
+              <div style="font-size:12px;color:#8b93a1;line-height:1.5;">{{ ins.text }}</div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+
+      <div>
+        <div style="font-size:10px;color:#4d5560;font-family:'IBM Plex Mono',monospace;letter-spacing:0.14em;margin-bottom:10px;">FLAGGED ERROR CODES</div>
+        <div style="background:#12151b;border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+            <span style="font-size:14px;font-weight:600;font-family:'IBM Plex Mono',monospace;">P0300</span>
+            <span style="font-size:9.5px;color:#8b93a1;border:1px solid rgba(255,255,255,0.12);border-radius:99px;padding:3px 8px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.06em;">NO LONGER REPORTED</span>
+          </div>
+          <div style="font-size:12px;color:#8b93a1;line-height:1.5;margin-bottom:10px;">Random or multiple cylinder misfire detected.</div>
+          <div style="display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:11px;">
+            <span style="color:#4d5560;font-family:'IBM Plex Mono',monospace;">SOURCE</span><span style="color:#c6ccd6;">Vehicle ECU</span>
+            <span style="color:#4d5560;font-family:'IBM Plex Mono',monospace;">STAGE</span><span style="color:#c6ccd6;">Stored</span>
+            <span style="color:#4d5560;font-family:'IBM Plex Mono',monospace;">SYSTEM</span><span style="color:#c6ccd6;">Ignition / misfire</span>
+            <span style="color:#4d5560;font-family:'IBM Plex Mono',monospace;">SEVERITY</span><span style="color:#ffcb85;">Warning</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;accent&quot;: {&quot;editor&quot;: &quot;color&quot;, &quot;default&quot;: &quot;#6ea8ff&quot;, &quot;options&quot;: [&quot;#6ea8ff&quot;, &quot;#3ddc84&quot;, &quot;#ffb04a&quot;, &quot;#b48cff&quot;], &quot;tsType&quot;: &quot;string&quot;}, &quot;showInsights&quot;: {&quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;}}">
+class Component extends DCLogic {
+  state = { tab: 'headway', driving: false };
+  renderVals() {
+    const accent = this.props.accent ?? '#6ea8ff';
+    const tabBase = 'flex:1;padding:8px;border-radius:7px;font-size:12px;font-weight:500;cursor:pointer;font-family:inherit;border:none;';
+    const on = tabBase + 'background:rgba(255,255,255,0.08);color:#fff;';
+    const off = tabBase + 'background:transparent;color:#8b93a1;';
+    const toStyle = s => { const o = {}; s.split(';').forEach(p => { const i = p.indexOf(':'); if (i > 0) { const k = p.slice(0, i).trim().replace(/-([a-z])/g, (_, c) => c.toUpperCase()); o[k] = p.slice(i + 1).trim(); } }); return o; };
+    const badge = (color) => toStyle(`font-size:9.5px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.06em;color:${color};width:56px;text-align:right;`);
+    const normal = badge('#5a6270'), warn = badge('#ffcb85'), good = badge('#3ddc84');
+    const r = (name, value, unit, state, b) => ({ name, value, unit, state, badgeStyle: b || normal });
+    const telemetryGroups = [
+      { label: 'ELECTRICAL', rows: [r('Battery voltage', '14.2', 'V', 'CHARGING', good)] },
+      { label: 'ENGINE', rows: [r('Coolant temp', '191', '°F', 'NORMAL'), r('Oil pressure', '47', 'psi', 'NORMAL'), r('Oil temp', '198', '°F', 'NORMAL'), r('Fuel pressure', '59', 'psi', 'NORMAL')] },
+      { label: 'INDUCTION & FUEL', rows: [r('Air-fuel ratio', '14.7', ':1', 'NORMAL'), r('Wideband O₂', '14.6', ':1', 'NORMAL'), r('MAP', '42', 'kPa', 'NORMAL'), r('Mass air flow', '14.7', 'g/s', 'NORMAL'), r('Throttle position', '1', '%', 'IDLE'), r('Engine load', '28', '%', 'NORMAL'), r('Intake air temp', '87', '°F', 'NORMAL'), r('Short term fuel trim', '0.6', '%', 'NORMAL'), r('Long term fuel trim', '2.1', '%', 'NORMAL')] },
+    ];
+    const insights = (this.props.showInsights ?? true) ? [
+      { time: '04:09', text: 'Vehicle operating within expected parameters.' },
+      { time: '00:00', text: 'Vehicle operating within expected parameters.' },
+      { time: 'YESTERDAY', text: 'Vehicle operating within expected parameters.' },
+      { time: '2 DAYS AGO', text: 'Vehicle operating within expected parameters.' },
+    ] : [];
+    const driveBase = `width:100%;padding:13px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit;border:none;`;
+    return {
+      setHeadway: () => this.setState({ tab: 'headway' }),
+      setLayers: () => this.setState({ tab: 'layers' }),
+      headwayTabStyle: toStyle(this.state.tab === 'headway' ? on : off),
+      layersTabStyle: toStyle(this.state.tab === 'layers' ? on : off),
+      toggleDrive: () => this.setState(s => ({ driving: !s.driving })),
+      driveBtnStyle: toStyle(this.state.driving
+        ? driveBase + 'background:rgba(255,109,90,0.14);color:#ff9d8c;border:1px solid rgba(255,109,90,0.3);'
+        : driveBase + `background:${accent};color:#0b0d10;`),
+      driveBtnLabel: this.state.driving ? 'Stop drive' : 'Start drive',
+      statusLabel: this.state.driving ? 'Driving' : 'Standby',
+      telemetryGroups, insights,
+    };
+  }
+}
+</script>
+</body>
+</html>

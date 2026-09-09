@@ -6,70 +6,246 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<meta name="theme-color" content="#020308" />
+<meta name="theme-color" content="#08090b" />
 <title>RIO // SPEED SUSPECTS</title>
+<!-- IBM Plex Mono carries every number, unit and small-caps label on this
+     page. It comes from Google Fonts when there is a network, and from
+     static/fonts when there is not: the car is the one place this dashboard
+     runs where "the font did not load" is the normal case, not the
+     exception. See the @font-face pair and --font-mono below -- the offline
+     family is the SECOND name in the stack, so it is only reached when the
+     Google copy is genuinely absent. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Anta&family=JetBrains+Mono:wght@400;500&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+  /* =====================================================================
+     THE DESIGN SYSTEM
+     ---------------------------------------------------------------------
+     Every colour, radius, spacing step and type size on this page is one of
+     the tokens below. Nothing further down the stylesheet is allowed to
+     invent a hex value: the mockup in docs/design/ is the source, this block
+     is the transcription of it, and a component rule that reaches past these
+     names is a component that will drift the next time the design moves.
+
+     Read it in four parts: surfaces, text tiers, state colours, geometry
+     and type. The rest of the file is those five things arranged.
+     ===================================================================== */
+
+  /* IBM Plex Mono, self-hosted, as the arm of the stack that survives a car
+     with no signal. `local()` first so a machine that already has the family
+     installed pays for nothing; the woff2 beside it is the latin subset
+     Google serves, 15KB per weight, committed next to the page it belongs
+     to. This family is deliberately NOT called "IBM Plex Mono" -- two
+     @font-face sets under one name (this one and the Google stylesheet's)
+     fight over unicode-ranges, and the loser is whichever one loads second. */
+  @font-face {
+    font-family: 'IBM Plex Mono Local';
+    font-style: normal; font-weight: 400; font-display: swap;
+    src: local('IBM Plex Mono'), local('IBMPlexMono'),
+         url('/static/fonts/ibm-plex-mono-400-latin.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'IBM Plex Mono Local';
+    font-style: normal; font-weight: 500; font-display: swap;
+    src: local('IBM Plex Mono Medium'), local('IBMPlexMono-Medium'),
+         url('/static/fonts/ibm-plex-mono-500-latin.woff2') format('woff2');
+  }
+
   :root {
-    --bg-0: #020308; --bg-1: #04060c; --bg-2: #060a12; --bg-3: #0a0f18;
-    --surface: rgba(95,179,232,0.030); --surface-2: rgba(95,179,232,0.060); --surface-hover: rgba(95,179,232,0.100);
-    --border: rgba(95,179,232,0.22); --border-strong: rgba(95,179,232,0.55);
-    --text: #cfe8ff; --text-bright: #e8f4ff; --text-dim: rgba(180,215,246,0.65); --text-dimmer: rgba(120,165,205,0.45);
-    --green: #6ee7c7; --amber: #ffb84d; --red: #ff6b6b; --blue: #5fb3e8;
-    --accent: #5fb3e8; --accent-bright: #9bd6ff; --accent-glow: 0 0 14px rgba(95,179,232,0.65);
-    --radius-card: 0px; --radius-pill: 0px;
+    /* ---- surfaces -------------------------------------------------------
+       Three depths and nothing else. The page is the floor, a card sits on
+       it, an inset sits in the card. A fourth depth would mean two of them
+       are within two percent of each other on a phone in daylight, which is
+       the same as not having it. */
+    --page:   #08090b;
+    --card:   #0d0f13;
+    --inset:  #12151b;
+    /* The one border weight the design uses, at three strengths: resting,
+       interactive, hovered. Alpha rather than a hex so a card, an inset and
+       a chip all take the same line and it still reads on each of them. */
+    --hairline:        rgba(255,255,255,0.06);
+    --hairline-strong: rgba(255,255,255,0.10);
+    --hairline-hover:  rgba(255,255,255,0.22);
+    /* Row separators inside a list. Half a hairline: a telemetry list is
+       thirty of these stacked, and at 0.06 they add up to a grid. */
+    --rule:            rgba(255,255,255,0.04);
+    /* The stage behind the camera feed and the hatch behind an idle map. */
+    --stage: radial-gradient(120% 100% at 50% 0%, #0e1118 0%, #090a0d 70%);
+    --hatch: repeating-linear-gradient(45deg, #0f1116, #0f1116 8px, #111319 8px, #111319 16px);
+    --scrim: rgba(13,15,19,0.80);   /* chips floating on the picture */
 
-    --font-display: 'Anta', 'Rajdhani', -apple-system, sans-serif;
-    --font-ui: 'Rajdhani', -apple-system, 'Helvetica Neue', sans-serif;
-    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+    /* ---- text tiers -----------------------------------------------------
+       Five, in order of how much of the driver's attention they are owed.
+       t1 a value being read, t2 body copy, t3 a supporting fact, t4 a card
+       subtitle, t5 a label that exists only to name the thing beside it.
+       If a new element does not fit one of these, it does not need to be on
+       the page. */
+    --t1: #e9ebee;
+    --t2: #c6ccd6;
+    --t3: #8b93a1;
+    --t4: #5a6270;
+    --t5: #4d5560;
 
-    --miter: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+    /* ---- state ----------------------------------------------------------
+       Accent is a control the driver can press or a value RIO produced.
+       good/warn/danger are the car's opinion of itself and are never used
+       decoratively -- a green thing on this page means a measurement came
+       back healthy, and nothing else. */
+    --accent:       #6ea8ff;
+    --accent-hover: #9cc4ff;
+    --accent-soft:  rgba(110,168,255,0.12);
+    --accent-wash:  rgba(110,168,255,0.06);
+    --accent-line:  rgba(110,168,255,0.25);
+    --accent-edge:  rgba(110,168,255,0.35);
+
+    --good:       #3ddc84;
+    --good-soft:  rgba(61,220,132,0.10);
+    --good-line:  rgba(61,220,132,0.25);
+
+    --warn:       #ffb04a;
+    --warn-text:  #ffcb85;
+    --warn-soft:  rgba(255,176,74,0.07);
+    --warn-line:  rgba(255,176,74,0.20);
+
+    --danger:      #ff6d5a;
+    --danger-text: #ff9d8c;
+    --danger-soft: rgba(255,109,90,0.14);
+    --danger-line: rgba(255,109,90,0.30);
+
+    /* ---- geometry -------------------------------------------------------
+       Cards are 14px, insets 10px, controls 9px, chips a full pill. The
+       three-step ladder is what makes a nested inset read as nested rather
+       than as a second card. */
+    --r-card:  14px;
+    --r-inset: 10px;
+    --r-ctl:    9px;
+    --r-chip:   7px;
+    --r-pill:  99px;
+
+    --pad-card: 18px;
+    --gap:      16px;
+    --gap-s:    12px;
+    --gap-xs:    8px;
+    --gap-2xs:   6px;
+    --header-h: 60px;
+    /* The floating talk control in drive mode, and the column reserved for it
+       beside the feed in landscape, are the SAME number. They were two
+       hand-tuned constants and they disagreed the moment the type changed:
+       the caption grew, the control grew with it, the reservation did not. */
+    --talk-w: 200px;
+
+    /* ---- type -----------------------------------------------------------
+       Two families. The system sans for anything a person reads as a
+       sentence, IBM Plex Mono for anything that is a number, a unit, a code
+       or a small-caps label -- the things whose columns have to line up and
+       whose glyphs have to be told apart at a glance in a moving car. */
+    --font-ui:   -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica,
+                 "Segoe UI", Roboto, Arial, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'IBM Plex Mono Local', ui-monospace,
+                 'SF Mono', Menlo, Consolas, monospace;
+
+    --fs-title: 12px;     /* card title */
+    --fs-sub:   11px;     /* card subtitle */
+    --fs-body:  12.5px;   /* body copy, inputs, buttons */
+    --fs-micro: 10.5px;   /* chips, footers, small-caps labels */
+    --fs-nano:  10px;     /* the smallest label the design uses */
+
+    /* Letter-spacing for the mono small caps. Two steps: a label inside a
+       card, and a section heading that has to hold a column together. */
+    --ls-mono:  0.10em;
+    --ls-caps:  0.14em;
+
+    /* ---- motion ---------------------------------------------------------
+       One duration for state changes and one for the two pulses. Nothing on
+       this page animates for decoration. */
+    --t-fast: 140ms;
+  }
+
+  /* ---------------------------------------------------------------------
+     COMPATIBILITY LAYER. The component rules below this point are being
+     moved onto the tokens above one section at a time; until they all are,
+     the old names resolve to the nearest new token so the page is never
+     half-designed between commits. Nothing new may use these.
+     --------------------------------------------------------------------- */
+  :root {
+    --bg-0: var(--page); --bg-1: var(--inset); --bg-2: var(--inset); --bg-3: var(--card);
+    --surface: var(--card); --surface-2: var(--hairline); --surface-hover: var(--hairline-strong);
+    --border: var(--hairline); --border-strong: var(--hairline-strong);
+    --text: var(--t2); --text-bright: var(--t1);
+    --text-dim: var(--t3); --text-dimmer: var(--t5);
+    --green: var(--good); --amber: var(--warn); --red: var(--danger); --blue: var(--accent);
+    --accent-bright: var(--accent-hover); --accent-glow: none;
+    --radius-card: var(--r-ctl); --radius-pill: var(--r-pill);
+    --font-display: var(--font-ui);
+    --miter: none;
   }
 
   * { box-sizing: border-box; }
 
-  html { background: var(--bg-0); }
+  html { background: var(--page); }
 
   body {
     font-family: var(--font-ui);
-    max-width: 1600px; margin: 28px auto; padding: 0 20px 40px;
+    margin: 0; padding: 0;
     min-height: 100vh;
-    color: var(--text);
-    background:
-      radial-gradient(ellipse 130% 75% at 50% 0%, rgba(95,179,232,0.05) 0%, rgba(95,179,232,0) 62%),
-      linear-gradient(180deg, var(--bg-1) 0%, var(--bg-0) 55%);
-    background-attachment: fixed;
+    display: flex; flex-direction: column;
+    color: var(--t1);
+    background: var(--page);
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ---------- shared HUD primitives ---------- */
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-hover); }
+  ::placeholder { color: var(--t5); }
+  input, select, textarea, button { font-family: inherit; }
+  input:focus { outline: none; }
 
-  .bracketed { position: relative; }
-  .bracketed::before,
-  .bracketed::after {
-    content: ''; position: absolute; width: 12px; height: 12px;
-    border: 1.5px solid var(--accent); pointer-events: none;
-    filter: drop-shadow(0 0 4px rgba(95,179,232,0.75));
-    z-index: 2;
-  }
-  .bracketed::before { top: 0; left: 0; border-right: 0; border-bottom: 0; }
-  .bracketed::after { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+  /* The two pulses on the page: a live link, and a drive that is running.
+     Opacity only -- nothing on a driving surface may move its own geometry. */
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.30; } }
+  @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
+  /* ---------- shared primitives ---------- */
+
+  /* A card. One background, one hairline, one radius, one padding -- the
+     four numbers the whole layout is built out of. */
   .panel {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 14px;
+    background: var(--card);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-card);
+    padding: var(--pad-card);
   }
 
   .panel-label, .col-sublabel {
     font-family: var(--font-mono);
-    font-size: 10.5px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    margin-bottom: 8px;
+    font-size: var(--fs-micro); letter-spacing: var(--ls-mono);
+    text-transform: uppercase;
+    color: var(--t5);
+    margin-bottom: var(--gap-xs);
   }
+
+  /* Thin scrollbars everywhere something scrolls inside a card. The default
+     Chromium bar is 15px and eats a fifth of the health column. */
+  .history, .tm-scroll, .vi-scroll, .dtc-scroll, .nav-suggest {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.14) transparent;
+  }
+  .history::-webkit-scrollbar, .tm-scroll::-webkit-scrollbar,
+  .vi-scroll::-webkit-scrollbar, .dtc-scroll::-webkit-scrollbar,
+  .nav-suggest::-webkit-scrollbar { width: 5px; }
+  .history::-webkit-scrollbar-track, .tm-scroll::-webkit-scrollbar-track,
+  .vi-scroll::-webkit-scrollbar-track, .dtc-scroll::-webkit-scrollbar-track,
+  .nav-suggest::-webkit-scrollbar-track { background: transparent; }
+  .history::-webkit-scrollbar-thumb, .tm-scroll::-webkit-scrollbar-thumb,
+  .vi-scroll::-webkit-scrollbar-thumb, .dtc-scroll::-webkit-scrollbar-thumb,
+  .nav-suggest::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 99px; }
+
+
+  /* The page gutter lives on the grid, not on <body>: the header above it is
+     a full-bleed 60px bar with a rule that has to reach both edges of the
+     window, which it cannot do from inside a body inset. */
+  .pipeline { padding: var(--gap) 20px 24px; }
 
   /* ---------- header ---------- */
 
@@ -1444,10 +1620,10 @@
   }
   body.driving #mic {
     pointer-events: auto;
-    width: auto; min-width: 168px; max-width: min(72vw, 300px);
+    width: auto; min-width: 168px; max-width: min(72vw, var(--talk-w));
     min-height: 64px; height: auto;
     padding: 12px 20px;
-    font-size: 17px; font-weight: 700; letter-spacing: 0.14em;
+    font-size: 15px; font-weight: 600; letter-spacing: 0.01em;
     /* Legible over whatever the feed is showing if the two ever do meet --
        fullscreen, where the picture is the whole screen and the control has
        nowhere else to be. */
@@ -1464,7 +1640,7 @@
   @media (orientation: landscape) and (max-height: 480px) {
     body.driving { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
     body.driving #mic {
-      min-height: 56px; padding: 10px 16px; font-size: 15px; min-width: 148px;
+      min-height: 56px; padding: 10px 16px; font-size: 14px; min-width: 148px;
     }
     body.driving .hud-header { display: none; }
     /* A 16:9 box across a 844px-wide viewport is 475px tall -- taller than the
@@ -1475,14 +1651,18 @@
        disjoint columns cannot overlap at any scroll offset, which is a
        stronger guarantee than any offset that has to be re-measured. */
     body.driving .cam-wrap:not(.pseudo-full) {
-      margin-right: max(196px, calc(env(safe-area-inset-right, 0px) + 196px));
+      margin-right: calc(var(--talk-w) + 24px + env(safe-area-inset-right, 0px));
     }
     /* Fullscreen is the one place the picture is meant to be everything. */
     body.driving .cam-wrap:fullscreen { margin-right: 0; }
   }
 
   @supports (padding: max(0px)) {
-    body {
+    .pipeline {
+      padding-left: max(20px, env(safe-area-inset-left));
+      padding-right: max(20px, env(safe-area-inset-right));
+    }
+    .hud-header {
       padding-left: max(20px, env(safe-area-inset-left));
       padding-right: max(20px, env(safe-area-inset-right));
     }
