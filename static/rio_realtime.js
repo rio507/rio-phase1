@@ -665,6 +665,13 @@
                                           instead of behind a 40 s tool call. */
                      turns_superseded: 0, tools_aborted: 0,
                      turns_coalesced: 0, commands_preempted: 0,
+                     /* Transcripts that were NOT a driver turn: her own voice
+                        back through the speaker, or speech the barge gate
+                        never confirmed. Every one of these used to cancel the
+                        answer it was an echo of. On the iPhone test that
+                        produced this counter, ten of fifteen supersedes were
+                        one of these. */
+                     turns_phantom: 0,
                      // Tool results that came back for a turn nobody was
                      // waiting for. Never spoken; the number that says how
                      // often a stale answer WOULD have been.
@@ -749,6 +756,21 @@
     var inflightTools = {};     // call_id -> {name, turn, controller, at}
     var lastTurnAt = 0;         // when the last driver fragment landed
     var lastTurnText = '';
+
+    /* WHAT SHE HAS RECENTLY SAID, and when she last made a sound.
+     *
+     * Both exist for one question: is this transcript a new question, or is it
+     * her own voice coming back through the phone's speaker? On a live iPhone
+     * test her opening line -- "Hey. What's up." -- came back through the
+     * microphone as "Hello." and "What's up?", was taken for a new driver
+     * turn, and cancelled the response that was producing the audio. Ten times
+     * across two sessions. She never finished a sentence.
+     *
+     * `recentSaid` is her output transcript over a short window; `lastAudioAt`
+     * is when the last of it was produced. Between them and the barge gate,
+     * `supersedeGate` decides whether a cancel is a supersede. */
+    var recentSaid = [];        // [{t, text}] of her own transcript deltas
+    var lastAudioAt = 0;
     /* Fallbacks only, and the same arrangement rio_navcore uses for its
        timing: the real values live in config.py (REALTIME_DRIVER_COMMANDS,
        REALTIME_COALESCE_*) and arrive with the session. These exist so a
@@ -845,6 +867,94 @@
       return false;
     }
 
+    /* --- IS THIS A REAL NEW QUESTION? --------------------------------------
+     *
+     * The whole of the fix, in one function. A supersede CANCELS: it stops the
+     * response she is producing, aborts the tool calls behind it and clears
+     * the mouth. That is a barge-in by another name, and it has to clear the
+     * same bar barge-in does.
+     *
+     * Two gates, and the first one is the load-bearing one.
+     */
+    function noteSaid(text) {
+        if (!text) return;
+        var at = now();
+        lastAudioAt = at;
+        recentSaid.push({ t: at, text: String(text) });
+        var cutoff = at - echoTextWindowMs;
+        while (recentSaid.length && recentSaid[0].t < cutoff) recentSaid.shift();
+    }
+
+    function normWords(text) {
+        return String(text || '').toLowerCase()
+            .replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    }
+
+    /* Does this transcript look like something she just said?
+     *
+     * THE SECOND NET, and it is second for a measured reason: her audio is
+     * transcribed twice by two different models -- once as her output, once as
+     * microphone input -- and they disagree. She said "Hey"; the input
+     * transcriber wrote "Hello". A text test alone would have missed the exact
+     * case that motivated it. It catches the verbatim ones, which on that test
+     * was "What's up?" against her own "What's up.", and the structural gate
+     * catches the rest. */
+    function looksLikeEcho(text) {
+        var words = normWords(text);
+        if (!words.length) return false;
+        var mine = [];
+        var at = now();
+        for (var i = 0; i < recentSaid.length; i++) {
+            if (at - recentSaid[i].t <= echoTextWindowMs) {
+                mine = mine.concat(normWords(recentSaid[i].text));
+            }
+        }
+        if (!mine.length) return false;
+        var hay = ' ' + mine.join(' ') + ' ';
+        if (hay.indexOf(' ' + words.join(' ') + ' ') >= 0) return true;
+        // Below a couple of words, only exact containment counts: "yes" and
+        // "no" share every word with almost anything she has ever said.
+        if (words.length < echoTextMinWords) return false;
+        var hit = 0;
+        for (var j = 0; j < words.length; j++) {
+            if (hay.indexOf(' ' + words[j] + ' ') >= 0) hit++;
+        }
+        return (hit / words.length) >= echoTextOverlap;
+    }
+
+    /* -> {allow, why}. `why` is recorded on every refusal, because "she
+     * stopped finishing sentences" needs a number over a session rather than a
+     * memory of the last one. */
+    function supersedeGate(text) {
+        if (looksLikeEcho(text)) {
+            return { allow: false, why: 'echo_of_her_own_words' };
+        }
+        var speakingNow = !!(speaking && !speaking.cancelled);
+        var tail = now() - lastAudioAt;
+        if (!speakingNow && tail > echoTailMs) {
+            // Nothing of hers is in the room. A transcript is a question, and
+            // this is the path a genuine second question takes while she is
+            // waiting on a tool call.
+            return { allow: true, why: null };
+        }
+        /* She is speaking, or has only just stopped. The ONLY evidence that
+           this is a driver and not a loudspeaker is the barge gate -- which
+           has already refused it in three of its paths, all of them meaning
+           "this is her": a dictation in progress, the onset guard over her
+           opening syllable, and the level test that says the microphone never
+           got louder than the speaker. None of those creates a pendingBarge,
+           and the supersede used to fire anyway. */
+        if (!pendingBarge) {
+            return { allow: false, why: onsetHold ? 'inside_onset_guard'
+                                                  : 'no_confirmed_barge' };
+        }
+        if (!pendingBarge.cancelled) {
+            // The detector fired and the sustain gate has not agreed with it.
+            return { allow: false, why: 'barge_not_sustained' };
+        }
+        return { allow: true, why: null };
+    }
+
     /* Abort every tool call that belongs to a turn nobody is waiting for. */
     function abortStaleTools(reason) {
       var n = 0;
@@ -935,6 +1045,12 @@
 
     var bargeSustainMs = cfg.bargeSustainMs || 300;
     var bargeConfirmMs = cfg.bargeConfirmMs || 1500;
+    /* Fallbacks only; the real values arrive with the session, exactly as the
+       barge policy does. See config.REALTIME_ECHO_*. */
+    var echoTailMs = cfg.echoTailMs || 600;
+    var echoTextWindowMs = (cfg.echoTextWindowS || 15) * 1000;
+    var echoTextOverlap = cfg.echoTextOverlap || 0.8;
+    var echoTextMinWords = cfg.echoTextMinWords || 2;
 
     /* ---- THE ECHO GATE, and why the desk does not have one -----------------
      *
@@ -1181,7 +1297,16 @@
     if (arbiter && typeof arbiter.onEvent === 'function') {
       arbiter.onEvent(function (ev) {
         if (!ev || stopped) return;
-        if (ev.type === 'start') lastArbiterStart = ev.item || null;
+        if (ev.type === 'start') {
+          lastArbiterStart = ev.item || null;
+          /* THE ONE PLACE THAT SEES EVERYTHING RIO SAYS. A gap warning, a turn
+             call, a health line and a conversational answer all claim the
+             mouth here and all come back through the microphone the same way.
+             Without this the echo test would only know about the words the
+             model composed, and "Left here." would still be able to cancel the
+             answer that followed it. */
+          if (ev.item && ev.item.text) noteSaid(ev.item.text);
+        }
         if (ev.type === 'end' || ev.type === 'drop') {
           // Next tick: the arbiter is mid-pump and `current` is not settled
           // until it returns.
@@ -1817,6 +1942,49 @@
        to write down. */
     function transcriptArrived(text) {
       var real = !!(text && text.trim());
+
+      /* IS IT HERS? Asked before anything is done about it.
+       *
+       * A transcript that does not clear this bar is not a driver turn at all:
+       * it does not supersede, it does not advance the turn counter, it does
+       * not become the question the camera answers, and it does not reset the
+       * resume budget. It is her own voice, and the only correct response to
+       * hearing yourself is to carry on.
+       *
+       * TWO DIFFERENT BARS, and the difference is what each path DOES.
+       *
+       * A supersede cancels: it stops the response, aborts the tool calls
+       * behind it, and clears the mouth. That is a barge-in by another name
+       * and it clears the barge-in bar -- sustained speech the level test did
+       * not call an echo.
+       *
+       * A continuation cancels far less: the driver is still mid-sentence and
+       * semantic VAD split them, so the second half is the SAME speech and may
+       * well be absorbed as a blip by a gate that already confirmed the first
+       * half. Requiring a fresh confirmed barge for it would answer half of
+       * every question that has a breath in it. It gets the echo TEXT test
+       * alone -- which is the right test anyway, because her own words are
+       * never a continuation of the driver's.
+       */
+      var at = now();
+      var gap = lastTurnAt ? (at - lastTurnAt) : Infinity;
+      var cmd = real ? driverCommand(text) : null;
+      var cont = real && !cmd && isContinuation(lastTurnText, text, gap);
+      var gate = !real ? { allow: false, why: 'empty' }
+               : cont ? (looksLikeEcho(text)
+                          ? { allow: false, why: 'echo_of_her_own_words' }
+                          : { allow: true, why: null })
+               : supersedeGate(text);
+      if (real && !gate.allow) {
+        counters.turns_phantom++;
+        emit('LIVE_TURN_PHANTOM', {
+          why: gate.why, text: text.slice(0, 160), turn: turnSeq,
+          speaking: !!(speaking && !speaking.cancelled),
+          said_chars: (saidSoFar() || '').length,
+          since_audio_ms: Math.round(now() - lastAudioAt),
+        });
+        real = false;
+      }
       if (real) {
         transcriptFresh = true;
         // A new turn from the driver. Whatever was outstanding is theirs to
@@ -1825,11 +1993,6 @@
         pendingResume = null;
         resumeChain = 0;
         retryArmed = true;
-
-        var at = now();
-        var gap = lastTurnAt ? (at - lastTurnAt) : Infinity;
-        var cmd = driverCommand(text);
-        var cont = !cmd && isContinuation(lastTurnText, text, gap);
 
         if (cont) {
           /* ONE QUESTION IN TWO BREATHS. The turn number does NOT advance, so
@@ -2369,6 +2532,9 @@
           case 'response.output_text.delta':
             if (sink && (!dictation || dictation.responseId !== ev.response_id)) {
               generated += (ev.delta || '');
+              // In text mode the sink is the mouth, so this is the moment
+              // these words become sound in the room.
+              noteSaid(ev.delta || '');
               try { sink.delta(ev.response_id, ev.delta || ''); } catch (e) {}
             }
             break;
@@ -2387,6 +2553,12 @@
             // stopped" is not a thing the model can do with them -- it would
             // rewrite them. A direct line cut off is dropped, which is the
             // same decision transcriptArrived already makes via `wasDirect`.
+            /* EVERYTHING THAT REACHES THE SPEAKER, including the dictated
+               and direct lines excluded from `partial` below. `partial` is for
+               a resume and only a resumable answer belongs in it; this is for
+               recognising her own voice on the way back in, and a nav line
+               echoes exactly as readily as an answer does. */
+            noteSaid(ev.delta || '');
             if ((!dictation || dictation.responseId !== ev.response_id)
                 && (!directSpeech || directSpeech.realId !== ev.response_id)) {
               partial += (ev.delta || '');
@@ -2964,6 +3136,13 @@
              behaves as it does on a desk. */
           levels: function () { return meter ? meter() : null; },
           maxResumes: session.max_resumes,
+          /* How long her own voice may still be in the room after she stops,
+             and what counts as hearing herself. config.py decides both; see
+             REALTIME_ECHO_* and the iPhone test that produced them. */
+          echoTailMs: session.echo_tail_ms,
+          echoTextWindowS: session.echo_text_window_s,
+          echoTextOverlap: session.echo_text_overlap,
+          echoTextMinWords: session.echo_text_min_words,
           /* NEWEST WINS. The commands that preempt, how long two fragments may
              be apart and still be one question, and what a continuation looks
              like — all decided in config.py and carried here with the session,

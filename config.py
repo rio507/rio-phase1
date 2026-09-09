@@ -594,6 +594,65 @@ REALTIME_BARGE_CONFIRM_MS = 1500
 REALTIME_MAX_RESUMES = 1
 
 # ---------------------------------------------------------------------------
+# A CANCEL IS A SUPERSEDE ONLY WHEN A REAL NEW QUESTION EXISTS
+# ---------------------------------------------------------------------------
+# THE BUG THIS CLOSES, from a live iPhone test on 2026-09-09. Two sessions,
+# 36 cut-offs between them, and RIO never finished a sentence:
+#
+#     turn_superseded   15   of which TEN were by="Hello." or "What's up?"
+#     cutoff other      12   every one reason="cleared"
+#     cutoff barge_in    1   a genuine interruption
+#     echo_suppressed    1   the gate working
+#     blips_absorbed     1   the gate working
+#
+# "Hey. What's up." is RIO's own opening line (rio_prompts.py). Her voice came
+# out of the iPhone speaker, back into the microphone, through the input
+# transcriber as "Hello." / "What's up?", and the newest-wins supersede treated
+# each one as a new driver question and cancelled the response that was
+# producing the audio. A self-sustaining loop: she could never get past her own
+# greeting. The said_chars at the moment of cancellation were 4, 9, 4, 4 -- she
+# was four characters in.
+#
+# The twelve `cleared` cut-offs were the same bug downstream: supersedeTurn
+# calls RIO.speech.clear('convo'), the arbiter drops the speaking item with
+# reason 'cleared', and that is reported as a cut-off. One cause, 27 events.
+#
+# AND THE GATES THAT SHOULD HAVE STOPPED IT WERE ALREADY THERE AND WORKING.
+# bargeIn() returns without creating a pendingBarge in three cases -- during a
+# dictation, inside the onset guard, and when the level test says the
+# microphone is quieter than the loudspeaker. All three mean "this is her, do
+# not cancel". The supersede never asked. It fired on any non-empty transcript.
+#
+# So the rule, and it is the same one barge-in has always had: WHILE SHE IS
+# SPEAKING, a transcript may only supersede if the barge gate CONFIRMED it --
+# sustained past the guard and past the level test. While she is silent there
+# is nothing of hers in the room and a transcript is a question.
+
+# How long after her audio stops the room may still contain it. Her voice
+# reaches the microphone through a speaker a few centimetres away, so this is
+# generous rather than tight; what it buys is that a transcript arriving in the
+# tail of her own sentence is still judged as an echo rather than as a question.
+REALTIME_ECHO_TAIL_MS = 600
+
+# The second net: does the transcript look like something she just said?
+#
+# Deliberately a SECOND net and not the first one, because it cannot be relied
+# on. Her audio is transcribed twice by two different models -- once as her
+# output transcript, once as microphone input -- and they disagree: she said
+# "Hey" and the input transcriber wrote "Hello". A text test would not have
+# caught the very case that motivated it. It catches the verbatim ones
+# ("What's up?" against her own "What's up."), the structural gate above
+# catches the rest, and neither is sufficient alone.
+REALTIME_ECHO_TEXT_WINDOW_S = 15.0
+# Fraction of the incoming transcript's words that must also appear in what she
+# has recently said for it to be called an echo. 0.8 is "almost all of it":
+# a driver's question that happens to reuse two of her words is not an echo.
+REALTIME_ECHO_TEXT_OVERLAP = 0.8
+# ...and below this many words, only an exact containment counts. "Yes" and
+# "no" share every word with almost anything.
+REALTIME_ECHO_TEXT_MIN_WORDS = 2
+
+# ---------------------------------------------------------------------------
 # Newest wins: superseding a turn (item 4 of the first real-drive punch list)
 # ---------------------------------------------------------------------------
 # WHY THIS IS URGENT AND NOT TIDINESS. On the first real drive the four `look`

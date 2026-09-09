@@ -2396,6 +2396,7 @@ async function toggleLive() {
     live.stop();
     live = null;
     stopLiveFrames();
+    stopBusWatch();
     setMicState('idle');
     RIO.ui.voice('idle');
     return;
@@ -2419,6 +2420,13 @@ const LIVE_REPORTED = {
    * four `look` calls took 40.1, 12.9, 48.5 and 27.1 seconds each, and nothing
    * anywhere recorded that a driver had asked again in the meantime. */
   LIVE_TURN_SUPERSEDED: 'turn_superseded',
+  /* A transcript that was NOT a driver turn — her own voice back through the
+     phone's speaker, or speech the barge gate never confirmed. Reported
+     because the failure it replaced was invisible: on the iPhone test of
+     2026-09-09 ten of fifteen supersedes were one of these, and the log called
+     every one of them a new question. */
+  LIVE_TURN_PHANTOM: 'turn_phantom',
+  LIVE_BUS_HEALTH: 'bus_health',
   LIVE_TURN_COALESCED: 'turn_coalesced',
   LIVE_TOOL_ABORTED: 'tool_aborted',
   LIVE_TOOL_RESULT_DISCARDED: 'tool_result_discarded',
@@ -2467,11 +2475,75 @@ function reportLive(ev) {
           gap_ms: ev.gap_ms === undefined ? null : ev.gap_ms,
           command: ev.command || null,
           superseded: ev.superseded || ev.first || null,
+          // Why a transcript was refused, and what it was.
+          why: ev.why || null,
+          text: ev.text || null,
+          speaking: ev.speaking === undefined ? null : ev.speaking,
+          since_audio_ms: ev.since_audio_ms === undefined ? null : ev.since_audio_ms,
+          // Output-bus health, when that is what is being reported.
+          covered: ev.covered === undefined ? null : ev.covered,
+          context: ev.context || null,
+          to_destination: ev.to_destination === undefined ? null : ev.to_destination,
+          bus_failures: ev.bus_failures === undefined ? null : ev.bus_failures,
+          fallbacks: ev.fallbacks === undefined ? null : ev.fallbacks,
           by: ev.by || ev.second || null,
         },
       }),
     }).catch(() => {});
   } catch (e) { /* never let reporting touch the session */ }
+}
+
+/* ---- the output bus, watched --------------------------------------------
+ *
+ * THIS EXISTED AND NOBODY COULD SEE IT. rio_output.js has carried a state()
+ * -- is the loopback covering the audio, is the AudioContext running, how many
+ * times has the bus failed -- since it was written, and nothing has ever read
+ * it. So when the complaint on 2026-09-09 was "her voice cuts out on the
+ * phone", the honest first answer was that the log could not say whether the
+ * bus had starved, because the bus had never been asked.
+ *
+ * It is asked now, once a second, and reported ON CHANGE. An AudioContext that
+ * iOS suspends under a phone call or a route change, a loopback that fails to
+ * renegotiate and drops back to ctx.destination, a bus failure counter that
+ * moves: all of them sound exactly like a cut-off from the passenger seat and
+ * none of them produces a cancel event. Now they leave a mark.
+ *
+ * Deliberately not a fault: falling back to ctx.destination is audible and
+ * correct, it just costs echo cancellation. What matters is being able to SAY
+ * so afterwards. */
+let busWatch = null;
+let busLast = '';
+
+function busHealth(force) {
+  if (!(window.RIO && RIO.output && RIO.output.state)) return;
+  let st;
+  try { st = RIO.output.state(); } catch (e) { return; }
+  const key = [st.covered, st.ready, st.context, st.to_destination,
+               (st.stats || {}).bus_failures, (st.stats || {}).fallbacks].join('|');
+  if (!force && key === busLast) return;
+  busLast = key;
+  reportLive({
+    type: 'LIVE_BUS_HEALTH',
+    covered: !!st.covered,
+    context: st.context || null,
+    to_destination: !!st.to_destination,
+    bus_failures: (st.stats || {}).bus_failures || 0,
+    fallbacks: (st.stats || {}).fallbacks || 0,
+  });
+}
+
+function startBusWatch() {
+  if (busWatch !== null) return;
+  busLast = '';
+  busHealth(true);                       // the opening state, always recorded
+  busWatch = setInterval(busHealth, 1000);
+}
+
+function stopBusWatch() {
+  if (busWatch === null) return;
+  busHealth(true);                       // ...and the closing one
+  clearInterval(busWatch);
+  busWatch = null;
 }
 
   liveBusy = true;
@@ -2499,6 +2571,9 @@ function reportLive(ev) {
     });
     setMicState('listening');
     RIO.ui.voice('listening');
+    // The bus is now carrying her voice. Watch it for the length of the
+    // conversation; see busHealth.
+    startBusWatch();
     // Give her something to see. A drive already does; this covers the case
     // where the driver just wants to talk.
     const eyes = await startLiveFrames();
@@ -2510,6 +2585,7 @@ function reportLive(ev) {
     liveMode = false;
     live = null;
     stopLiveFrames();
+    stopBusWatch();
     setMicState('hold');
     obs.textContent = 'Live conversation unavailable (' +
       (e && e.message ? e.message : e) + ') — hold to talk instead.';

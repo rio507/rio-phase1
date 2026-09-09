@@ -828,7 +828,11 @@ _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
 # The kinds the browser reports about turn arbitration. Kept next to the store
 # so adding one is an edit in a single place.
 _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
-               "tool_result_discarded", "driver_command", "command_done")
+               "tool_result_discarded", "driver_command", "command_done",
+               # A transcript that was not a driver turn: her own voice back
+               # through the speaker, or speech the barge gate never confirmed.
+               # The number that says whether the echo loop is closed.
+               "turn_phantom", "bus_health")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -858,7 +862,11 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # RIO simply being slow.
                              "turn", "now_turn", "tool", "call_id",
                              "tools_aborted", "took_ms", "age_ms", "gap_ms",
-                             "command", "superseded")})
+                             "command", "superseded",
+                             # phantom transcripts and output-bus health
+                             "why", "text", "speaking", "since_audio_ms",
+                             "covered", "context", "to_destination",
+                             "bus_failures", "fallbacks")})
         _cutoffs["recent"].append(rec)
         if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
             _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]
@@ -1163,6 +1171,14 @@ def mint_client_secret() -> dict:
             "echo_margin_db": float(config.REALTIME_BARGE_ECHO_MARGIN_DB),
         },
         "barge_echo_floor_db": float(config.REALTIME_BARGE_ECHO_FLOOR_DB),
+        # A CANCEL IS A SUPERSEDE ONLY WHEN A REAL NEW QUESTION EXISTS. How
+        # long her own voice may still be in the room after she stops, and what
+        # counts as hearing herself in a transcript. See config.REALTIME_ECHO_*
+        # and the iPhone test that produced them.
+        "echo_tail_ms": int(config.REALTIME_ECHO_TAIL_MS),
+        "echo_text_window_s": float(config.REALTIME_ECHO_TEXT_WINDOW_S),
+        "echo_text_overlap": float(config.REALTIME_ECHO_TEXT_OVERLAP),
+        "echo_text_min_words": int(config.REALTIME_ECHO_TEXT_MIN_WORDS),
         # NEWEST WINS. The turn policy travels with the session for the same
         # reason the barge policy does: config.py decides it, the browser holds
         # no second copy, and tools/realtime_selftest.py checks the one copy.

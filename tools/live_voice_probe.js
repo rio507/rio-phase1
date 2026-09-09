@@ -77,6 +77,41 @@ let RECOVERABLE = 0;
    that answer. A real interruption and the token ceiling are deliberate stops
    and belong in neither column; everything else is an answer the car threw
    away for no reason, which is the thing being counted. */
+/* --phone: the drive that broke on 2026-09-09, reproduced.
+ *
+ * An iPhone in a cradle. Her voice comes out of the loudspeaker a few
+ * centimetres from the microphone, goes back in, and the input transcriber
+ * writes it down. Her opening line is "Hey. What's up." and it came back as
+ * "Hello." and "What's up?" -- which the newest-wins supersede took for new
+ * driver questions and cancelled the response that was producing the audio.
+ * Ten times across two sessions. She never finished a sentence.
+ *
+ * So this script is five long answers with NOBODY TALKING, and the room full
+ * of her own voice: echoes inside the onset guard, echoes the level test
+ * catches, echoes that arrive as a transcript with no sustained speech at all.
+ * The number that matters is zero.
+ *
+ * Then the two things that must still work: a driver who really interrupts,
+ * and a driver who really asks something else.
+ */
+const PHONE_TURNS = [
+  { name: 'long answer, her voice echoes back inside the onset guard',
+    kind: 'echo_onset', recoverable: true },
+  { name: 'long answer, echo arrives as a transcript, no sustained speech',
+    kind: 'echo_transcript', recoverable: true },
+  { name: 'long answer, her exact words come back verbatim',
+    kind: 'echo_verbatim', recoverable: true },
+  { name: 'long answer, echo louder than nothing but never sustained',
+    kind: 'echo_blip_transcript', recoverable: true },
+  { name: 'long answer, nobody talking at all',
+    kind: 'clean', recoverable: false },
+  { name: 'driver really interrupts', kind: 'real_barge', recoverable: false },
+  { name: 'driver really asks something else, over the top of her',
+    kind: 'real_second_question', recoverable: false },
+  { name: 'driver asks again while a tool is still out',
+    kind: 'real_second_question_tool', recoverable: false },
+];
+
 const TURNS = [
   { name: 'clean answer', kind: 'clean', recoverable: false },
   { name: 'echo of her own voice, brief', kind: 'blip', recoverable: true },
@@ -107,7 +142,15 @@ function makeSession(opts) {
   const controller = rt.createController({
     arbiter,
     send: (o) => sent.push(o),
-    tool: () => Promise.resolve({ ok: true }),
+    tool: opts.slowTool
+      ? ((name, a, controller) => new Promise((res) => {
+          if (controller) {
+            controller.signal.addEventListener('abort', () => {
+              const e = new Error('aborted'); e.name = 'AbortError'; res(Promise.reject(e));
+            });
+          }
+        }))
+      : (() => Promise.resolve({ ok: true })),
     audio: rig
       ? { mute: () => { audio.muted = true; rig.sink.mute(); },
           unmute: () => { audio.muted = false; rig.sink.unmute(); } }
@@ -118,9 +161,36 @@ function makeSession(opts) {
     bargeSustainMs: opts.sustain,
     bargeConfirmMs: opts.confirm,
     resumeInstruction: 'RESUME>>',
+    /* THE PHONE COLUMN. The onset guard and the level test only exist on a
+       touch device, and they are two of the three gates the supersede was
+       bypassing -- so a probe that runs the desktop numbers cannot see this
+       bug at all. `levels` is the meter the echo test reads: microphone
+       quieter than loudspeaker is her, which is the whole point. */
+    ...(opts.phone ? {
+      /* The onset guard is scaled with the other two timers, and it has to be:
+         this script's turns are milliseconds apart, and a real 400 ms guard
+         would hold EVERY barge in the whole run -- including the driver's --
+         which reads as the gate working and is actually the clock being wrong.
+         6 ms sits in the same proportion to these sleeps as 400 ms does to a
+         real sentence. The echo margin is a dB and does not scale. */
+      bargeOnsetGuardMs: opts.onsetGuard === undefined ? 6 : opts.onsetGuard,
+      bargeEchoMarginDb: 6,
+      bargeEchoFloorDb: -50,
+      levels: () => phoneLevels,
+      // Scaled with everything else. 600 ms is to a real sentence what 10 ms
+      // is to one of these turns.
+      echoTailMs: opts.echoTail === undefined ? 10 : opts.echoTail,
+    } : {}),
   });
   return { arbiter, sent, events, audio, controller, rig };
 }
+
+/* What the meter says right now. Echo is the microphone hearing the speaker,
+   so it is QUIETER than the speaker -- the margin is negative and the level
+   test refuses to cancel on it. A real driver is louder. */
+let phoneLevels = { mic: -46, out: -18 };
+function asEcho() { phoneLevels = { mic: -46, out: -18 }; }
+function asDriver() { phoneLevels = { mic: -12, out: -18 }; }
 
 async function runTurn(s, turn, n) {
   const rid = 'r' + n;
@@ -157,6 +227,7 @@ async function runTurn(s, turn, n) {
       break;
 
     case 'real_barge':
+      asDriver();
       // A real sentence: it runs well past the gate, THEN stops, and the
       // transcript follows a beat later. The long middle is the part that
       // matters -- an implementation that starts its confirmation clock at the
@@ -203,6 +274,111 @@ async function runTurn(s, turn, n) {
       break;
     }
 
+    /* --- the phone's own failures -------------------------------------- */
+
+    case 'echo_onset':
+      /* Her first syllable comes straight back. The onset guard HOLDS the
+         barge decision rather than taking it -- so there is no pendingBarge --
+         and then the transcript lands. This is the exact path that produced
+         `said_chars: 4` on the real device: four characters in, cancelled. */
+      asEcho();
+      s.controller.handle({ type: 'input_audio_buffer.speech_started' });
+      await sleep(2);
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'Hello.' });
+      await sleep(4);
+      s.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+      await sleep(4);
+      s.controller.handle({ type: 'response.done',
+                            response: { id: rid, status: 'completed' } });
+      break;
+
+    case 'echo_transcript':
+      /* No speech_started at all -- the detector never fired, and a transcript
+         turned up anyway. Nothing in the barge machinery has an opinion about
+         this one; only the gate does. */
+      asEcho();
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'What is up?' });
+      await sleep(4);
+      s.controller.handle({ type: 'response.done',
+                            response: { id: rid, status: 'completed' } });
+      break;
+
+    case 'echo_verbatim':
+      /* Her own words, exactly, after the guard has expired and sustained
+         past the gate -- a phone at high volume in a hard-surfaced cabin. The
+         structural gate would let this through; the text test is what catches
+         it. */
+      asEcho();
+      s.controller.handle({ type: 'input_audio_buffer.speech_started' });
+      await sleep(40);
+      s.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+      await sleep(4);
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: said });
+      await sleep(4);
+      s.controller.handle({ type: 'response.done',
+                            response: { id: rid, status: 'completed' } });
+      break;
+
+    case 'echo_blip_transcript':
+      // Fires the detector, stops well inside the sustain gate, and a
+      // transcript follows anyway.
+      asEcho();
+      s.controller.handle({ type: 'input_audio_buffer.speech_started' });
+      await sleep(1);
+      s.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+      await sleep(2);
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'Hello.' });
+      await sleep(4);
+      s.controller.handle({ type: 'response.done',
+                            response: { id: rid, status: 'completed' } });
+      break;
+
+    case 'real_second_question':
+      /* A DRIVER, not a loudspeaker: louder than the output, sustained well
+         past the gate, and saying something she has not said. This must still
+         supersede -- it is the whole point of newest-wins. */
+      asDriver();
+      s.controller.handle({ type: 'input_audio_buffer.speech_started' });
+      await sleep(40);
+      s.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+      await sleep(4);
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'Actually, where is the nearest petrol station?' });
+      break;
+
+    case 'real_second_question_tool':
+      /* THE CASE NEWEST-WINS EXISTS FOR, and the one the phone gate must not
+         break. She is not speaking -- she is waiting on a `look` that has been
+         out for a while, which on the first real drive was up to 48 seconds --
+         and the driver asks something else. Nothing of hers is in the room, so
+         the gate lets it through, the tool is aborted and the turn supersedes. */
+      asDriver();
+      // She has finished saying "let me look" and is now SILENT, waiting on
+      // the camera. That is the real shape of it: on the first drive these
+      // calls ran up to 48 seconds with nothing coming out of the speaker.
+      s.controller.handle({ type: 'response.done',
+                            response: { id: rid, status: 'completed' } });
+      s.controller.handle({ type: 'response.function_call_arguments.done',
+                            name: 'look', call_id: 'probe_look',
+                            arguments: JSON.stringify({ question: 'what is that' }) });
+      // ...and her voice has been out of the room for longer than the echo
+      // tail, which is what makes a transcript a question rather than an echo.
+      await sleep(16);
+      s.controller.handle({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'Never mind that, how far to the next junction?' });
+      await sleep(4);
+      break;
+
     case 'token_cap':
       s.controller.handle({
         type: 'response.done',
@@ -225,7 +401,8 @@ async function runTurn(s, turn, n) {
 async function drive(opts) {
   const s = makeSession(opts);
   if (s.rig) await s.rig.opened;
-  for (let i = 0; i < TURNS.length; i++) await runTurn(s, TURNS[i], i + 1);
+  const script = opts.script || TURNS;
+  for (let i = 0; i < script.length; i++) await runTurn(s, script[i], i + 1);
   s.controller.stop();
   const st = s.controller.state();
   return {
@@ -334,7 +511,91 @@ async function postAll(base, events) {
   return n;
 }
 
+/* --phone: five long answers with nobody talking and the room full of her own
+   voice, then the two things that must still work. The acceptance is stated in
+   the output rather than left for a reader to total up. */
+async function phoneRun() {
+  console.log('=========================================================');
+  console.log(' live voice probe — PHONE. An iPhone in a cradle: her voice');
+  console.log(' out of the loudspeaker, back into the microphone, and');
+  console.log(' through the input transcriber as a "new question".');
+  console.log(' Onset guard 400 ms, sustain 600 ms, echo margin 6 dB.');
+  console.log('=========================================================');
+  PHONE_TURNS.forEach((t, i) => console.log(
+    '  ' + String(i + 1).padStart(2) + '. ' + t.name.padEnd(58)
+    + (t.recoverable ? '(must survive)' : '')));
+
+  const r = await drive({ sustain: 4, confirm: 40, phone: true,
+                          slowTool: true, script: PHONE_TURNS });
+  const c = r.counters;
+  const cut = r.cutoffs || {};
+  const quiet = PHONE_TURNS.filter(t => t.recoverable).length;
+
+  const phantom = r.events.filter(e => e.type === 'LIVE_TURN_PHANTOM');
+  const superseded = r.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED');
+
+  console.log('\n  the five answers nobody interrupted');
+  line('cut-offs during them',
+       Object.keys(cut).reduce((a, k) => a + cut[k], 0) - (cut.barge_in || 0));
+  line('phantom transcripts refused', c.turns_phantom);
+  // padEnd, not '%-24s': node's console.log understands %s and nothing about
+  // widths — the same trap this file already documents further down.
+  phantom.forEach(e => console.log('      refused ' + String(e.why).padEnd(24)
+                                   + JSON.stringify(e.text)));
+  line('supersedes', c.turns_superseded);
+  superseded.forEach(e => console.log('      superseded by %s', JSON.stringify(e.by)));
+
+  console.log('\n  the three that must still work');
+  line('genuine barge-ins', cut.barge_in || 0);
+  line('genuine supersedes', c.turns_superseded);
+  line('tool calls aborted by one', c.tools_aborted);
+
+  const fails = [];
+  const noise = (cut.other || 0) + (cut.false_barge_in || 0) + (cut.transport || 0)
+              + (cut.preempted || 0);
+  if (noise) fails.push(noise + ' cut-off(s) with nobody talking');
+  if (c.turns_phantom !== quiet) {
+    fails.push('expected ' + quiet + ' phantom transcripts refused, got '
+               + c.turns_phantom);
+  }
+  /* TWO barge-ins, not one: a driver talking over her is a barge-in whether
+     they are interrupting or asking something new, and both turns 6 and 7 do
+     exactly that. The supersede that matters is turn 8's -- the driver asking
+     again while a tool is still out, which is the case newest-wins was built
+     for and the one a phone gate could most easily have broken. */
+  if ((cut.barge_in || 0) !== 2) {
+    fails.push('expected 2 genuine barge-ins (turns 6 and 7), got '
+               + (cut.barge_in || 0));
+  }
+  if (c.turns_superseded !== 1) {
+    fails.push('expected exactly 1 supersede (turn 8, over a live tool call), '
+               + 'got ' + c.turns_superseded);
+  }
+  if (c.tools_aborted !== 1) {
+    fails.push('expected the superseded turn to abort its tool call, got '
+               + c.tools_aborted + ' aborts');
+  }
+
+  console.log('');
+  if (fails.length) {
+    fails.forEach(f => console.log('  FAIL  ' + f));
+    console.log('\n  PHONE: FAILED');
+    return 1;
+  }
+  console.log('  PASS  five long answers, nobody talking, ZERO cut-offs');
+  console.log('  PASS  ' + quiet + ' phantom transcripts refused, none of them '
+              + 'cancelled anything');
+  console.log('  PASS  a real interruption still stops her (2 barge-ins)');
+  console.log('  PASS  a real second question over a live tool call still '
+              + 'supersedes, and aborts it');
+  console.log('\n  PHONE: PASSED');
+  return 0;
+}
+
 async function main() {
+  if (args.indexOf('--phone') >= 0) {
+    process.exit(await phoneRun());
+  }
   console.log('=========================================================');
   console.log(' live voice probe — %d scripted turns through the real', TURNS.length);
   console.log(' controller and the real arbiter');

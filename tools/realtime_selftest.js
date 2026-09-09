@@ -120,6 +120,17 @@ function harness(opts) {
     toolSchemas: opts.toolSchemas,
     conditionalTools: opts.conditionalTools,
     turnPolicy: opts.turnPolicy,
+    /* The phone column. The onset guard and the level meter only exist on a
+       touch device, and they are two of the three gates a supersede has to
+       honour -- so a harness that cannot set them cannot see the bug they
+       were bypassed by. */
+    bargeOnsetGuardMs: opts.bargeOnsetGuardMs,
+    bargeEchoMarginDb: opts.bargeEchoMarginDb,
+    bargeEchoFloorDb: opts.bargeEchoFloorDb,
+    levels: opts.levels,
+    echoTailMs: opts.echoTailMs,
+    echoTextWindowS: opts.echoTextWindowS,
+    echoTextOverlap: opts.echoTextOverlap,
   });
   return { arbiter, sent, events, audio, controller,
            types: () => sent.map(e => e.type),
@@ -3266,10 +3277,19 @@ function slowTool() {
   return fn;
 }
 
-function askAndCall(h, text, callId, rid) {
-  // The shape of a real turn: the driver speaks, the transcript lands, the
-  // model asks for a tool.
+/* The shape of a REAL turn: the driver speaks, and keeps speaking long enough
+ * for the barge gate to agree that somebody is there, and then the transcript
+ * lands.
+ *
+ * The sustain used to be missing, and every one of these turns started and
+ * stopped inside a single tick. That passed until a supersede had to clear the
+ * same bar a barge-in does -- and then it failed, correctly, because a
+ * transcript from zero milliseconds of speech is not a driver. On the iPhone
+ * it was RIO's own voice out of the loudspeaker. See supersedeGate.
+ */
+async function askAndCall(h, text, callId, rid) {
   h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);                    // past bargeSustainMs (4 in this harness)
   h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
   h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
                         transcript: text });
@@ -3281,15 +3301,23 @@ function askAndCall(h, text, callId, rid) {
   }
 }
 
+/* ...and the shape of her own voice coming back. No sustained speech, just a
+   transcript. This is what an iPhone in a cradle produces, ten times a
+   session, and it must change nothing at all. */
+function echoSays(h, text) {
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: text });
+}
+
 {
   const tool = slowTool();
   const h = harness({ tool });
 
-  askAndCall(h, 'What kind of car is that?', 'c1', 'r1');
+  await askAndCall(h, 'What kind of car is that?', 'c1', 'r1');
   await tick();
-  askAndCall(h, 'Where is the nearest petrol station?', 'c2', 'r2');
+  await askAndCall(h, 'Where is the nearest petrol station?', 'c2', 'r2');
   await tick();
-  askAndCall(h, 'How far to the turn?', 'c3', 'r3');
+  await askAndCall(h, 'How far to the turn?', 'c3', 'r3');
   await tick();
 
   ok(tool.calls.length === 3, 'three questions, three tool calls');
@@ -3360,12 +3388,12 @@ section('newest wins — a driver command preempts');
     },
   };
 
-  askAndCall(h, 'Tell me about that building on the left.', 'c1', 'r1');
+  await askAndCall(h, 'Tell me about that building on the left.', 'c1', 'r1');
   await tick();
   h.controller.handle({ type: 'response.output_audio_transcript.delta',
                         response_id: 'r1', delta: 'That is the old' });
 
-  askAndCall(h, 'stop navigation', null, null);
+  await askAndCall(h, 'stop navigation', null, null);
   await settle();
 
   ok(tool.calls[0].aborted, 'the in-flight look is aborted mid-answer');
@@ -3400,7 +3428,7 @@ section('newest wins — a driver command preempts');
   h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
   h.controller.handle({ type: 'response.output_audio_transcript.delta',
                         response_id: 'r1', delta: 'The building on the left is' });
-  askAndCall(h, 'stop', null, null);
+  await askAndCall(h, 'stop', null, null);
   await settle();
   const cmd = h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND');
   ok(cmd.length === 1 && cmd[0].command === 'silence',
@@ -3414,13 +3442,13 @@ section('newest wins — a driver command preempts');
   // ...and a command must be a COMMAND. This is the false positive that would
   // make the feature unusable.
   const h = harness();
-  askAndCall(h, "Don't stop at the next light, the junction is just after it",
+  await askAndCall(h, "Don't stop at the next light, the junction is just after it",
              null, 'r1');
   await settle();
   ok(h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 0,
      '"don\'t stop at the next light" is not a command to stop navigating');
   const h2 = harness();
-  askAndCall(h2, 'Is there anywhere to stop for coffee', null, 'r1');
+  await askAndCall(h2, 'Is there anywhere to stop for coffee', null, 'r1');
   await settle();
   ok(h2.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 0,
      '...and neither is asking where to stop for coffee');
@@ -3437,7 +3465,7 @@ section('newest wins — a split utterance is one question');
   const tool = slowTool();
   const h = harness({ tool });
 
-  askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
+  await askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
   await tick();
   h.controller.handle({ type: 'input_audio_buffer.speech_started' });
   h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
@@ -3464,9 +3492,9 @@ section('newest wins — a split utterance is one question');
   // Two real questions in quick succession are still two questions.
   const tool = slowTool();
   const h = harness({ tool });
-  askAndCall(h, 'What is that building.', 'c1', 'r1');
+  await askAndCall(h, 'What is that building.', 'c1', 'r1');
   await tick();
-  askAndCall(h, 'Where are we going?', null, 'r2');
+  await askAndCall(h, 'Where are we going?', null, 'r2');
   await settle();
   ok(tool.calls[0].aborted,
      'a finished sentence followed by a new question is NOT a continuation');
@@ -3478,12 +3506,244 @@ section('newest wins — a split utterance is one question');
   // A long pause is a new question however it opens.
   const tool = slowTool();
   const h = harness({ turnPolicy: { coalesce_gap_ms: 1 }, tool });
-  askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
+  await askAndCall(h, 'Is there a petrol station', 'c1', 'r1');
   await settle(10);
-  askAndCall(h, 'near the next exit', null, 'r2');
+  await askAndCall(h, 'near the next exit', null, 'r2');
   await settle();
   ok(h.events.filter(e => e.type === 'LIVE_TURN_COALESCED').length === 0,
      'past the coalesce window the same words are a new turn');
+}
+
+// ---------------------------------------------------------------------------
+section('a cancel is a supersede only when a real new question exists');
+// ---------------------------------------------------------------------------
+/* THE iPHONE TEST OF 2026-09-09, which is where every transcript below comes
+ * from. Two sessions, 36 cut-offs, and RIO never finished a sentence:
+ *
+ *     turn_superseded  15   TEN of them by="Hello." or "What's up?"
+ *     cutoff other     12   every one reason="cleared"
+ *     cutoff barge_in   1   a genuine interruption
+ *
+ * "Hey. What's up." is her own opening line. It came out of the iPhone's
+ * loudspeaker, back into the microphone, through the input transcriber as
+ * "Hello." / "What's up?", and newest-wins cancelled the response that was
+ * producing the audio. said_chars at the moment of the cancel: 4, 9, 4, 4.
+ *
+ * The gates that should have stopped it were already there and already
+ * working: bargeIn() returns WITHOUT creating a pendingBarge during a
+ * dictation, inside the onset guard, and when the level test says the
+ * microphone never got louder than the speaker. All three mean "this is her".
+ * The supersede never asked.
+ */
+
+/* A phone-shaped session: the onset guard and the level meter exist only on a
+   touch device, and they are two of the three gates that were bypassed. */
+function phoneHarness(opts) {
+  opts = opts || {};
+  const levels = { mic: -46, out: -18 };     // echo: quieter than the speaker
+  const h = harness(Object.assign({
+    bargeOnsetGuardMs: opts.onsetGuard === undefined ? 6 : opts.onsetGuard,
+    bargeEchoMarginDb: 6,
+    bargeEchoFloorDb: -50,
+    echoTailMs: 10,
+    levels: () => levels,
+  }, opts));
+  h.levels = levels;
+  h.asEcho = () => { levels.mic = -46; levels.out = -18; };
+  h.asDriver = () => { levels.mic = -12; levels.out = -18; };
+  return h;
+}
+
+/* She is mid-sentence: a response is open and audio is coming out. */
+function speaking(h, rid, said) {
+  h.controller.handle({ type: 'response.created', response: { id: rid } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: rid, delta: said || 'Hey. What\'s up.' });
+}
+
+{
+  // The exact failure, reproduced: her greeting comes back inside the onset
+  // guard, which is where said_chars was 4.
+  const h = phoneHarness();
+  speaking(h, 'r1');
+  h.asEcho();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Hello.' });
+  await settle();
+  const ph = h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM');
+  ok(ph.length === 1 && ph[0].why === 'inside_onset_guard',
+     'her own greeting, echoed inside the onset guard, is not a new question');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 0,
+     '...so nothing is superseded');
+  ok(h.sent.filter(e => e.type === 'response.cancel').length === 0,
+     '...and the answer it was an echo OF is not cancelled');
+  ok(h.controller.state().counters.turns_phantom === 1,
+     '...and it is counted, so a drive can be asked how often this happens');
+}
+
+{
+  // No detector firing at all — a transcript out of nowhere. Nothing in the
+  // barge machinery has an opinion about this one; only the gate does.
+  const h = phoneHarness();
+  speaking(h, 'r1');
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'What\'s up?' });
+  await settle();
+  const ph = h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM');
+  ok(ph.length === 1, 'a transcript with no speech behind it is refused');
+  ok(h.sent.filter(e => e.type === 'response.cancel').length === 0,
+     '...and cancels nothing');
+}
+
+{
+  // The level test already said "this is her". The supersede used to cancel
+  // anyway — this is the one that made the echo gate pointless.
+  const h = phoneHarness({ onsetGuard: 0 });
+  speaking(h, 'r1');
+  h.asEcho();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Hello.' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_ECHO_SUPPRESSED').length === 1,
+     'the level test recognises the echo, as it always did');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 1,
+     '...and NOW the supersede honours that verdict instead of overriding it');
+  ok(h.sent.filter(e => e.type === 'response.cancel').length === 0,
+     '...so she keeps talking');
+}
+
+{
+  // Sustained, loud, past every gate — and her own words, verbatim. A phone
+  // at high volume in a hard-surfaced cabin. The text test is the net here.
+  const h = phoneHarness({ onsetGuard: 0 });
+  const line = 'The car ahead is a silver estate about four car lengths away';
+  speaking(h, 'r1', line);
+  h.asDriver();                       // loud enough to be a person
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: line });
+  await settle();
+  const ph = h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM');
+  ok(ph.length === 1 && ph[0].why === 'echo_of_her_own_words',
+     'a sustained, loud echo of her exact words is still refused, on the text');
+}
+
+{
+  // ...AND EVERYTHING SHE SAYS COUNTS, not only what the model composed. A nav
+  // call and a gap warning come out of the same speaker and echo the same way.
+  const h = phoneHarness({ onsetGuard: 0 });
+  h.arbiter.say({
+    priority: h.arbiter.P.NAV, group: 'nav:m3', id: 'nav:m3:primary',
+    text: 'Take the next left onto Cedar Street', play: () => {},
+  });
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'It is about ten minutes' });
+  h.asDriver();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Take the next left onto Cedar Street' });
+  await settle();
+  const ph = h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM');
+  ok(ph.length === 1 && ph[0].why === 'echo_of_her_own_words',
+     'a navigation call echoing back is not a driver asking for a left turn',
+     'the arbiter is the one place that sees everything she says');
+}
+
+{
+  // A COMMAND IS THE MOST DESTRUCTIVE THING AN ECHO COULD DO. It ends a route.
+  const h = phoneHarness();
+  speaking(h, 'r1', 'Okay, stopping navigation');
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'stop navigation' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 0,
+     'an unconfirmed "stop navigation" does NOT end the route');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 1,
+     '...it is refused like any other phantom');
+}
+
+// --- and the three things that must still work ----------------------------
+{
+  // A real driver, over the top of her, saying something new.
+  const h = phoneHarness({ onsetGuard: 0 });
+  speaking(h, 'r1');
+  h.asDriver();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Actually, where is the nearest petrol station?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 0,
+     'a real driver talking over her is NOT refused');
+  ok(h.cutoffs().barge_in === 1,
+     '...she stops, and it is recorded as the barge-in it is');
+}
+
+{
+  // The case newest-wins exists for: she is silent, waiting on a tool, and the
+  // driver asks something else.
+  const tool = slowTool();
+  const h = phoneHarness({ onsetGuard: 0, tool });
+  h.controller.handle({ type: 'response.function_call_arguments.done',
+                        name: 'look', call_id: 'c1',
+                        arguments: JSON.stringify({ question: 'what is that' }) });
+  await settle(30);                     // her voice is out of the room
+  h.asDriver();
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Never mind, how far to the junction?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 1,
+     'a second question while she is silent and a tool is out still supersedes');
+  ok(tool.calls[0].aborted, '...and still aborts the tool call');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 0,
+     '...and is not mistaken for an echo');
+}
+
+{
+  // A DESK IS NOT A PHONE. With no meter and no onset guard, a transcript
+  // arriving while she speaks is a driver: there is no loopback to be an echo
+  // of, and requiring one would make the desk worse to use than the car.
+  const h = harness();
+  speaking(h, 'r1');
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'What is that building on the left?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 0,
+     'on a desk, sustained speech is still a driver');
+}
+
+{
+  // The half-sentence a breath split in two. It is the SAME speech, so it does
+  // not need a fresh confirmed barge -- but it does get the text test.
+  const tool = slowTool();
+  const h = phoneHarness({ onsetGuard: 0, tool });
+  h.asDriver();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Is there a petrol station' });
+  h.controller.handle({ type: 'response.function_call_arguments.done',
+                        name: 'find_places', call_id: 'c1', arguments: '{}' });
+  await tick();
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'near the next exit' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_COALESCED').length === 1,
+     'a breath in the middle of a question is still one question on a phone');
+  ok(!tool.calls[0].aborted, '...and its tool call is not aborted');
 }
 
 const serverArg = process.argv.indexOf('--server');
