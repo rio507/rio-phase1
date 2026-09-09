@@ -919,6 +919,10 @@ def reset_cutoffs() -> None:
         _cutoffs["resume_skipped"] = 0
         _cutoffs["blips_absorbed"] = 0
         _cutoffs["echo_suppressed"] = 0
+        # The turn counters too. `turn_phantom` is the number that says whether
+        # the echo loop is closed, and a measured phone run that starts with
+        # the last run's phantoms already on the board cannot say anything.
+        _cutoffs["turns"] = {}
         _cutoffs["recent"] = []
 
 
