@@ -191,6 +191,32 @@ global.Audio = function (initialSrc) {
     });
   };
 
+  /* THE ATTRIBUTE HALF OF AN AUDIO ELEMENT, and it is here because leaving it
+     out cost a whole navigation acceptance run.
+     rio_nav.js:unlockOne() saves the real clip off the element, swaps in the
+     silent buffer to unlock it on iOS, and puts the clip back:
+         var real = a.getAttribute('src') || '';
+         ... a.src = silent; a.load(); ... a.src = real; a.load();
+     A stub with only a `src` PROPERTY throws "a.getAttribute is not a
+     function" on the first line of that, inside the panel's own route tool, so
+     start_navigation came back ok=false with a DOM TypeError for a note and
+     the recording caught RIO saying "it didn't start. The route failed to
+     load." That is the harness failing, not the car: the same unlock path is
+     green in a real browser (tools/output_bus_selftest.py, 27/27).
+     Backed by the same `src` state as the property, so the two cannot
+     disagree -- which is the bug a second copy would have introduced. */
+  el.getAttribute = (name) => (String(name).toLowerCase() === 'src' ? (src || null) : null);
+  el.setAttribute = (name, v) => {
+    if (String(name).toLowerCase() === 'src') { src = String(v); load(src); }
+  };
+  el.removeAttribute = (name) => {
+    if (String(name).toLowerCase() === 'src') { src = ''; decoded = null; }
+  };
+  // load() re-reads whatever src currently holds, exactly as a browser does.
+  // Without it the restore half of unlockOne silently keeps the silent buffer
+  // on the element and the junction call is a clip of nothing.
+  el.load = () => { if (src) load(src); };
+
   if (initialSrc) { src = initialSrc; load(initialSrc); }
   return el;
 };

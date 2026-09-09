@@ -11,6 +11,12 @@ training_data/
 runs/
 weights/
 
+# Acceptance recordings. Served over /static/recordings so a drive can be
+# LISTENED to -- which is the only way some of these failures are visible at
+# all -- but they are tens of megabytes of WAV per pass and they are evidence
+# of one run, not part of the project. The report carries the URLs.
+static/recordings/
+
 # Local Claude Code settings — per-machine, not part of the project
 .claude/
 

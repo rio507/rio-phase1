@@ -725,6 +725,31 @@
        one turn is asking the same question of the same empty budget. */
     var retryArmed = true;
     var turnSeq = 0;            // which driver turn is outstanding
+    /* WHICH UTTERANCE THE ANSWER IN FLIGHT IS FOR, and the bug it closes.
+     *
+     * The input transcription is ASYNCHRONOUS and races the model. On a turn
+     * whose answer is a tool call, the model can call the tool before the
+     * transcriber has finished writing down the question that caused it --
+     * measured at 86 ms apart on a live session. The late transcript then
+     * arrived at transcriptArrived() looking exactly like a brand new
+     * question, superseded the turn it belonged to, aborted the look() that
+     * was running for it, discarded the result and left the driver in
+     * silence. The question superseded itself.
+     *
+     * It reproduced on every visual turn -- 3 of 3 runs -- and never on a
+     * fast tool (25 ms: the answer is already out before the transcript
+     * lands) or on deep_dive (a holding line is spoken first, so the barge
+     * gate protects it). A long tool call with nothing said over it was the
+     * exact shape that lost.
+     *
+     * The session gives the identity needed to tell the two apart for free:
+     * speech_started, speech_stopped, committed and the transcription of one
+     * utterance all carry the SAME item_id, and a genuinely new question is a
+     * different one. So the rule is not a timer or a text comparison -- it is
+     * identity. A transcript for the utterance the in-flight response is
+     * already answering is not news. */
+    var committedItemId = null;   // the input item the server last closed
+    var answeringItemId = null;   // ...and the one the live response is for
 
     /* ---- NEWEST WINS ------------------------------------------------------
      *
@@ -1940,8 +1965,42 @@
        transcript says "someone spoke". An empty transcript is a real answer
        here and not a failure -- it is the transcriber saying there was nothing
        to write down. */
-    function transcriptArrived(text) {
+    function transcriptArrived(text, itemId) {
       var real = !!(text && text.trim());
+
+      /* THE ANSWER IN FLIGHT IS ALREADY THIS QUESTION'S.
+       *
+       * The transcription races the model, and on a tool turn the model wins:
+       * look() is already running for this utterance by the time the words
+       * for it arrive. Superseding here cancels the answer to the question
+       * that is arriving -- measured, it aborted the tool, discarded the
+       * result and left the turn silent, every time, on a live session.
+       *
+       * Identity rather than heuristics: the transcription carries the SAME
+       * item_id the utterance was committed under, and the response created
+       * after that commit was bound to it. Same id means the response being
+       * cancelled IS the answer to these words. A real second question
+       * arrives under a different id and still supersedes -- which is the
+       * behaviour the phone probe pins down and which stays pinned. */
+      var selfAnswered = !!(real && itemId && itemId === answeringItemId);
+      if (selfAnswered) {
+        emit('LIVE_TURN_SELF', {
+          turn: turnSeq, item_id: itemId, text: String(text).slice(0, 160),
+        });
+        // It IS this turn's text -- it just is not a new turn. Recorded so a
+        // genuine follow-up is still measured for continuation against the
+        // right sentence, and so the camera resolves "the black one" against
+        // the question actually asked.
+        lastTurnText = text;
+        lastTurnAt = now();
+        transcriptFresh = true;
+      }
+      /* NOT `real = false`, deliberately. The driver DID speak -- these are
+         their words -- so the barge block below must still classify the
+         speech as real. Setting it false there would file a genuine question
+         as a false_barge_in with 'empty transcript' for a reason and arm a
+         resume against it. What this utterance is not is a NEW turn, and that
+         is the only thing selfAnswered suppresses. */
 
       /* IS IT HERS? Asked before anything is done about it.
        *
@@ -1985,7 +2044,7 @@
         });
         real = false;
       }
-      if (real) {
+      if (real && !selfAnswered) {
         transcriptFresh = true;
         // A new turn from the driver. Whatever was outstanding is theirs to
         // have interrupted, and the resume budget starts again -- and so does
@@ -2436,7 +2495,18 @@
         if (!ev || !ev.type || stopped) return;
         switch (ev.type) {
           case 'response.created':
+            /* The response being created now is the model's answer to the
+               last utterance the server closed. Binding the two here is what
+               lets a late transcript for that same utterance be recognised as
+               the question already being answered rather than a new one. */
+            answeringItemId = committedItemId;
             beginResponse((ev.response && ev.response.id) || ev.response_id);
+            break;
+          case 'input_audio_buffer.committed':
+            // The turn's audio is closed and handed to the model. Its item_id
+            // is the identity the transcription will arrive under, whenever
+            // the transcriber gets round to it.
+            committedItemId = ev.item_id || null;
             break;
           case 'output_audio_buffer.started':
             if (dictation && dictation.responseId === ev.response_id) {
@@ -2600,7 +2670,7 @@
           case 'conversation.item.input_audio_transcription.completed':
             lastTranscript = ev.transcript || '';
             emit('LIVE_TRANSCRIPT', { transcript: lastTranscript, role: 'driver' });
-            transcriptArrived(lastTranscript);
+            transcriptArrived(lastTranscript, ev.item_id || null);
             break;
           case 'conversation.item.input_audio_transcription.failed':
             // The transcriber could not make words out of it. That is not

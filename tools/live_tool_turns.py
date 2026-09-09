@@ -108,6 +108,15 @@ SCRIPT = [
     {"say": "How are my tires?",
      "want": "the car, interpreted rather than recited",
      "budget_s": 25.0},
+    # PLAIN CONVERSATION, and it is here as the CONTROL. Every other turn above
+    # reaches a tool, so every one of them measures the tool as well as the
+    # session. This one reaches nothing: no camera, no reasoning model, no
+    # route, no vehicle data. Whatever latency it shows is the floor the others
+    # are built on, and a slow turn elsewhere means something only when set
+    # against it.
+    {"say": "How long have you been driving with me?",
+     "want": "conversation, no tool at all — the latency floor",
+     "budget_s": 15.0},
 ]
 
 
@@ -628,8 +637,27 @@ def report_drive(turn, notes, t0):
     imminent = []
     print(f"\n  [driving {turn['drive_s']:.0f}s]   ({turn['want']})")
     for c in calls:
+        # WHERE THE CAR WAS WHEN IT SAID IT, against the floor that call type
+        # is configured to fire at. A turn call is right or wrong almost
+        # entirely by distance -- "Left here." at 300 m is not the same
+        # sentence as "Left here." at 30 m -- and the planner already carries
+        # the number on every call. Printing it is the difference between a
+        # recording that proves the turns were CALLED and one that proves they
+        # were called WHERE THEY SHOULD BE.
+        floor = {"early": config.NAV_EARLY_DISTANCE_M,
+                 "primary": config.NAV_PRIMARY_DISTANCE_M,
+                 "imminent": config.NAV_IMMINENT_DISTANCE_M}.get(c.get("call_type"))
+        m = c.get("to_maneuver_m")
+        where = ""
+        if m is not None:
+            where = f"  @ {float(m):6.1f} m"
+            if floor:
+                where += f"  (floor {floor:.0f} m)"
+            if c.get("tta_s") is not None:
+                where += f"  {float(c['tta_s']):.1f}s out"
         print(f"      {c.get('call_type'):>8}  {c.get('text')!r}"
-              + (f"  ({c.get('anchor_label')})" if c.get("anchor_label") else ""))
+              + (f"  ({c.get('anchor_label')})" if c.get("anchor_label") else "")
+              + where)
     if len(planned) != len(spoken):
         print(f"      planned {len(planned)}, spoken {len(spoken)}")
     if audio:
@@ -757,6 +785,23 @@ def report(turn, notes, t_ask, t_speech_end):
     print(f"      said: {spoken[:220]!r}")
     print(f"      audio that reached the speaker: {len(heard)} events"
           + ("   <-- SILENT" if not heard else ""))
+    # THE NUMBER THE DRIVER FEELS, and the only one they can. From the last
+    # sample of their own speech to the first sample of hers -- the silence
+    # they actually sit in. Everything in between is inside it: the detector
+    # deciding the turn is over, the model deciding to answer, any tool it
+    # calls, the first clause, the chunker, the socket and the synthesiser.
+    # tools/voice_latency.py measures this per VOICE PATH; this is the same
+    # clock per QUESTION TYPE, which is what says whether it is the camera or
+    # the reasoning model that a driver is waiting on.
+    #
+    # Printed in a fixed shape on purpose: an acceptance pass wants a
+    # distribution over turn types, and that means many runs of this file
+    # aggregated by something that can find the number without a parser.
+    if heard:
+        print(f"      FIRST_AUDIO_MS {(heard[0]['t'] - t_speech_end) * 1000:.0f}"
+              f"   (speech-end -> first sound)")
+    else:
+        print("      FIRST_AUDIO_MS none   (nothing was ever spoken)")
     tags = _tags_in(spoken)
     if tags:
         print(f"      <-- EXPRESSIVE TAG IN SPOKEN OUTPUT: {tags} — a "

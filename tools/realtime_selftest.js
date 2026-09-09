@@ -3746,6 +3746,76 @@ function speaking(h, rid, said) {
   ok(!tool.calls[0].aborted, '...and its tool call is not aborted');
 }
 
+{
+  /* THE QUESTION THAT SUPERSEDED ITSELF.
+   *
+   * The input transcription is asynchronous and races the model. On a turn
+   * whose answer is a tool call, the model can win: look() is already running
+   * for this utterance when the words that caused it finally arrive --
+   * measured at 86 ms apart on a live session. The late transcript then read
+   * as a brand new question, superseded the turn it belonged to, aborted the
+   * tool and discarded the result, and the driver got silence. It reproduced
+   * on every full_visual turn of a live acceptance pass, 3 for 3.
+   *
+   * The evidence that tells the two cases apart is identity, not timing:
+   * speech_started, committed and the transcription of ONE utterance all
+   * carry the same item_id, and the response created after that commit is
+   * bound to it. */
+  const tool = slowTool();
+  const h = phoneHarness({ onsetGuard: 0, tool });
+  h.asDriver();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started',
+                        item_id: 'item_A' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped',
+                        item_id: 'item_A' });
+  h.controller.handle({ type: 'input_audio_buffer.committed',
+                        item_id: 'item_A' });
+  // The model answers BEFORE the transcriber has written the question down.
+  h.controller.handle({ type: 'response.created', response: { id: 'r_look' } });
+  h.controller.handle({ type: 'response.function_call_arguments.done',
+                        name: 'look', call_id: 'c1', arguments: '{}' });
+  /* AND THE RESPONSE THAT CARRIED THE CALL IS DONE, which is the state that
+     makes this dangerous and the reason an earlier version of this test
+     passed without the fix. A tool-call response completes as soon as the
+     call is emitted -- the tool itself runs on for seconds afterwards. So by
+     the time the transcript lands she is NOT speaking and the echo tail has
+     long expired, which is exactly the branch of supersedeGate that lets a
+     genuine second question through. Live, that is 86 ms after the call. */
+  h.controller.handle({ type: 'response.done',
+                        response: { id: 'r_look', status: 'completed' } });
+  await tick();
+  // ...and only now do the words for that same utterance land.
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        item_id: 'item_A',
+                        transcript: 'What kind of car is in front of us?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 0,
+     'the late transcript of the question being answered does not supersede it');
+  ok(!tool.calls[0].aborted,
+     '...and the look() it started is still running');
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SELF').length === 1,
+     '...and it is recorded as the turn it is, not counted as a phantom');
+
+  // AND THE OTHER HALF: a genuinely new question, under a NEW item_id, still
+  // supersedes and still aborts. This is the behaviour the fix must not buy.
+  h.controller.handle({ type: 'input_audio_buffer.speech_started',
+                        item_id: 'item_B' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped',
+                        item_id: 'item_B' });
+  h.controller.handle({ type: 'input_audio_buffer.committed',
+                        item_id: 'item_B' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        item_id: 'item_B',
+                        transcript: 'Never mind, how far to the next junction?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 1,
+     'a real second question, under its own item, still supersedes');
+  ok(tool.calls[0].aborted,
+     '...and still aborts the tool call the first one left running');
+}
+
 const serverArg = process.argv.indexOf('--server');
 if (serverArg >= 0) {
   const base = (process.argv[serverArg + 1] || '').indexOf('http') === 0
