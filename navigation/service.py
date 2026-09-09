@@ -330,6 +330,13 @@ def timing_config() -> dict:
         "early_distance_m": config.NAV_EARLY_DISTANCE_M,
         "primary_distance_m": config.NAV_PRIMARY_DISTANCE_M,
         "imminent_distance_m": config.NAV_IMMINENT_DISTANCE_M,
+        # How far the car travels between the tick that could call the turn
+        # and the next one, and how long the clip takes to start. The planner
+        # leads the imminent thresholds by both so the junction call lands at
+        # or before its floor rather than a tick past it.
+        "progress_tick_s": config.NAV_PROGRESS_TICK_S,
+        "clip_start_latency_s": config.NAV_CLIP_START_LATENCY_S,
+        "imminent_lead_margin_m": config.NAV_IMMINENT_LEAD_MARGIN_M,
         "speed_floor_ms": config.NAV_SPEED_FLOOR_MS,
         "speed_nominal_ms": config.NAV_SPEED_NOMINAL_MS,
         "duplicate_instruction_cooldown_s": config.NAV_DUPLICATE_INSTRUCTION_COOLDOWN_S,

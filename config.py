@@ -397,7 +397,31 @@ REALTIME_MAX_RESPONSE_TOKENS = REALTIME_MAX_RESPONSE_TEXT_TOKENS
 # number is wrong for one of the two backends whichever value it holds, and a
 # single constant is how it was wrong in the first place.
 REALTIME_LOOK_ANSWER_TEXT_TOKENS = 60
-REALTIME_LOOK_ANSWER_AUDIO_TOKENS = 240
+# 240 -> 360, and the measurement that moved it. On the acceptance pass of
+# 2026-09-09 a normal two-sentence visual answer --
+#
+#     "That white sedan ahead looks like a BMW 5 Series, probably an E60 from
+#      the mid-2000s. Clean shape, very BMW about it."
+#
+# -- came back status=incomplete, reason max_output_tokens, and was filed as a
+# token_cap cutoff. 117 characters. The 240 above was sized at ~100 characters
+# by the arithmetic in the note over it, so an answer barely longer than the
+# sizing case hit the ceiling.
+#
+# AND IT IS NOT A CHARACTER COUNT, which is why the new number has real room
+# rather than another 20%: a 131-character answer on the very next run did NOT
+# truncate. Audio tokens are billed on the SPEECH, and how long a sentence
+# takes to say varies with what is in it -- so characters predict the cost
+# loosely and cannot be tuned against tightly. 360 is ~190 characters at the
+# measured 1.879 tokens/char, which covers two sentences plus the one short
+# "want to know more about it?" clause the look() rules explicitly invite, with
+# margin for the same sentence being said slower.
+#
+# Still a real ceiling, and still far below the session's own cap: the point of
+# it is that a camera answer is one or two sentences and not an essay, and that
+# is enforced by the rules in the look() result, not by cutting her off
+# mid-clause. A ceiling should be the thing that never happens.
+REALTIME_LOOK_ANSWER_AUDIO_TOKENS = 360
 
 
 def look_answer_max_tokens() -> int:
@@ -2672,6 +2696,59 @@ NAV_EARLY_MAX_DISTANCE_M = 900.0
 NAV_EARLY_DISTANCE_M = 300.0        # "...coming up"       at 300 m if not sooner
 NAV_PRIMARY_DISTANCE_M = 130.0      # the instruction      at 130 m if not sooner
 NAV_IMMINENT_DISTANCE_M = 35.0      # "Left here."         at 35 m if not sooner
+
+# ---------------------------------------------------------------------------
+# ...AND THE TICK THE CALL ACTUALLY FIRES ON
+# ---------------------------------------------------------------------------
+# A threshold is checked on a tick, so a call fires on the first tick AFTER the
+# car crosses it, never at it. rio_nav.js has said so since it was written --
+# "a one-second granularity puts up to a second of error into 'Left here'" --
+# and the acceptance pass of 2026-09-09 measured what that costs. Griffith
+# Observatory at 25 mph, against a 35 m floor:
+#
+#     'Left here.'    29.4 m   2.6 s out
+#     'Right here.'   24.8 m   2.2 s out
+#     'Left here.'    24.0 m   2.2 s out
+#
+# 6 to 11 metres late, which at 11.2 m/s is one to two ticks. "Left here" is
+# the one line in the system whose entire worth is WHEN it arrives: late, it is
+# a confirmation of a turn the driver is already in.
+#
+# So the threshold is LED by what the car covers between the tick that could
+# fire it and the next one. The call then fires on the tick BEFORE the
+# crossing, landing at or just before the floor rather than after it. Speed
+# times these two, added to the distance floor and to the time floor -- the
+# time term overshoots for the same reason and needs the same lead.
+#
+# HALF A SECOND, because that is the interval rio_nav.js ticks the tracker at
+# and the granularity every distance term is subject to. Stated here rather
+# than left implicit in a setInterval, because it is now load-bearing for a
+# call's timing and a change to one without the other reintroduces the lag.
+NAV_PROGRESS_TICK_S = 0.5
+# ...and the time between the planner deciding and a listener hearing the front
+# of the clip. Measured at 0-1 ms across every junction call of that pass --
+# the clips are pre-rendered and preloaded, which is what makes it a rounding
+# error rather than a term. It is named and added anyway: it is real, it is not
+# guaranteed to stay at 1 ms, and a lead that silently omits it is a lead that
+# is wrong by however much it grows to.
+NAV_CLIP_START_LATENCY_S = 0.05
+# ...and a fixed metre or two on top, for the part of the overshoot that is not
+# travel at all.
+#
+# The speed term above is exact when the car is moving: at 21 m/s the junction
+# call now goes out at 60 m, led by the time term, and at 11 m/s the lead is
+# 6 m of real travel. It collapses to nothing at a crawl -- 1.23 m/s is 0.7 m
+# per tick -- and yet the replay still called two junctions at 33.7 m and
+# 32.9 m against a 35 m floor while crawling.
+#
+# That residue is not the tick. Fixes arrive at 1 Hz and the tracker is ticked
+# at 2 Hz, so half the progress events are dead-reckoned and the next real fix
+# CORRECTS them; the projection can step a metre or two when it lands. A lead
+# measured in travel cannot absorb a correction that is not travel.
+#
+# Two metres, which is under a second even at a crawl and is invisible at
+# speed next to the terms above.
+NAV_IMMINENT_LEAD_MARGIN_M = 2.0
 # Below this, time-to-maneuver stops meaning anything: at 0.2 m/s every
 # maneuver is hours away and nothing is ever said, including the turn being
 # crept towards in traffic. A floor for the arithmetic, not a claimed speed.

@@ -3816,6 +3816,74 @@ function speaking(h, rid, said) {
      '...and still aborts the tool call the first one left running');
 }
 
+{
+  /* THE WARM-UP MUST NOT EAT THE FIRST ANSWER.
+   *
+   * The session is primed at connect with a one-token text response so the
+   * driver's first real question is not the warm-up. The first version
+   * identified that response as "the one that arrives before any driver turn",
+   * asking `!lastTurnText` -- and lastTurnText is set by the transcript, which
+   * on a tool turn lands AFTER the model has answered. So the driver's first
+   * question was taken for the warm-up and cancelled, and the turn went
+   * silent on a live run.
+   *
+   * The discriminator is `committedItemId`: the server closes the audio buffer
+   * before the model answers it, so a response created while nothing has been
+   * committed cannot be an answer. */
+  const tool = slowTool();
+  const h = phoneHarness({ onsetGuard: 0, tool });
+  h.controller.warmSession();
+  // The warm-up itself: nothing committed, so it is claimed and cancelled.
+  h.controller.handle({ type: 'response.created', response: { id: 'r_warm' } });
+  await settle(20);
+  ok(h.events.filter(e => e.type === 'LIVE_SESSION_WARMED').length === 1,
+     'the warm-up response is recognised and never claims the mouth');
+
+  /* THE CASE THAT ACTUALLY BROKE, and it is the one where the warm-up never
+     arrives: the create is sent into a channel that is not open, or the
+     session answers the driver first. The claim stays armed, and the next
+     response.created is the driver's. A second harness, because the first has
+     already spent its warm-up on a response that did arrive. */
+  const tool2 = slowTool();
+  const h2 = phoneHarness({ onsetGuard: 0, tool: tool2 });
+  h2.controller.warmSession();          // sent, and nothing ever comes back
+  h2.asDriver();
+  h2.controller.handle({ type: 'input_audio_buffer.speech_started',
+                         item_id: 'item_only' });
+  await settle(20);
+  h2.controller.handle({ type: 'input_audio_buffer.speech_stopped',
+                         item_id: 'item_only' });
+  h2.controller.handle({ type: 'input_audio_buffer.committed',
+                         item_id: 'item_only' });
+  h2.controller.handle({ type: 'response.created',
+                         response: { id: 'r_real' } });
+  h2.controller.handle({ type: 'response.function_call_arguments.done',
+                         name: 'look', call_id: 'c9', arguments: '{}' });
+  await settle();
+  ok(h2.events.filter(e => e.type === 'LIVE_SESSION_WARMED').length === 0,
+     'an unclaimed warm-up never swallows the first real answer');
+  ok(!tool2.calls[0].aborted,
+     '...and that turn keeps the look() it asked for');
+
+  // ...and now a REAL first turn, whose answer arrives before its transcript.
+  h.asDriver();
+  h.controller.handle({ type: 'input_audio_buffer.speech_started',
+                        item_id: 'item_first' });
+  await settle(20);
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped',
+                        item_id: 'item_first' });
+  h.controller.handle({ type: 'input_audio_buffer.committed',
+                        item_id: 'item_first' });
+  h.controller.handle({ type: 'response.created', response: { id: 'r_first' } });
+  h.controller.handle({ type: 'response.function_call_arguments.done',
+                        name: 'look', call_id: 'c1', arguments: '{}' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_SESSION_WARMED').length === 1,
+     'the first real answer is NOT mistaken for a second warm-up');
+  ok(!tool.calls[0].aborted,
+     '...and the look() the driver actually asked for is still running');
+}
+
 const serverArg = process.argv.indexOf('--server');
 if (serverArg >= 0) {
   const base = (process.argv[serverArg + 1] || '').indexOf('http') === 0

@@ -748,6 +748,12 @@
      * different one. So the rule is not a timer or a text comparison -- it is
      * identity. A transcript for the utterance the in-flight response is
      * already answering is not news. */
+    /* THE WARM-UP RESPONSE. `warmed` so a reconnect does not spend a second
+       one; `warmingId` so the response it creates can be told apart from a
+       real answer and cancelled without touching the mouth. */
+    var warmed = false;
+    var warmPending = false;      // a warm-up create is out and unclaimed
+    var warmingId = null;
     var committedItemId = null;   // the input item the server last closed
     var answeringItemId = null;   // ...and the one the live response is for
 
@@ -2495,6 +2501,39 @@
         if (!ev || !ev.type || stopped) return;
         switch (ev.type) {
           case 'response.created':
+            /* THE WARM-UP IS NOT AN ANSWER. Caught before beginResponse so it
+               never claims the mouth, never becomes `speaking`, and never
+               enters the resume or supersede bookkeeping -- it is a token
+               generated to prove the path works. Cancelled here rather than
+               left to finish because one token is the point and the rest is
+               latency nobody is waiting for. */
+            /* IDENTIFIED ON `committedItemId`, and the first version of this
+               got it wrong in a way worth keeping written down. It asked
+               `!lastTurnText` -- "no driver turn has happened yet" -- and
+               lastTurnText is set by transcriptArrived, which on a tool turn
+               arrives AFTER the model has already responded. That is the same
+               async-transcript race this file fixes two hundred lines below,
+               and it bit the fix for it: on a live run the driver's FIRST
+               question came back before its own transcript, was taken for the
+               warm-up, was cancelled, and "What do you see outside?" went
+               silent. 6/7 turns spoke, and the one that did not was the one
+               this was supposed to help.
+
+               `committedItemId` is the honest question. The server closes the
+               driver's audio buffer BEFORE the model answers it -- measured at
+               825 ms and 0 ms apart on that run -- so a response created while
+               nothing has ever been committed cannot be an answer to anything.
+               Cleared on the first commit, so the window shuts the instant a
+               real turn begins whether the warm-up ever arrived or not. */
+            if (warmPending && committedItemId === null && !speaking
+                && !dictation) {
+              warmPending = false;
+              warmingId = (ev.response && ev.response.id) || ev.response_id;
+              try { send({ type: 'response.cancel',
+                           response_id: warmingId }); } catch (e) {}
+              emit('LIVE_SESSION_WARMED', { response_id: warmingId });
+              break;
+            }
             /* The response being created now is the model's answer to the
                last utterance the server closed. Binding the two here is what
                lets a late transcript for that same utterance be recognised as
@@ -2507,6 +2546,10 @@
             // is the identity the transcription will arrive under, whenever
             // the transcriber gets round to it.
             committedItemId = ev.item_id || null;
+            // A real turn has begun. Any response from here belongs to it, so
+            // the warm-up's claim on the next response.created is given up
+            // whether it was ever created or not.
+            warmPending = false;
             break;
           case 'output_audio_buffer.started':
             if (dictation && dictation.responseId === ev.response_id) {
@@ -2540,6 +2583,16 @@
             break;
           case 'response.done':
           case 'output_audio_buffer.stopped':
+            /* The warm-up finishing is not an answer finishing. It never
+               claimed the mouth, so there is nothing to release, and it was
+               cancelled on purpose, so it is not a cut-off either -- letting
+               it reach the code below files a deliberate cancel as a lost
+               answer on the very first event of every drive. */
+            if (warmingId !== null && warmingId ===
+                ((ev.response && ev.response.id) || ev.response_id)) {
+              warmingId = null;
+              break;
+            }
             if (dictation && dictation.responseId ===
                 ((ev.response && ev.response.id) || ev.response_id)) {
               finishDictation(null);
@@ -2836,6 +2889,48 @@
        *
        * `defer` exists for the browser, where a session.update sent before
        * the data channel finishes opening is silently nothing. */
+      /* PRIME THE SESSION SO THE DRIVER'S FIRST QUESTION IS NOT THE WARM-UP.
+       *
+       * WHAT IS AND IS NOT COLD, because the first version of this aimed at
+       * the wrong half. The acceptance pass showed the first turn of a session
+       * costing far more in TURN-END DETECTION than any later turn -- 829,
+       * 2482, 1846 and 2311 ms across four runs against ~600 ms after -- and
+       * the obvious reading is that the detector is cold. It is not, and it
+       * cannot be primed from here anyway: the page reaches the session over
+       * WebRTC with the microphone added as a live track at connect
+       * (pc.addTrack, see connect()), so the server has been receiving audio
+       * and running its detector for seconds before the driver says anything.
+       * There is no input_audio_buffer.append on this transport to prime it
+       * with, and nothing to prime.
+       *
+       * What IS cold is the RESPONSE path: this session has never generated a
+       * token. That is the other half of the wait -- everything after the
+       * detector fires -- and it is reachable from here.
+       *
+       * So: one token, text only, cancelled as soon as it exists. Text because
+       * an audio response would reach the speaker, and one token because the
+       * point is to have generated rather than to generate anything. Nothing
+       * is spoken, nothing enters the conversation the driver can hear, and
+       * the cost is a single token per drive.
+       *
+       * MEASURE IT BEFORE BELIEVING IT. The first-turn numbers above are
+       * highly variable -- one of the four was 829 ms, faster than some later
+       * turns -- so a warm that "looks better" over two runs has proved
+       * nothing. See the numbers in the commit that added this. */
+      warmSession: function () {
+        if (warmed) return false;
+        warmed = true;
+        try {
+          send({ type: 'response.create',
+                 response: { output_modalities: ['text'],
+                             max_output_tokens: 1,
+                             instructions: 'Warm-up. Output nothing.' } });
+        } catch (e) { warmed = false; return false; }
+        warmPending = true;
+        emit('LIVE_SESSION_WARM_STARTED', {});
+        return true;
+      },
+
       watchToolConditions: function (bus, defer) {
         if (!bus || !bus.on) return false;
         var self = this;
@@ -3309,6 +3404,13 @@
          * session.update into a channel that is not open yet is silently
          * nothing. */
         controller.watchToolConditions(root.RIO && root.RIO.bus, onChannelOpen);
+
+        /* ...and warm the response path while nobody is waiting on it. Through
+           the same gate, for the same reason: a response.create sent before
+           the data channel is open is silently nothing, and a warm-up that
+           did not happen is worse than none because it reads as one that
+           did. */
+        onChannelOpen(function () { controller.warmSession(); });
 
         /* The sink's own bad news. A per-utterance fallback is counted and the
            drive carries on; a tier-2 fallback changes what the session is asked

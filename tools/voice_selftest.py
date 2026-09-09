@@ -368,11 +368,25 @@ def run_scene_gate():
     # backend: 60 text tokens is two short sentences, 60 audio tokens is
     # twenty-six characters. Both are checked as "two short sentences", which
     # is the thing the number is for.
-    ok(cap == (60 if config.VOICE_BACKEND == "elevenlabs" else 240),
+    # ASKED OF THE CONSTANTS, not of a copy of their values. This read
+    # `cap == (60 if elevenlabs else 240)` and went red the moment the audio
+    # ceiling was raised -- a test that has to be edited every time the number
+    # it guards changes is not guarding the number, it is repeating it. What
+    # matters is that look_answer_max_tokens() picks the right one of the two
+    # for the backend in force, and that is what this asks.
+    ok(cap == (config.REALTIME_LOOK_ANSWER_TEXT_TOKENS
+               if config.VOICE_BACKEND == "elevenlabs"
+               else config.REALTIME_LOOK_ANSWER_AUDIO_TOKENS),
        f"the camera-answer cap is in the units this backend is billed in "
        f"({cap} under {config.VOICE_BACKEND})")
-    ok(cap
-       and cap <= 300,
+    # ...and a ceiling on the ceiling, which is a different claim and still
+    # worth making: the cap exists to keep a camera answer to one or two
+    # sentences, so it must stay small enough to mean that. 400 audio tokens is
+    # ~210 characters at the measured 1.879 tokens/char -- two sentences and a
+    # short clause, and nowhere near an essay. Raised from 300 with the cap
+    # itself (240 -> 360, see config.py) after a normal two-sentence answer was
+    # cut off mid-thought and filed as a token_cap cutoff.
+    ok(cap and cap <= 400,
        f"a camera answer is capped at {cap} "
        "tokens — measured at 23 words median and 44 at p95 against "
        "instructions asking for one sentence")

@@ -595,6 +595,39 @@ function main() {
        + (isFinite(worst) ? worst.toFixed(0) + ' m' : 'none')
        + ' — the recorded drive gave one at 47 m');
 
+  /* AND THE ONE CALL THAT IS ONLY WORTH ITS TIMING. "Left here." confirms the
+     junction the driver is arriving at; a metre late it is confirming one they
+     are already in. The floor is 35 m and the call is checked on a tick, so
+     before the lead went in it fired on the tick AFTER the crossing and landed
+     at 24-29 m on a live route at 25 mph.
+
+     >= floor - 2 m, and the 2 m is for arithmetic rather than for slack: the
+     lead is speed x (tick + clip latency) computed from the speed on the tick
+     BEFORE, and a car that is accelerating covers slightly more than that
+     estimate. It is not room for another tick -- one tick at 11 m/s is 5.6 m
+     and would fail this. */
+  const imminents = clean.events.filter(e => e.type === 'NAV_NEAR_TURN'
+                                        && e.call_type === 'imminent'
+                                        && !e.skipped
+                                        && typeof e.to_maneuver_m === 'number');
+  const floorM = timing.imminent_distance_m;
+  const late = imminents.filter(e => e.to_maneuver_m < floorM - 2);
+  if (process.env.NAV_DEBUG) {
+    for (const e of imminents) {
+      console.log('    [dbg] imminent', e.to_maneuver_m.toFixed(1), 'm',
+                  'tta', e.tta_s, 'speed', e.speed_ms, 'man', e.maneuver_id);
+    }
+  }
+  ok(imminents.length > 0 && late.length === 0,
+     'every junction call lands at or before its distance floor',
+     imminents.length
+       ? imminents.length + ' imminent call(s), closest '
+         + Math.min(...imminents.map(e => e.to_maneuver_m)).toFixed(1)
+         + ' m against a ' + floorM.toFixed(0) + ' m floor'
+         + (late.length ? ' — LATE: '
+             + late.map(e => e.to_maneuver_m.toFixed(1) + ' m').join(', ') : '')
+       : 'no imminent calls in the drive to check');
+
   // -------------------------------------------------------------------------
   section('the other half of the fix: the watch that watches the watch');
   // -------------------------------------------------------------------------

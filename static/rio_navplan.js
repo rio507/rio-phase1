@@ -93,6 +93,12 @@
     early_distance_m: 300.0,
     primary_distance_m: 130.0,
     imminent_distance_m: 35.0,
+    /* THE LEAD, so the junction call fires on the tick BEFORE the crossing.
+       Fallbacks only; the real values arrive with the route. See
+       config.NAV_PROGRESS_TICK_S and NAV_CLIP_START_LATENCY_S. */
+    progress_tick_s: 0.5,
+    clip_start_latency_s: 0.05,
+    imminent_lead_margin_m: 2.0,
     gps_degraded_bias_s: 2.0,
     stationary_speed_ms: 0.7,
     duplicate_instruction_cooldown_s: 8.0,
@@ -532,8 +538,28 @@
       // ago — at a crawl the distance clamp can bring both calls due within a
       // second of each other, and two instructions stacked back to back is
       // RIO talking over itself.
+      /* LED BY ONE TICK OF TRAVEL, plus however long the clip takes to
+         start. A threshold is only ever CHECKED on a tick, so without this the
+         call fires on the first tick after the car crosses it and "Left here."
+         arrives 6-11 m late -- measured, on a live route at 25 mph, against a
+         35 m floor. Leading by what the car covers in that gap moves the fire
+         to the tick before the crossing, which lands the clip at or just
+         before the floor. Never after it: late is the one direction this call
+         must not be wrong in.
+
+         BOTH TERMS, because both are sampled on the same tick and overshoot
+         the same way -- two of the three late calls came off the time term. */
+      var leadS = (opt.progress_tick_s || 0) + (opt.clip_start_latency_s || 0);
+      /* Plus a fixed metre or two, for the part of the overshoot that is not
+         travel: fixes land at 1 Hz on a 2 Hz tick, so half the progress events
+         are dead-reckoned and the next real fix corrects them. At a crawl that
+         correction is the whole overshoot -- the speed term is 0.7 m -- and a
+         lead measured in travel cannot absorb it. */
+      var leadM = Math.max(0, ev.speed_ms || 0) * leadS
+                  + (opt.imminent_lead_margin_m || 0);
       if (!b.called[CALL.IMMINENT] && man.speech && man.speech.imminent &&
-          (tta <= opt.near_turn_s + bs || dist <= opt.imminent_distance_m)) {
+          (tta <= opt.near_turn_s + bs + leadS
+           || dist <= opt.imminent_distance_m + leadM)) {
         b.called[CALL.IMMINENT] = true;
         var stacked = (b.primarySpokenAt !== undefined) &&
                       (clock - b.primarySpokenAt) < opt.imminent_min_gap_s;
