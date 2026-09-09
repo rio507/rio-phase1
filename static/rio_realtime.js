@@ -672,6 +672,11 @@
                         produced this counter, ten of fifteen supersedes were
                         one of these. */
                      turns_phantom: 0,
+                     /* Turns the client had to end itself because the server's
+                        detector had not, after the microphone had been quiet
+                        for REALTIME_TURN_BACKSTOP_MS. Zero is the number to
+                        want: it means semantic_vad never needed catching. */
+                     turns_backstopped: 0,
                      // Tool results that came back for a turn nobody was
                      // waiting for. Never spoken; the number that says how
                      // often a stale answer WOULD have been.
@@ -1072,6 +1077,12 @@
     var bargeConfirmMs = cfg.bargeConfirmMs || 1500;
     /* Fallbacks only; the real values arrive with the session, exactly as the
        barge policy does. See config.REALTIME_ECHO_*. */
+    /* THE BACKSTOP under semantic_vad's tail. 0 is off. Fallbacks only; the
+       real values arrive with the session. See config.REALTIME_TURN_BACKSTOP_MS. */
+    var turnBackstopMs = cfg.turnBackstopMs || 0;
+    var turnBackstopMicDb = (cfg.turnBackstopMicDb === undefined
+                             || cfg.turnBackstopMicDb === null)
+                            ? -45 : cfg.turnBackstopMicDb;
     var echoTailMs = cfg.echoTailMs || 600;
     var echoTextWindowMs = (cfg.echoTextWindowS || 15) * 1000;
     var echoTextOverlap = cfg.echoTextOverlap || 0.8;
@@ -1679,6 +1690,62 @@
      * network hop away from the microphone, on the first sample that crossed a
      * threshold, with nothing available to check the guess against.
      */
+    /* ---- THE TURN BACKSTOP ------------------------------------------------
+     *
+     * A timer UNDER semantic_vad, and only under it: it fires when the
+     * driver's microphone has been quiet for turnBackstopMs and the server has
+     * still not said the turn is over. Then the browser commits the buffer
+     * itself.
+     *
+     * It exists because semantic_vad's tail is a judgement rather than a
+     * timer, so it has no worst case -- median 705 ms, p95 1308 ms, and 829 to
+     * 2482 ms on the first turn of a live session. A driver feels the worst
+     * case, not the median.
+     *
+     * WHY THE METER AND NOT THE SERVER'S OWN EVENTS. The thing being
+     * backstopped IS the server's detector, so its silence cannot be the
+     * evidence that there is silence. `levels()` is the page's own microphone
+     * measurement and the only independent signal there is. No meter, no
+     * backstop -- the same rule the level test follows, and for the same
+     * reason: absence is not evidence.
+     *
+     * It is OFF unless config says otherwise, and it must stay far enough out
+     * to be invisible on the turns semantic_vad already handles well. A
+     * backstop that fires on an ordinary turn is server_vad with extra steps. */
+    var backstopTimer = null;
+    var backstopQuietSince = 0;
+
+    function stopBackstop() {
+      if (backstopTimer) { clearInterval(backstopTimer); backstopTimer = null; }
+      backstopQuietSince = 0;
+    }
+
+    function startBackstop() {
+      stopBackstop();
+      if (!turnBackstopMs || !levels) return;
+      backstopQuietSince = 0;
+      backstopTimer = setInterval(function () {
+        if (stopped || !speechActive) { stopBackstop(); return; }
+        var v = readLevels();
+        if (!v) return;                       // no meter: say nothing
+        if (v.mic > turnBackstopMicDb) {      // still talking
+          backstopQuietSince = 0;
+          return;
+        }
+        var at = now();
+        if (!backstopQuietSince) { backstopQuietSince = at; return; }
+        if (at - backstopQuietSince < turnBackstopMs) return;
+        // Quiet this long with the detector still holding the turn open.
+        stopBackstop();
+        counters.turns_backstopped++;
+        emit('LIVE_TURN_BACKSTOP', {
+          turn: turnSeq, quiet_ms: Math.round(at - backstopQuietSince),
+          mic_db: v.mic,
+        });
+        try { send({ type: 'input_audio_buffer.commit' }); } catch (e) {}
+      }, 100);
+    }
+
     /* ---- the meter, and what it is allowed to conclude --------------------
      *
      * `levels()` is the page's own measurement of two things it is the only
@@ -1915,6 +1982,9 @@
      */
     function speechStopped() {
       speechActive = false;
+      // The detector got there on its own, which is the ordinary case and the
+      // one the backstop must never pre-empt.
+      stopBackstop();
       stopEchoWatch();
       /* A firing that never got past her opening syllable, and has now stopped
          on its own. That is the shape of echo and it cost nothing: no mute, no
@@ -2507,6 +2577,8 @@
             // is the identity the transcription will arrive under, whenever
             // the transcriber gets round to it.
             committedItemId = ev.item_id || null;
+            // Committed by either side: nothing left for the backstop to do.
+            stopBackstop();
             break;
           case 'output_audio_buffer.started':
             if (dictation && dictation.responseId === ev.response_id) {
@@ -2659,6 +2731,8 @@
             // Whatever was last transcribed is about the turn before this one.
             transcriptFresh = false;
             speechActive = true;
+            // The turn is open. Arm the floor under the detector's tail.
+            startBackstop();
             bargeIn();
             break;
           case 'input_audio_buffer.speech_stopped':
@@ -3209,6 +3283,9 @@
           /* How long her own voice may still be in the room after she stops,
              and what counts as hearing herself. config.py decides both; see
              REALTIME_ECHO_* and the iPhone test that produced them. */
+          /* The floor under semantic_vad's tail. 0 is off. */
+          turnBackstopMs: session.turn_backstop_ms,
+          turnBackstopMicDb: session.turn_backstop_mic_db,
           echoTailMs: session.echo_tail_ms,
           echoTextWindowS: session.echo_text_window_s,
           echoTextOverlap: session.echo_text_overlap,

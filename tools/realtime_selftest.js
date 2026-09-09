@@ -131,6 +131,13 @@ function harness(opts) {
     echoTailMs: opts.echoTailMs,
     echoTextWindowS: opts.echoTextWindowS,
     echoTextOverlap: opts.echoTextOverlap,
+    /* The backstop under semantic_vad's tail. Listed here for the same reason
+       every key above is: this object is an explicit mapping and not a spread,
+       so an option the harness does not name is an option the controller never
+       sees -- which is silently a test of the DEFAULT, passing for the wrong
+       reason. That is exactly what happened when these two were first added. */
+    turnBackstopMs: opts.turnBackstopMs,
+    turnBackstopMicDb: opts.turnBackstopMicDb,
   });
   return { arbiter, sent, events, audio, controller,
            types: () => sent.map(e => e.type),
@@ -3814,6 +3821,52 @@ function speaking(h, rid, said) {
      'a real second question, under its own item, still supersedes');
   ok(tool.calls[0].aborted,
      '...and still aborts the tool call the first one left running');
+}
+
+{
+  /* THE BACKSTOP UNDER SEMANTIC_VAD'S TAIL.
+   *
+   * semantic_vad has no worst case -- it is a judgement, and on a live session
+   * its first turn landed anywhere from 829 to 2482 ms. The backstop is a
+   * timer underneath it: the driver's microphone has been quiet this long and
+   * the server still has not called the turn, so the client commits it.
+   *
+   * OFF BY DEFAULT, and these check both halves of that. */
+  const h = phoneHarness({ onsetGuard: 0, turnBackstopMs: 300,
+                           turnBackstopMicDb: -45 });
+  h.controller.handle({ type: 'input_audio_buffer.speech_started',
+                        item_id: 'item_slow' });
+  h.asDriver();                        // mic loud: nothing to backstop yet
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_BACKSTOP').length === 0,
+     'the backstop does not fire while the driver is still talking');
+  h.asEcho();                          // mic drops below the floor
+  await settle(900);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_BACKSTOP').length === 1,
+     '...and does fire once the room is quiet and the detector has not called it');
+
+  // AND THE ORDINARY TURN IT MUST NEVER TOUCH: the detector gets there first.
+  const h2 = phoneHarness({ onsetGuard: 0, turnBackstopMs: 300,
+                            turnBackstopMicDb: -45 });
+  h2.controller.handle({ type: 'input_audio_buffer.speech_started',
+                         item_id: 'item_ok' });
+  h2.asDriver();
+  await settle(50);
+  h2.controller.handle({ type: 'input_audio_buffer.speech_stopped',
+                         item_id: 'item_ok' });
+  h2.asEcho();
+  await settle(600);
+  ok(h2.events.filter(e => e.type === 'LIVE_TURN_BACKSTOP').length === 0,
+     'a turn the detector ended on its own is never backstopped');
+
+  // ...and off is off.
+  const h3 = phoneHarness({ onsetGuard: 0 });     // no backstop configured
+  h3.controller.handle({ type: 'input_audio_buffer.speech_started',
+                         item_id: 'item_off' });
+  h3.asEcho();
+  await settle(600);
+  ok(h3.events.filter(e => e.type === 'LIVE_TURN_BACKSTOP').length === 0,
+     'and with no backstop configured it never fires at all');
 }
 
 

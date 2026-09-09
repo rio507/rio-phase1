@@ -367,13 +367,28 @@ async def run(base, out_path, video, dump=None, script="tools"):
                 # it. Every turn-end latency below is measured from here, the
                 # same zero tools/turn_end_bench.py uses.
                 t_speech_end = start + (len(q_pcm) / 2) / RATE
+                # THE MICROPHONE, AS A METER. The browser measures its own mic
+                # and hands the controller {mic, out} in dBFS; node has no
+                # microphone and no way to measure one, so the half of that
+                # signal this harness CAN state honestly is stated here: the
+                # driver is talking from the first sample of the question to
+                # t_speech_end, and the room is quiet afterwards. It is the
+                # only independent evidence the turn backstop has, and without
+                # it that arm of the experiment could not run at all.
+                panel.tell({"k": "mic", "loud": True})
+                told_quiet = False
                 for i in range(0, len(payload), step):
                     delay = start + (i / 2) / RATE - time.perf_counter()
                     if delay > 0:
                         await asyncio.sleep(delay)
+                    if not told_quiet and time.perf_counter() >= t_speech_end:
+                        panel.tell({"k": "mic", "loud": False})
+                        told_quiet = True
                     await oai.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": base64.b64encode(payload[i:i + step]).decode()}))
+                if not told_quiet:
+                    panel.tell({"k": "mic", "loud": False})
 
                 # Wait for the answer, then for the speaker to run out. A
                 # script that asks the next question over the tail of the last

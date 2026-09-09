@@ -439,8 +439,18 @@ const mouth = sink || audioMouth;
 /* ---------------------------------------------------------------------------
    The controller, wired exactly as static/index.html wires it.
    --------------------------------------------------------------------------- */
+/* WHETHER THE DRIVER IS TALKING RIGHT NOW, told by the side that paces the
+   audio. See the note over panel.tell({"k": "mic"}) in live_tool_turns.py. */
+let micLoud = false;
+
 const controller = rt.createController({
   arbiter: require(path.join(REPO, 'static', 'rio_speech.js')).makeArbiter(),
+  /* The meter, as much of it as this harness can honestly report. `out` is
+     held at the floor: what RIO is rendering to a speaker is measured by the
+     page's own audio graph and there is nothing here to measure. The level
+     test reads both and declines when it has no output to compare against,
+     which is the correct behaviour; the turn backstop reads `mic` alone. */
+  levels: () => ({ mic: micLoud ? -12 : -60, out: -60 }),
   send: (obj) => out({ k: 'send', obj }),
   tool: (name, args) => {
     const t = Date.now();
@@ -491,6 +501,16 @@ const controller = rt.createController({
   bargeSustainMs: session.barge_sustain_ms,
   bargeConfirmMs: session.barge_confirm_ms,
   maxResumes: session.max_resumes,
+  /* THE BACKSTOP, and it is listed here because leaving it out cost a whole
+     arm of an experiment. This object is an explicit mapping, not a spread, so
+     a session field nobody names is a field the controller never sees -- and
+     the arm measuring the backstop ran as plain semantic_vad, produced numbers
+     matching the control to within noise, and reported the backstop firing
+     zero times. Which was true, and meant nothing.
+     The same shape had already bitten tools/realtime_selftest.js's harness()
+     an hour earlier, and there is a comment there saying so. */
+  turnBackstopMs: session.turn_backstop_ms,
+  turnBackstopMicDb: session.turn_backstop_mic_db,
   onEvent: (ev) => out({ k: 'note', note: 'live', ev }),
 });
 
@@ -671,6 +691,8 @@ process.stdin.on('data', (d) => {
             remaining_m: st ? Math.round(st.remaining_m || 0) : null,
             tools: controller.state().tools || null,
             speak_stats: RIO.speak.stats ? RIO.speak.stats() : null });
+    } else if (m.k === 'mic') {
+      micLoud = !!m.loud;
     } else if (m.k === 'bye') {
       process.exit(0);
     }

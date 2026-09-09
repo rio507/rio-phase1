@@ -1175,6 +1175,10 @@ def mint_client_secret() -> dict:
             "echo_margin_db": float(config.REALTIME_BARGE_ECHO_MARGIN_DB),
         },
         "barge_echo_floor_db": float(config.REALTIME_BARGE_ECHO_FLOOR_DB),
+        # THE BACKSTOP under semantic_vad's tail. 0 is off, which is the
+        # shipped default; see config.REALTIME_TURN_BACKSTOP_MS.
+        "turn_backstop_ms": int(config.REALTIME_TURN_BACKSTOP_MS),
+        "turn_backstop_mic_db": float(config.REALTIME_TURN_BACKSTOP_MIC_DB),
         # A CANCEL IS A SUPERSEDE ONLY WHEN A REAL NEW QUESTION EXISTS. How
         # long her own voice may still be in the room after she stops, and what
         # counts as hearing herself in a transcript. See config.REALTIME_ECHO_*

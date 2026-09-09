@@ -461,7 +461,44 @@ def look_answer_max_tokens() -> int:
 #   server_vad 700     829m    869m   30/30      3/8   <- what this was
 #   semantic_vad low   762m    942m   26/30*     0/8
 #   semantic_vad med   723m   1678m   29/30*     0/8
-#   semantic_vad high  705m   1308m   50/50      0/40  <- what this is
+#   semantic_vad high  705m   1308m   50/50      0/40  <- what this WAS
+#
+# AND RE-MEASURED ON 2026-09-09, both rows on the same bench in the same hour,
+# because the 3/8 above is what the choice below rested on and it did not
+# survive being checked:
+#
+#   config              p50     p95     max    clean   sentences cut in half
+#   server_vad 700     812m    848m    848m   10/10      0/8   <- what this IS
+#   semantic_vad high  781m   2167m   2167m   10/10      0/8
+#
+#   ...and by gap length, which is where a timer is supposed to fail:
+#   config             350ms   500ms   700ms   900ms
+#   server_vad 700       0/2     0/2     0/2     0/2
+#   semantic_vad high    0/2     0/2     0/2     0/2
+#
+# server_vad cut NOTHING. Not at 350 ms, not at 900 ms. The 3/8 in the row
+# above is from before the bench's TAIL_MS bug was fixed -- the same bug the
+# two starred rows carry a footnote for -- and it was never re-measured for
+# this row, so the argument for semantic_vad was resting on a number the fix
+# had already invalidated. Corrected here rather than quietly overwritten,
+# because the reasoning below was written against it.
+#
+# AND ON A LIVE DRIVE, three runs of the seven-question script per arm
+# (tools/live_tool_turns.py), turn-end measured to the commit:
+#
+#   arm                          first turns       later p50   p95    max  cuts
+#   semantic_vad high      704, 2321, 2306             546   2321   2330     0
+#   server_vad 700           619,  558,  603            620    671    685     0
+#   semantic + 1s backstop  1112, 1091,  423             510   1112   1124     0
+#
+# The p95 is the whole story: 671 ms against 2321. semantic_vad's median is
+# better by 74 ms and its tail is worse by 1.6 SECONDS, and a driver feels the
+# tail. It also has no first-turn penalty -- 558 to 619 ms where semantic_vad
+# spent 704 to 2321 on the same question.
+#
+# So the trade this file was built around is not there. It was real when it was
+# measured and it is not real now, and the honest response to that is to switch
+# and say why.
 #
 # * READ THOSE TWO STARS AS UNKNOWN, NOT AS BAD. Those runs fed a fixed tail
 #   of silence after each question and then stopped sending; a detector
@@ -517,7 +554,12 @@ def look_answer_max_tokens() -> int:
 # is the browser's sustain gate, exactly as REALTIME_BARGE_SUSTAIN_MS says.
 # The server_vad numbers below are kept because server_vad is one env var
 # away and they are what it should be set to.
-REALTIME_TURN_DETECTION = os.getenv("RIO_TURN_DETECTION", "semantic_vad")
+# server_vad since 2026-09-09, on the re-measurement above: same cut rate as
+# semantic_vad (zero, at every gap width tested) and a p95 3.5x better. Set
+# RIO_TURN_DETECTION=semantic_vad to go back, and if you do, consider turning
+# REALTIME_TURN_BACKSTOP_MS on with it -- it caps semantic's tail at 1124 ms
+# where it otherwise runs to 2330.
+REALTIME_TURN_DETECTION = os.getenv("RIO_TURN_DETECTION", "server_vad")
 
 # How ready semantic_vad is to call a sentence finished: low, medium, high or
 # auto. Higher is quicker to end the turn and quicker to be wrong about it.
@@ -529,6 +571,37 @@ REALTIME_SEMANTIC_EAGERNESS = os.getenv("RIO_SEMANTIC_EAGERNESS", "high")
 REALTIME_VAD_THRESHOLD = 0.62
 REALTIME_VAD_PREFIX_MS = 300
 REALTIME_VAD_SILENCE_MS = 700
+
+# ---------------------------------------------------------------------------
+# THE BACKSTOP: a client-side floor under semantic_vad's tail
+# ---------------------------------------------------------------------------
+# semantic_vad is a JUDGEMENT and its tail is unpredictable -- median 705 ms,
+# p95 1308 ms, and measured on live drives the FIRST turn of a session lands
+# between 829 and 2482 ms while every later turn sits near 500. server_vad is a
+# timer: it lands within 100 ms of the same number every time, and it cuts
+# sentences a hesitating driver leaves dangling.
+#
+# This is the third option, and the idea is to take the good half of each: keep
+# semantic_vad deciding, and put a TIMER UNDER IT that only ever fires when the
+# judgement has taken too long. The driver's microphone has been quiet this
+# long and the detector still has not called the turn over, so the browser
+# commits it.
+#
+# 0 DISABLES IT, which is the shipped default until the measurement says
+# otherwise. A backstop that fires on an ordinary turn is server_vad with extra
+# steps -- it has to sit far enough out that it is invisible on the turns
+# semantic_vad handles well and only catches the tail.
+#
+# IT NEEDS A MICROPHONE LEVEL, and that is the honest limit on it: the browser
+# has one (connect() passes `levels`), and a caller that provides no meter gets
+# no backstop rather than a guess. Silence cannot be inferred from the server's
+# own detector, because the server's own detector being slow is the thing being
+# backstopped.
+REALTIME_TURN_BACKSTOP_MS = int(os.getenv("RIO_TURN_BACKSTOP_MS", "0"))
+# What counts as the driver having stopped, in dBFS on the microphone. The
+# barge gate's echo floor is the same kind of number and this sits with it: a
+# cabin at rest is well under this, and speech is well over.
+REALTIME_TURN_BACKSTOP_MIC_DB = -45.0
 
 # INTERRUPTION IS THE CLIENT'S DECISION, NOT THE SERVER'S — see
 # realtime.session_config. The browser mutes RIO the instant the detector fires
