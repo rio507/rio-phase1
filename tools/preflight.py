@@ -6,9 +6,10 @@
 WHY THIS EXISTS
 ---------------
 Only /workspace survives a pod restart. Everything boot.sh installs into the
-container layer -- apt packages, site-packages, the RF-DETR wheel -- is gone on
-every rebuild, and boot.sh has to put it back. When boot.sh does not finish, the
-pod comes up looking fine and behaving differently.
+container layer -- apt packages, site-packages, the RF-DETR wheel, the Chromium
+the browser suites drive -- is gone on every rebuild, and boot.sh has to put it
+back. When boot.sh does not finish, the pod comes up looking fine and behaving
+differently.
 
 On 2026-08-02 that happened. boot.sh completed steps 1-4 and never reached step
 5c, so RF-DETR was absent for a whole day: headway had no candidate source and
@@ -175,6 +176,80 @@ def check_detector():
           "pinned contrib-headless build.",
           "pip uninstall -y opencv-python && pip install --force-reinstall "
           "opencv-contrib-python-headless")
+
+
+def check_browser():
+    head("playwright + chromium (boot.sh step 5d) — the suites that were never run")
+    fix = ("pip install --no-cache-dir playwright && "
+           "python -m playwright install-deps chromium && "
+           "python -m playwright install chromium")
+
+    # WHY THIS IS HERE AT ALL. On 2026-09-09 both browser suites had been
+    # unrunnable on this pod for as long as anyone had been asking for "the
+    # full suite": playwright was in neither requirements.txt nor boot.sh, so
+    # each exited 2 with an install hint. Nobody noticed, because a suite that
+    # CANNOT RUN reads almost exactly like a suite that passes -- no failures,
+    # no red, nothing in a summary line. That is the same shape as the 2026-08-02
+    # detector incident in this file's header: silently degraded, and nothing to
+    # ask. This is the asking.
+    try:
+        import playwright  # noqa: F401
+        ok = True
+    except Exception:
+        ok = False
+    check(ok, "playwright",
+          "tools/output_bus_selftest.py and tools/mobile_layout_selftest.py "
+          "cannot run. They are the only checks the shared audio bus and its "
+          "unlock, and the mobile layout, have -- and neither can be faked in "
+          "node, because what they assert is what a BROWSER does with the page.",
+          fix)
+    if not ok:
+        return
+
+    # Two questions, ONE driver. The module and the browser are separate
+    # installs that fail separately -- `pip install playwright` alone leaves you
+    # importable with nothing to drive -- and the launch is the only way to
+    # catch the apt half, since install-deps is its own boot.sh command and can
+    # fail on its own, leaving a binary that is present and unstartable for want
+    # of libnss3 or a font. Same shape as torch above, where cuda can report
+    # available while the runtime is broken. A headless launch costs ~0.1 s.
+    #
+    # Both asked inside a SINGLE sync_playwright(), because opening a second one
+    # in the same process leaves the first connection's teardown pending and
+    # prints "Task was destroyed but it is pending" and a TargetClosedError
+    # traceback AFTER the summary -- noise out of a file whose entire job is a
+    # checklist somebody can read.
+    present, launched, detail = False, False, ""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            present = Path(pw.chromium.executable_path).exists()
+            if present:
+                try:
+                    browser = pw.chromium.launch()
+                    detail = f" ({browser.version})"
+                    browser.close()
+                    launched = True
+                except Exception as e:
+                    # Wide enough for a path to survive: the first line of a
+                    # launch failure is usually "Executable doesn't exist at
+                    # <path>" or a named missing library, and a cut in the
+                    # middle of either says nothing.
+                    detail = (f" ({type(e).__name__}: "
+                              f"{str(e).splitlines()[0][:140]})")
+    except Exception as e:
+        detail = f" ({type(e).__name__})"
+
+    check(present, "chromium binary present",
+          "playwright imports but has no browser to launch: both suites fail at "
+          "the first line rather than reporting anything about the page.",
+          "python -m playwright install chromium")
+    if not present:
+        return
+    check(launched, "...and it launches" + detail,
+          "the browser is installed but will not start — usually the system "
+          "libraries, which are a separate boot.sh command from the download.",
+          "python -m playwright install-deps chromium")
 
 
 def check_weights():
@@ -390,6 +465,7 @@ def main():
     check_torch()
     check_voice()
     check_detector()
+    check_browser()
     check_weights()
     check_persistent()
     check_server()
