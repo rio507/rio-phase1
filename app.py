@@ -304,6 +304,28 @@ def health():
             # all, the server is answering.
             "readiness": "ok" if not degraded else "degraded",
             "degraded": degraded,
+            # WHAT IS ACTUALLY LOADED, by name. The dashboard's card
+            # subtitles are written from this and from /voice/status: they
+            # used to be typed into the markup, and they were two model
+            # generations stale -- the Perception card said Qwen2.5-VL-3B for
+            # weeks after vision.py had moved to Qwen3-VL-8B, which is a
+            # dashboard telling a driver something false about itself.
+            #
+            # Cheap for the same reason the checks above are: every value is
+            # a module constant or a config attribute already in memory.
+            "models": {
+                "vision": vision.MODEL_ID,
+                "chat": config.OPENAI_CHAT_MODEL,
+                "reasoning": config.OPENAI_REASONING_MODEL,
+                "realtime": config.OPENAI_REALTIME_MODEL,
+                "stt": config.OPENAI_STT_MODEL,
+                # Which of the two above is answering the driver right now
+                # depends on the voice backend, and the panel should not have
+                # to work that out from a string comparison of its own.
+                "dialogue": (config.OPENAI_REALTIME_MODEL
+                             if config.VOICE_BACKEND == "openai_realtime"
+                             else config.OPENAI_CHAT_MODEL),
+            },
             # WHICH DETECTOR THIS PROCESS IS ACTUALLY RUNNING. Not a health
             # question -- eager is a perfectly good answer and is the one the
             # car has been driven on -- but it IS the first thing to ask when a

@@ -206,9 +206,42 @@
   var wired = false;
   var lastInsightSig = null;
 
+  /* The two things outside this column that describe it: the card's subtitle
+     and the header's live dot. Both are written from THIS payload, on this
+     poll, because the alternative is a second source of truth about the same
+     fact -- a header that says "live" over a column that says "lost" is worse
+     than a header with nothing on it.
+
+     The subtitle used to be typed into the markup and named one particular
+     mock ECU whatever was actually plugged in. */
+  function mountSource(snap) {
+    var sub = document.getElementById('subvehicle');
+    if (sub) {
+      sub.textContent = (snap.source_label || snap.provider_label || 'Telemetry')
+                        + ' \u00b7 live telemetry';
+    }
+    var hdr = document.getElementById('hdrlive');
+    if (hdr) {
+      /* connection_state is the server's word for the link, unchanged: live,
+         stale or lost. `available: false` means no provider is configured at
+         all, which is not the same as a link that dropped. */
+      var link = snap.available === false ? 'lost' : (snap.connection_state || 'unknown');
+      hdr.setAttribute('data-link', link);
+      var text = document.getElementById('hdrlivetext');
+      if (text) {
+        text.textContent = link === 'live'  ? 'Telemetry live'
+                         : link === 'stale' ? 'Telemetry stale'
+                         : link === 'lost'  ? 'Telemetry lost'
+                         :                    'Telemetry \u2014';
+      }
+    }
+  }
+
   function mountTelemetry(snap) {
     var banner = $('vehbanner');
     if (banner) banner.replaceChildren(renderStatusBanner(snap));
+
+    mountSource(snap);
 
     var list = $('vehtelemetry');
     if (list) list.replaceChildren(renderTelemetryList(snap.rows));
@@ -243,6 +276,12 @@
      keep whatever they last showed; blanking them would claim the sensors had
      gone quiet, which is a different failure. */
   function mountOffline() {
+    var hdr = document.getElementById('hdrlive');
+    if (hdr) {
+      hdr.setAttribute('data-link', 'lost');
+      var text = document.getElementById('hdrlivetext');
+      if (text) text.textContent = 'Telemetry lost';
+    }
     var banner = $('vehbanner');
     if (!banner) return;
     banner.replaceChildren(renderStatusBanner({

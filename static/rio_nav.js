@@ -454,7 +454,7 @@
         mapsFailed = true;
         if (elMapIdle) {
           elMapIdle.style.display = '';
-          elMapIdle.textContent = 'Map Offline';
+          elMapIdle.textContent = 'Map offline';
           elMapIdle.title = String(e && e.message || e);
         }
         // The MESSAGE, not the Error. A stack here says where the promise
@@ -750,7 +750,7 @@
       RIO.speech.clear('nav:');
       clearMap();
       paintRoute();
-      status(reason || 'No Route Set');
+      status(reason || 'No route set');
     }
 
     /* STOPPING, on purpose. The one path, whoever asked: the Clear button on
@@ -992,7 +992,7 @@
       sim.ms = Math.max(1, mph * MPH_TO_MS);
       sim.s = 0;
       clockS = 0;
-      if (elSim) { elSim.textContent = 'Stop Sim'; elSim.setAttribute('aria-pressed', 'true'); }
+      if (elSim) { elSim.textContent = 'Stop sim'; elSim.setAttribute('aria-pressed', 'true'); }
       RIO.bus.emit('NAV_SIM_START', { speed_ms: Math.round(sim.ms * 100) / 100, mph: mph,
                                       route_id: route.route_id });
       sim.timer = setInterval(function () {
@@ -1013,7 +1013,7 @@
         sim.timer = null;
         if (!quiet) RIO.bus.emit('NAV_SIM_END', { along_m: Math.round(sim.s) });
       }
-      if (elSim) { elSim.textContent = 'Simulate Drive'; elSim.setAttribute('aria-pressed', 'false'); }
+      if (elSim) { elSim.textContent = 'Simulate drive'; elSim.setAttribute('aria-pressed', 'false'); }
     }
 
     if (elSim) {
@@ -1083,6 +1083,6 @@
     };
 
     paintRoute();
-    status('No Route Set');
+    status('No route set');
   });
 })();

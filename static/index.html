@@ -160,6 +160,12 @@
        One duration for state changes and one for the two pulses. Nothing on
        this page animates for decoration. */
     --t-fast: 140ms;
+
+    /* Tells the browser its own widgets are on a dark page. The <audio>
+       element in the Voice Layer card used to be corrected with an
+       invert()/hue-rotate() filter, which is a guess about what Chromium
+       draws and was wrong the last two times Chromium changed it. */
+    color-scheme: dark;
   }
 
   /* ---------------------------------------------------------------------
@@ -247,90 +253,124 @@
      window, which it cannot do from inside a body inset. */
   .pipeline { padding: var(--gap) 20px 24px; }
 
+  /* =====================================================================
+     COMPONENTS
+     ---------------------------------------------------------------------
+     Everything below is the token block above, arranged. Class names are the
+     ones the scripts generate and the markup already carries -- rio_vehicle.js,
+     rio_dtc.js and rio_nav.js build nodes with these names and know nothing
+     about what they look like, which is the whole reason a restyle is a
+     stylesheet change and not a rewrite.
+     ===================================================================== */
+
   /* ---------- header ---------- */
 
   .hud-header {
-    display: flex; align-items: center; gap: 12px;
-    padding-bottom: 14px; margin-bottom: 18px;
-    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; gap: var(--gap);
+    height: var(--header-h); flex: none;
+    padding: 0 28px;
+    border-bottom: 1px solid var(--hairline);
   }
 
+  .hud-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+
+  /* The mark: a rounded tile with the diamond inside it, rather than the
+     diamond alone. A 16px rotated square with a glow was legible on a desk
+     and disappeared against the first bright windscreen. */
   .logo-mark {
-    width: 16px; height: 16px; flex: 0 0 16px;
+    width: 26px; height: 26px; flex: none;
+    border-radius: 7px;
+    background: linear-gradient(135deg, #1b2a44, #0e1524);
+    border: 1px solid var(--accent-edge);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .logo-mark span {
+    display: block; width: 8px; height: 8px;
+    border-radius: 2px; background: var(--accent);
     transform: rotate(45deg);
-    border: 1.5px solid var(--accent);
-    background: radial-gradient(circle at 50% 50%, rgba(155,214,255,0.75) 0%, rgba(95,179,232,0.10) 70%);
-    box-shadow: var(--accent-glow), inset 0 0 6px rgba(155,214,255,0.65);
   }
 
-  .wordmark { display: flex; flex-direction: column; gap: 2px; line-height: 1; }
-
-  .brand {
-    font-family: var(--font-display);
-    font-size: 19px; letter-spacing: 0.18em; text-transform: uppercase;
-    color: var(--text-bright);
-    text-shadow: 0 0 8px rgba(95,179,232,0.55);
+  .wordmark {
+    font-size: 14px; font-weight: 600; letter-spacing: 0.02em;
+    color: var(--t1); white-space: nowrap;
   }
 
+  /* The initials, as a chip. Same pill the HUD and the code badges use. */
   .brand-sub {
-    font-family: var(--font-ui); font-weight: 600;
-    font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: var(--fs-sub); letter-spacing: 0.12em;
+    color: var(--t4);
+    padding: 3px 8px;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-pill);
+    white-space: nowrap;
   }
 
-  .hud-header-meta {
-    margin-left: auto; text-align: right;
-    font-family: var(--font-mono); font-size: 10.5px;
-    letter-spacing: 0.15em; text-transform: uppercase;
-    color: var(--text-dimmer);
+  .hud-header-meta { display: flex; align-items: center; gap: var(--gap); margin-left: auto; }
+
+  /* The live dot. `data-link` is written by rio_vehicle.js from the same
+     payload the health column is painted from -- there is no second poll and
+     no second opinion about whether the car is talking. Unknown until the
+     first one lands, which is the honest state for the first second. */
+  .hdr-live {
+    display: flex; align-items: center; gap: 7px;
+    font-size: 12px; color: var(--t3); white-space: nowrap;
   }
+  .hdr-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--t4); flex: none; }
+  .hdr-live[data-link="live"]  .hdr-dot { background: var(--good); animation: pulse 2.4s ease-in-out infinite; }
+  .hdr-live[data-link="stale"] .hdr-dot { background: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+  .hdr-live[data-link="lost"]  .hdr-dot { background: var(--danger); }
+  .hdr-role { font-size: 12px; color: var(--t4); white-space: nowrap; }
+  /* On a phone the role spells out initials the driver already knows. */
+  @media (max-width: 620px) { .hdr-role { display: none; } }
 
-  /* ---------- 5-column pipeline ---------- */
+  /* ---------- the three regions ---------- */
 
-  /* Vehicle Health is the fifth column and is given slightly more than a share:
-     its telemetry rows carry a name, a value, a status word and a trend arrow
-     on one line, and below about 300px "Throttle Position" starts wrapping
-     into the value column beside it. */
   .pipeline {
-    display: grid;
-    grid-template-columns: 1.3fr 1fr 1fr 1fr 1.2fr;
-    gap: 16px;
-    align-items: start;
+    display: flex; flex-wrap: wrap; align-items: flex-start;
+    gap: var(--gap);
+    flex: 1;
   }
+
+  /* Left rail. Two cards that each hug their own content -- the reason this
+     is a wrapper and not two grid areas is that a Navigation card stretched
+     to the height of the camera stage beside it starts halfway down the page. */
+  .rail {
+    display: flex; flex-direction: column; gap: var(--gap-s);
+    flex: 1 1 260px; max-width: 340px; min-width: 240px;
+  }
+
+  /* Centre. The picture, then the three cards that interpret it. */
+  .stage {
+    display: flex; flex-direction: column; gap: var(--gap);
+    flex: 3 1 480px; min-width: 0;
+  }
+  /* Three across wherever three will fit. 190px is not a guess: the stage is
+     what is left of a 1440px window after the rail's 340 and the health
+     column's 420, which is about 600 -- 240px tracks give two columns and
+     leave the Voice Layer card alone on a second row. */
+  .stage-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: var(--gap);
+  }
+
+  #vehcol { flex: 1 1 340px; max-width: 420px; min-width: 300px; }
 
   .col { display: flex; flex-direction: column; min-width: 0; }
 
-  .col-head {
-    padding-bottom: 10px; margin-bottom: 12px;
-    border-bottom: 1px solid var(--border);
-  }
+  .col-head { margin-bottom: 14px; }
   .col-title {
-    font-family: var(--font-ui); font-weight: 700;
-    font-size: 15px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--text-bright);
-    text-shadow: 0 0 8px rgba(95,179,232,0.35);
+    font-size: var(--fs-title); font-weight: 600; letter-spacing: 0.02em;
+    color: var(--t1); margin-bottom: 2px;
   }
-  .col-sub {
-    font-family: var(--font-mono);
-    font-size: 10.5px; letter-spacing: 0.15em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    margin-top: 4px;
-  }
-
-  /* Stack in the same order on portrait / narrow screens. */
-  @media (max-width: 1000px), (orientation: portrait) {
-    .pipeline { grid-template-columns: 1fr; }
-  }
+  /* The subtitle is the one line on a card that says what is actually loaded.
+     Every one of them is written at runtime -- see the bindSubtitles() block
+     at the foot of the page. */
+  .col-sub { font-size: var(--fs-sub); color: var(--t4); }
 
   /* ---------- buttons ---------- */
 
-  button {
-    font-family: var(--font-ui);
-    border-radius: var(--radius-card);
-    cursor: pointer;
-    min-height: 60px;
-    -webkit-appearance: none; appearance: none;
-  }
+  button { cursor: pointer; -webkit-appearance: none; appearance: none; }
 
   #drive, #mic {
     -webkit-user-select: none; user-select: none;
@@ -338,224 +378,317 @@
     touch-action: manipulation;
   }
 
+  /* The one solid accent button on the page. Everything else is a ghost,
+     which is what makes this one read as the thing to press. */
   #drive {
     position: relative;
     display: block; width: 100%;
-    min-height: 64px; margin: 0 0 12px 0; padding: 14px 18px;
-    font-weight: 700; font-size: 18px;
-    letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--accent-bright);
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    box-shadow: var(--accent-glow), inset 0 0 22px rgba(95,179,232,0.08);
-    clip-path: var(--miter);
-    transition: background 140ms linear, box-shadow 140ms linear, color 140ms linear;
+    margin: 0 0 10px; padding: 13px;
+    border: 1px solid transparent; border-radius: var(--r-inset);
+    background: var(--accent); color: #0b0d10;
+    font-size: 13.5px; font-weight: 600;
+    transition: background var(--t-fast) linear, color var(--t-fast) linear,
+                border-color var(--t-fast) linear;
   }
-  #drive:hover { background: var(--surface-hover); }
-  #drive:disabled { opacity: 0.55; }
+  #drive:hover { filter: brightness(1.12); }
+  #drive:disabled { opacity: 0.55; filter: none; }
+  /* Running. Hollow and red, with the pulse -- a drive in progress is a state
+     to notice, not a button to press again by reflex. */
   #drive.active {
-    color: #ffdede;
-    border-color: var(--red);
-    background: rgba(255,107,107,0.08);
-    box-shadow: 0 0 14px rgba(255,107,107,0.60), inset 0 0 22px rgba(255,107,107,0.10);
-    padding-left: 38px;
+    background: var(--danger-soft); color: var(--danger-text);
+    border-color: var(--danger-line);
+    padding-left: 34px;
   }
   #drive.active::before {
     content: ''; position: absolute;
-    left: 16px; top: 50%; margin-top: -3.5px;
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--red);
-    box-shadow: 0 0 8px var(--red);
+    left: 16px; top: 50%; margin-top: -3px;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--danger);
     animation: livepulse 1.6s ease-in-out infinite;
   }
-  @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
+  /* Ghost button. Every secondary action on the page is one of these. */
   .hud-btn {
-    font-family: var(--font-ui); font-weight: 600;
-    font-size: 12.5px; letter-spacing: 0.15em; text-transform: uppercase;
-    min-height: 60px; padding: 12px 16px; width: 100%;
     display: flex; align-items: center; justify-content: center;
-    border-radius: var(--radius-card);
+    width: 100%; padding: 10px;
+    border-radius: var(--r-ctl);
+    background: transparent;
+    border: 1px solid var(--hairline-strong);
+    color: var(--t2);
+    font-size: var(--fs-body); font-weight: 500;
     cursor: pointer;
-    clip-path: var(--miter);
-    color: var(--accent-bright);
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
+    transition: border-color var(--t-fast) linear, color var(--t-fast) linear;
   }
-  /* Reads as a setting rather than an action: shorter than the buttons it sits
-     with, and hollow when off, the same on/off language #layers and #headway
-     already use at the top of the column. */
+  .hud-btn:hover { border-color: var(--hairline-hover); color: #fff; }
+
+  /* Reads as a setting rather than an action: the filled/hollow ring the
+     Headway and Layers toggles use, in a smaller size. */
   .detect-toggle {
-    min-height: 40px; font-size: 11px;
-    color: var(--accent-bright);
-    background: rgba(95,179,232,0.10);
+    padding: 8px; font-size: var(--fs-sub);
+    color: var(--accent-hover); border-color: var(--accent-line);
+    background: var(--accent-wash);
   }
   .detect-toggle::before { content: '\25C9\00a0\00a0'; }
   .detect-toggle[aria-pressed="false"] {
-    color: var(--text-dimmer);
-    background: transparent;
-    border-color: var(--border);
+    color: var(--t4); background: transparent; border-color: var(--hairline-strong);
   }
   .detect-toggle[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
 
-  .upload-label {
-    color: var(--green);
-    background: rgba(110,231,199,0.07);
-    border: 1px solid rgba(110,231,199,0.45);
-  }
-  #grab {
-    color: #ffdede;
-    background: rgba(255,107,107,0.10);
-    border: 1px solid var(--red);
-  }
+  /* A destructive-ish capture, and the one ghost that is not neutral. */
+  #grab { color: var(--danger-text); border-color: var(--danger-line); background: var(--danger-soft); }
 
-  /* ---------- column 1: camera ---------- */
+  .manual-controls { display: flex; flex-direction: column; gap: var(--gap-xs); margin-top: auto; }
+
+  /* ---------- drive card: the segmented toggles ---------- */
+
+  /* Two INDEPENDENT toggles that share a track, not a radio pair: headway is
+     routinely armed with the overlay off. aria-pressed is the only state and
+     the stylesheet reads nothing else. */
+  .head-toggles {
+    display: flex; gap: 3px;
+    background: var(--inset); border-radius: var(--r-ctl);
+    padding: 3px; margin-bottom: 12px;
+  }
+  .head-toggles button {
+    flex: 1; padding: 8px; border: none; border-radius: var(--r-chip);
+    background: transparent; color: var(--t3);
+    font-size: 12px; font-weight: 500;
+    transition: background var(--t-fast) linear, color var(--t-fast) linear;
+  }
+  .head-toggles button:hover { color: var(--t1); }
+  .head-toggles button[aria-pressed="true"] { background: rgba(255,255,255,0.08); color: #fff; }
+  /* Headway can talk. A toggle that only draws and a toggle that can
+     interrupt the driver should not look identical when both are armed. */
+  #headway[aria-pressed="true"] { background: var(--warn-soft); color: var(--warn-text); }
+
+  /* ---------- drive card: the speed override ---------- */
+
+  .speed-row { display: flex; gap: var(--gap-xs); }
+  .speed-row input {
+    flex: 1 1 auto; min-width: 0;
+    background: var(--inset);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    padding: 9px 12px;
+    color: var(--t1); font-size: var(--fs-body);
+    -webkit-appearance: none; appearance: none;
+  }
+  .speed-row input:focus { border-color: var(--accent-line); }
+  /* The unit is a chip on the end of the field, not a button in the stack:
+     it changes what the number beside it MEANS. */
+  #speedunit {
+    flex: none; display: flex; align-items: center;
+    padding: 0 12px;
+    background: var(--inset);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    font-family: var(--font-mono); font-size: var(--fs-sub);
+    color: var(--t3);
+  }
+  #speedunit[aria-pressed="true"] {
+    color: var(--warn-text); border-color: var(--warn-line); background: var(--warn-soft);
+  }
+  .speed-hint { font-size: var(--fs-micro); color: var(--t5); line-height: 1.5; margin-top: 2px; }
+
+  /* ---------- the camera stage ---------- */
+
+  /* Picture to the edges. The card has no padding of its own; the only thing
+     under the feed is one hairline and the footer strip. */
+  .stage-card { padding: 0; overflow: hidden; }
 
   .cam-wrap {
     position: relative;
-    aspect-ratio: 16 / 9;
-    background: #000;
-    border: 1px solid var(--border-strong);
+    aspect-ratio: 16 / 8.2;
+    background: var(--stage);
     overflow: hidden;
-    margin-bottom: 12px;
   }
-  /* The capture element is now genuinely visible, which also sidesteps the iOS
+  /* The capture element is genuinely visible, which also sidesteps the iOS
      Safari quirk where a fully hidden <video> stops decoding frames. */
   #video { width: 100%; height: 100%; object-fit: cover; display: block; }
 
-  .cam-badge {
-    position: absolute; top: 8px; left: 8px;
-    display: none; align-items: center; gap: 6px;
-    padding: 4px 9px;
-    font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.2em; text-transform: uppercase;
-    color: #ffdede;
-    background: rgba(255,107,107,0.16);
-    border: 1px solid var(--red);
-    box-shadow: 0 0 10px rgba(255,107,107,0.5);
-    z-index: 3;
+  /* Uploaded stills / clips and manual captures share the camera box with the
+     live stream. Layered under the chips (z-index 3) so those stay readable
+     on top of whatever is showing. */
+  #campreview, #preview {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover; background: #000;
+    z-index: 1;
   }
-  body.driving .cam-badge { display: flex; }
-  .cam-badge::before {
-    content: ''; width: 7px; height: 7px; border-radius: 50%;
-    background: var(--red); box-shadow: 0 0 8px var(--red);
-    animation: livepulse 1.6s ease-in-out infinite;
+  #campreview { display: none; }
+
+  /* Perception overlay. Above the media (z-index 1) so boxes land on the
+     frame, below the chips (z-index 3) so those stay readable on top of them.
+     Never interactive: the canvas must not swallow taps meant for the video
+     underneath. */
+  #overlay {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block; pointer-events: none;
+    z-index: 2;
   }
+  body.layers-off #overlay { display: none; }
 
   .cam-nosignal {
     position: absolute; inset: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-family: var(--font-mono); font-size: 11px;
-    letter-spacing: 0.25em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    background: repeating-linear-gradient(
-      0deg, rgba(95,179,232,0.03) 0px, rgba(95,179,232,0.03) 1px, transparent 1px, transparent 4px);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 8px;
     z-index: 2;
+  }
+  .cam-nosignal b {
+    font-family: var(--font-mono); font-weight: 400;
+    font-size: 12px; letter-spacing: 0.22em; color: var(--t4);
+  }
+  .cam-nosignal i {
+    font-style: normal; font-family: var(--font-mono);
+    font-size: var(--fs-sub); color: #3a414c;
   }
   body.driving .cam-nosignal { display: none; }
   /* An upload or a manual capture is occupying the box. */
   body.previewing .cam-nosignal { display: none; }
 
-  /* Uploaded stills / clips and manual captures share the camera box with the
-     live stream. Layered under the badge and status strip (z-index 3) so those
-     stay readable on top of whatever is showing. */
-  #campreview, #preview {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    object-fit: cover;
-    background: #000;
-    z-index: 1;
-  }
-  #campreview { display: none; }
+  /* ---- the chips on the picture ----
+     Two corners, and they are held apart by the LAYOUT rather than by
+     hand-measured offsets. The left group and the right stack each get a
+     bounded share of the width, and the two shares plus the gutters add up to
+     less than the box: that is what makes "they do not collide" a fact about
+     the stylesheet instead of a fact about one browser's font metrics. */
 
-  .cam-overlay {
-    position: absolute; left: 0; right: 0; bottom: 0;
-    display: flex; gap: 14px; flex-wrap: wrap;
-    padding: 7px 10px;
-    background: linear-gradient(180deg, rgba(2,3,8,0) 0%, rgba(2,3,8,0.88) 55%);
-    font-family: var(--font-mono); font-size: 10.5px;
-    letter-spacing: 0.12em; text-transform: uppercase;
+  .cam-badge {
+    position: absolute; top: 14px; left: 16px;
+    display: none; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: var(--r-pill);
+    background: var(--danger-soft); border: 1px solid var(--danger-line);
+    font-family: var(--font-mono); font-size: var(--fs-micro);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--danger-text);
     z-index: 3;
   }
-  .cam-overlay i { font-style: normal; color: var(--text-dimmer); margin-right: 5px; }
-  .cam-overlay b { font-weight: 500; color: var(--text); }
-
-  #drivestatus {
-    font-family: var(--font-mono);
-    font-size: 10.5px; line-height: 1.5;
-    letter-spacing: 0.15em; text-transform: uppercase;
-    color: var(--text);
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    padding: 9px 12px;
-    margin-bottom: 12px;
-    min-height: 1.2em;
-    word-break: break-word;
+  body.driving .cam-badge { display: flex; }
+  .cam-badge::before {
+    content: ''; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--danger);
+    animation: livepulse 1.6s ease-in-out infinite;
   }
-  #drivestatus::before { content: 'STATUS \0020 \25B8 \0020 '; color: var(--text-dimmer); }
-  #drivestatus:empty::after { content: 'STANDBY'; color: var(--text-dimmer); }
 
-  .manual-controls { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
-  /* #preview now lives inside .cam-wrap and is styled with #campreview above. */
-
-  /* Perception overlay. Above the media (z-index 1) so boxes land on the
-     frame, below the badge and status strip (z-index 3) so those stay
-     readable on top of them. Never interactive: the canvas must not swallow
-     taps meant for the video underneath. */
-  #overlay {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    display: block;
-    pointer-events: none;
-    z-index: 2;
-  }
-  body.layers-off #overlay { display: none; }
-
-  /* Fullscreen goes through the WRAP, never the bare <video>. Fullscreening a
-     video element promotes only that element, so the canvas -- a sibling --
-     is left behind on the normal page and the overlay vanishes. Promoting the
-     container takes the canvas along. */
   /* The top-right stack. Two things want that corner -- the fullscreen button
      and the source badge -- and hand-picked `top` offsets for the second one
      only hold while the first one is exactly the height it was on the desk
      browser it was measured in. iOS Safari renders the button taller (its own
      font floor, and a text-size adjustment the page does not control) and the
-     badge landed on top of it. A flex column cannot collide with itself: the
-     badge is placed by the button's real height, whatever that turns out to
-     be, on every browser. */
+     badge landed on top of it. A flex column cannot collide with itself. */
   .cam-tr {
-    position: absolute; top: 8px; right: 8px; z-index: 4;
-    display: flex; flex-direction: column; align-items: flex-end; gap: 6px;
-    max-width: 62%;
+    position: absolute; top: 14px; right: 16px; z-index: 4;
+    display: flex; flex-direction: column; align-items: flex-end; gap: var(--gap-xs);
+    max-width: calc(40% - 24px);
     /* Only the button is a target; the badge must not eat taps meant for the
        picture underneath it. */
     pointer-events: none;
   }
   #camfull {
     position: static; pointer-events: auto;
-    /* The page-wide 60px button floor is for things a driver aims at at
-       speed. This is a corner affordance on top of the picture, and 60px of
-       it was both out of proportion and half the reason the badge below
-       collided with it. 44px is the iOS touch minimum and it stays a real
-       target. */
     display: flex; align-items: center;
-    min-height: 44px;
-    padding: 5px 9px;
-    font-family: var(--font-mono); font-size: 9.5px;
-    letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--accent-bright);
-    background: rgba(6,10,18,0.55);
-    border: 1px solid var(--border-strong);
-    clip-path: var(--miter);
-    cursor: pointer;
+    padding: 4px 12px; border-radius: var(--r-pill);
+    background: var(--scrim);
+    border: 1px solid var(--hairline-strong);
+    font-size: var(--fs-micro); color: var(--t2);
+    white-space: nowrap;
+    transition: color var(--t-fast) linear, border-color var(--t-fast) linear;
   }
+  #camfull:hover { color: #fff; border-color: var(--hairline-hover); }
   #camfull::before { content: '⤡\00a0\00a0'; }
   .cam-wrap.is-full #camfull::before { content: '⤢\00a0\00a0'; }
+  /* A corner affordance on a touch screen is still a touch target. The page's
+     other controls carry their floor unconditionally; this one only needs it
+     where there is a finger, and 44px of pill on a desk is out of proportion
+     with everything else on the picture. */
+  @media (pointer: coarse) { #camfull { min-height: 44px; } }
 
-  /* Both fullscreen paths drop the 16:9 lock and let the media letterbox
-     inside the real screen. object-fit becomes `contain`, which the overlay's
-     mapper reads from computed style on every redraw -- so the boxes follow
-     the letterbox instead of staying on the cropped `cover` geometry. */
+  /* WHICH PICTURE. The bug this replaces was invisible: the clip stayed on
+     screen while the frames came from the phone's front camera, and nothing
+     said so. */
+  .cam-source {
+    position: static;
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 12px; border-radius: var(--r-pill);
+    background: var(--scrim);
+    border: 1px solid var(--hairline-strong);
+    font-family: var(--font-mono);
+    font-size: var(--fs-micro); letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--t3);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cam-source.src-camera { color: var(--t2); }
+  /* A drive running off a file is a test, not a drive -- the same amber
+     everything else on this page uses for "not the normal arrangement". */
+  .cam-source.src-clip { color: var(--warn-text); border-color: var(--warn-line); }
+  .cam-source.src-none { color: var(--t5); }
+
+  /* ---- the headway HUD ----
+     One pill per fact. They wrap inside their own share of the width rather
+     than growing into the right-hand stack. */
+  #headwayhud {
+    position: absolute; top: 14px; left: 16px;
+    display: none; flex-wrap: wrap; gap: var(--gap-xs);
+    max-width: calc(60% - 24px);
+    z-index: 3; pointer-events: none;
+  }
+  body.driving #headwayhud { top: 46px; }   /* clear the LIVE badge */
+  body.headway-on #headwayhud { display: flex; }
+  #headwayhud .hw-band, #headwayhud .hw-line {
+    font-family: var(--font-mono); font-size: var(--fs-micro);
+    color: var(--t3);
+    background: var(--scrim);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-pill);
+    padding: 4px 10px;
+    white-space: nowrap;
+    transition: color var(--t-fast) linear, border-color var(--t-fast) linear,
+                background var(--t-fast) linear;
+  }
+  #headwayhud .hw-band {
+    color: var(--t2); letter-spacing: var(--ls-mono); text-transform: uppercase;
+  }
+  #headwayhud i { font-style: normal; color: var(--t5); text-transform: uppercase; }
+  #headwayhud b { font-weight: 500; color: var(--t2); }
+  /* Lane source. Accent when the corridor is real paint, dim when it has
+     fallen back to the trapezoid -- deliberately not amber or red: falling
+     back is correct behaviour in rain and at night, not a fault to alarm
+     about. */
+  #headwayhud b.hw-lanesrc.src-ufld   { color: var(--accent); }
+  #headwayhud b.hw-lanesrc.src-static { color: var(--t5); }
+  #headwayhud b.hw-speedsrc           { font-size: 0.9em; opacity: .85; margin-left: 4px; }
+  #headwayhud b.hw-speedsrc.src-obd   { color: var(--accent); }
+  #headwayhud b.hw-speedsrc.src-gps   { color: var(--t5); }
+  /* Coasted or disagreeing: amber, because "wider margins" is a state the
+     driver should be able to see without being alarmed by it. */
+  #headwayhud b.hw-speedsrc.degraded  { color: var(--warn); }
+  #headwayhud b.hw-speedsrc.src-none  { color: var(--warn); }
+
+  /* One class per band. The colour IS the warning at a glance. */
+  #headwayhud.hw-NORMAL .hw-band { color: var(--accent); border-color: var(--accent-line); }
+  #headwayhud.hw-GETTING_UNSAFE .hw-band {
+    color: var(--warn-text); border-color: var(--warn-line); background: var(--warn-soft);
+  }
+  #headwayhud.hw-UNSAFE .hw-band {
+    color: var(--danger-text); border-color: var(--danger-line); background: var(--danger-soft);
+  }
+  /* Amber rather than dim: "Bad Range" is not a quiet state like Low Speed,
+     it is the system saying it does not believe its own measurement. */
+  #headwayhud.hw-IMPLAUSIBLE .hw-band { color: var(--warn-text); border-color: var(--warn-line); }
+  #headwayhud.hw-SUPPRESSED .hw-band,
+  #headwayhud.hw-UNKNOWN .hw-band { color: var(--t4); }
+
+  /* ---- fullscreen ----
+     Fullscreen goes through the WRAP, never the bare <video>. Fullscreening a
+     video element promotes only that element, so the canvas -- a sibling -- is
+     left behind on the normal page and the overlay vanishes. Promoting the
+     container takes the canvas along.
+
+     Both paths drop the aspect lock and let the media letterbox inside the real
+     screen. object-fit becomes `contain`, which the overlay's mapper reads from
+     computed style on every redraw -- so the boxes follow the letterbox instead
+     of staying on the cropped `cover` geometry. */
   .cam-wrap:fullscreen, .cam-wrap:-webkit-full-screen {
     width: 100vw; height: 100vh; aspect-ratio: auto; border: none;
   }
@@ -575,935 +708,301 @@
   .cam-wrap.pseudo-full #video, .cam-wrap.pseudo-full #campreview,
   .cam-wrap.pseudo-full #preview { object-fit: contain; }
 
-  .col-head-row {
-    display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+  /* ---- the footer under the picture ----
+     The counters and the drive status, under the feed rather than on it. They
+     answer "is this thing running", which is a question asked between glances
+     at the road, not during one. */
+  .stage-foot {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: var(--gap-xs) var(--gap);
+    padding: 12px 16px;
+    border-top: 1px solid var(--rule);
   }
+  .cam-overlay {
+    display: flex; flex-wrap: wrap; gap: var(--gap-xs) 20px;
+    font-family: var(--font-mono); font-size: var(--fs-sub);
+    color: var(--t4);
+  }
+  .cam-overlay span { display: inline-flex; align-items: baseline; gap: 6px; }
+  .cam-overlay i {
+    font-style: normal; text-transform: uppercase; letter-spacing: var(--ls-mono);
+    color: var(--t4);
+  }
+  .cam-overlay b { font-weight: 400; color: var(--t2); }
 
-  #layers {
-    font-family: var(--font-mono);
-    font-size: 9.5px; letter-spacing: 0.2em; text-transform: uppercase;
-    padding: 5px 9px; flex: none;
-    cursor: pointer;
-    color: var(--accent-bright);
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-    box-shadow: var(--accent-glow);
-    clip-path: var(--miter);
-    white-space: nowrap;
+  /* The dot is the element's own background rather than a pseudo-element:
+     ::before already carries the "Status ·" prefix and ::after the standby
+     fallback, and a control that says what it is doing should not have to
+     give one of those up to also show a colour. */
+  #drivestatus {
+    display: flex; align-items: center;
+    min-height: 1.2em; min-width: 0;
+    padding-left: 14px;
+    font-size: var(--fs-sub); line-height: 1.5;
+    color: var(--t3);
+    word-break: break-word;
+    background: radial-gradient(circle 3px at 3px 50%, var(--t4) 0 100%, transparent 100%) no-repeat;
   }
-  #layers::before { content: '\25C9\00a0\00a0'; }
-  #layers[aria-pressed="false"] {
-    color: var(--text-dimmer);
-    background: transparent;
-    border-color: var(--border);
-    box-shadow: none;
-  }
-  #layers[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
-
-  /* ---------- live headway ---------- */
-
-  .head-toggles { display: flex; gap: 6px; flex: none; align-items: flex-start; }
-
-  /* Shares #layers' shape so the two toggles read as one control group, but
-     amber when armed: this one can talk, and that should look different from a
-     toggle that only draws. */
-  #headway {
-    font-family: var(--font-mono);
-    font-size: 9.5px; letter-spacing: 0.2em; text-transform: uppercase;
-    padding: 5px 9px; flex: none;
-    cursor: pointer;
-    color: #1a1206;
-    background: var(--amber);
-    border: 1px solid var(--amber);
-    box-shadow: 0 0 12px rgba(255,184,77,0.55);
-    clip-path: var(--miter);
-    white-space: nowrap;
-  }
-  #headway::before { content: '\25C9\00a0\00a0'; }
-  #headway[aria-pressed="false"] {
-    color: var(--text-dimmer);
-    background: transparent;
-    border-color: var(--border);
-    box-shadow: none;
-  }
-  #headway[aria-pressed="false"]::before { content: '\25CB\00a0\00a0'; }
-
-  /* Band/tau strip. Sits under the LIVE badge (top-left, z-index 3) so neither
-     covers the other, and stays out of #camfull's corner. */
-  /* The source badge. Top-left of the camera box, opposite the LIVE badge:
-     the two answer different questions ("is a drive running" vs "of what") and
-     both have to be readable at a glance. */
-  .cam-source {
-    /* Top RIGHT, under the fullscreen button -- as a sibling row in .cam-tr,
-       so "under" is a fact of the layout rather than a 36px guess. The left
-       column is taken: the LIVE badge and the headway HUD both live there and
-       already shuffle around each other when a drive starts. */
-    position: static;
-    display: flex; align-items: center; gap: 6px;
-    padding: 4px 9px; border-radius: 4px;
-    background: rgba(2, 3, 8, 0.72);
-    border: 1px solid rgba(120, 165, 205, 0.35);
-    border-left-width: 3px;
-    font-family: 'JetBrains Mono', ui-monospace, monospace;
-    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dim);
-    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .cam-source.src-camera { border-left-color: var(--blue); color: var(--text); }
-  /* Amber, like everything else on this page that means "not the normal
-     arrangement": a drive running off a file is a test, not a drive. */
-  .cam-source.src-clip { border-left-color: var(--amber); color: var(--amber); }
-  .cam-source.src-none { border-left-color: var(--text-dimmer); }
-  /* Nothing to dodge on this side, so it stays put whether or not a drive
-     is running -- which also means it does not move at the exact moment the
-     driver is checking what it says. */
-
-  #headwayhud {
-    position: absolute; top: 8px; left: 8px;
-    display: none; flex-direction: column; gap: 4px;
-    padding: 6px 10px;
-    font-family: var(--font-mono); font-size: 11px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text);
-    background: rgba(2,3,8,0.72);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--text-dimmer);
-    z-index: 3;
-    pointer-events: none;
-    min-width: 168px;
-    transition: border-left-color 120ms linear, box-shadow 120ms linear;
-  }
-  body.driving #headwayhud { top: 40px; }   /* clear the LIVE badge */
-  body.headway-on #headwayhud { display: flex; }
-  #headwayhud .hw-band { font-weight: 500; font-size: 12px; letter-spacing: 0.18em; }
-  #headwayhud .hw-line { color: var(--text-dim); font-size: 10px; }
-  #headwayhud .hw-line b { color: var(--text); font-weight: 500; }
-  /* Lane source. Cyan when the corridor is real paint, dim when it has fallen
-     back to the trapezoid -- deliberately not amber or red: falling back is
-     correct behaviour in rain and at night, not a fault to alarm about. */
-  #headwayhud b.hw-lanesrc.src-ufld   { color: var(--blue); }
-  #headwayhud b.hw-lanesrc.src-static { color: var(--text-dimmer); }
-  #headwayhud b.hw-speedsrc            { font-size: 0.85em; opacity: .8; margin-left: 4px; }
-  #headwayhud b.hw-speedsrc.src-obd    { color: var(--blue); }
-  #headwayhud b.hw-speedsrc.src-gps    { color: var(--text-dimmer); }
-  /* Coasted or disagreeing: amber, because "wider margins" is a state the
-     driver should be able to see without being alarmed by it. */
-  #headwayhud b.hw-speedsrc.degraded   { color: var(--amber, #ffb84d); }
-  #headwayhud b.hw-speedsrc.src-none   { color: var(--amber, #ffb84d); }
-
-  /* One class per band. The colour IS the warning at a glance, so it drives the
-     rail, the label and the glow together. */
-  #headwayhud.hw-NORMAL         { border-left-color: var(--blue); }
-  #headwayhud.hw-NORMAL .hw-band { color: var(--blue); }
-  #headwayhud.hw-GETTING_UNSAFE { border-left-color: var(--amber); box-shadow: 0 0 14px rgba(255,184,77,0.28); }
-  #headwayhud.hw-GETTING_UNSAFE .hw-band { color: var(--amber); }
-  #headwayhud.hw-UNSAFE         { border-left-color: var(--red); box-shadow: 0 0 18px rgba(255,107,107,0.42); }
-  #headwayhud.hw-UNSAFE .hw-band { color: var(--red); }
-  #headwayhud.hw-SUPPRESSED .hw-band,
-  #headwayhud.hw-UNKNOWN .hw-band { color: var(--text-dimmer); }
-  /* Amber rather than dim: "Bad Range" is not a quiet state like Low Speed, it
-     is the system telling the driver it does not believe its own measurement,
-     and that is worth noticing. */
-  #headwayhud.hw-IMPLAUSIBLE      { border-left-color: var(--amber); }
-  #headwayhud.hw-IMPLAUSIBLE .hw-band { color: var(--amber); }
-
-  .speed-row {
-    display: flex; align-items: stretch; gap: 8px;
-  }
-  .speed-row input {
-    flex: 1 1 auto; min-width: 0;
-    font-family: var(--font-mono); font-size: 12px;
-    padding: 10px 12px;
-    color: var(--text-bright);
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: 0;
-    -webkit-appearance: none; appearance: none;
-  }
-  .speed-row input:focus { outline: none; border-color: var(--border-strong); }
-  .speed-row button {
-    flex: 0 0 auto; min-height: 0; padding: 10px 12px;
-    font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.15em; text-transform: uppercase;
-    color: var(--accent-bright);
-    background: var(--surface-2);
-    border: 1px solid var(--border-strong);
-  }
-  .speed-row button[aria-pressed="true"] {
-    color: #1a1206; background: var(--amber); border-color: var(--amber);
-  }
-  .speed-hint {
-    font-family: var(--font-mono); font-size: 9.5px;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    margin-top: -2px;
+  #drivestatus::before { content: 'Status \00b7\00a0'; color: var(--t5); }
+  #drivestatus:empty::after { content: 'Standby'; color: var(--t4); }
+  body.driving #drivestatus {
+    background-image: radial-gradient(circle 3px at 3px 50%, var(--good) 0 100%, transparent 100%);
   }
 
   /* ---------- navigation ---------- */
 
-  /* Nested inside the camera column the way .audio-panel nests in the voice
-     column, so it reads as a sub-panel of that column rather than a fifth
-     pipeline stage. */
-  .nav-panel { margin-top: 14px; }
-
-  .nav-head {
-    padding-bottom: 8px; margin-bottom: 10px;
-    border-bottom: 1px solid var(--border);
-  }
-  .nav-head .col-title { font-size: 13px; }
-
   .nav-empty {
-    font-family: var(--font-mono);
-    font-size: 10.5px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    padding: 9px 12px; margin-bottom: 8px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-  }
-  .nav-empty::before { content: '\25B8\0020\0020'; }
-
-  .nav-dest {
-    display: block; width: 100%;
+    display: flex; align-items: center; gap: var(--gap-xs);
     padding: 10px 12px; margin-bottom: 10px;
-    font-family: var(--font-mono); font-size: 12px;
-    color: var(--text-bright);
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: 0;
+    background: var(--inset); border-radius: var(--r-ctl);
+    font-size: 12px; color: var(--t3);
+    word-break: break-word;
+  }
+  .nav-empty::before {
+    content: ''; flex: none;
+    width: 6px; height: 6px; border-radius: 50%; background: var(--t5);
+  }
+
+  /* Destination on its own line, the two actions sharing the one below it --
+     an address is long and a 90px input beside two buttons is unusable. */
+  .nav-destrow { display: flex; flex-wrap: wrap; gap: var(--gap-xs); margin-bottom: var(--gap-xs); }
+  .nav-dest {
+    flex: 1 1 100%; min-width: 0;
+    background: var(--inset);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    padding: 9px 12px;
+    color: var(--t1); font-size: var(--fs-body);
     -webkit-appearance: none; appearance: none;
   }
-  .nav-dest:focus { outline: none; border-color: var(--border-strong); }
+  .nav-dest:focus { border-color: var(--accent-line); }
   /* Only disabled if the page is served without a Maps key. */
-  .nav-dest:disabled { opacity: 1; color: var(--text-dimmer); cursor: not-allowed; }
-  .nav-dest::placeholder {
-    color: var(--text-dimmer);
-    letter-spacing: 0.15em; text-transform: uppercase;
-  }
+  .nav-dest:disabled { opacity: 1; color: var(--t5); cursor: not-allowed; }
 
-  .nav-destrow { display: flex; gap: 6px; align-items: stretch; margin-bottom: 8px; }
-  .nav-destrow .nav-dest { margin-bottom: 0; flex: 1; min-width: 0; }
-  /* Compact next to the destination box: these are desk controls, not the
-     drive-safe targets #mic and #drive are. */
-  .nav-btn {
-    width: auto; min-height: 0; flex: 0 0 auto;
-    padding: 0 12px; font-size: 11px; letter-spacing: 0.12em;
+  .nav-btn { flex: 1 1 0; width: auto; padding: 9px; font-size: 12px; }
+  /* The affirmative one. */
+  .nav-btn-go, .nav-btn[aria-pressed="true"] {
+    background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-hover);
   }
-  .nav-btn[aria-pressed="true"] {
-    color: #1a1206; background: var(--amber); border-color: var(--amber);
+  .nav-btn-go:hover, .nav-btn[aria-pressed="true"]:hover {
+    background: rgba(110,168,255,0.20); color: #fff; border-color: var(--accent-edge);
   }
 
   /* Autocomplete, rendered here rather than by Google's own widget: one key
      surface (the suggest call is server-side) and it can be made to look like
-     the rest of the HUD. */
+     the rest of the page. */
   .nav-suggest {
-    margin: -6px 0 10px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
+    margin: -2px 0 10px;
+    background: var(--inset);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-inset);
     max-height: 190px; overflow-y: auto;
   }
-  .nav-sug {
-    padding: 8px 10px; cursor: pointer;
-    border-bottom: 1px solid rgba(95,179,232,0.10);
-  }
+  .nav-sug { padding: 9px 12px; cursor: pointer; border-bottom: 1px solid var(--rule); }
   .nav-sug:last-child { border-bottom: 0; }
-  .nav-sug:hover { background: var(--surface-hover); }
-  .nav-sug b {
-    display: block; font-family: var(--font-mono); font-weight: 500;
-    font-size: 11.5px; color: var(--text-bright);
-  }
+  .nav-sug:hover { background: rgba(255,255,255,0.04); }
+  .nav-sug b { display: block; font-weight: 500; font-size: 12px; color: var(--t1); }
   .nav-sug i {
     display: block; font-style: normal;
-    font-family: var(--font-mono); font-size: 10px;
-    color: var(--text-dimmer); margin-top: 2px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    color: var(--t5); margin-top: 3px;
   }
 
-  .nav-summary { display: flex; gap: 6px; margin-bottom: 8px; }
+  .nav-summary { display: flex; flex-wrap: wrap; gap: var(--gap-xs); margin-bottom: var(--gap-xs); }
   .nav-summary span {
-    flex: 1; padding: 7px 9px;
-    background: var(--bg-1); border: 1px solid var(--border);
-    font-family: var(--font-mono);
+    flex: 1 1 0; min-width: 0;
+    padding: 9px 10px;
+    background: var(--inset); border-radius: var(--r-inset);
   }
   .nav-summary i {
     display: block; font-style: normal;
-    font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase;
-    color: var(--text-dimmer); margin-bottom: 3px;
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5); margin-bottom: 3px;
   }
-  .nav-summary b { font-weight: 500; font-size: 12.5px; color: var(--text); }
+  .nav-summary b {
+    font-family: var(--font-mono); font-weight: 500;
+    font-size: 12.5px; color: var(--t2);
+  }
+  .nav-state b { font-size: var(--fs-sub); }
 
   /* The current maneuver. The one thing in this panel a driver may glance at,
      so it is the brightest thing in it and the distance is the largest text. */
   .nav-man {
     display: flex; align-items: center; gap: 10px;
-    padding: 10px 12px; margin-bottom: 10px;
-    background: var(--bg-1);
-    border: 1px solid var(--border-strong);
-    box-shadow: inset 0 0 22px rgba(95,179,232,0.06);
-    clip-path: var(--miter);
+    padding: 12px 14px; margin-bottom: 10px;
+    background: var(--accent-wash);
+    border: 1px solid rgba(110,168,255,0.12);
+    border-radius: var(--r-inset);
   }
-  .nav-man-icon {
-    flex: 0 0 auto; font-size: 22px; line-height: 1;
-    color: var(--accent-bright);
-    text-shadow: 0 0 10px rgba(95,179,232,0.65);
-  }
-  .nav-man-text {
-    flex: 1; min-width: 0;
-    font-family: var(--font-ui); font-weight: 600;
-    font-size: 14px; line-height: 1.3;
-    color: var(--text-bright);
-  }
-  .nav-man-dist {
-    flex: 0 0 auto;
-    font-family: var(--font-mono); font-size: 15px;
-    color: var(--amber);
-  }
+  .nav-man-icon { flex: none; font-size: 20px; line-height: 1; color: var(--accent); }
+  .nav-man-text { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; line-height: 1.3; color: var(--t1); }
+  .nav-man-dist { flex: none; font-family: var(--font-mono); font-size: 14px; color: var(--warn-text); }
 
-  /* Desk controls. Deliberately last and deliberately dimmer: this row is for
-     testing announcements without a car, and it should never read as part of
-     the driving surface. */
-  .nav-state { margin-top: 2px; }
-  .nav-state b { font-size: 11px; letter-spacing: 0.04em; }
+  /* Debug, and dashed like every other development affordance here: what RIO
+     verified must never look like part of the driving surface. */
   .nav-anchor {
-    margin-bottom: 8px; padding: 5px 8px; border: 1px dashed var(--border);
-    border-radius: 3px; font-size: 11px; color: var(--text-dim);
-    letter-spacing: 0.02em;
+    margin-bottom: var(--gap-xs); padding: 7px 10px;
+    border: 1px dashed var(--hairline-strong); border-radius: var(--r-ctl);
+    font-size: var(--fs-sub); color: var(--t3);
   }
   .nav-anchor b { color: var(--accent); font-weight: 500; }
 
-  .nav-dev { display: flex; gap: 6px; margin-top: 10px; }
-  .nav-dev input {
-    min-width: 0;
-    padding: 7px 9px;
-    font-family: var(--font-mono); font-size: 11px;
-    color: var(--text); background: var(--bg-1);
-    border: 1px solid var(--border);
-    -webkit-appearance: none; appearance: none; border-radius: 0;
-  }
-  .nav-dev input:focus { outline: none; border-color: var(--border-strong); }
-  .nav-dev input::placeholder { color: var(--text-dimmer); }
-  #navsimspeed { flex: 0 0 70px; }
-  #navorigin { flex: 1; }
-
-  /* Same 16:9 lock and corner brackets as the camera box. */
+  /* The map. An aspect lock rather than the mockup's fixed 120px: this box
+     holds a real route once one is set, and a route needs area. */
   .nav-map {
     position: relative;
-    aspect-ratio: 16 / 9;
-    background: #000;
-    border: 1px solid var(--border-strong);
+    aspect-ratio: 16 / 9; min-height: 120px;
+    margin-top: 12px;
+    border-radius: var(--r-inset);
+    border: 1px solid rgba(255,255,255,0.05);
+    background: var(--hatch);
     overflow: hidden;
   }
   .nav-map-idle {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
-    font-family: var(--font-mono); font-size: 11px;
-    letter-spacing: 0.25em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    background: repeating-linear-gradient(
-      0deg, rgba(95,179,232,0.03) 0px, rgba(95,179,232,0.03) 1px, transparent 1px, transparent 4px);
+    font-family: var(--font-mono); font-size: var(--fs-micro);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5);
     z-index: 1;
   }
 
-  /* ---------- column 2: perception ---------- */
+  /* Desk controls. Deliberately last and deliberately dimmer: this row is for
+     testing announcements without a car. */
+  .nav-dev { display: flex; gap: var(--gap-xs); margin-top: 12px; }
+  .nav-dev .nav-btn { flex: 0 0 auto; padding: 9px 12px; white-space: nowrap; }
+  .nav-dev input {
+    min-width: 0; padding: 9px 10px;
+    background: var(--inset);
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    color: var(--t1); font-size: var(--fs-body);
+    -webkit-appearance: none; appearance: none;
+  }
+  .nav-dev input:focus { border-color: var(--accent-line); }
+  #navsimspeed { flex: 0 0 48px; text-align: center; font-family: var(--font-mono); padding: 9px 4px; }
+  #navorigin { flex: 1 1 0; }
+
+  /* ---------- perception ---------- */
 
   #observation {
-    font-family: var(--font-mono);
-    font-size: 11.5px; line-height: 1.65;
-    color: var(--text);
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-card);
-    padding: 14px;
+    flex: 1;
+    background: var(--inset); border-radius: var(--r-inset);
+    padding: 14px; min-height: 72px;
+    font-size: var(--fs-body); line-height: 1.6; color: var(--t3);
     white-space: pre-wrap; word-wrap: break-word;
-    margin-bottom: 14px;
+    margin-bottom: 12px;
   }
 
-  .history { display: flex; flex-direction: column; gap: 8px; max-height: 320px; overflow-y: auto; }
-  .history::-webkit-scrollbar { width: 4px; }
-  .history::-webkit-scrollbar-thumb { background: var(--border-strong); }
-
+  .history { display: flex; flex-direction: column; gap: var(--gap-xs); max-height: 320px; overflow-y: auto; }
   .hist-item {
-    font-family: var(--font-mono); font-size: 11px; line-height: 1.55;
-    padding: 8px 10px;
-    background: var(--bg-1);
-    border-left: 2px solid var(--border);
-    color: var(--text-dim);
+    padding: 9px 12px;
+    background: var(--inset); border-radius: var(--r-ctl);
+    font-size: 12px; line-height: 1.5; color: var(--t4);
   }
   /* Newest entry reads bright; the rest recede. */
-  .history .hist-item:first-child { color: var(--text); border-left-color: var(--accent); }
+  .history .hist-item:first-child { color: var(--t3); box-shadow: inset 2px 0 0 var(--accent-line); }
   .hist-time {
     display: block; margin-bottom: 4px;
-    font-size: 9.5px; letter-spacing: 0.18em; color: var(--text-dimmer);
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t5);
   }
 
-  /* ---------- column 3: dialogue ---------- */
+  /* ---------- dialogue ---------- */
 
-  .turn { padding: 10px 12px; background: var(--bg-1); border: 1px solid var(--border); margin-bottom: 10px; }
+  .turn { padding: 12px 14px; margin-bottom: var(--gap-xs); border-radius: var(--r-inset); }
+  .turn-driver { background: var(--inset); }
+  /* RIO's side is tinted, so which one of you said a thing is answered by
+     colour before it is answered by the tag. */
+  .turn-rio { background: var(--accent-wash); border: 1px solid rgba(110,168,255,0.12); }
   .turn-tag {
-    font-family: var(--font-mono); font-size: 9.5px;
-    letter-spacing: 0.22em; text-transform: uppercase;
-    margin-bottom: 5px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    margin-bottom: 4px;
   }
-  .turn-driver .turn-tag { color: var(--text-dimmer); }
+  .turn-driver .turn-tag { color: var(--t5); }
   .turn-rio .turn-tag { color: var(--accent); }
-  .turn-route { color: var(--text-dimmer); letter-spacing: 0.16em; }
-  .turn-text { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text); }
-  .turn-rio .turn-text { color: var(--text-bright); }
-  .turn-empty { color: var(--text-dimmer); font-family: var(--font-mono); font-size: 11px; }
+  .turn-route { color: var(--t5); margin-left: 6px; }
+  /* The transcript label sits at the foot of the card, the way HISTORY does in
+     the Perception card next to it -- the two are the same kind of label and
+     the cards are the same height, so they should land on the same line. */
+  .turn-rio { margin-bottom: auto; }
+  .turn-text { font-size: var(--fs-body); line-height: 1.5; color: var(--t3); }
+  .turn-rio .turn-text { color: var(--t2); }
+  .turn-empty { color: var(--t4); }
 
-  /* ---------- column 4: voice layer ---------- */
+  /* ---------- voice layer ---------- */
 
-  .ring-wrap { display: flex; justify-content: center; padding: 18px 0 14px; }
+  .ring-wrap { display: flex; justify-content: center; padding: 18px 0; }
   .ring {
     position: relative;
-    width: 120px; height: 120px; border-radius: 50%;
+    width: 88px; height: 88px; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    border: 2px solid rgba(95,179,232,0.30);
-    background: radial-gradient(circle at 50% 50%, rgba(95,179,232,0.06), transparent 70%);
+    border: 1px solid var(--accent-edge);
+    background: radial-gradient(circle at 50% 40%, var(--accent-soft), transparent 70%);
     transition: border-color 160ms linear, box-shadow 160ms linear;
   }
   .ring-state {
-    font-family: var(--font-mono); font-size: 10.5px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
     letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--text-dimmer);
+    color: var(--accent);
   }
   .ring.listening {
-    border-color: var(--red);
-    box-shadow: 0 0 22px rgba(255,107,107,0.55), inset 0 0 22px rgba(255,107,107,0.12);
-    animation: ringpulse 1.2s ease-in-out infinite;
+    border-color: var(--good);
+    background: radial-gradient(circle at 50% 40%, var(--good-soft), transparent 70%);
+    animation: ringpulse 1.6s ease-in-out infinite;
   }
-  .ring.listening .ring-state { color: #ffdede; }
-  @keyframes ringpulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.06); } }
+  .ring.listening .ring-state { color: var(--good); }
+  @keyframes ringpulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.04); } }
 
-  .ring.speaking {
-    border-color: var(--accent-bright);
-    box-shadow: 0 0 26px rgba(95,179,232,0.70), inset 0 0 26px rgba(95,179,232,0.15);
-  }
-  .ring.speaking .ring-state { color: var(--accent-bright); }
+  .ring.speaking { border-color: var(--accent-hover); box-shadow: 0 0 0 5px var(--accent-wash); }
+  .ring.speaking .ring-state { color: var(--accent-hover); }
+  /* A sweep, not a glow: it says audio is moving right now, which a static
+     colour cannot. */
   .ring.speaking::before {
-    content: ''; position: absolute; inset: -7px;
+    content: ''; position: absolute; inset: -6px;
     border-radius: 50%;
-    background: conic-gradient(from 0deg, transparent 0deg, rgba(95,179,232,0.85) 90deg, transparent 180deg);
-    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
-    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    background: conic-gradient(from 0deg, transparent 0deg, var(--accent) 90deg, transparent 180deg);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
     animation: ringspin 1.8s linear infinite;
   }
   @keyframes ringspin { to { transform: rotate(360deg); } }
 
   .spoken {
-    font-family: var(--font-ui); font-style: italic;
-    font-size: 14px; line-height: 1.5; text-align: center;
-    color: var(--text-dim);
     min-height: 3em; padding: 0 4px 14px;
+    font-size: 13px; font-style: italic; line-height: 1.5; text-align: center;
+    color: var(--t4);
   }
-  .spoken.has-line { color: var(--text-bright); }
+  .spoken.has-line { color: var(--t2); }
 
-  .chips { display: flex; gap: 8px; margin-bottom: 12px; }
-  .chip {
-    flex: 1; padding: 8px 10px;
-    background: var(--bg-1); border: 1px solid var(--border);
-    font-family: var(--font-mono);
-  }
+  .chips { display: flex; gap: var(--gap-xs); margin-bottom: 12px; }
+  .chip { flex: 1 1 0; min-width: 0; padding: 10px 12px; background: var(--inset); border-radius: var(--r-inset); }
+  /* Two chips share a 190px column at the narrowest the stage grid goes, so
+     the label is sized to fit "ROUND TRIP" on one line there rather than
+     wrapping under its own value. */
   .chip i {
     display: block; font-style: normal;
-    font-size: 9.5px; letter-spacing: 0.18em; text-transform: uppercase;
-    color: var(--text-dimmer); margin-bottom: 3px;
-  }
-  .chip b { font-weight: 500; font-size: 13px; color: var(--text); }
-
-  .audio-panel { margin-top: auto; }
-  .audio-panel audio {
-    display: block; width: 100%;
-    filter: invert(92%) hue-rotate(175deg) saturate(0.85) brightness(1.05);
-  }
-
-  /* ---------- column 5: vehicle health ----------
-
-     Everything below is colour and geometry only. Not one threshold, not one
-     number and not one piece of wording lives in this stylesheet or in
-     rio_vehicle.js — the server sends the status name, this decides what that
-     status looks like. See telemetry.py and insights.py.
-
-     The palette is the dashboard's, unchanged: cyan is normal, amber is
-     "attention recommended", red is "immediate issue", and --text-dimmer means
-     nobody is answering. A dimmed row is not a failing sensor and it must not
-     look like one.
-
-     No gauges, no circular meters, no vehicle graphic. A telemetry screen is a
-     list of channels, and the reason professional motorsport software looks
-     like this is that a list is the only layout where adding the twentieth
-     channel costs nothing. */
-
-  .veh-section {
-    margin: 16px 0 8px;
-    padding-bottom: 5px;
-    font-family: var(--font-ui); font-weight: 700;
-    font-size: 11px; letter-spacing: 0.2em; text-transform: uppercase;
-    color: var(--text-dim);
-    border-bottom: 1px solid var(--border);
-  }
-
-  /* ---- status banner ----
-     The one-class-per-band shape #headwayhud uses, for the same reason: at a
-     glance the colour IS the message, so it drives the rail, the dot and the
-     headline together. */
-
-  .veh-banner {
-    padding: 10px 12px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--text-dimmer);
-    transition: border-left-color 120ms linear, box-shadow 120ms linear;
-  }
-  .veh-banner-head { display: flex; align-items: center; gap: 8px; }
-  .veh-dot {
-    width: 7px; height: 7px; flex: 0 0 7px;
-    border-radius: 50%;
-    background: var(--text-dimmer);
-  }
-  .veh-banner-text {
-    font-family: var(--font-ui); font-weight: 700;
-    font-size: 13px; letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-
-  /* Live connection, last update, engine runtime — the three facts the spec
-     puts under the headline. Held at the smallest size in the column: they are
-     the answer to "is this panel still talking to anything", not something to
-     read on a healthy car. */
-  .veh-banner-meta {
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 4px 8px;
-    margin-top: 9px; padding-top: 8px;
-    border-top: 1px solid var(--border);
-  }
-  .veh-meta-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .veh-meta-key {
-    font-family: var(--font-mono); font-size: 8px;
-    letter-spacing: 0.18em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  .veh-meta-val {
-    font-family: var(--font-mono); font-size: 10.5px;
-    color: var(--text); white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-  }
-  .veh-meta-val.veh-link-live { color: var(--accent); }
-  .veh-meta-val.veh-link-lost { color: var(--text-dimmer); }
-
-  .veh-banner.veh-NORMAL { border-left-color: var(--accent); }
-  .veh-banner.veh-NORMAL .veh-banner-text { color: var(--accent); }
-  .veh-banner.veh-NORMAL .veh-dot {
-    background: var(--accent); box-shadow: 0 0 8px rgba(95,179,232,0.85);
-  }
-  .veh-banner.veh-ATTENTION {
-    border-left-color: var(--amber); box-shadow: 0 0 14px rgba(255,184,77,0.22);
-  }
-  .veh-banner.veh-ATTENTION .veh-banner-text { color: var(--amber); }
-  .veh-banner.veh-ATTENTION .veh-dot {
-    background: var(--amber); box-shadow: 0 0 8px rgba(255,184,77,0.85);
-  }
-  .veh-banner.veh-CRITICAL {
-    border-left-color: var(--red); box-shadow: 0 0 18px rgba(255,107,107,0.34);
-  }
-  .veh-banner.veh-CRITICAL .veh-banner-text { color: var(--red); }
-  .veh-banner.veh-CRITICAL .veh-dot {
-    background: var(--red); box-shadow: 0 0 8px rgba(255,107,107,0.9);
-  }
-  .veh-banner.veh-UNAVAILABLE .veh-banner-text { color: var(--text-dimmer); }
-
-  /* ---- telemetry rows ----
-     Four columns, fixed: name, value, status, trend. Fixed rather than
-     content-sized because the whole readability of a list this long comes from
-     the numbers sharing an edge — a value column that shifts when one channel
-     gains a digit is a column the eye has to re-find on every row. */
-
-  .tm-list { display: flex; flex-direction: column; }
-  .tm-scroll { max-height: 430px; overflow-y: auto; }
-
-  .tm-group {
-    margin: 11px 0 4px; padding-bottom: 3px;
-    font-family: var(--font-mono); font-size: 8px;
-    letter-spacing: 0.22em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    border-bottom: 1px solid rgba(95,179,232,0.12);
-  }
-  .tm-group:first-child { margin-top: 0; }
-
-  .tm-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto 60px 12px;
-    align-items: baseline; gap: 8px;
-    padding: 4px 6px 4px 5px;
-    border-left: 2px solid transparent;
-    border-bottom: 1px solid rgba(95,179,232,0.06);
-  }
-  .tm-label {
-    font-family: var(--font-ui); font-weight: 600;
-    font-size: 12.5px; letter-spacing: 0.04em;
-    color: var(--text);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .tm-value { display: flex; align-items: baseline; gap: 3px; justify-self: end; }
-  .tm-value b {
-    font-family: var(--font-mono); font-weight: 500;
-    font-size: 13px; color: var(--text-bright);
-    font-variant-numeric: tabular-nums;
-  }
-  .tm-value i {
-    font-style: normal; font-family: var(--font-mono);
-    font-size: 8px; letter-spacing: 0.12em;
-    color: var(--text-dimmer);
-  }
-  .tm-status {
-    font-family: var(--font-mono); font-size: 8px;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--text-dimmer); text-align: right;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .tm-trend {
-    font-family: var(--font-mono); font-size: 11px; line-height: 1;
-    color: var(--text-dimmer); text-align: center;
-  }
-
-  /* One rule per status. No animation: a telemetry panel that pulses is a
-     telemetry panel a driver looks at, and the whole point of the colour is
-     that it does not need looking at. */
-  .tm-row.st-warning {
-    border-left-color: var(--amber);
-    background: rgba(255,184,77,0.05);
-  }
-  .tm-row.st-warning .tm-status,
-  .tm-row.st-warning .tm-value b { color: var(--amber); }
-  .tm-row.st-critical {
-    border-left-color: var(--red);
-    background: rgba(255,107,107,0.06);
-  }
-  .tm-row.st-critical .tm-status,
-  .tm-row.st-critical .tm-value b { color: var(--red); }
-  /* The reading is fine and stays white — it is the sensor that needs
-     attention, and colouring the number would say the wrong thing. */
-  .tm-row.st-sensor-low { border-left-color: rgba(255,184,77,0.34); }
-  .tm-row.st-sensor-low .tm-status { color: var(--amber); }
-  /* Nothing is coming from this channel. Deliberately not amber — a sensor
-     that has gone quiet is a wiring fault, not an engine fault, and colouring
-     it like a low reading would be a lie about the car. */
-  .tm-row.st-offline .tm-value b,
-  .tm-row.st-no-data .tm-value b,
-  .tm-row.st-stale .tm-value b { color: var(--text-dimmer); }
-  .tm-row.st-offline .tm-label,
-  .tm-row.st-no-data .tm-label,
-  .tm-row.st-stale .tm-label { color: var(--text-dim); }
-  /* The contextual modes. Blue, because they are the healthy states — they
-     describe the engine rather than grading it. */
-  .tm-row.st-idle .tm-status,
-  .tm-row.st-stopped .tm-status,
-  .tm-row.st-warming .tm-status,
-  .tm-row.st-charging .tm-status,
-  .tm-row.st-cranking .tm-status { color: var(--accent); }
-
-  .tm-row.tr-up .tm-trend, .tm-row.tr-down .tm-trend { color: var(--accent); }
-  /* Out of band AND still moving the wrong way. The one combination on the row
-     that means the situation is not under control. */
-  .tm-row.tr-abnormal .tm-trend { color: var(--red); }
-
-  /* ---- vehicle insights ----
-     A history, not a fault log. Closer to Apple Health: severity is a 4px rail
-     and a glyph rather than a shouting badge, and a healthy car still writes
-     entries — "nothing to report" and "no data" have to look different. */
-
-  .vi-list { display: flex; flex-direction: column; gap: 5px; }
-  .vi-scroll { max-height: 250px; overflow-y: auto; }
-
-  .vi-card {
-    padding: 7px 10px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--text-dimmer);
-  }
-  .vi-head { display: flex; align-items: baseline; gap: 6px; }
-  .vi-icon { font-family: var(--font-mono); font-size: 10px; color: var(--text-dimmer); }
-  .vi-when {
-    font-family: var(--font-mono); font-size: 8.5px;
-    letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  /* Seeded demo history, labelled on screen. Dashed like every other
-     development affordance in this dashboard, and for the same reason: an
-     entry the car did not measure must never look like one it did. */
-  .vi-seed {
-    margin-left: auto;
-    padding: 0 4px;
-    font-family: var(--font-mono); font-size: 7px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    border: 1px dashed rgba(95,179,232,0.30);
-  }
-  .vi-text {
-    margin-top: 3px;
-    font-family: var(--font-ui); font-weight: 500;
-    font-size: 12.5px; line-height: 1.45; letter-spacing: 0.01em;
-    color: var(--text);
-  }
-  .vi-info { border-left-color: rgba(95,179,232,0.30); }
-  .vi-info .vi-icon { color: var(--accent); }
-  .vi-notice { border-left-color: var(--accent); }
-  .vi-notice .vi-icon { color: var(--accent); }
-  .vi-attention { border-left-color: var(--amber); }
-  .vi-attention .vi-icon { color: var(--amber); }
-  .vi-critical { border-left-color: var(--red); }
-  .vi-critical .vi-icon { color: var(--red); }
-  .vi-empty {
-    padding: 10px 2px;
-    font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.1em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-
-  /* ---- flagged error codes / RIO-observed conditions ----
-     A code card is denser than an insight card and that is deliberate: §17.5
-     asks for nine or ten fields per code and a driver reading one has stopped
-     to read it. The condition card below is deliberately a DIFFERENT shape —
-     same density would invite the eye to read a vehicle verdict and a RIO
-     inference as the same kind of claim, which is the one thing this whole
-     section exists to prevent. */
-
-  .dtc-list { display: flex; flex-direction: column; gap: 6px; }
-  .dtc-scroll { max-height: 300px; overflow-y: auto; }
-
-  /* A group heading, not a card. Server-supplied and server-ordered. */
-  .dtc-group {
-    margin: 8px 0 2px;
-    font-family: var(--font-mono); font-size: 8.5px;
-    letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  .dtc-group:first-child { margin-top: 0; }
-
-  .dtc-card {
-    padding: 8px 10px;
-    background: var(--bg-1);
-    border: 1px solid var(--border);
-    border-left: 2px solid var(--text-dimmer);
-  }
-  .dtc-head { display: flex; align-items: baseline; gap: 8px; }
-  .dtc-code {
-    font-family: var(--font-mono); font-weight: 700;
-    font-size: 13px; letter-spacing: 0.06em;
-    color: var(--text-bright);
-  }
-  .dtc-status {
-    margin-left: auto;
-    padding: 1px 5px;
-    font-family: var(--font-mono); font-size: 7.5px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dim);
-    border: 1px solid var(--border);
-  }
-  .dtc-desc {
-    margin-top: 4px;
-    font-family: var(--font-ui); font-weight: 500;
-    font-size: 12.5px; line-height: 1.4;
-    color: var(--text);
-  }
-
-  /* The severity rail, one class per band — the same shape .vi-card uses. The
-     names come from vehicle/dtc/catalog.py's four DTC severities and
-     vehicle_health_policy.py's five health severities; both sets are listed
-     because both render through .sev-*. */
-  .sev-information, .sev-informational { border-left-color: rgba(95,179,232,0.30); }
-  .sev-watch, .sev-advisory { border-left-color: var(--accent); }
-  .sev-warning { border-left-color: var(--amber); }
-  .sev-urgent, .sev-critical { border-left-color: var(--red); }
-
-  /* Detected early is the thing that distinguishes RIO from a code reader, so
-     it is the one status that gets its own emphasis rather than a rail colour. */
-  .dtc-early { border-color: rgba(110,231,199,0.35); }
-  .st-detected-early { color: var(--green); border-color: rgba(110,231,199,0.45); }
-  .st-active, .st-permanent { color: var(--red); border-color: rgba(255,107,107,0.45); }
-  .st-confirmed { color: var(--amber); border-color: rgba(255,184,77,0.45); }
-  .st-repair-validated, .st-no-longer-reported { color: var(--green); }
-
-  /* Label/value rows. Monospace values so digits line up down the card. */
-  .dtc-meta { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
-  .dtc-field { display: flex; gap: 8px; align-items: baseline; }
-  .dtc-key {
-    flex: 0 0 42%;
-    font-family: var(--font-mono); font-size: 8.5px;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  .dtc-val {
-    flex: 1 1 auto;
-    font-family: var(--font-mono); font-size: 10px;
-    color: var(--text-dim); word-break: break-word;
-  }
-
-  .dtc-block { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--border); }
-  .dtc-block-head {
-    font-family: var(--font-mono); font-size: 8px;
-    letter-spacing: 0.16em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  .dtc-block-body {
-    margin-top: 3px;
-    font-family: var(--font-ui); font-size: 12px; line-height: 1.45;
-    color: var(--text-dim);
-  }
-  .dtc-causes {
-    margin: 3px 0 0; padding-left: 16px;
-    font-family: var(--font-ui); font-size: 12px; line-height: 1.45;
-    color: var(--text-dim);
-  }
-  /* Sits directly under the causes so the two cannot be read apart: a list of
-     possibilities with no cause status next to it reads as a diagnosis. */
-  .dtc-cause-status {
-    margin-top: 4px;
-    font-family: var(--font-mono); font-size: 8.5px;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-
-  /* Freeze frame. Collapsed by default and labelled historical every time it
-     opens — a table of live-looking numbers beside a fault is read as live. */
-  .dtc-ff { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--border); }
-  .dtc-ff > summary {
-    cursor: pointer;
-    font-family: var(--font-mono); font-size: 8.5px;
-    letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--accent);
-  }
-  .dtc-ff-note {
-    margin: 5px 0 4px;
-    font-family: var(--font-ui); font-size: 11px; line-height: 1.4;
-    color: var(--text-dimmer);
-  }
-  .dtc-ff-rows { display: flex; flex-direction: column; gap: 2px; }
-  .dtc-snap {
-    margin-top: 6px;
-    font-family: var(--font-ui); font-size: 11px; line-height: 1.4;
-    color: var(--text-dimmer);
-  }
-
-  .dtc-empty {
-    padding: 10px 2px;
-    font-family: var(--font-mono); font-size: 10px;
-    letter-spacing: 0.08em;
-    color: var(--text-dimmer);
-  }
-  /* The caveat is never styled to be skippable. It is the sentence most likely
-     to be paraphrased into something false if it is not read. */
-  .dtc-caveat {
-    margin-top: 5px;
-    font-family: var(--font-ui); font-size: 11px; line-height: 1.45;
-    letter-spacing: 0; text-transform: none;
-    color: var(--text-dim);
-  }
-  .dtc-warn { border-left: 2px solid var(--amber); padding-left: 8px; }
-
-  /* Conditions: lighter, no code, provenance leading. */
-  .cond-card {
-    padding: 7px 10px;
-    background: transparent;
-    border: 1px dashed var(--border);
-    border-left: 2px solid var(--text-dimmer);
-  }
-  .cond-head { display: flex; align-items: baseline; gap: 6px; }
-  .cond-prov {
-    font-family: var(--font-mono); font-size: 8px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--accent);
-  }
-  .cond-sev {
-    margin-left: auto;
-    font-family: var(--font-mono); font-size: 7.5px;
-    letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--text-dimmer);
-  }
-  .cond-text {
-    margin-top: 3px;
-    font-family: var(--font-ui); font-weight: 500;
-    font-size: 12.5px; line-height: 1.45;
-    color: var(--text);
-  }
-  /* What RIO could not look at. Dimmer than a finding and never coloured — an
-     unmonitored subsystem must not read as a troubled one. */
-  .cond-gap {
-    padding: 4px 10px;
-    font-family: var(--font-ui); font-size: 11.5px; line-height: 1.4;
-    color: var(--text-dimmer);
-    border-left: 1px dashed var(--border);
-  }
-
-  /* ---- diagnostic report ---- */
-  .dtc-run {
-    width: 100%;
-    padding: 8px 10px;
-    background: var(--surface); color: var(--accent-bright);
-    border: 1px solid var(--border-strong);
-    clip-path: var(--miter);
-    font-family: var(--font-display); font-size: 11px;
-    letter-spacing: 0.18em; text-transform: uppercase;
-    cursor: pointer;
-    transition: background 120ms linear, box-shadow 120ms linear;
-  }
-  .dtc-run:hover:not(:disabled) { background: var(--surface-hover); box-shadow: var(--accent-glow); }
-  .dtc-run:disabled { color: var(--text-dimmer); border-color: var(--border); cursor: default; }
-
-  /* The stage list is walked in order rather than replaced by a spinner: the
-     driver is watching a list of questions being asked, and naming them is more
-     honest than hiding them behind one. */
-  .dtc-stages { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
-  .dtc-stage {
-    display: flex; align-items: center; gap: 7px;
-    font-family: var(--font-mono); font-size: 9.5px;
-    letter-spacing: 0.08em;
-    color: var(--text-dimmer);
-  }
-  .dtc-stage-dot { width: 5px; height: 5px; background: var(--text-dimmer); flex: 0 0 auto; }
-  .dtc-stage-done { color: var(--text-dim); }
-  .dtc-stage-done .dtc-stage-dot { background: var(--green); }
-  .dtc-stage-now { color: var(--accent-bright); }
-  .dtc-stage-now .dtc-stage-dot { background: var(--accent); box-shadow: var(--accent-glow); }
-
-  .dtc-summary { margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--border); }
-
-  /* Thin, unobtrusive scrollbars on the scrolling regions. The default
-     Chromium bar is 15px wide and eats a fifth of the status column. */
-  .tm-scroll, .vi-scroll, .dtc-scroll { scrollbar-width: thin; scrollbar-color: rgba(95,179,232,0.35) transparent; }
-  .tm-scroll::-webkit-scrollbar, .vi-scroll::-webkit-scrollbar, .dtc-scroll::-webkit-scrollbar { width: 5px; }
-  .tm-scroll::-webkit-scrollbar-track, .vi-scroll::-webkit-scrollbar-track, .dtc-scroll::-webkit-scrollbar-track { background: transparent; }
-  .tm-scroll::-webkit-scrollbar-thumb, .vi-scroll::-webkit-scrollbar-thumb, .dtc-scroll::-webkit-scrollbar-thumb {
-    background: rgba(95,179,232,0.30);
-  }
-
-  /* ---- dev controls ----
-     Dashed border and dimmed text, the same signal .nav-dev and the old tire
-     selector use: these are development affordances and must never read as
-     part of the driving surface. Each disappears on its own when a provider
-     with no scenarios is live, which is every real one. */
-  .veh-foot { display: flex; gap: 6px; margin-top: 12px; }
-  .veh-select {
-    flex: 1 1 0; min-width: 0; height: 30px;
-    padding: 0 6px;
-    font-family: var(--font-mono); font-size: 9.5px;
+    font-family: var(--font-mono); font-size: 9px;
     letter-spacing: 0.06em; text-transform: uppercase;
-    color: var(--text-dimmer);
-    background: var(--bg-1);
-    border: 1px dashed rgba(95,179,232,0.30);
-    border-radius: 0;
-    -webkit-appearance: none; appearance: none;
-    cursor: pointer;
+    color: var(--t5);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
-  .veh-select:focus { outline: none; border-color: var(--border-strong); }
-  .veh-select option { background: var(--bg-1); color: var(--text); }
+  .chip b {
+    display: block; margin-top: 2px;
+    font-family: var(--font-mono); font-weight: 400;
+    font-size: 13px; color: var(--t2);
+  }
 
-  /* Stacked full-width on a phone the column is the whole screen, so the
-     scrolling regions can afford to be taller — a 430px cap that made sense
-     beside four other columns just adds a second scrollbar inside the one the
-     page already has. */
-  @media (max-width: 1000px), (orientation: portrait) {
-    .tm-scroll { max-height: none; }
-    .vi-scroll { max-height: 340px; }
+  .audio-panel {
+    margin-top: auto;
+    background: var(--inset); border: none; border-radius: var(--r-inset);
+    padding: 12px;
   }
+  /* No filter. :root carries color-scheme: dark, so the browser's own control
+     comes back dark and stays legible when Chromium changes its skin. */
+  .audio-panel audio { display: block; width: 100%; }
 
   /* ---------- hold to talk ---------- */
 
@@ -1513,81 +1012,68 @@
      second line saying what a tap does now. `data-state` on the button is the
      single switch; every rule below hangs off it. */
   .mic-dot {
-    flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
-    background: var(--text-dimmer);
-    box-shadow: 0 0 8px currentColor;
+    flex: none; width: 10px; height: 10px; border-radius: 50%;
+    background: var(--t4);
   }
-  .mic-text {
-    display: flex; flex-direction: column; align-items: center; gap: 2px;
-    min-width: 0;
-  }
+  .mic-text { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0; }
   .mic-label { display: block; }
   .mic-hint {
     display: none;
     font-family: var(--font-mono); font-weight: 400;
-    font-size: 9.5px; letter-spacing: 0.16em;
-    color: var(--text-dim);
+    font-size: 9.5px; letter-spacing: 0.08em;
+    opacity: 0.75;
   }
   /* Only shown when a tap does something other than what the label says. */
   #mic[data-state="listening"] .mic-hint,
   #mic[data-state="speaking"] .mic-hint,
   #mic[data-state="connecting"] .mic-hint { display: block; }
 
-  #mic[data-state="idle"] .mic-dot      { background: var(--text-dimmer); box-shadow: none; }
-  #mic[data-state="connecting"] .mic-dot { background: var(--amber); animation: livepulse 1.2s ease-in-out infinite; }
-  #mic[data-state="listening"] .mic-dot  { background: var(--green); animation: livepulse 1.6s ease-in-out infinite; }
-  #mic[data-state="speaking"] .mic-dot   { background: var(--blue);  animation: livepulse 0.9s ease-in-out infinite; }
-  #mic[data-state="recording"] .mic-dot  { background: var(--red);   animation: livepulse 1.2s ease-in-out infinite; }
-
-  /* Idle/desk layout: the control lives at the foot of the VOICE LAYER column,
-     full panel width, sized as a comfortable target without stealing a whole
-     band across the page. The drive-mode override further down is the one that
-     matters at speed and is deliberately left untouched by this placement. */
+  /* Idle/desk layout: the control lives at the foot of the Voice Layer card,
+     full width. White, because it is the one thing on this page that starts a
+     conversation and nothing else may compete with it. */
   #micbar { margin-top: 12px; }
   #mic {
     display: flex; align-items: center; justify-content: center; gap: 10px;
-    width: 100%;
-    min-height: 90px;
-    padding: 14px 20px; margin: 0;
-    font-weight: 600; font-size: 18px;
-    letter-spacing: 0.18em; text-transform: uppercase;
-    color: var(--text-bright);
-    background: var(--surface);
-    border: 1px solid var(--border-strong);
-    box-shadow: 0 0 10px rgba(95,179,232,0.28), inset 0 0 26px rgba(95,179,232,0.05);
-    clip-path: var(--miter);
-    transition: background 120ms linear, box-shadow 120ms linear, border-color 120ms linear;
+    width: 100%; min-height: 56px;
+    padding: 12px 18px; margin: 0;
+    border: 1px solid transparent; border-radius: var(--r-inset);
+    background: var(--t1); color: #0b0d10;
+    font-size: 13px; font-weight: 600;
+    transition: background var(--t-fast) linear, color var(--t-fast) linear,
+                border-color var(--t-fast) linear;
   }
-  #mic:hover { background: var(--surface-hover); }
-  /* Hold-to-talk, mid-recording: the loudest thing on the page, because
-     something is being captured right now. */
-  #mic.recording, #mic[data-state="recording"] {
-    color: #ffe4e4;
-    border-color: var(--red);
-    background: rgba(255,107,107,0.10);
-    box-shadow: 0 0 18px rgba(255,107,107,0.62), inset 0 0 32px rgba(255,107,107,0.12);
+  #mic:hover { background: #fff; }
+  #mic[data-state="idle"] .mic-dot { background: #0b0d10; }
+
+  #mic[data-state="connecting"] {
+    background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn-text);
   }
+  #mic[data-state="connecting"] .mic-dot { background: var(--warn); animation: livepulse 1.2s ease-in-out infinite; }
+
   /* An open live session. Deliberately not the recording red: the driver is
      not being recorded into a clip, they are in a conversation, and the one
      thing a tap does here is end it. */
-  #mic[data-state="listening"], #mic[data-state="speaking"] {
-    color: #d8fff2;
-    border-color: var(--green);
-    background: rgba(110,231,199,0.08);
-    box-shadow: 0 0 16px rgba(110,231,199,0.45), inset 0 0 28px rgba(110,231,199,0.08);
+  #mic[data-state="listening"] {
+    background: var(--good-soft); border-color: var(--good-line); color: var(--good);
   }
-  #mic[data-state="speaking"] {
-    color: var(--accent-bright);
-    border-color: var(--blue);
-    background: rgba(95,179,232,0.10);
-    box-shadow: 0 0 16px rgba(95,179,232,0.55), inset 0 0 28px rgba(95,179,232,0.10);
-  }
+  #mic[data-state="listening"] .mic-dot { background: var(--good); animation: livepulse 1.6s ease-in-out infinite; }
 
-  /* While driving the mic leaves the Voice Layer column entirely and pins to
-     the bottom of the viewport so it can be hit without looking, regardless of
-     how far the columns have scrolled. position:fixed lifts it out of the
-     column's flow, so the in-column placement above costs the drive-safe
-     target nothing.
+  #mic[data-state="speaking"] {
+    background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-hover);
+  }
+  #mic[data-state="speaking"] .mic-dot { background: var(--accent); animation: livepulse 0.9s ease-in-out infinite; }
+
+  /* Hold-to-talk, mid-recording: the loudest thing on the page, because
+     something is being captured right now. */
+  #mic.recording, #mic[data-state="recording"] {
+    background: var(--danger-soft); border-color: var(--danger-line); color: var(--danger-text);
+  }
+  #mic[data-state="recording"] .mic-dot { background: var(--danger); animation: livepulse 1.2s ease-in-out infinite; }
+
+  /* While driving the mic leaves the Voice Layer card entirely and pins to the
+     bottom of the viewport so it can be hit without looking, regardless of how
+     far the columns have scrolled. position:fixed lifts it out of the column's
+     flow, so the in-column placement above costs the drive-safe target nothing.
 
      IT IS A BUTTON, NOT A PANEL. It used to be 42dvh of full-width viewport,
      which on a phone in portrait is most of the screen: the camera box -- the
@@ -1597,7 +1083,8 @@
      target is worth having; it is not worth the picture. So: bottom-RIGHT
      corner, sized as a comfortable thumb target and no larger, clear of the
      feed at every scroll position (the camera box sits at the top of the
-     document and can only ever move further up as the page scrolls).
+     document on a phone -- see the media query -- and can only ever move
+     further up as the page scrolls).
 
      #micbar is now only a positioner and takes no taps of its own -- an
      invisible full-width strip that swallows them is the same bug in a
@@ -1624,16 +1111,416 @@
     min-height: 64px; height: auto;
     padding: 12px 20px;
     font-size: 15px; font-weight: 600; letter-spacing: 0.01em;
-    /* Legible over whatever the feed is showing if the two ever do meet --
-       fullscreen, where the picture is the whole screen and the control has
-       nowhere else to be. */
-    background: rgba(4,7,14,0.92);
-    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
-    box-shadow: 0 0 14px rgba(95,179,232,0.42), 0 6px 22px rgba(0,0,0,0.55);
+    box-shadow: 0 6px 22px rgba(0,0,0,0.55);
   }
+  /* Legible over whatever the feed is showing if the two ever do meet --
+     fullscreen, where the picture is the whole screen and the control has
+     nowhere else to be. */
+  body.driving #mic[data-state="connecting"],
   body.driving #mic[data-state="listening"],
   body.driving #mic[data-state="speaking"],
-  body.driving #mic[data-state="recording"] { background: rgba(4,7,14,0.92); }
+  body.driving #mic[data-state="recording"] {
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+
+  /* ---------- vehicle health ----------
+
+     Everything below is colour and geometry only. Not one threshold, not one
+     number and not one piece of wording lives in this stylesheet or in
+     rio_vehicle.js — the server sends the status name, this decides what that
+     status looks like. See telemetry.py and insights.py.
+
+     good is "this measurement came back healthy", warn is "attention
+     recommended", danger is "immediate issue", and --t4/--t5 mean nobody is
+     answering. A dimmed row is not a failing sensor and it must not look like
+     one.
+
+     No gauges, no circular meters, no vehicle graphic. A telemetry screen is a
+     list of channels, and the reason professional motorsport software looks
+     like this is that a list is the only layout where adding the twentieth
+     channel costs nothing. */
+
+  .veh-section {
+    margin: 18px 0 8px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5);
+  }
+
+  /* ---- status banner ---- */
+
+  .veh-banner {
+    padding: 12px 14px;
+    background: var(--inset);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-inset);
+    transition: background var(--t-fast) linear, border-color var(--t-fast) linear;
+  }
+  .veh-banner-head { display: flex; align-items: center; gap: var(--gap-xs); margin-bottom: var(--gap-xs); }
+  .veh-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--t4); }
+  .veh-banner-text { font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; color: var(--t2); }
+
+  /* Live connection, last update, engine runtime — the three facts the spec
+     puts under the headline, on one line. They are the answer to "is this
+     panel still talking to anything", not something to read on a healthy car. */
+  .veh-banner-meta {
+    display: flex; flex-wrap: wrap; gap: 4px 18px;
+    font-family: var(--font-mono); font-size: var(--fs-micro);
+  }
+  .veh-meta-cell { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+  .veh-meta-key { letter-spacing: 0.08em; text-transform: uppercase; color: var(--t5); }
+  .veh-meta-val { color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .veh-meta-val.veh-link-live { color: var(--good); }
+  .veh-meta-val.veh-link-lost { color: var(--t4); }
+
+  .veh-banner.veh-NORMAL { background: var(--good-soft); border-color: var(--good-line); }
+  .veh-banner.veh-NORMAL .veh-banner-text { color: var(--good); }
+  .veh-banner.veh-NORMAL .veh-dot { background: var(--good); animation: pulse 2.4s ease-in-out infinite; }
+  .veh-banner.veh-ATTENTION { background: var(--warn-soft); border-color: var(--warn-line); }
+  .veh-banner.veh-ATTENTION .veh-banner-text { color: var(--warn-text); }
+  .veh-banner.veh-ATTENTION .veh-dot { background: var(--warn); animation: pulse 2s ease-in-out infinite; }
+  .veh-banner.veh-CRITICAL { background: var(--danger-soft); border-color: var(--danger-line); }
+  .veh-banner.veh-CRITICAL .veh-banner-text { color: var(--danger-text); }
+  .veh-banner.veh-CRITICAL .veh-dot { background: var(--danger); animation: pulse 1.4s ease-in-out infinite; }
+  .veh-banner.veh-UNAVAILABLE .veh-banner-text { color: var(--t4); }
+
+  /* ---- telemetry rows ----
+     Four columns, fixed: name, value+unit, status, trend. Fixed rather than
+     content-sized because the whole readability of a list this long comes from
+     the numbers sharing an edge — a value column that shifts when one channel
+     gains a digit is a column the eye has to re-find on every row. */
+
+  .tm-list { display: flex; flex-direction: column; }
+  .tm-scroll { max-height: 430px; overflow-y: auto; }
+
+  .tm-group {
+    padding: 10px 0 4px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5);
+  }
+  .tm-group:first-child { padding-top: 0; }
+
+  .tm-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 56px 12px;
+    align-items: center; gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .tm-label {
+    font-size: var(--fs-body); color: var(--t2);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* The value and its unit are one element in the DOM (rio_vehicle.js emits a
+     <b> and an <i> inside one span) and two columns on the screen, so the
+     digits share a right edge and the units share a left one. */
+  .tm-value {
+    display: grid; grid-template-columns: auto 28px;
+    align-items: baseline; gap: 6px; justify-self: end;
+  }
+  .tm-value b {
+    font-family: var(--font-mono); font-weight: 500;
+    font-size: 13px; color: var(--t1);
+    text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .tm-value i {
+    font-style: normal; font-family: var(--font-mono);
+    font-size: var(--fs-nano); color: var(--t4);
+  }
+  .tm-status {
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t4); text-align: right;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .tm-trend {
+    font-family: var(--font-mono); font-size: var(--fs-nano); line-height: 1;
+    color: var(--t5); text-align: center;
+  }
+
+  /* One rule per status. No animation: a telemetry panel that pulses is a
+     telemetry panel a driver looks at, and the whole point of the colour is
+     that it does not need looking at. */
+  .tm-row.st-warning .tm-status,
+  .tm-row.st-warning .tm-value b { color: var(--warn-text); }
+  .tm-row.st-critical .tm-status,
+  .tm-row.st-critical .tm-value b { color: var(--danger-text); }
+  /* The reading is fine and stays bright — it is the sensor that needs
+     attention, and colouring the number would say the wrong thing. */
+  .tm-row.st-sensor-low .tm-status { color: var(--warn-text); }
+  /* Nothing is coming from this channel. Deliberately not amber — a sensor
+     that has gone quiet is a wiring fault, not an engine fault, and colouring
+     it like a low reading would be a lie about the car. */
+  .tm-row.st-offline .tm-value b,
+  .tm-row.st-no-data .tm-value b,
+  .tm-row.st-stale .tm-value b { color: var(--t4); }
+  .tm-row.st-offline .tm-label,
+  .tm-row.st-no-data .tm-label,
+  .tm-row.st-stale .tm-label { color: var(--t4); }
+  /* Charging is the one contextual mode that is a positive fact about the
+     car, and the mockup gives it the green. The rest describe the engine
+     rather than grading it, so they stay in the label tier. */
+  .tm-row.st-charging .tm-status { color: var(--good); }
+  .tm-row.st-idle .tm-status,
+  .tm-row.st-stopped .tm-status,
+  .tm-row.st-warming .tm-status,
+  .tm-row.st-cranking .tm-status { color: var(--t4); }
+
+  .tm-row.tr-up .tm-trend, .tm-row.tr-down .tm-trend { color: var(--accent); }
+  /* Out of band AND still moving the wrong way. The one combination on the row
+     that means the situation is not under control. */
+  .tm-row.tr-abnormal .tm-trend { color: var(--danger); }
+
+  /* ---- vehicle insights ----
+     A history, not a fault log. Rows with a hairline between them and a glyph
+     for severity rather than a shouting badge, and a healthy car still writes
+     entries — "nothing to report" and "no data" have to look different. */
+
+  .vi-list { display: flex; flex-direction: column; }
+  .vi-scroll { max-height: 250px; overflow-y: auto; }
+
+  .vi-card { padding: 8px 0; border-bottom: 1px solid var(--rule); }
+  .vi-head { display: flex; align-items: center; gap: var(--gap-xs); margin-bottom: 3px; }
+  .vi-icon { font-size: var(--fs-sub); line-height: 1.4; color: var(--t4); }
+  .vi-when {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t5);
+  }
+  /* Seeded demo history, labelled on screen. Dashed like every other
+     development affordance in this dashboard, and for the same reason: an
+     entry the car did not measure must never look like one it did. */
+  .vi-seed {
+    margin-left: auto; padding: 1px 7px;
+    font-family: var(--font-mono); font-size: 8px;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--t5);
+    border: 1px dashed var(--hairline-strong); border-radius: var(--r-pill);
+  }
+  .vi-text { font-size: 12px; line-height: 1.5; color: var(--t3); }
+  .vi-info .vi-icon { color: var(--good); }
+  .vi-notice .vi-icon { color: var(--accent); }
+  .vi-attention .vi-icon { color: var(--warn); }
+  .vi-critical .vi-icon { color: var(--danger); }
+  .vi-empty {
+    padding: 10px 0;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5);
+  }
+
+  /* ---- flagged error codes / RIO-observed conditions ----
+     A code card is denser than an insight row and that is deliberate: §17.5
+     asks for nine or ten fields per code and a driver reading one has stopped
+     to read it. The condition card below is deliberately a DIFFERENT shape —
+     same density would invite the eye to read a vehicle verdict and a RIO
+     inference as the same kind of claim, which is the one thing this whole
+     section exists to prevent. */
+
+  .dtc-list { display: flex; flex-direction: column; gap: var(--gap-xs); }
+  .dtc-scroll { max-height: 300px; overflow-y: auto; }
+
+  /* A group heading, not a card. Server-supplied and server-ordered. */
+  .dtc-group {
+    margin: 8px 0 2px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5);
+  }
+  .dtc-group:first-child { margin-top: 0; }
+
+  .dtc-card {
+    padding: 14px;
+    background: var(--inset);
+    border: 1px solid var(--hairline);
+    border-left: 2px solid var(--hairline-strong);
+    border-radius: var(--r-inset);
+  }
+  .dtc-head { display: flex; align-items: center; justify-content: space-between; gap: var(--gap-xs); margin-bottom: 6px; }
+  .dtc-code { font-family: var(--font-mono); font-weight: 600; font-size: 14px; color: var(--t1); }
+  .dtc-status {
+    flex: none;
+    padding: 3px 8px; border-radius: var(--r-pill);
+    border: 1px solid var(--hairline-strong);
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t3); white-space: nowrap;
+  }
+  .dtc-desc { font-size: 12px; line-height: 1.5; color: var(--t3); margin-bottom: 10px; }
+
+  /* The severity rail, one class per band — the names come from
+     vehicle/dtc/catalog.py's four DTC severities and
+     vehicle_health_policy.py's five health severities; both sets are listed
+     because both render through .sev-*. */
+  .sev-information, .sev-informational { border-left-color: var(--hairline-strong); }
+  .sev-watch, .sev-advisory { border-left-color: var(--accent); }
+  .sev-warning { border-left-color: var(--warn); }
+  .sev-urgent, .sev-critical { border-left-color: var(--danger); }
+
+  /* Detected early is the thing that distinguishes RIO from a code reader, so
+     it is the one status that gets its own emphasis rather than a rail colour. */
+  .dtc-early { border-color: var(--good-line); }
+  .st-detected-early { color: var(--good); border-color: var(--good-line); }
+  .st-active, .st-permanent { color: var(--danger-text); border-color: var(--danger-line); }
+  .st-confirmed { color: var(--warn-text); border-color: var(--warn-line); }
+  .st-repair-validated, .st-no-longer-reported { color: var(--good); }
+
+  /* Label/value rows. `display: contents` puts the key and the value straight
+     into the card's own two-column grid, so every value in the card shares one
+     left edge no matter how long the labels are. */
+  .dtc-meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin-top: 8px; font-size: var(--fs-sub); }
+  .dtc-field { display: contents; }
+  .dtc-key {
+    font-family: var(--font-mono);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t5);
+  }
+  .dtc-val { color: var(--t2); word-break: break-word; }
+
+  .dtc-block { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--rule); }
+  .dtc-block-head {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5);
+  }
+  .dtc-block-body { margin-top: 4px; font-size: 12px; line-height: 1.5; color: var(--t3); }
+  .dtc-causes { margin: 4px 0 0; padding-left: 16px; font-size: 12px; line-height: 1.5; color: var(--t3); }
+  /* Sits directly under the causes so the two cannot be read apart: a list of
+     possibilities with no cause status next to it reads as a diagnosis. */
+  .dtc-cause-status {
+    margin-top: 5px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t5);
+  }
+
+  /* Freeze frame. Collapsed by default and labelled historical every time it
+     opens — a table of live-looking numbers beside a fault is read as live. */
+  .dtc-ff { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--rule); }
+  .dtc-ff > summary {
+    cursor: pointer;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--accent);
+  }
+  .dtc-ff-note { margin: 6px 0 4px; font-size: var(--fs-sub); line-height: 1.45; color: var(--t5); }
+  .dtc-ff-rows { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font-size: var(--fs-sub); }
+  .dtc-snap { margin-top: 8px; font-size: var(--fs-sub); line-height: 1.45; color: var(--t5); }
+
+  .dtc-empty { padding: 10px 0; font-size: 12px; line-height: 1.5; color: var(--t4); }
+  /* The caveat is never styled to be skippable. It is the sentence most likely
+     to be paraphrased into something false if it is not read. */
+  .dtc-caveat { margin-top: 6px; font-size: var(--fs-sub); line-height: 1.45; color: var(--t3); }
+  .dtc-warn { border-left: 2px solid var(--warn); padding-left: 10px; }
+
+  /* Conditions: lighter, no code, provenance leading. */
+  .cond-card {
+    padding: 12px 14px;
+    background: transparent;
+    border: 1px dashed var(--hairline-strong);
+    border-left: 2px solid var(--hairline-strong);
+    border-radius: var(--r-inset);
+  }
+  .cond-head { display: flex; align-items: center; gap: var(--gap-xs); margin-bottom: 4px; }
+  .cond-prov {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--accent);
+  }
+  .cond-sev {
+    margin-left: auto;
+    font-family: var(--font-mono); font-size: 9.5px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--t5);
+  }
+  .cond-text { font-size: 12px; line-height: 1.5; color: var(--t2); }
+  /* What RIO could not look at. Dimmer than a finding and never coloured — an
+     unmonitored subsystem must not read as a troubled one. */
+  .cond-gap {
+    padding: 6px 12px;
+    border-left: 1px dashed var(--hairline-strong);
+    font-size: var(--fs-sub); line-height: 1.45; color: var(--t5);
+  }
+
+  /* ---- diagnostic report ---- */
+  .dtc-run {
+    width: 100%; padding: 10px;
+    background: transparent;
+    border: 1px solid var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    color: var(--t2); font-size: var(--fs-body); font-weight: 500;
+    transition: border-color var(--t-fast) linear, color var(--t-fast) linear;
+  }
+  .dtc-run:hover:not(:disabled) { border-color: var(--hairline-hover); color: #fff; }
+  .dtc-run:disabled { color: var(--t5); border-color: var(--hairline); cursor: default; }
+
+  /* The stage list is walked in order rather than replaced by a spinner: the
+     driver is watching a list of questions being asked, and naming them is more
+     honest than hiding them behind one. */
+  .dtc-stages { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+  .dtc-stage {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: 0.06em;
+    color: var(--t5);
+  }
+  .dtc-stage-dot { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--t5); }
+  .dtc-stage-done { color: var(--t3); }
+  .dtc-stage-done .dtc-stage-dot { background: var(--good); }
+  .dtc-stage-now { color: var(--accent-hover); }
+  .dtc-stage-now .dtc-stage-dot { background: var(--accent); }
+
+  .dtc-summary { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--rule); }
+
+  /* ---- dev controls ----
+     Dashed and dimmed, the same signal .nav-dev and .vi-seed use: these are
+     development affordances and must never read as part of the driving
+     surface. Each disappears on its own when a provider with no scenarios is
+     live, which is every real one. */
+  .veh-foot { display: flex; gap: var(--gap-xs); margin-top: 14px; }
+  .veh-select {
+    flex: 1 1 0; min-width: 0; height: 32px; padding: 0 8px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--t5);
+    background: var(--inset);
+    border: 1px dashed var(--hairline-strong);
+    border-radius: var(--r-ctl);
+    -webkit-appearance: none; appearance: none;
+    cursor: pointer;
+  }
+  .veh-select:focus { outline: none; border-color: var(--accent-line); }
+  .veh-select option { background: var(--inset); color: var(--t2); }
+
+  /* ---------- phone and narrow ----------
+
+     The wrappers go `display: contents` and every card becomes a direct child
+     of one column, so each can be ordered on its own. The camera stage is
+     pulled to the TOP of the document, which is not cosmetic: the floating
+     talk control is pinned to the bottom-right of the viewport, and the only
+     thing that keeps it off the picture at every scroll offset is that the
+     picture starts above it and can only ever scroll further up. A feed placed
+     below two rail cards would meet the control halfway down the page. */
+  @media (max-width: 1000px), (orientation: portrait) {
+    .pipeline {
+      flex-direction: column; flex-wrap: nowrap;
+      align-items: stretch;
+    }
+    .rail, .stage, .stage-grid { display: contents; }
+    .stage-card { order: -1; }
+    #vehcol { max-width: none; }
+
+    /* Drive-safe floors. On a desk these are pointer targets and the mockup's
+       proportions are right; in a car they are aimed at at speed. */
+    #drive, .hud-btn { min-height: 56px; }
+
+    /* The column is the whole screen, so the scrolling regions can afford to
+       be taller — a 430px cap that made sense beside four other columns just
+       adds a second scrollbar inside the one the page already has. */
+    .tm-scroll { max-height: none; }
+    .vi-scroll { max-height: 340px; }
+  }
 
   /* Landscape phone: same control, shorter, so it eats less of a 375px-tall
      viewport. Still above the 44px iOS touch-target floor by a wide margin. */
@@ -1643,14 +1530,15 @@
       min-height: 56px; padding: 10px 16px; font-size: 14px; min-width: 148px;
     }
     body.driving .hud-header { display: none; }
-    /* A 16:9 box across a 844px-wide viewport is 475px tall -- taller than the
-       screen. The "the feed is above the control and can only scroll upward"
-       argument does not hold here: the box crosses the whole viewport, so a
-       corner-anchored control would meet it somewhere in the scroll. So the
-       control gets a column of its own and the picture keeps the rest. Two
-       disjoint columns cannot overlap at any scroll offset, which is a
-       stronger guarantee than any offset that has to be re-measured. */
-    body.driving .cam-wrap:not(.pseudo-full) {
+    /* A 16:8.2 box across a 844px-wide viewport is taller than the screen. The
+       "the feed is above the control and can only scroll upward" argument does
+       not hold here: the box crosses the whole viewport, so a corner-anchored
+       control would meet it somewhere in the scroll. So the control gets a
+       column of its own and the picture keeps the rest. Two disjoint columns
+       cannot overlap at any scroll offset, which is a stronger guarantee than
+       any offset that has to be re-measured. The width is --talk-w, the same
+       token the control's own cap is written from. */
+    body.driving .stage-card {
       margin-right: calc(var(--talk-w) + 24px + env(safe-area-inset-right, 0px));
     }
     /* Fullscreen is the one place the picture is meant to be everything. */
@@ -1669,43 +1557,183 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    #drive.active::before, .cam-badge::before, .ring.listening, .ring.speaking::before { animation: none; }
+    #drive.active::before, .cam-badge::before, .hdr-dot, .veh-dot, .mic-dot,
+    .ring.listening, .ring.speaking::before { animation: none; }
   }
 </style>
 </head>
 
 <body>
 
+<!-- The 60px bar. Left: the mark, the wordmark and the RIO chip. Right: the
+     one live fact the header is allowed to carry -- whether telemetry is
+     arriving -- and the role the initials stand for. The dot is written by
+     rio_vehicle.js from the same /vehicle/telemetry payload the health column
+     is painted from, so a header that says "live" and a column that says
+     "lost" cannot happen. -->
 <header class="hud-header">
-  <div class="logo-mark"></div>
-  <div class="wordmark">
-    <div class="brand">SPEED SUSPECTS</div>
+  <div class="hud-brand">
+    <div class="logo-mark"><span></span></div>
+    <div class="wordmark">Speed Suspects</div>
     <div class="brand-sub">RIO</div>
   </div>
-  <div class="hud-header-meta">Radar Intercept<br>Officer</div>
+  <div class="hud-header-meta">
+    <div class="hdr-live" id="hdrlive" data-link="unknown">
+      <span class="hdr-dot" aria-hidden="true"></span>
+      <span id="hdrlivetext">Telemetry &mdash;</span>
+    </div>
+    <div class="hdr-role">Radar Intercept Officer</div>
+  </div>
 </header>
 
 <main class="pipeline">
 
-  <!-- ============ COLUMN 1 - CAMERA ============ -->
-  <section class="col panel bracketed">
+  <!-- ============ LEFT RAIL — DRIVE, NAVIGATION ============
+       Two cards, each hugging its own content. They are wrapped rather than
+       laid out as grid areas because the rail must not be stretched to the
+       height of the stage beside it: a Navigation card that starts halfway
+       down the page because the camera card is tall is a card nobody finds.
+       On a phone the wrapper goes `display: contents` and both cards become
+       direct children of the column -- see the media query. -->
+  <div class="rail">
+
+  <section class="col panel" id="drivecard">
     <div class="col-head">
-      <div class="col-head-row">
-        <div>
-          <div class="col-title">Camera</div>
-          <div class="col-sub">Visual Input &middot; Capture</div>
-        </div>
-        <div class="head-toggles">
-          <button id="headway" type="button" aria-pressed="true"
-                  title="Live headway monitoring — 4 fps lead tracking with automatic voice">Headway</button>
-          <button id="layers" type="button" aria-pressed="true"
-                  title="Toggle the perception overlay">Layers</button>
-        </div>
-      </div>
+      <div class="col-title">Drive</div>
+      <div class="col-sub" id="subdrive">Visual input &middot; capture</div>
+    </div>
+
+    <!-- Segmented control. Two independent toggles, not a radio pair: headway
+         can be armed with the overlay off and often is. aria-pressed carries
+         the state and the stylesheet reads nothing else. -->
+    <div class="head-toggles" role="group" aria-label="Overlay modes">
+      <button id="headway" type="button" aria-pressed="true"
+              title="Live headway monitoring — 4 fps lead tracking with automatic voice">Headway</button>
+      <button id="layers" type="button" aria-pressed="true"
+              title="Toggle the perception overlay">Layers</button>
     </div>
 
     <button id="drive">Start Drive</button>
 
+    <div class="manual-controls">
+      <button id="frame" class="hud-btn">Send webcam frame</button>
+      <label for="upload" class="hud-btn upload-label">Upload image or video</label>
+      <input type="file" id="upload" accept="image/*,video/*" style="display:none">
+      <button id="grab" class="hud-btn" style="display:none;">Grab this frame</button>
+      <button id="runheadway" class="hud-btn" style="display:none;">Run headway on video</button>
+      <!-- Detection follows the play button by default. Off, a clip plays with
+           no boxes at all, which is a real state a driver may want (watching
+           the footage rather than the analysis) and is now the ONLY way to see
+           a clip unannotated -- there is no second box layer to fall back to. -->
+      <button id="autodetect" class="hud-btn detect-toggle" type="button"
+              aria-pressed="true" style="display:none;"
+              title="Start detection automatically whenever the clip is playing">Auto-detect on play</button>
+      <!-- The way back. Shown only while a clip is the source, because that is
+           the only state it changes, and explicit because the clip must never
+           be dropped by anything else. -->
+      <button id="usecamera" class="hud-btn" style="display:none;">Use camera instead</button>
+
+      <!-- Manual speed override. GPS has no speed on a desk, and tau is
+           meaningless without one, so a bench test needs to supply it. The
+           unit is a chip on the end of the field rather than a second button
+           in the stack: it changes what the number beside it MEANS. -->
+      <div class="speed-row">
+        <input id="speedval" type="number" inputmode="decimal" step="0.5" min="0"
+               placeholder="Speed override" aria-label="Manual host speed override">
+        <button id="speedunit" type="button" aria-pressed="false"
+                title="Toggle between m/s and mph">m/s</button>
+      </div>
+      <div class="speed-hint" id="speedhint">GPS speed &middot; override blank</div>
+    </div>
+  </section>
+
+  <!-- ---- NAVIGATION ----
+       The provider computes the route; RIO tracks the car against it and
+       decides what is worth saying. The wiring is in static/rio_nav.js, the
+       deterministic tracker in static/rio_navcore.js, the speech planner and
+       visual-context lifecycle in static/rio_navplan.js, and every
+       announcement goes out through the arbiter in static/rio_speech.js —
+       there is only one mouth. Vision is optional throughout: with no
+       camera, no landmarks or no verification, RIO says "Take the next
+       left" and the drive is unaffected. -->
+  <section class="col panel nav-panel">
+    <div class="col-head nav-head">
+      <div class="col-title">Navigation</div>
+      <div class="col-sub" id="subnav">Provider route &middot; RIO context</div>
+    </div>
+
+    <div class="nav-empty" id="navempty">No route set</div>
+
+    <div class="nav-destrow">
+      <input id="navdest" class="nav-dest" type="text"
+             placeholder="Destination" aria-label="Destination"
+             autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button id="navgo" class="hud-btn nav-btn nav-btn-go" type="button">Route</button>
+      <button id="navclear" class="hud-btn nav-btn" type="button">Clear</button>
+    </div>
+    <div class="nav-suggest" id="navsuggest" style="display:none;"></div>
+
+    <div class="nav-summary" id="navsummary" style="display:none;">
+      <span><i>ETA</i><b id="naveta">&mdash;</b></span>
+      <span><i>Distance</i><b id="navdistance">&mdash;</b></span>
+      <span><i>Remaining</i><b id="navremaining">&mdash;</b></span>
+    </div>
+
+    <div class="nav-man" id="navman" style="display:none;">
+      <span class="nav-man-icon" id="navmanicon">&#8593;</span>
+      <span class="nav-man-text" id="navmantext"></span>
+      <span class="nav-man-dist" id="navmandist"></span>
+    </div>
+
+    <!-- The four states worth showing, and they are four because they are
+         genuinely independent. A maneuver can be APPROACHING while its
+         visual context is still ACQUIRING; GPS can be STALE while the route
+         state is ON_ROUTE (a lost fix is not a wrong turn). Collapsing any
+         of these into a single "nav status" would hide exactly the
+         disagreement worth seeing. -->
+    <div class="nav-summary nav-state" id="navstate" style="display:none;">
+      <span><i>Maneuver</i><b id="navmanstate">&mdash;</b></span>
+      <span><i>GPS</i><b id="navgpsstate">&mdash;</b></span>
+      <span><i>Route</i><b id="navroutestate">&mdash;</b></span>
+      <span><i>Context</i><b id="navctxstate">&mdash;</b></span>
+    </div>
+
+    <!-- Debug, not driver-facing: which landmark was verified, with the
+         confidences that let it through. A drive where this is empty most of
+         the time is a drive where the gates are working. -->
+    <div class="nav-anchor" id="navanchor" style="display:none;"></div>
+
+    <div class="nav-map" id="navmap">
+      <div class="nav-map-idle" id="navmapidle">Awaiting route</div>
+    </div>
+
+    <!-- Desk mode. GPS on a desk is a stationary fix with no speed, so the
+         simulator walks the host position along the route's own polyline at a
+         set speed and feeds it through exactly the same position handler a
+         real fix goes through. The start-point box exists for the same
+         reason: to test a route somewhere other than where the laptop is. -->
+    <div class="nav-dev">
+      <button id="navsim" class="hud-btn nav-btn" type="button" aria-pressed="false"
+              title="Walk the host position along the route to test announcements">Simulate drive</button>
+      <input id="navsimspeed" type="number" inputmode="decimal" min="1" step="5" value="30"
+             aria-label="Simulated speed in mph" title="Simulated speed (mph)">
+      <input id="navorigin" type="text" placeholder="Start point"
+             autocomplete="off" spellcheck="false"
+             aria-label="Start point override — address or lat,lng">
+    </div>
+  </section>
+
+  </div><!-- /.rail -->
+
+  <!-- ============ CENTRE STAGE — THE PICTURE, THEN THE THREE READINGS ====
+       The feed is the one thing on this page a driver looks at, so it is the
+       one thing that gets a card of its own with no padding: picture to the
+       edges, one hairline footer under it carrying the counters and the drive
+       status. Everything that INTERPRETS the picture -- what was seen, what
+       was said, what was spoken -- sits under it as three equal cards. -->
+  <div class="stage">
+
+  <section class="panel stage-card">
     <div class="cam-wrap">
       <video id="video" autoplay playsinline muted></video>
       <img id="campreview" alt="">
@@ -1738,7 +1766,7 @@
         <div id="camsource" class="cam-source src-camera">REAR CAM</div>
       </div>
       <div class="cam-badge">Live</div>
-      <div class="cam-nosignal">No Signal</div>
+      <div class="cam-nosignal"><b>STANDBY</b><i>NO SIGNAL</i></div>
       <div id="headwayhud" class="hw-UNKNOWN">
         <span class="hw-band" id="hwband">Standby</span>
         <span class="hw-line"><i>&tau;</i> <b id="hwtau">--</b> &middot; <b id="hwtrend">--</b></span>
@@ -1757,202 +1785,111 @@
              must be visible without opening the log. -->
         <span class="hw-line"><i>Lanes</i> <b id="hwlanes" class="hw-lanesrc">--</b></span>
       </div>
+    </div>
+
+    <!-- The counters and the drive status, under the picture rather than on
+         it. They are the answer to "is this thing running", which is a
+         question asked between glances at the road, not during one. -->
+    <div class="stage-foot">
       <div class="cam-overlay">
         <span><i>Frames</i><b id="statframes">0</b></span>
         <span><i>Last</i><b id="statlast">--:--:--</b></span>
         <span><i>Session</i><b id="statsession">&mdash;</b></span>
       </div>
-    </div>
-
-    <div id="drivestatus"></div>
-
-    <div class="manual-controls">
-      <button id="frame" class="hud-btn">Send Webcam Frame</button>
-      <label for="upload" class="hud-btn upload-label">Upload Image/Video</label>
-      <input type="file" id="upload" accept="image/*,video/*" style="display:none">
-      <button id="grab" class="hud-btn" style="display:none;">Grab This Frame</button>
-      <button id="runheadway" class="hud-btn" style="display:none;">Run Headway On Video</button>
-      <!-- Detection follows the play button by default. Off, a clip plays with
-           no boxes at all, which is a real state a driver may want (watching
-           the footage rather than the analysis) and is now the ONLY way to see
-           a clip unannotated -- there is no second box layer to fall back to. -->
-      <button id="autodetect" class="hud-btn detect-toggle" type="button"
-              aria-pressed="true" style="display:none;"
-              title="Start detection automatically whenever the clip is playing">Auto-Detect On Play</button>
-      <!-- The way back. Shown only while a clip is the source, because that is
-           the only state it changes, and explicit because the clip must never
-           be dropped by anything else. -->
-      <button id="usecamera" class="hud-btn" style="display:none;">Use Camera Instead</button>
-
-      <!-- Manual speed override. GPS has no speed on a desk, and tau is
-           meaningless without one, so a bench test needs to supply it. -->
-      <div class="speed-row">
-        <input id="speedval" type="number" inputmode="decimal" step="0.5" min="0"
-               placeholder="Speed override" aria-label="Manual host speed override">
-        <button id="speedunit" type="button" aria-pressed="false"
-                title="Toggle between m/s and mph">m/s</button>
-      </div>
-      <div class="speed-hint" id="speedhint">GPS speed &middot; override blank</div>
-    </div>
-
-    <!-- ---- NAVIGATION ----
-         The provider computes the route; RIO tracks the car against it and
-         decides what is worth saying. The wiring is in static/rio_nav.js, the
-         deterministic tracker in static/rio_navcore.js, the speech planner and
-         visual-context lifecycle in static/rio_navplan.js, and every
-         announcement goes out through the arbiter in static/rio_speech.js —
-         there is only one mouth. Vision is optional throughout: with no
-         camera, no landmarks or no verification, RIO says "Take the next
-         left" and the drive is unaffected. -->
-    <div class="panel nav-panel">
-      <div class="nav-head">
-        <div class="col-title">Navigation</div>
-        <div class="col-sub">Provider Route &middot; RIO Context</div>
-      </div>
-
-      <div class="nav-empty" id="navempty">No Route Set</div>
-
-      <div class="nav-destrow">
-        <input id="navdest" class="nav-dest" type="text"
-               placeholder="Destination" aria-label="Destination"
-               autocomplete="off" autocapitalize="off" spellcheck="false">
-        <button id="navgo" class="hud-btn nav-btn" type="button">Route</button>
-        <button id="navclear" class="hud-btn nav-btn" type="button">Clear</button>
-      </div>
-      <div class="nav-suggest" id="navsuggest" style="display:none;"></div>
-
-      <div class="nav-summary" id="navsummary" style="display:none;">
-        <span><i>ETA</i><b id="naveta">&mdash;</b></span>
-        <span><i>Distance</i><b id="navdistance">&mdash;</b></span>
-        <span><i>Remaining</i><b id="navremaining">&mdash;</b></span>
-      </div>
-
-      <div class="nav-man" id="navman" style="display:none;">
-        <span class="nav-man-icon" id="navmanicon">&#8593;</span>
-        <span class="nav-man-text" id="navmantext"></span>
-        <span class="nav-man-dist" id="navmandist"></span>
-      </div>
-
-      <!-- The four states worth showing, and they are four because they are
-           genuinely independent. A maneuver can be APPROACHING while its
-           visual context is still ACQUIRING; GPS can be STALE while the route
-           state is ON_ROUTE (a lost fix is not a wrong turn). Collapsing any
-           of these into a single "nav status" would hide exactly the
-           disagreement worth seeing. -->
-      <div class="nav-summary nav-state" id="navstate" style="display:none;">
-        <span><i>Maneuver</i><b id="navmanstate">&mdash;</b></span>
-        <span><i>GPS</i><b id="navgpsstate">&mdash;</b></span>
-        <span><i>Route</i><b id="navroutestate">&mdash;</b></span>
-        <span><i>Context</i><b id="navctxstate">&mdash;</b></span>
-      </div>
-
-      <!-- Debug, not driver-facing: which landmark was verified, with the
-           confidences that let it through. A drive where this is empty most of
-           the time is a drive where the gates are working. -->
-      <div class="nav-anchor" id="navanchor" style="display:none;"></div>
-
-      <div class="nav-map bracketed" id="navmap">
-        <div class="nav-map-idle" id="navmapidle">Awaiting Route</div>
-      </div>
-
-      <!-- Desk mode. GPS on a desk is a stationary fix with no speed, so the
-           simulator walks the host position along the route's own polyline at a
-           set speed and feeds it through exactly the same position handler a
-           real fix goes through. The start-point box exists for the same
-           reason: to test a route somewhere other than where the laptop is. -->
-      <div class="nav-dev">
-        <button id="navsim" class="hud-btn nav-btn" type="button" aria-pressed="false"
-                title="Walk the host position along the route to test announcements">Simulate Drive</button>
-        <input id="navsimspeed" type="number" inputmode="decimal" min="1" step="5" value="30"
-               aria-label="Simulated speed in mph" title="Simulated speed (mph)">
-        <input id="navorigin" type="text" placeholder="Start point (blank = GPS)"
-               autocomplete="off" spellcheck="false"
-               aria-label="Start point override — address or lat,lng">
-      </div>
+      <div id="drivestatus"></div>
     </div>
   </section>
 
-  <!-- ============ COLUMN 2 - PERCEPTION ============ -->
-  <section class="col panel">
-    <div class="col-head">
-      <div class="col-title">Perception</div>
-      <div class="col-sub">Qwen2.5-VL-3B &middot; Seeing</div>
-    </div>
+  <div class="stage-grid">
 
-    <div id="observation">No observation yet.</div>
-
-    <div class="col-sublabel">History &middot; Last 5</div>
-    <div class="history" id="obshistory"></div>
-  </section>
-
-  <!-- ============ COLUMN 3 - DIALOGUE ============ -->
-  <section class="col panel">
-    <div class="col-head">
-      <div class="col-title">RIO's Dialogue</div>
-      <div class="col-sub">GPT-5.5 &middot; Speaking</div>
-    </div>
-
-    <div class="turn turn-driver">
-      <div class="turn-tag">Driver</div>
-      <div class="turn-text turn-empty" id="turndriver">Awaiting input.</div>
-    </div>
-    <div class="turn turn-rio">
-      <!-- The tag says which pipeline answered. A visual turn means GPT-5.5 was
-           handed the frame and a crop; anything else means it answered from the
-           conversation alone. A misroute is visible here before it is audible. -->
-      <div class="turn-tag">RIO<span class="turn-route" id="turnroute"></span></div>
-      <div class="turn-text turn-empty" id="turnrio">Standing by.</div>
-    </div>
-
-    <div class="col-sublabel">Session Transcript</div>
-    <div class="history" id="dialoghistory"></div>
-  </section>
-
-  <!-- ============ COLUMN 4 - VOICE LAYER ============ -->
-  <section class="col panel bracketed">
-    <div class="col-head">
-      <div class="col-title">Voice Layer</div>
-      <div class="col-sub">ElevenLabs &middot; Narrator</div>
-    </div>
-
-    <div class="ring-wrap">
-      <div class="ring" id="voicering">
-        <span class="ring-state" id="voicestate">Idle</span>
+    <!-- ============ PERCEPTION ============ -->
+    <section class="col panel">
+      <div class="col-head">
+        <div class="col-title">Perception</div>
+        <!-- Written at load from /health's `models` block. The name that used
+             to be hard-coded here was two model generations out of date and
+             said so to every driver who read it. -->
+        <div class="col-sub" id="subperception">Seeing</div>
       </div>
-    </div>
 
-    <div class="spoken" id="spokenline"></div>
+      <div id="observation">No observation yet.</div>
 
-    <div class="chips">
-      <div class="chip"><i>Round Trip</i><b id="statrtt">&mdash;</b></div>
-      <div class="chip"><i>Audio</i><b id="statdur">&mdash;</b></div>
-    </div>
+      <div class="col-sublabel">History &middot; last 5</div>
+      <div class="history" id="obshistory"></div>
+    </section>
 
-    <div class="panel audio-panel">
-      <div class="panel-label">Voice Downlink</div>
-      <audio id="player" controls autoplay playsinline></audio>
-    </div>
+    <!-- ============ DIALOGUE ============ -->
+    <section class="col panel">
+      <div class="col-head">
+        <div class="col-title">RIO's dialogue</div>
+        <div class="col-sub" id="subdialogue">Speaking</div>
+      </div>
 
-    <!-- Idle placement only. body.driving lifts this out of the column and
-         pins it to the bottom of the viewport; see #micbar in the stylesheet.
-         The control never covers the camera box in either placement.
+      <div class="turn turn-driver">
+        <div class="turn-tag">Driver</div>
+        <div class="turn-text turn-empty" id="turndriver">Awaiting input.</div>
+      </div>
+      <div class="turn turn-rio">
+        <!-- The tag says which pipeline answered. A visual turn means the chat
+             model was handed the frame and a crop; anything else means it
+             answered from the conversation alone. A misroute is visible here
+             before it is audible. -->
+        <div class="turn-tag">RIO<span class="turn-route" id="turnroute"></span></div>
+        <div class="turn-text turn-empty" id="turnrio">Standing by.</div>
+      </div>
 
-         The dot and the two lines are set by setMicState() and by nothing
-         else -- a control whose caption is written from six places drifts out
-         of step with the session it is supposed to be describing. -->
-    <div id="micbar">
-      <button id="mic" type="button" data-state="idle"
-              aria-label="Start a conversation with RIO">
-        <span class="mic-dot" aria-hidden="true"></span>
-        <span class="mic-text">
-          <span class="mic-label" id="miclabel">Talk to RIO</span>
-          <span class="mic-hint" id="michint" aria-hidden="true"></span>
-        </span>
-      </button>
-    </div>
-  </section>
+      <div class="col-sublabel">Session transcript</div>
+      <div class="history" id="dialoghistory"></div>
+    </section>
 
-  <!-- ============ COLUMN 5 - VEHICLE HEALTH ============
+    <!-- ============ VOICE LAYER ============ -->
+    <section class="col panel voice-col">
+      <div class="col-head">
+        <div class="col-title">Voice layer</div>
+        <div class="col-sub" id="subvoice">Narrator</div>
+      </div>
+
+      <div class="ring-wrap">
+        <div class="ring" id="voicering">
+          <span class="ring-state" id="voicestate">Idle</span>
+        </div>
+      </div>
+
+      <div class="spoken" id="spokenline"></div>
+
+      <div class="chips">
+        <div class="chip"><i>Round trip</i><b id="statrtt">&mdash;</b></div>
+        <div class="chip"><i>Audio</i><b id="statdur">&mdash;</b></div>
+      </div>
+
+      <div class="panel audio-panel">
+        <div class="panel-label">Voice downlink</div>
+        <audio id="player" controls autoplay playsinline></audio>
+      </div>
+
+      <!-- Idle placement only. body.driving lifts this out of the column and
+           pins it to the bottom of the viewport; see #micbar in the stylesheet.
+           The control never covers the camera box in either placement.
+
+           The dot and the two lines are set by setMicState() and by nothing
+           else -- a control whose caption is written from six places drifts out
+           of step with the session it is supposed to be describing. -->
+      <div id="micbar">
+        <button id="mic" type="button" data-state="idle"
+                aria-label="Start a conversation with RIO">
+          <span class="mic-dot" aria-hidden="true"></span>
+          <span class="mic-text">
+            <span class="mic-label" id="miclabel">Talk to RIO</span>
+            <span class="mic-hint" id="michint" aria-hidden="true"></span>
+          </span>
+        </button>
+      </div>
+    </section>
+
+  </div><!-- /.stage-grid -->
+  </div><!-- /.stage -->
+
+  <!-- ============ VEHICLE HEALTH ============
        Display only, and it stayed that way when RIO gained a voice for the car.
        There is still no arbiter call anywhere in this column and no voice path
        in rio_vehicle.js: a predictive insight is a line in a log, not an alert.
@@ -1971,10 +1908,13 @@
 
        The statuses, the numbers, the trend arrows and the sentences are all
        decided in telemetry.py and insights.py against config.py. -->
-  <section class="col panel bracketed" id="vehcol">
+  <section class="col panel" id="vehcol">
     <div class="col-head">
-      <div class="col-title">Vehicle Health</div>
-      <div class="col-sub">Holley Terminator X &middot; Live Telemetry</div>
+      <div class="col-title">Vehicle health</div>
+      <!-- The provider actually feeding the column, from the same payload the
+           rows come from. It used to name one mock ECU whatever was plugged
+           in. -->
+      <div class="col-sub" id="subvehicle">Live telemetry</div>
     </div>
 
     <!-- VehicleStatusBanner. Empty until the first poll; it carries the
@@ -1982,11 +1922,11 @@
          engine runtime line. -->
     <div id="vehbanner"></div>
 
-    <div class="veh-section">Real-Time Sensor Telemetry</div>
+    <div class="veh-section">Real-time sensor telemetry</div>
     <!-- TelemetryList. One row per channel, grouped, generated. -->
     <div class="tm-list tm-scroll" id="vehtelemetry"></div>
 
-    <div class="veh-section">Vehicle Insights</div>
+    <div class="veh-section">Vehicle insights</div>
     <!-- VehicleInsights. Newest first. Every sentence is written server-side
          by insights.py's narrator; seeded demo entries are labelled. -->
     <div class="vi-list vi-scroll" id="vehinsights"></div>
@@ -1998,16 +1938,16 @@
          things. static/rio_dtc.js fills both and decides neither: the groups,
          the order, the status labels and the wording all arrive already
          settled from /vehicle/dtc and /vehicle/conditions. -->
-    <div class="veh-section">Flagged Error Codes</div>
+    <div class="veh-section">Flagged error codes</div>
     <div class="dtc-list dtc-scroll" id="vehdtc"></div>
 
-    <div class="veh-section">RIO-Observed Conditions</div>
+    <div class="veh-section">RIO-observed conditions</div>
     <div class="dtc-list dtc-scroll" id="vehconditions"></div>
 
     <!-- The one control on this panel that asks the car anything — and it is a
          read. Modes 03, 07 and 0A plus freeze frames; nothing here can clear a
          code, because no endpoint exists to do it. -->
-    <div class="veh-section">Diagnostic Report</div>
+    <div class="veh-section">Diagnostic report</div>
     <div id="vehreport"></div>
 
     <!-- Dev only. Both hidden by rio_vehicle.js the moment a provider with no
@@ -5087,6 +5027,74 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_vehicle.js"></script>
 <script src="/static/rio_dtc.js"></script>
 <script src="/static/rio_health.js"></script>
+<script>
+/* WHAT IS ACTUALLY LOADED, on the cards that claim it.
+ *
+ * The four subtitles under the card titles used to be typed into the markup.
+ * They said Qwen2.5-VL-3B, GPT-5.5, "ElevenLabs · narrator" and "Holley
+ * Terminator X" — and by the time anyone read them the vision model was two
+ * generations further on, the voice backend was OpenAI's realtime session,
+ * and the telemetry provider was whatever the source selector last pointed
+ * at. A dashboard that is confidently wrong about its own pipeline is worse
+ * than one that says nothing, because a driver has no way to tell.
+ *
+ * So they are written at load from the server's own answer: /health carries a
+ * `models` block built from vision.MODEL_ID and config, /voice/status carries
+ * the backend and the voice it is speaking with. The Vehicle Health subtitle
+ * is not here — it comes from the telemetry payload itself, on every poll,
+ * inside rio_vehicle.js, because that one changes while the page is open.
+ *
+ * Nothing here is required for the page to work. Each subtitle keeps the
+ * short generic line already in the markup ("Seeing", "Speaking",
+ * "Narrator") if the request fails, which is the honest fallback: it says
+ * what the card is for and claims nothing about what is behind it. */
+document.addEventListener('DOMContentLoaded', () => {
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if (el && text) el.textContent = text;
+  };
+  /* "Qwen/Qwen3-VL-8B-Instruct" is a checkpoint path, not a name to read at a
+     glance. The org prefix goes; the rest is what the log calls it. */
+  const short = (id) => String(id || '').split('/').pop();
+
+  const readHealth = () => fetch('/health', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(h => {
+      const m = h.models || {};
+      set('subperception', short(m.vision) + ' · seeing');
+      set('subdialogue', short(m.dialogue) + ' · speaking');
+      /* A degraded pod is a fact about what the driver is looking at: with no
+         detector there are no candidate boxes and headway reports UNKNOWN for
+         every frame, and the Drive card is where that belongs. */
+      const missing = (h.degraded || []).map(d => d.component);
+      set('subdrive', missing.length
+        ? 'Visual input · degraded: ' + missing.join(', ')
+        : 'Visual input · capture');
+      /* `warm` clears on its own about forty-five seconds in, and a subtitle
+         that still says "degraded: warm" ten minutes later is the same stale
+         claim this whole block exists to remove. So a degraded answer is
+         asked again, and only a degraded answer -- a healthy pod stops
+         polling after the first reply. */
+      if (missing.length) setTimeout(readHealth, 10000);
+    })
+    .catch(() => {});
+  readHealth();
+
+  fetch('/voice/status', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(v => {
+      /* Two backends with two different things worth naming: the realtime
+         session speaks with a named voice, ElevenLabs with a voice id under a
+         named model. Whichever is live is what the card should say. */
+      const line = v.backend === 'openai_realtime'
+        ? 'OpenAI Realtime · ' + (v.live_voice || 'voice')
+        : 'ElevenLabs · ' + (v.configured ? (v.voice_id || 'narrator') : 'not configured');
+      set('subvoice', line);
+    })
+    .catch(() => {});
+});
+</script>
+
 <script>
 /* One mouth, one line on the HUD. Whatever the arbiter starts playing is what
    the Voice Layer column shows — headway, navigation and vehicle health alike,
