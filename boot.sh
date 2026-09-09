@@ -248,6 +248,45 @@ print(f"   cv2 {cv2.__version__} has the tracking API")
 PY
 
 # ---------------------------------------------------------------------------
+# 5d. Playwright + Chromium — the two selftests that need a real browser
+# ---------------------------------------------------------------------------
+# tools/output_bus_selftest.py and tools/mobile_layout_selftest.py drive an
+# actual browser: the shared audio bus and its unlock, and the mobile layout
+# swept over its whole scroll range. Neither can be faked in node, because what
+# they assert is what a browser does with the page rather than what the code
+# says it should.
+#
+# NOT FATAL, and nothing about the server needs it -- this is a test dependency
+# and RIO drives without it. What a pod without it loses is the ability to run
+# those two suites, which is worth knowing IN THE LOG rather than discovering
+# as an ImportError months later.
+#
+# AND THAT IS NOT HYPOTHETICAL. On 2026-09-09 both of these had been quietly
+# unrunnable here for as long as anyone had been asking for "the full suite":
+# playwright was in neither requirements.txt nor this script, so both exited 2
+# with an install hint. A skipped suite reads almost exactly like a passing one
+# at a glance, which is the whole reason this step is here and logs when it
+# fails.
+#
+# The browser lands in ~/.cache/ms-playwright, which is the container layer and
+# does NOT survive a pod restart -- the same as apt packages, pip packages and
+# torch above, and the reason all of them are reinstalled here on every boot.
+# It is ~115 MB, against torch's ~3 GB, so it is not worth the persistent
+# volume and a PLAYWRIGHT_BROWSERS_PATH to go with it.
+#
+# Three commands, because the browser is three things: the python package, the
+# apt half it needs to run (fonts, libnss3, xvfb and the rest), and the browser
+# binary itself. Chained on && so that a failure anywhere short-circuits to the
+# one message -- there is no useful half-installed state to carry forward, and
+# the message says what is lost rather than which of the three fell over. The
+# log line above it is what says how far it got.
+log "playwright + chromium (browser selftests)"
+pip install --no-cache-dir playwright \
+    && python -m playwright install-deps chromium \
+    && python -m playwright install chromium \
+    || log "  !! playwright unavailable - output_bus_selftest and mobile_layout_selftest cannot run"
+
+# ---------------------------------------------------------------------------
 # 6. Free port 8888
 # ---------------------------------------------------------------------------
 # RunPod starts JupyterLab on 8888, which is the port the proxy exposes and the
