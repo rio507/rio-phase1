@@ -671,14 +671,6 @@ process.stdin.on('data', (d) => {
             remaining_m: st ? Math.round(st.remaining_m || 0) : null,
             tools: controller.state().tools || null,
             speak_stats: RIO.speak.stats ? RIO.speak.stats() : null });
-    } else if (m.k === 'warm') {
-      /* THE WARM-UP, and it waits for the socket for the same reason the page
-         waits for the data channel. Called at module load -- which is what the
-         first version did -- the create is written to stdout before python has
-         connected the session socket, pump_node drops it on `and self.oai`,
-         and the warm-up silently never happens. A warm that did not happen is
-         worse than none: it reads in the numbers as one that did. */
-      controller.warmSession();
     } else if (m.k === 'bye') {
       process.exit(0);
     }

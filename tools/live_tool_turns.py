@@ -314,10 +314,6 @@ async def run(base, out_path, video, dump=None, script="tools"):
             panel.oai = oai
             pumps = [asyncio.create_task(panel.pump_node()),
                      asyncio.create_task(panel.pump_session())]
-            # THE SESSION IS REACHABLE NOW, and not before: pump_node drops a
-            # send while self.oai is None. The page warms on its data channel
-            # opening; this is the same moment.
-            panel.tell({"k": "warm"})
             if text_mode:
                 panel.relay = await stack.enter_async_context(
                     websockets.connect(
