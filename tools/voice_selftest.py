@@ -29,6 +29,7 @@ reaches it.
 """
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -348,9 +349,18 @@ def run_scene_gate():
     call = re.search(r"realtime\.run_tool,(.*?\))\)", app)
     ok(call and 'body.get("spoken")' in call.group(1),
        "the server passes it through to the tool")
-    ok("def look(question: str, session_key: str = \"default\",\n         spoken" in
-       Path(REPO / "realtime.py").read_text(),
-       "and look() takes it")
+    # Asked of the FUNCTION, not of the file. This matched the source text of
+    # look()'s signature down to the newline and the nine spaces of
+    # indentation before `spoken` -- true only for as long as nobody reflowed
+    # a line. The parameter is the fact; how it is wrapped is not.
+    # .get rather than [], so that a look() without the parameter at all
+    # reports two honest failures instead of taking the suite down with a
+    # KeyError on the line after the one that already said what was wrong.
+    spoken_param = inspect.signature(realtime.look).parameters.get("spoken")
+    ok(spoken_param is not None, "and look() takes it")
+    ok(spoken_param is not None and spoken_param.default is None,
+       "...and takes it optionally, because every other caller of look() -- "
+       "the hold-to-talk turn among them -- has no live transcript to hand it")
 
     # A camera answer has a ceiling, at the API rather than in the prompt.
     cap = config.look_answer_max_tokens()
