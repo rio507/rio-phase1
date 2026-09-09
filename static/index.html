@@ -2691,8 +2691,12 @@ function stopBusWatch() {
 }
 
 async function toggleLive() {
-  if (liveBusy) return;
   RIO.unlockAudio(player);
+
+  /* AN OPEN SESSION ENDS. Checked before the connect guard below, because for
+     the last await of the connect path both are true at once -- and what a tap
+     means there is "end the conversation that has already started", not
+     "cancel the connect that has already finished". */
   if (live) {
     // Spend the generation FIRST, so anything stop() shakes loose on the way
     // out is already disowned by the time it reaches the handler.
@@ -2701,6 +2705,36 @@ async function toggleLive() {
     live = null;
     stopLiveFrames();
     stopBusWatch();
+    setMicState('idle');
+    RIO.ui.voice('idle');
+    return;
+  }
+
+  /* A CONNECT STILL IN FLIGHT. The tap cancels it.
+   *
+   * This used to be `if (liveBusy) return;` at the top of the function, which
+   * made the control dead for the whole of the connect -- a POST for an
+   * ephemeral session, getUserMedia, and a WebRTC offer/answer, about 1.3s
+   * against a warm server on this desk and longer on a phone over cellular.
+   * The driver taps Talk to RIO, changes their mind, taps again, and nothing
+   * happens.
+   *
+   * There is no way to stop connect() arriving -- it has no abort -- so the
+   * cancel is expressed the same way ending a session is: spend the
+   * generation. The control goes back to idle on this tap, and the session
+   * that eventually resolves is disowned and torn down where it lands, below.
+   *
+   * Nothing needs unwinding here. The bus watch and the frame feed are both
+   * started AFTER connect() resolves, and if they had started then `live`
+   * would be set and the branch above would have taken this tap instead.
+   *
+   * One window remains and it is the honest one: a second tap cannot open a
+   * NEW conversation until the cancelled connect settles. Two overlapping
+   * connects is not a thing this page can survive -- both would hold a
+   * microphone, and handle.stop() ends with `element.srcObject = null` on the
+   * one shared player, so tearing the first down would silence the second. */
+  if (liveBusy) {
+    liveGen++;
     setMicState('idle');
     RIO.ui.voice('idle');
     return;
@@ -2732,6 +2766,17 @@ async function toggleLive() {
         reportLive(ev);
       },
     });
+    /* Cancelled while this was in flight. The session is real -- it opened a
+       microphone and a peer connection on the way here -- so it is torn down
+       rather than dropped: handle.stop() closes the channel, closes the peer
+       connection, stops the mic tracks and clears the player. Nothing else
+       owns the player at this instant, which is exactly why cancelling had to
+       forbid a second connect rather than allow one. */
+    if (gen !== liveGen) {
+      try { live.stop(); } catch (e) { /* a half-built session is still gone */ }
+      live = null;
+      return;
+    }
     setMicState('listening');
     RIO.ui.voice('listening');
     // The bus is now carrying her voice. Watch it for the length of the
@@ -2740,9 +2785,17 @@ async function toggleLive() {
     // Give her something to see. A drive already does; this covers the case
     // where the driver just wants to talk.
     const eyes = await startLiveFrames();
+    // Ended while the feed was opening. The branch above has already stopped
+    // the session and the frames; all that is left is not to narrate it.
+    if (gen !== liveGen) return;
     obs.textContent = 'Live — just talk. She will stop when you do.'
       + (eyes || RIO.driving ? '' : ' (no camera — she cannot see)');
   } catch (e) {
+    /* Cancelled, and then it failed anyway. The failure is moot and must not
+       be acted on: liveMode = false would take live conversation away for the
+       REST OF THE DRIVE on the strength of a session the driver had already
+       said they did not want. */
+    if (gen !== liveGen) { live = null; return; }
     // One failure is enough: fall back for the rest of the drive rather than
     // making the driver discover it again at the next junction.
     liveMode = false;

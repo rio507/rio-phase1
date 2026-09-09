@@ -318,6 +318,133 @@ def run_bus_watch(page, errors):
     page.wait_for_timeout(300)
 
 
+# ---------------------------------------------------------------------------
+# Cancelling a connect
+# ---------------------------------------------------------------------------
+# toggleLive() used to open with `if (liveBusy) return;`, which made the talk
+# control dead for the whole of a connect -- an ephemeral-session POST,
+# getUserMedia and a WebRTC offer/answer, about 1.3s against a warm server on
+# a desk and longer on a phone over cellular. A driver who taps Talk to RIO,
+# changes their mind and taps again got nothing, and then got a conversation
+# they had already cancelled.
+#
+# connect() has no abort, so the cancel is expressed the way ending a session
+# is -- the generation is spent -- and the session that eventually resolves is
+# stopped where it lands. This asserts the three things that has to mean: the
+# control answers the cancelling tap immediately, the arriving session is torn
+# down rather than adopted, and no bus watch is started for it.
+#
+# The stub here is a connect held open on purpose, released by hand, so the
+# window that used to be a race is a place the test can stand still inside.
+HELD_CONNECT_STUB = """
+() => {
+  window.__iv = [];
+  const si = window.setInterval, ci = window.clearInterval;
+  window.setInterval = function (fn, ms) {
+    const id = si.apply(this, arguments);
+    if (ms === 1000) window.__iv.push({ id: id, live: true });
+    return id;
+  };
+  window.clearInterval = function (id) {
+    const r = window.__iv.find(x => x.id === id);
+    if (r) r.live = false;
+    return ci.apply(this, arguments);
+  };
+  window.__attempts = 0; window.__opened = 0; window.__stopped = 0;
+  window.__resolve = null; window.__reject = null;
+  if (!(window.RIO && RIO.realtime)) return false;
+  RIO.realtime.connect = (opts) => new Promise((res, rej) => {
+    window.__attempts++;
+    window.__resolve = () => {
+      window.__opened++;
+      res({ onEvent: opts.onEvent, stop: function () { window.__stopped++; } });
+    };
+    window.__reject = () => rej(new Error('socket refused'));
+  });
+  return true;
+}
+"""
+
+CONNECT_STATE = """
+() => ({
+  mic: document.getElementById('mic').dataset.state,
+  ring: document.getElementById('voicering').className,
+  attempts: window.__attempts,
+  opened: window.__opened,
+  stopped: window.__stopped,
+  running: window.__iv.filter(r => r.live).length,
+})
+"""
+
+
+def run_connect_cancel(page, errors):
+    section("a tap during the connect cancels it")
+
+    if not page.evaluate(HELD_CONNECT_STUB):
+        ok(False, "RIO.realtime exists to be stubbed")
+        return
+    before = len(errors)
+
+    page.click("#mic")
+    page.wait_for_timeout(400)
+    r = page.evaluate(CONNECT_STATE)
+    ok(r["attempts"] == 1 and r["mic"] == "connecting",
+       f"a tap starts a connect and the control says so (is {r['mic']!r})")
+
+    # The regression: this used to stay 'connecting' for the whole connect.
+    page.click("#mic")
+    page.wait_for_timeout(300)
+    r = page.evaluate(CONNECT_STATE)
+    ok(r["mic"] == "idle",
+       f"a second tap answers immediately, without waiting for the connect "
+       f"(is {r['mic']!r})")
+    ok(r["attempts"] == 1,
+       f"and does not start a second connect on top of the first "
+       f"({r['attempts']} attempts)")
+
+    # Now let the cancelled connect land.
+    page.evaluate("() => window.__resolve()")
+    page.wait_for_timeout(500)
+    r = page.evaluate(CONNECT_STATE)
+    ok(r["opened"] == 1 and r["stopped"] == 1,
+       f"the session that arrives is torn down, not adopted "
+       f"(opened {r['opened']}, stopped {r['stopped']})")
+    ok(r["mic"] == "idle",
+       f"the control stays idle — the driver cancelled (is {r['mic']!r})")
+    ok("listening" not in r["ring"] and "speaking" not in r["ring"],
+       f"and the ring never lights for it (is {r['ring']!r})")
+    ok(r["running"] == 0,
+       f"no bus watch was started for a session nobody wanted ({r['running']})")
+    ok(len(errors) == before,
+       "cancelling throws nothing"
+       + ("" if len(errors) == before else ": " + "; ".join(errors[before:])))
+
+    # A cancelled connect that then FAILS must not cost the drive its live
+    # mode: liveMode = false in the catch would drop every later tap to
+    # hold-to-talk, on the strength of a session the driver had called off.
+    page.click("#mic")
+    page.wait_for_timeout(300)
+    page.click("#mic")
+    page.wait_for_timeout(300)
+    page.evaluate("() => window.__reject()")
+    page.wait_for_timeout(500)
+    r = page.evaluate(CONNECT_STATE)
+    ok(r["mic"] == "idle",
+       f"a cancelled connect that then fails leaves the control idle "
+       f"(is {r['mic']!r})")
+
+    page.click("#mic")
+    page.wait_for_timeout(400)
+    r = page.evaluate(CONNECT_STATE)
+    ok(r["mic"] == "connecting",
+       f"and live conversation still works afterwards — the cancelled failure "
+       f"did not fall the drive back to hold-to-talk (is {r['mic']!r})")
+
+    # Leave the page idle: cancel the connect this check just started.
+    page.click("#mic")
+    page.wait_for_timeout(200)
+
+
 def run_unlock(page):
     section("Start Drive primes on silence, never on a warning")
     page.evaluate(SPY)
@@ -464,6 +591,7 @@ def main():
 
         run_unlock(page)
         run_bus_watch(page, errors)
+        run_connect_cancel(page, errors)
 
         ok(not errors, "no uncaught page errors" +
            ("" if not errors else ": " + "; ".join(errors[:3])))
