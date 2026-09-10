@@ -578,6 +578,67 @@ def run_speech():
        "Head east on Venice Boulevard, then turn left onto Lincoln Boulevard.",
        "the route-start line is the whole first move — got "
        + repr(r.depart_speech))
+
+    # --- THE DEPART STEP'S TWO SHAPES, AND THE ONE THAT SAID A ROAD TWICE ---
+    #
+    # Google's DEPART step names either the road you are ON ("Head north on
+    # Lincoln Blvd") or the road you are AIMED AT, which is what it says when
+    # the road you are on has no name ("Head northeast toward 16th St"). The
+    # second one names the road the first maneuver turns onto, so chaining it
+    # says that road twice. Measured on a live route to Griffith Observatory
+    # (tools/live_tool_turns.py --script nav, 2026-09-10):
+    #
+    #     "Head northeast toward 16th St, then turn left onto 16th St."
+    #
+    # The rule is a comparison, not a rewrite: the "toward" clause is dropped
+    # only when its road IS the road the next instruction turns onto.
+    def depart_for(depart_instruction, road, kind=M.TURN, direction=M.LEFT):
+        man = M.CanonicalManeuver(
+            id="m0", sequence=0, type=kind, direction=direction, road_name=road,
+            latitude=0.0, longitude=0.0, route_distance_position=100.0,
+            polyline_index=0, instruction="")
+        return speech_mod.depart_text(M.CanonicalRoute(
+            route_id="r", journey_id="j", generation_id=1, provider="fixture",
+            origin_lat=0.0, origin_lng=0.0,
+            destination=M.CanonicalDestination("D", "D", 0.0, 0.0),
+            total_distance_m=0.0, duration_s=0.0, geometry=[], maneuvers=[man],
+            depart_instruction=depart_instruction))
+
+    same = depart_for("Head northeast toward 16th St", "16th St")
+    ok(same == "Head northeast, then turn left onto 16th St.",
+       "same road: the toward clause is dropped and the name lands on the "
+       "instruction that acts on it — got " + repr(same))
+    ok(same.lower().count("16th st") == 1,
+       "...so the road is said once, not twice")
+
+    other = depart_for("Head northeast toward 16th St", "Ocean Ave",
+                       direction=M.RIGHT)
+    ok(other == "Head northeast toward 16th St, then turn right onto Ocean Ave.",
+       "different roads: both are kept, because 'toward 16th St' is then real "
+       "information about the way out — got " + repr(other))
+
+    on_form = depart_for("Head north on Lincoln Blvd", "Ocean Ave",
+                         direction=M.RIGHT)
+    ok(on_form == "Head north on Lincoln Blvd, then turn right onto Ocean Ave.",
+       "the 'on <road>' shape is never touched — it names the road under the "
+       "car, which is different information — got " + repr(on_form))
+
+    # Punctuation and case only. No abbreviation table: guessing that "St" and
+    # "Street" are the same road is a guess, and a wrong one drops a road name
+    # the driver needed.
+    ok(depart_for("Head northeast toward 16TH ST.", "16th St")
+       == "Head northeast, then turn left onto 16th St.",
+       "the comparison survives case and punctuation")
+    ok(depart_for("Head northeast toward 16th Street", "16th St")
+       == "Head northeast toward 16th Street, then turn left onto 16th St.",
+       "and stops there — a spelling this cannot prove is the same road keeps "
+       "both halves rather than dropping one")
+
+    # A head that is NOTHING but the toward clause has nothing left to say.
+    ok(depart_for("Toward 16th St", "16th St")
+       == "Toward 16th St, then turn left onto 16th St.",
+       "a head with no direction in it is kept whole — a bare 'then turn left' "
+       "came from nowhere")
     ok(arrive.speech["arrival"] == "Your destination is on the right.",
        "arrival says the side the provider gave")
     ok(arrive.speech["arrived"] == "You have arrived.",

@@ -78,6 +78,7 @@ stored on the route. Nothing generates language while the car is moving; the
 timing path only ever looks a string up, and /nav/voice re-reads the same
 table, so what is spoken and what is logged cannot drift apart.
 """
+import re
 from typing import List, Optional
 
 import config
@@ -268,6 +269,39 @@ def near_text(maneuver: "M.CanonicalManeuver",
     return _sentence(clause)
 
 
+# Google's DEPART step comes in two shapes, and only one of them composes.
+#
+#   "Head north on Lincoln Blvd"        the road you are ON. Complementary to
+#                                       the move that follows it.
+#   "Head northeast toward 16th St"     the road you are AIMED AT, which is
+#                                       what it says when the road you are on
+#                                       has no name — a car park, a driveway,
+#                                       an unnamed segment.
+#
+# The second one names the road the first maneuver turns onto, so chaining it
+# says that road twice. Measured on a live route to Griffith Observatory:
+#
+#     "Head northeast toward 16th St, then turn left onto 16th St."
+#
+# Not wrong, and not a sentence anyone says. The direction is the useful half
+# of the head; the road name belongs on the instruction that acts on it.
+_TOWARD = re.compile(r"\s*\b(?:toward|towards)\s+(.+)$", re.IGNORECASE)
+
+
+def _same_road(a: str, b: str) -> bool:
+    """Are these the same road, allowing for punctuation and case?
+
+    Both strings come out of the same route response, so the provider spells
+    them the same way and normalising case and punctuation is enough. No
+    abbreviation table: guessing that "St" and "Street" are the same road is a
+    guess, and a wrong one drops a road name the driver needed.
+    """
+    def norm(t):
+        return " ".join(re.sub(r"[^\w\s]", " ", (t or "").lower()).split())
+    a, b = norm(a), norm(b)
+    return bool(a) and a == b
+
+
 def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
     """"Head north on Lincoln Blvd, then turn right onto Ocean Ave."
 
@@ -277,9 +311,9 @@ def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
     second later at 31 m; nothing ever told them what road they were on or
     which way they were pointing.
 
-    Google's DEPART step is exactly "Head north on Lincoln Blvd" and it is
-    provider text, so it is used verbatim. With no depart step the line is just
-    the first move, which is still more than silence.
+    Google's DEPART step is provider text and is used verbatim, with one
+    subtraction: a trailing "toward <road>" that names the road the first
+    maneuver already turns onto. See the note above _TOWARD.
     """
     head = (route.depart_instruction or "").strip().rstrip(".")
     first = None
@@ -293,6 +327,17 @@ def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
         return _sentence(head)
     if not head:
         return near_text(first)
+
+    # "...toward 16th St" + "turn left onto 16th St" -> drop the toward.
+    m_toward = _TOWARD.search(head)
+    if m_toward and _same_road(m_toward.group(1), first.road_name):
+        trimmed = head[:m_toward.start()].strip().rstrip(",")
+        # Only if something is left worth saying. "Head northeast" is; a head
+        # that was nothing BUT the toward phrase is not, and keeping it whole
+        # is better than announcing a bare direction that came from nowhere.
+        if trimmed:
+            head = trimmed
+
     return _sentence(f"{head}, then {action_phrase(first)}")
 
 
