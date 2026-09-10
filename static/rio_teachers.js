@@ -133,11 +133,28 @@
       col.appendChild(err);
     }
 
+    var flags = r.flags || {};
     FIELDS.forEach(function (f) {
       var label = f.label || TRACE_LABEL[model] || 'Reasoning';
       var text = r[f.key];
       var field = el('div', 'teach-field');
-      field.appendChild(el('div', 'teach-label', label));
+      var head = el('div', 'teach-label', label);
+      /* THIS ANSWER LOOKS RECITED. Structural only -- see teachers/canned.py.
+         Marked rather than hidden: it is a real thing the model said and it
+         belongs in the record and on the card. What it must not do is sit
+         here looking like perception. */
+      if (flags[f.key]) {
+        var strong = flags[f.key].strength !== 'weak';
+        /* "recited?" is a claim about the model; "repeating" is a claim about
+           the text. A repeated answer on an unchanging road may simply be
+           right again, and saying "recited" about it would teach a driver to
+           ignore the marker -- which is the only way a marker can fail. */
+        var warn = el('span', 'teach-recited' + (strong ? '' : ' weak'),
+                      strong ? ' recited?' : ' repeating');
+        warn.title = flags[f.key].why || 'looks recited rather than observed';
+        head.appendChild(warn);
+      }
+      field.appendChild(head);
       var body = el('div', 'teach-text', text || 'No reading yet.');
       if (!text) body.classList.add('empty');
       field.appendChild(body);

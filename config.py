@@ -3179,14 +3179,56 @@ TEACHER_CORPUS_KEEP_FRAMES = True
 # ONE PROMPT SET, BOTH MODELS, WORD FOR WORD. The whole point of the panel is
 # that the two columns are answers to the same question; a prompt tuned for
 # one of them would make the comparison a comparison of prompts.
+# TWO OF THESE ARE NOT THE OBVIOUS WORDING, AND THAT IS THE POINT.
+#
+# "Describe the scene." is the natural question and it is the one NVIDIA's own
+# VQA notebook uses. Asked of Alpamayo on a real road it returns, every time,
+# a string out of a TRAINING LABEL SET rather than a description:
+#
+#     "A vehicle controls loss. The vehicle driver is in distracted driving."
+#     "A vehicle changes lanes with the same direction to ego-car/another
+#      vehicle. Vehicles do not notice the coming vehicles when turning or
+#      changling lanes"
+#     "Lead vehicle stops. The vehicle driver is in distracted driving."
+#
+# Eight of ten keyframes on the acceptance clip returned the first one
+# VERBATIM, and the giveaways are in the characters: NON-BREAKING SPACES
+# between the words, and "changling" -- a typo carried out of a label
+# spreadsheet. It is scenario-category recall, not perception, and it happens
+# on every sample, seeded or not.
+#
+# This project has met that failure before from the other side: the observer's
+# prompt ended with four example sentences and Qwen returned the first one
+# whatever the frame was (rio_prompts.is_prompt_example, vision.parroted).
+# Same shape, different memory -- there the prompt's examples, here the
+# training set's labels.
+#
+# Rewording fixes it completely. Asked "Describe the road, the traffic and the
+# weather", the SAME model on the SAME four frames answers:
+#
+#     "The scene shows a clear day with good visibility... The road appears to
+#      be a multi-lane highway with a concrete divider..."
+#
+# So the wording below is chosen to elicit perception from BOTH models rather
+# than to be the tidiest phrasing, and it is still ONE prompt set asked of both
+# word for word -- which is the property that matters. See teachers/canned.py,
+# which flags a reading that looks recited so this cannot come back silently,
+# and docs/teacher_panel.md §6c for the A/B.
 TEACHER_PROMPTS = {
-    "scene": "Describe the scene.",
+    # NOT "Describe the scene." -- see above.
+    "scene": "Describe the road, the traffic and the weather.",
     "critical_actor": (
         "Which single road user is the most safety-relevant to the ego "
         "vehicle right now, and why?"
     ),
+    # NOT "What should the ego vehicle pay attention to in the next 2 seconds?"
+    # -- that one returns "The vehicle should pay attention to vehicles
+    # changing lanes" on nine keyframes out of ten. Asking for the hazard AND
+    # its position gets a real answer from both models, and gives the actor
+    # association something to work with.
     "attention": (
-        "What should the ego vehicle pay attention to in the next 2 seconds?"
+        "What is the main hazard the ego vehicle should watch in the next two "
+        "seconds, and where is it?"
     ),
 }
 # Cosmos's extra question -- the one Alpamayo answers with its Chain-of-

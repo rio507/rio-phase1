@@ -42,6 +42,7 @@ import time
 import config
 
 from . import associate as assoc_mod
+from . import canned as canned_mod
 from . import corpus as corpus_mod
 from . import egomotion
 from . import keyframe as kf_mod
@@ -53,6 +54,9 @@ MODEL_NAMES = ("alpamayo1.5", "cosmos-reason2")
 
 _lock = threading.RLock()
 _clients = {}
+# Per-session, per-model, per-field: how many keyframes in a row have carried
+# the identical answer. See teachers/canned.py.
+_repeats = {}
 _sessions = {}      # key -> per-drive panel state
 _started = False
 
@@ -116,7 +120,9 @@ def _state(key):
                       "agree_eligible": 0, "matched": 0, "actors": 0,
                       "dropped_build": 0},
             "last_build_refusal": None,
+            "canned": 0,
         }
+        _repeats[key] = canned_mod.RepeatTracker()
         _sessions[key] = st
     return st
 
@@ -315,6 +321,22 @@ def _on_reading(model: str, job: dict, reading: dict) -> None:
     with _lock:
         st = _state(key)
         if not not_run:
+            # DOES THIS READING LOOK RECITED? Structural only -- exotic
+            # whitespace out of a memorised label sheet, and the same answer
+            # given to keyframe after keyframe. It cannot tell whether an
+            # answer is TRUE and does not try. See teachers/canned.py for what
+            # this caught and why the prompt set is worded the way it is.
+            tracker = _repeats.get(key) or canned_mod.RepeatTracker()
+            _repeats[key] = tracker
+            flags = {}
+            for field in ("scene", "critical_actor", "attention", "reasoning"):
+                n = tracker.note(model, field, rec.get(field))
+                f = canned_mod.describe(rec.get(field) or "", n)
+                if f:
+                    flags[field] = f
+            rec["flags"] = flags
+            if flags:
+                st["tally"]["canned"] = st["tally"].get("canned", 0) + 1
             st["readings"][model] = rec
             st["assoc"][model] = a
             if rec.get("ok"):
@@ -447,10 +469,12 @@ def drop(session_key: str) -> bool:
     key = str(session_key or "default")
     egomotion.drop(key)
     with _lock:
+        _repeats.pop(key, None)
         return _sessions.pop(key, None) is not None
 
 
 def reset_all() -> None:
     with _lock:
         _sessions.clear()
+        _repeats.clear()
     egomotion.reset_all()

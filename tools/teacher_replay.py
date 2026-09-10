@@ -102,11 +102,25 @@ def side_by_side(row, width=52):
 
     lines.append(f"  {'ALPAMAYO 1.5':<{width}} | COSMOS-REASON2")
     lines.append(f"  {'-' * width} | {'-' * width}")
-    two("SCENE", a["scene"], c["scene"])
-    two("CHAIN-OF-CAUSATION / PHYSICAL REASONING",
+    def mark(rec, key):
+        """A one-word note when this answer looks recited or looped."""
+        f = (rec.get("flags") or {}).get(key)
+        if not f:
+            return ""
+        if f.get("loop"):
+            return f"   [LOOP x{f['loop']}]"
+        if f.get("markers"):
+            return "   [RECITED?]"
+        return f"   [repeats x{f.get('repeated')}]"
+
+    two("SCENE" + mark(a, "scene") + mark(c, "scene"), a["scene"], c["scene"])
+    two("CHAIN-OF-CAUSATION / PHYSICAL REASONING"
+        + mark(a, "reasoning") + mark(c, "reasoning"),
         a["reasoning"], c["reasoning"], limit=520)
-    two("ATTENTION (NEXT 2 s)", a["attention"], c["attention"])
-    two("CRITICAL ACTOR", a["critical_actor"], c["critical_actor"])
+    two("ATTENTION (NEXT 2 s)" + mark(a, "attention") + mark(c, "attention"),
+        a["attention"], c["attention"])
+    two("CRITICAL ACTOR" + mark(a, "critical_actor") + mark(c, "critical_actor"),
+        a["critical_actor"], c["critical_actor"])
 
     def actor(x):
         if x.get("matched"):

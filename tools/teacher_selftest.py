@@ -117,7 +117,12 @@ class FakeTeacher:
             "latency_ms": 1234.5,
             "raw": {"scene": {"question": "Describe the scene.",
                               "answer": "A two-lane road with a white van ahead."}},
-            "scene": "A two-lane road with a white van ahead.",
+            # VARIES PER KEYFRAME, because a real model's does. A fixture
+            # that answers every keyframe with the same sentence is itself
+            # reciting, and teachers/canned.py flags it -- correctly, which is
+            # how this line came to be written.
+            "scene": ("A two-lane road with a white van ahead ("
+                      + str(payload.get("kf_id")) + ")."),
             "critical_actor": "The white van directly ahead, because it is braking.",
             "attention": "The van's brake lights and the gap closing.",
             "reasoning": "The van ahead is decelerating; the ego should ease off.",
@@ -660,6 +665,131 @@ def run_desync():
     corpus_mod.close(key)
 
 
+def run_canned():
+    section("H. a recited answer is flagged, not filtered")
+    from teachers import canned as canned_mod
+
+    # THE REAL STRING, from the acceptance run. Alpamayo returned this verbatim
+    # on eight of ten keyframes of a clip with no lane change, no stopped lead
+    # and no distracted driver in it -- and the giveaway is in the characters:
+    # non-breaking spaces, carried out of a label spreadsheet.
+    RECITED = ("A vehicle controls\u00a0loss. The vehicle driver is in "
+               "distracted driving.")
+    REAL = ("The scene shows a clear day with good visibility. The road is a "
+            "multi-lane highway with a concrete divider.")
+    ok(canned_mod.looks_canned(RECITED),
+       f"the non-breaking spaces in a memorised label are seen "
+       f"({canned_mod.markers(RECITED)})")
+    ok(not canned_mod.looks_canned(REAL),
+       "a real description is not flagged")
+    ok(not canned_mod.looks_canned(""), "and neither is nothing")
+
+    t = canned_mod.RepeatTracker()
+    counts = [t.note("m", "scene", REAL) for _ in range(4)]
+    ok(counts == [1, 2, 3, 4],
+       f"the same answer keyframe after keyframe is counted ({counts})")
+    ok(not canned_mod.describe(REAL, 2),
+       "twice is a coincidence on a motorway where nothing changes")
+    ok(canned_mod.describe(REAL, 3).get("repeated") == 3,
+       "three times is the model not looking, whatever the words are — which "
+       "is the half of this that needs no list of known phrases")
+    ok(t.note("m", "critical_actor", REAL) == 1,
+       "counted per FIELD: Alpamayo's critical-actor answers were specific on "
+       "the very keyframes where its scene answers were a fixed string")
+    ok(t.note("m2", "scene", REAL) == 1, "...and per model")
+    ok(canned_mod.describe(RECITED, 5).get("why"),
+       "and a flag says in words why it fired, for whoever reads the corpus")
+    ok(canned_mod.describe(RECITED, 5).get("strength") == "strong",
+       "a non-breaking space between two words is near-proof — strong")
+    LOOP = ("The ego vehicle is on the freeway. "
+            + "The sedan is also further away from the ego vehicle. " * 5)
+    ok(canned_mod.loop_run(LOOP) == 5,
+       f"a sentence repeated inside ONE answer is counted "
+       f"({canned_mod.loop_run(LOOP)}) — Cosmos filled its whole token budget "
+       f"with one sentence on the acceptance clip")
+    ok(canned_mod.describe(LOOP, 0).get("strength") == "strong",
+       "a decoding loop is strong evidence: it is not analysis whatever it "
+       "says, and a corpus row that looks like four hundred words of "
+       "reasoning and is one sentence should say so")
+    ok(canned_mod.loop_run(REAL) < canned_mod.LOOP_FLOOR,
+       "a real answer that restates nothing is not a loop")
+    ok(canned_mod.describe(REAL, 5).get("strength") == "weak",
+       "repetition alone is a HINT — weak. On a straight empty motorway "
+       "'keep lane, the lane is clear' three keyframes running is the model "
+       "being right three times, and calling that recited would teach whoever "
+       "reads the card to ignore the flag")
+
+    section("H2. the shipped prompt set is the reworded one")
+    ok("Describe the scene." not in config.TEACHER_PROMPTS.values(),
+       "'Describe the scene.' is NOT asked — it returns a training-set label "
+       "from Alpamayo on every sample, seeded or not")
+    ok("weather" in config.TEACHER_PROMPTS["scene"],
+       f"the scene question asks for road, traffic and weather instead "
+       f"({config.TEACHER_PROMPTS['scene']!r})")
+    ok("where is it" in config.TEACHER_PROMPTS["attention"],
+       "and the attention question asks WHERE the hazard is, which gets a real "
+       "answer from both models and gives the association something to match")
+    ok(len(set(config.TEACHER_PROMPTS.values())) == 3,
+       "three distinct questions, asked of both models word for word")
+
+    section("H3. end to end, a recited reading reaches the record flagged")
+    panel.reset_all()
+    panel.stop()
+
+    class Reciter(FakeTeacher):
+        def answer(self, payload):
+            out = super().answer(payload)
+            out["scene"] = RECITED          # the same string every time
+            return out
+
+    a = Reciter("alpamayo1.5", 18931)
+    c = FakeTeacher("cosmos-reason2", 18932)
+    config.TEACHER_ALPAMAYO_URL = "http://127.0.0.1:18931"
+    config.TEACHER_COSMOS_URL = "http://127.0.0.1:18932"
+    panel.start()
+    key = "canned"
+    framebuf.drop_ring(key)
+    import shutil
+
+    shutil.rmtree(corpus_mod.session_dir(key), ignore_errors=True)
+    for i in range(40):
+        egomotion.note_speed(key, 12.0, "obd", at=time.time() - 3.0 + i * 0.1)
+    floor, gap = config.TEACHER_KEYFRAME_FLOOR_S, config.TEACHER_KEYFRAME_MIN_GAP_S
+    config.TEACHER_KEYFRAME_FLOOR_S = 0.15
+    config.TEACHER_KEYFRAME_MIN_GAP_S = 0.1
+    for _ in range(30):
+        ring, _ = push_window(key, n=5, spacing=0.1)
+        panel.on_frame(key, RESULT, ring)
+        time.sleep(0.12)
+    config.TEACHER_KEYFRAME_FLOOR_S, config.TEACHER_KEYFRAME_MIN_GAP_S = floor, gap
+    deadline = time.time() + 25
+    while time.time() < deadline and len(corpus_mod.read_rows(key)) < 4:
+        time.sleep(0.5)
+    rows = corpus_mod.read_rows(key)
+    ok(len(rows) >= 3, f"the drive produced rows ({len(rows)})")
+    flagged = [r for r in rows
+               if (r["readings"]["alpamayo1.5"].get("flags") or {}).get("scene")]
+    ok(len(flagged) >= 1,
+       f"the reciting model's scene answers are flagged in the corpus "
+       f"({len(flagged)} of {len(rows)})")
+    if flagged:
+        f = flagged[0]["readings"]["alpamayo1.5"]["flags"]["scene"]
+        ok("markers" in f,
+           f"with the structural evidence attached ({f.get('markers')})")
+        ok(flagged[0]["readings"]["alpamayo1.5"]["scene"] == RECITED,
+           "and the text is kept EXACTLY as the model said it — flagging is "
+           "not filtering, and a recited answer is still evidence")
+    clean = [r for r in rows
+             if not (r["readings"]["cosmos-reason2"].get("flags") or {}).get("scene")]
+    ok(len(clean) == len(rows),
+       f"the other model's varying answers are not flagged ({len(clean)}/"
+       f"{len(rows)})")
+    panel.stop()
+    a.stop()
+    c.stop()
+    corpus_mod.close(key)
+
+
 def run_association():
     section("F. association — deterministic, and allowed to abstain")
     cases = [
@@ -756,6 +886,7 @@ def main():
         run_service_isolation()
         run_flow_and_corpus()
         run_desync()
+        run_canned()
         run_association()
         if args.live:
             run_live(args.alpamayo, args.cosmos)

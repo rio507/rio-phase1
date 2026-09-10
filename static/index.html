@@ -1615,6 +1615,14 @@
   .teach-field.open .teach-text { -webkit-line-clamp: unset; overflow: auto;
                                   max-height: 260px; }
   .teach-text.empty { color: var(--t5); font-style: italic; }
+  /* An answer that looks recited rather than observed. Warn-coloured because
+     it IS a warning about the reading -- but only the two words are, never the
+     text itself, which is a real thing the model said and is still evidence. */
+  .teach-recited { color: var(--warn-text); text-transform: none;
+                   letter-spacing: 0; font-style: italic; }
+  /* Repetition alone is a hint, not a finding — dimmer, so the strong marker
+     keeps its weight. */
+  .teach-recited.weak { color: var(--t4); }
   .teach-more {
     font-family: var(--font-mono); font-size: var(--fs-nano);
     letter-spacing: var(--ls-mono); text-transform: uppercase;

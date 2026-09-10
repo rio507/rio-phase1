@@ -131,6 +131,14 @@ READING_FIELDS = (
                         #          "pixels": [[u,v] ...] | null}
                         #         DISPLAY ONLY. Nothing downstream reads it.
     "gpu",              # dict  — {"vram_mb": float, "device": str}
+    "flags",            # dict  — what this reading looks like, structurally.
+                        #         Empty when clean. {"markers": [...],
+                        #         "repeated": n, "why": "..."} when the answer
+                        #         looks RECITED rather than observed -- see
+                        #         teachers/canned.py. Flagging is not
+                        #         filtering: the reading is still shown and
+                        #         still recorded, it just may not sit on a
+                        #         dashboard looking like perception.
     "extra",            # dict  — everything else the service reported, kept
                         #         verbatim. Per-stage timings, cameras: 1,
                         #         frames_as, ego_synthetic, code_revision. This
@@ -174,7 +182,7 @@ def blank_reading(model: str, model_id: str = "", revision: str = "",
         "latency_ms": 0.0, "queue_ms": 0.0, "freshness_s": 0.0,
         "raw": {}, "scene": "", "critical_actor": "", "attention": "",
         "reasoning": "", "thinking": None, "meta_action": None,
-        "trajectory": None, "gpu": {}, "extra": {},
+        "trajectory": None, "gpu": {}, "flags": {}, "extra": {},
     }
 
 
