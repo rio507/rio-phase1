@@ -639,6 +639,55 @@ def run_speech():
        == "Toward 16th St, then turn left onto 16th St.",
        "a head with no direction in it is kept whole — a bare 'then turn left' "
        "came from nowhere")
+
+    # --- ...AND THE SAME REDUNDANCY THE OTHER WAY ROUND --------------------
+    #
+    # "Head north on Lincoln Blvd, then continue on Lincoln Blvd." The toward
+    # case collapses by moving the road onto the instruction; this one
+    # collapses by dropping the instruction, because the head already carries
+    # the road, the direction AND the fact that there is nothing to do yet —
+    # which is the whole of what a continue-straight means. Google's own app
+    # does not chain a continue-straight either.
+    same_on = depart_for("Head north on Lincoln Blvd", "Lincoln Blvd",
+                         kind=M.STRAIGHT, direction=M.STRAIGHT_DIR)
+    ok(same_on == "Head north on Lincoln Blvd.",
+       "same road: a continue-straight along the road we are already on adds "
+       "nothing, and goes — got " + repr(same_on))
+    ok(same_on.lower().count("lincoln") == 1,
+       "...so that road is said once too")
+
+    # NAME_CHANGE maps onto STRAIGHT, so a different road here is a road that
+    # changes name under the car — the opposite of redundant.
+    name_change = depart_for("Head north on Lincoln Blvd", "Foo Ave",
+                             kind=M.STRAIGHT, direction=M.STRAIGHT_DIR)
+    ok(name_change == "Head north on Lincoln Blvd, then continue on Foo Ave.",
+       "different roads: the name change is kept, because that is the whole "
+       "news in it — got " + repr(name_change))
+
+    # THE ONE THIS RULE MUST NOT EAT. A KEEP's action phrase names no road at
+    # all — it is "keep left" — so a collapse decided on a ROAD comparison
+    # would delete a real instruction on the strength of a word that was never
+    # in the sentence.
+    keep = depart_for("Head north on Lincoln Blvd", "Lincoln Blvd",
+                      kind=M.KEEP, direction=M.LEFT)
+    ok(keep == "Head north on Lincoln Blvd, then keep left.",
+       "a keep is never collapsed away — its instruction is the side, not the "
+       "road — got " + repr(keep))
+
+    # ...and the two clauses coexisting: the road we are ON, a toward that is
+    # something else, and a continue along the first. The toward must not
+    # swallow the road name before the comparison is made.
+    both = depart_for("Head north on Lincoln Blvd toward 5th St", "Lincoln Blvd",
+                      kind=M.STRAIGHT, direction=M.STRAIGHT_DIR)
+    ok(both == "Head north on Lincoln Blvd toward 5th St.",
+       "'on X toward Y' still reads X as the road under the car — got "
+       + repr(both))
+
+    # No "on" clause at all: nothing to compare, so nothing is dropped.
+    ok(depart_for("Head north", "Lincoln Blvd", kind=M.STRAIGHT,
+                  direction=M.STRAIGHT_DIR)
+       == "Head north, then continue on Lincoln Blvd.",
+       "a head that names no road keeps the instruction that does")
     ok(arrive.speech["arrival"] == "Your destination is on the right.",
        "arrival says the side the provider gave")
     ok(arrive.speech["arrived"] == "You have arrived.",

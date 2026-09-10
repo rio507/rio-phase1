@@ -286,6 +286,18 @@ def near_text(maneuver: "M.CanonicalManeuver",
 # Not wrong, and not a sentence anyone says. The direction is the useful half
 # of the head; the road name belongs on the instruction that acts on it.
 _TOWARD = re.compile(r"\s*\b(?:toward|towards)\s+(.+)$", re.IGNORECASE)
+_ON = re.compile(r"\bon\s+(.+)$", re.IGNORECASE)
+
+
+def _on_road(head: str) -> str:
+    """The road the depart step says we are ON, if it says one.
+
+    Any `toward` clause comes off first: "Head north on Lincoln Blvd toward
+    5th St" is a car on Lincoln, and a naive match to end-of-string reads the
+    road as "Lincoln Blvd toward 5th St" and then matches nothing.
+    """
+    m = _ON.search(_TOWARD.sub("", head or ""))
+    return m.group(1).strip() if m else ""
 
 
 def _same_road(a: str, b: str) -> bool:
@@ -311,9 +323,13 @@ def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
     second later at 31 m; nothing ever told them what road they were on or
     which way they were pointing.
 
-    Google's DEPART step is provider text and is used verbatim, with one
-    subtraction: a trailing "toward <road>" that names the road the first
-    maneuver already turns onto. See the note above _TOWARD.
+    Google's DEPART step is provider text and is used verbatim, with two
+    subtractions, both of them a road said twice in one sentence:
+
+      "...toward 16th St" + "turn left onto 16th St"   -> the toward goes
+      "...on Lincoln Blvd" + "continue on Lincoln Blvd" -> the clause goes
+
+    See the note above _TOWARD and the one in the body below.
     """
     head = (route.depart_instruction or "").strip().rstrip(".")
     first = None
@@ -337,6 +353,24 @@ def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
         # is better than announcing a bare direction that came from nowhere.
         if trimmed:
             head = trimmed
+
+    # "...on Lincoln Blvd" + "continue on Lincoln Blvd" -> drop the clause.
+    #
+    # The other half of the same redundancy, and it collapses the other way
+    # round: there the road name belonged on the instruction, here the
+    # instruction adds nothing the head has not said. "Head north on Lincoln
+    # Blvd" already carries the road, the direction AND the fact that there is
+    # nothing to do yet, which is the whole of what a continue-straight means.
+    #
+    # NARROW ON PURPOSE, on two counts. It is STRAIGHT only -- a KEEP's action
+    # phrase is "keep left", which names no road, and collapsing on a road
+    # comparison would delete a real instruction. And it is the SAME road only
+    # -- Google maps NAME_CHANGE onto STRAIGHT, so "Head north on Lincoln Blvd,
+    # then continue on Foo Ave" is a road that changes name under the car,
+    # which is the opposite of redundant.
+    if (first.type == M.STRAIGHT and first.road_name
+            and _same_road(_on_road(head), first.road_name)):
+        return _sentence(head)
 
     return _sentence(f"{head}, then {action_phrase(first)}")
 
