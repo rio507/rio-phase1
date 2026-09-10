@@ -114,6 +114,32 @@ class CosmosService(common.Service):
                 "frames_as": self.frames_as, "attn": self.attn}
 
     # -- input --------------------------------------------------------------
+    def _video_metadata(self, images):
+        """What the four frames ACTUALLY are, in time.
+
+        Without this, transformers warns and defaults to 24 fps -- so a model
+        asked "what is about to happen next" is told the window it is looking
+        at spans 4/24 = 0.17 s when it really spans 0.3 s. That is not a
+        cosmetic difference for a physical-reasoning model: every velocity it
+        infers from the frames is scaled by it, and a car closing at 2 m/s
+        reads as one closing at 3.6.
+
+        Caught by the input smoke test before the weights were ever loaded,
+        which is the only reason it is not a silent bias in every reading.
+        """
+        from transformers.video_utils import VideoMetadata
+
+        n = len(images)
+        return VideoMetadata(
+            total_num_frames=n,
+            fps=self.fps,
+            width=images[0].width,
+            height=images[0].height,
+            # (n-1) intervals, not n: four frames at 10 Hz span 0.3 s, which is
+            # exactly the window teachers/keyframe.py builds.
+            duration=(n - 1) / self.fps if self.fps else None,
+        )
+
     def _conversation(self, images, question):
         """Media first, then the text — the order the model was trained on.
 
@@ -140,6 +166,7 @@ class CosmosService(common.Service):
         kwargs = {}
         if self.frames_as == "video":
             kwargs["fps"] = self.fps
+            kwargs["video_metadata"] = [self._video_metadata(images)]
         try:
             inputs = self.processor.apply_chat_template(
                 self._conversation(images, question), tokenize=True,
