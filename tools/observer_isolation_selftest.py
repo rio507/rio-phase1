@@ -168,6 +168,42 @@ def run_isolation():
     ok(observer.cached("sess-C") == {},
        "it is told nothing, rather than being told about A's road")
 
+    section("C2. a frame that is still in the ring and is already history")
+    # THE STALLED FEED, from the observer's side.
+    #
+    # TWO WINDOWS, AND ONLY ONE OF THEM EXISTED. The ring keeps
+    # config.RING_SECONDS (6 s) and drops anything older, so the drive of
+    # 2026-09-09 -- 442 s with no frames -- emptied it, and look() said "I
+    # can't see the view right now", which is honest and is the whole of what
+    # was needed there.
+    #
+    # What had no window at all is the gap between "current" and "still in the
+    # ring": a frame four seconds old is describable, is described, and is a
+    # road the car has left at any speed above a crawl. fresh() refused to
+    # SERVE the sentence -- so no answer was ever wrong -- but the forward pass
+    # was spent, once per new frame id, and nothing counted it.
+    push("sess-STALE", "A ROAD THE CAR LEFT SECONDS AGO", "sess-STALE:camera")
+    ring = framebuf.get_ring("sess-STALE")
+    aged = 0
+    for f in ring.frames():
+        # Older than OBSERVER_MAX_FRAME_AGE_S, younger than RING_SECONDS: the
+        # window that had no test because it had no rule.
+        f.wall_t -= 4.0
+        aged += 1
+    ok(aged > 0 and len(ring.frames()) == aged,
+       f"the frames are 4 s old and still in the ring ({len(ring.frames())} "
+       f"of {aged})")
+    observer.start("sess-STALE")
+    time.sleep(1.5)
+    st = observer.status().get("sess-STALE") or {}
+    ok((st.get("stale_frames") or 0) >= 1,
+       f"a 4 s frame is not described, and the refusal is counted "
+       f"({st.get('stale_frames')})")
+    ok(observer.cached("sess-STALE") == {},
+       "so there is no record of it at all — not one that fresh() has to "
+       "refuse afterwards, and no forward pass spent making it")
+    observer.stop("sess-STALE")
+
     section("D. harness frames never satisfy a live session")
     # Exactly the shape of the acceptance harness: frames posted with no
     # session id at all, which land in the keyless ring.

@@ -109,34 +109,92 @@ announcement is validated against before it is allowed to speak.
 
 ---
 
-## Time, not distance
+## Distance, not time — Google's ladder
 
-Every threshold is seconds-to-maneuver at the current speed, with distance
-clamps at the extremes. 200 m of downtown and 200 m of arterial are the same
-distance and completely different warnings.
+> **Amended 2026-09-10.** This section used to say the opposite, and said it
+> for a defensible reason: 200 m of downtown and 200 m of arterial are the same
+> distance and completely different warnings, so every threshold was
+> seconds-to-maneuver with distance clamps at the extremes. Session 738fbb82
+> shows what that produced for one maneuver, in this order:
+>
+> ```
+> t=76.6   NAV_CONTEXTUAL_CALL  "Take the next right onto 14th St."   31.1 m
+> t=102.3  NAV_EARLY_GUIDANCE   "Coming up on a right onto 14th St."  28.2 m
+> ```
+>
+> The preparation line arrived AFTER the instruction and three metres closer to
+> the junction. At 0.12 m/s in traffic both floors were already crossed before
+> the route had finished loading, and a driver hearing that has no way to know
+> which sentence is the one to act on.
+>
+> The argument for seconds was never wrong about arterials; it was wrong about
+> what a driver is doing when they hear a call. They are not converting a
+> warning into a reaction budget. They are counting beats they already know —
+> half a mile, then the street name, then the confirmation — and a car that
+> uses a different set of beats is asking them to learn a second system while
+> driving.
 
-| opportunity | fires at | says |
-|---|---|---|
-| EARLY (optional) | ~25 s | "Right turn coming up." |
-| PRIMARY | ~6 s | "Turn right by the Shell station." / "Take the next right." |
-| IMMINENT (only if it adds something) | ~2.5 s | "Right here." |
+Every threshold is a DISTANCE, on a ladder chosen by road class, and every
+distance travels with the route on `maneuver.speech.tiers`. The planner reads a
+number; it holds no policy. `config.NAV_TIER_DISTANCES_M` is the table.
 
-Anchor acquisition starts at ~11 s, so verification has time to look at
-several frames before the primary call is due.
+| tier | surface | highway | says |
+|---|---|---|---|
+| ROUTE START | immediately | immediately | "Head north on Lincoln Blvd, then turn right onto Ocean Ave." |
+| FAR | 0.5 mi (805 m) | 2 mi | "In half a mile, turn right onto Ocean Ave." |
+| FAR_MID | — | 1 mi | "In one mile, take exit 43 toward Sunset Blvd." |
+| NEAR | 150 m | 0.25 mi (402 m) | "Turn right onto Ocean Ave." |
+| JUNCTION | 35 m | 150 m | "Turn right." — only if NEAR was >10 s ago |
+| ARRIVAL | 150 m | 150 m | "Your destination is on the right." |
+| ARRIVED | at the kerb | | "You have arrived." |
+
+**Road class** comes from the approach step's own average speed, not from a
+road taxonomy: Routes v2 returns no classification at this field mask, and
+behaviour is the better test anyway — a freeway the route crawls along is
+announced on the surface ladder because that is what its approach feels like.
+See `providers/google._road_class`.
+
+**The distance is said, and said rounded.** `navigation/distance.py` holds a
+closed set of phrases — feet to the nearest 50 under a tenth of a mile, then
+quarter / half / three quarters, then whole miles — and the phrase is computed
+at route load from the TIER's nominal distance rather than from the live
+measurement. Two drives down the same road say the same words at the same
+corner, and nothing formats language while the car is moving. `NAV_UNITS`
+switches the whole ladder to metric, which is its own set of round numbers
+rather than the imperial one converted.
 
 Rules the planner enforces:
 
-- **The primary call REPLACES distance narration.** Never "Turn right in 200
-  feet. Turn right by the Shell." Just "Turn right by the Shell."
-- **The imminent call stays armed** after a contextual call. It is skipped only
-  when the primary line was spoken moments earlier — at a crawl the distance
-  clamp can bring both due within a second, and two instructions stacked back
-  to back is RIO talking over itself.
-- **Nothing is begun too late to finish.** Inside ~4 s the full instruction is
-  skipped in favour of "Left here.", because a sentence still playing when the
-  driver has to act is worse than a shorter one that finished.
-- **A route set inside the window does not prepare.** No countdown that is
-  already false.
+- **The junction call is a confirmation, and only when it is one.** "Turn right
+  onto Ocean Ave." at 150 m and "Turn right." at 35 m are two instructions
+  about the same turn; whether the second is useful depends entirely on how
+  long ago the first was. In town that gap is ten seconds and it is wanted; on
+  a freeway the same two distances are four seconds apart and it is noise. The
+  suppression is logged with the gap that failed it.
+- **Two junctions inside 200 m are one sentence.** "Turn right onto Ocean, then
+  turn left onto 2nd." The second maneuver then gets no far and no near call of
+  its own — it has been announced — and keeps only its confirmation, whose
+  ten-second clock runs from the sentence that swallowed it.
+- **A tier further out than the leg is long is not a tier.** A half-mile call on
+  a 414 m block cannot be made half a mile out, and "in half a mile" said at
+  414 m is not a rounding. Dropped at route build.
+- **Nothing is begun too late to finish.** Inside ~4 s the near call is skipped
+  in favour of the two-word line, which then fires regardless of the ten-second
+  rule — there was no near call for it to be too close to.
+- **A route set inside the window does not narrate a distance that is false.**
+
+**Anchor acquisition is a distance too**, 150 m before the near call — 300 m
+out on a surface street, which is about where a forecourt sign becomes
+readable. It was 11 seconds, tuned against a primary call at 6; with the near
+call at a fixed 150 m, 11 seconds at a crawl is INSIDE it, and every contextual
+line silently became the canonical one. The anchor's own shelf life moved with
+it, from 6 seconds to 400 m of travel.
+
+**Verification.** `node tools/nav_drive_replay.js` drives a real recorded drive
+back through the tracker and the planner — with the words rebuilt by today's
+`navigation/speech.py` over a pipe, so the geometry and speeds are the drive's
+and the sentences are current — and prints a cadence table: every call against
+the tier it was due on, next to the leg it had to work with.
 
 ---
 
