@@ -50,6 +50,8 @@ from . import keyframe as kf_mod
 from . import project
 from . import schema
 from .client import TeacherClient
+from .client import hold_gpu as _hold_gpu
+from .client import hold_status as _hold_status
 
 MODEL_NAMES = ("alpamayo1.5", "cosmos-reason2")
 
@@ -97,6 +99,25 @@ def stop() -> None:
         _started = False
 
 
+def hold_gpu():
+    """No teacher starts new work while this is open. Re-entrant.
+
+    THE TEACHERS YIELD, and this is how it is said. Measured on this pod: one
+    observer forward pass costs 368 ms with both teachers idle and 704 ms at
+    p50 (1379 ms worst) with both inferring -- 1.9x, on exactly the call a
+    driver is waiting through when they ask RIO what she can see.
+
+    The panel is shadow. The driver is not. So RIO's answering paths wrap
+    themselves in this, and for the length of an answer the teachers take no
+    new work. A job already in flight is not preempted -- it is in another
+    process and there is nothing to preempt it with -- so what this buys is
+    that no NEW teacher inference starts during an answer.
+
+    Used from app.py and nowhere else, like everything else on this surface.
+    """
+    return _hold_gpu()
+
+
 def refresh_health() -> dict:
     out = {}
     for name, c in list(_clients.items()):
@@ -122,6 +143,7 @@ def _state(key):
                       "dropped_build": 0},
             "last_build_refusal": None,
             "canned": 0,
+            "last_state": None,
         }
         _repeats[key] = canned_mod.RepeatTracker()
         _sessions[key] = st
@@ -403,6 +425,17 @@ def _on_reading(model: str, job: dict, reading: dict) -> None:
                 kf_for_record = kf
                 readings_copy = {m: dict(slot["readings"][m]) for m in MODEL_NAMES}
                 assoc_copy = {m: dict(slot["assoc"][m]) for m in MODEL_NAMES}
+            # THE MEASURED STATE OUTLIVES THE KEYFRAME.
+            #
+            # The keyframe is dropped here -- both models have reported and it
+            # has done its job -- but the deterministic state at t0 is what
+            # RIO weighs a teacher's opinion against, and by the time a reading
+            # EXISTS the keyframe that carried it is already being popped. Kept
+            # alongside the readings, stamped with the same t0, so the block
+            # context_for builds is about one instant rather than two.
+            if kf is not None:
+                st["last_state"] = dict(kf.get("state") or {})
+                st["last_state"]["t0"] = kf.get("t0")
             st["kf"].pop(job["kf_id"], None)
         # Bounded, because a model that dies mid-generation never reports and
         # its slot would otherwise sit here for the rest of the drive.
@@ -468,6 +501,118 @@ def state(session_key: str) -> dict:
     return out
 
 
+# How old a teacher reading may be before it is no use to a driver asking a
+# question NOW -- see config.TEACHER_CONTEXT_FRESH_S, where the measured
+# latencies and the trade are written down. Read from config so the number can
+# be chosen without editing code.
+CONTEXT_FRESH_S = float(getattr(config, "TEACHER_CONTEXT_FRESH_S", 2.0))
+
+
+def context_for(session_key: str, max_age_s: float = None) -> dict:
+    """The teachers' latest reading, IF it is still about this road. -> {} if not.
+
+    WHAT THIS IS FOR, AND THE LINE IT DOES NOT CROSS.
+    ------------------------------------------------
+    When a driver ASKS -- "what's that car doing?", "is it safe to merge?" --
+    RIO may draw on what the two teachers said about the same instant, the way
+    she already draws on Qwen's observation and on the deterministic state.
+    She forms her own read from all of it and says it in her own words.
+
+    That is the ONLY path. Nothing proactive reads this: no warning, no
+    nav announcement, no band, no spoken line RIO produces on her own
+    initiative. tools/teacher_firewall_selftest.py asserts exactly that
+    boundary -- this function has exactly one caller, and it is the tool
+    endpoint a driver's question arrives through.
+
+    WHY IT OMITS RATHER THAN AGES.
+    ------------------------------
+    A reading about a road three seconds gone is not a weaker answer, it is a
+    different road. So a stale reading is left out of the block entirely and
+    the block says how many were dropped -- because "the teachers had nothing
+    fresh" is a fact RIO should be able to work with, and an old reading
+    dressed up with an age is a fact she would have to remember to discount.
+    """
+    key = str(session_key or "default")
+    fresh_s = float(max_age_s if max_age_s is not None
+                    else getattr(config, "TEACHER_CONTEXT_FRESH_S",
+                                 CONTEXT_FRESH_S))
+    now = time.time()
+    out, dropped = {}, []
+    with _lock:
+        st = _sessions.get(key)
+        if st is None:
+            return {}
+        for m in MODEL_NAMES:
+            rec = st["readings"].get(m)
+            assoc = st["assoc"].get(m) or {}
+            if not rec or not rec.get("ok") or not rec.get("t0"):
+                continue
+            age = now - float(rec["t0"])
+            if age > fresh_s:
+                dropped.append({"model": m, "age_s": round(age, 2)})
+                continue
+            block = {
+                "source": m,
+                "age_s": round(age, 2),
+                "precision": rec.get("precision"),
+                # The named actor and, crucially, WHICH TRACK it is -- so RIO
+                # can tell "the car it means" from "a car it mentioned".
+                "critical_actor": rec.get("critical_actor") or "",
+                "actor_track_id": assoc.get("track_id"),
+                "actor_label": assoc.get("label"),
+                "actor_range_m": assoc.get("range_m"),
+                "actor_matched": bool(assoc.get("matched")),
+                "attention": rec.get("attention") or "",
+            }
+            if m == "alpamayo1.5":
+                # Its own reasoning, and the two words derived from its path.
+                block["chain_of_causation"] = rec.get("reasoning") or ""
+                d = rec.get("decision") or {}
+                block["driving_decision"] = d.get("text") or ""
+                block["driving_decision_detail"] = {
+                    k: d.get(k) for k in ("longitudinal", "lateral",
+                                          "v_start_ms", "v_end_ms",
+                                          "accel_ms2", "lateral_end_m")
+                } if d else {}
+            else:
+                ph = rec.get("physics") or {}
+                block["physics"] = ph.get("actors") or (rec.get("reasoning") or "")
+                block["plausibility"] = ph.get("plausibility") or ""
+                block["implausible"] = ph.get("implausible")
+            # A reading that looked recited is passed on WITH that mark rather
+            # than withheld: RIO should weigh it less, and she can only do that
+            # if she is told.
+            if rec.get("flags"):
+                block["looks_recited"] = sorted(rec["flags"].keys())
+            out[m] = block
+    if not out and not dropped:
+        return {}
+    # THE MEASURED STATE FROM THE SAME INSTANT, not from now.
+    #
+    # It travels with the readings deliberately: what makes the block worth
+    # anything is that every line in it is about ONE moment of road, so the
+    # band a teacher's opinion should be weighed against is the band that was
+    # true when the teacher was looking -- not the one two seconds later. It
+    # is also why this comes from the keyframe rather than from a fresh call
+    # into headway: a second source would be a second instant.
+    measured = None
+    with _lock:
+        st = _sessions.get(key)
+        if st is not None:
+            last = st.get("last_state")
+            if last:
+                measured = {k: v for k, v in last.items() if k != "t0"}
+                measured["age_s"] = round(now - float(last.get("t0") or now), 2)
+            else:
+                for kf_id in sorted(st["kf"], reverse=True):
+                    kf = st["kf"][kf_id]
+                    measured = dict(kf.get("state") or {})
+                    measured["age_s"] = round(now - float(kf.get("t0") or now), 2)
+                    break
+    return {"readings": out, "dropped_stale": dropped,
+            "fresh_within_s": fresh_s, "measured": measured}
+
+
 def _svc():
     return {name: c.status() for name, c in _clients.items()}
 
@@ -479,6 +624,7 @@ def status() -> dict:
             "enabled": bool(getattr(config, "TEACHERS_ENABLED", False)),
             "started": _started,
             "services": _svc(),
+            "gpu_hold": _hold_status(),
             "sessions": {k: {"keyframes": st["tally"]["keyframes"],
                              "readings": st["tally"]["readings"],
                              "seq": st["seq"]}

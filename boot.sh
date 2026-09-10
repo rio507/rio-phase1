@@ -143,8 +143,22 @@ rio_stop() {
 rio_start() {
     cd "$REPO"
     # The log of the run you are restarting BECAUSE OF is the one thing you
-    # need after a crash, and `>` erases it. One generation back is enough.
+    # need after a crash, and `>` erases it.
+    #
+    # ONE GENERATION WAS NOT ENOUGH. On 2026-09-10 a live-conversation failure
+    # was reported hours after it happened, and by then the server log covering
+    # it had been rotated away by the restarts in between -- so the question
+    # "did the browser ever ask for a session?" could not be answered from the
+    # server at all, only inferred from the drive's own JSONL. Three
+    # generations is a few megabytes and covers a debugging session's worth of
+    # restarts.
+    for g in 3 2 1; do
+        [ -f "$REPO/uvicorn.log.$g" ] && mv -f "$REPO/uvicorn.log.$g" \
+            "$REPO/uvicorn.log.$((g + 1))"
+    done
+    [ -f "$REPO/uvicorn.log.prev" ] && cp -f "$REPO/uvicorn.log.prev" "$REPO/uvicorn.log.1"
     [ -f "$REPO/uvicorn.log" ] && mv -f "$REPO/uvicorn.log" "$REPO/uvicorn.log.prev"
+    rm -f "$REPO/uvicorn.log.5"
     # setsid + nohup + </dev/null: the server has to outlive the shell that
     # started it. A plain background job belongs to the caller's session, so an
     # agent's `bash -c` wrapper exiting takes the server with it -- the other

@@ -3118,6 +3118,38 @@ TEACHER_FRAME_MAX_AGE_S = 1.0
 # to the other model's, it is just not worth believing about the road NOW.
 TEACHER_READING_FRESH_S = 4.0
 
+# HOW OLD A TEACHER READING MAY BE BEFORE IT IS NO USE IN AN ANSWER.
+#
+# Measured from t0 -- the instant the frames were taken -- not from when the
+# reading came back, because what matters is the age of the ROAD it describes.
+# At 13 m/s two seconds is twenty-six metres.
+#
+# READ THE NUMBERS BELOW BEFORE CHANGING THIS. On the acceptance clip the
+# teachers answer in:
+#
+#     Alpamayo 1.5     ~4-7 s
+#     Cosmos-Reason2   ~8-10 s
+#
+# So a reading is ALREADY older than two seconds by the time it exists, and at
+# 2.0 this gate omits everything, always. That is not a bug in the gate; it is
+# what the gate is for, and it is the honest consequence of asking a 10B model
+# a question about a road a car is driving down.
+#
+# The choice is therefore a real one and it belongs to whoever owns the drive:
+#   2.0   the strict reading. The block is essentially always empty, and RIO
+#         answers from the camera and the measured state alone -- which is what
+#         she did before any of this existed.
+#   10.0  covers Alpamayo and usually Cosmos. A hundred and thirty metres of
+#         road at motorway speed; fine for "what is that car doing", wrong for
+#         anything about a gap.
+#   6.0   covers Alpamayo only. The model that predicts a path and names an
+#         actor gets heard; the slower one does not.
+#
+# Left at the strict value deliberately: a number that quietly lets stale
+# opinions into an answer about a moving road should be chosen on purpose, not
+# inherited from a default somebody picked while writing the plumbing.
+TEACHER_CONTEXT_FRESH_S = 2.0
+
 # --- the shared input ------------------------------------------------------
 # Four frames at t0-0.3, t0-0.2, t0-0.1, t0 -- the window Alpamayo's own loader
 # builds (num_frames=4, time_step=0.1) and the window Cosmos is given too, so
@@ -3215,8 +3247,24 @@ TEACHER_CORPUS_KEEP_FRAMES = True
 # which flags a reading that looks recited so this cannot come back silently,
 # and docs/teacher_panel.md §6c for the A/B.
 TEACHER_PROMPTS = {
-    # NOT "Describe the scene." -- see above.
-    "scene": "Describe the road, the traffic and the weather.",
+    # NOT "Describe the scene." -- see above. And CAPPED, with advice banned
+    # outright, because the uncapped version rambles: Alpamayo chains clauses
+    # with semicolons and drifts off the picture into counsel --
+    #
+    #   "...it's sunny outside, so it's good for driving but also a practice
+    #    to have sunglasses for sun protection"
+    #   "...which provides good visibility but could create glare; traffic is
+    #    light...; the surrounding area has trees and hills, so it's likely a
+    #    suburban or semi-rural setting"
+    #
+    # -- none of which is an observation, and the longest of those was 495
+    # characters for a row the card shows one sentence of. The cap and the ban
+    # cost a little variety (a capped answer repeats its opening more often,
+    # which teachers/canned.py will flag if it becomes recitation) and buy a
+    # row that is about the road.
+    "scene": ("Describe the road, the traffic and the weather in at most two "
+              "short sentences. Report observations only — no advice, no "
+              "recommendations, no mention of what a driver should do."),
     "critical_actor": (
         "Which single road user is the most safety-relevant to the ego "
         "vehicle right now, and why?"

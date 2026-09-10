@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import re
@@ -708,7 +709,20 @@ def realtime_cutoff_endpoint(body: dict = Body(...),
         cause = str(body.get("cause") or "other")
         detail = body.get("detail") if isinstance(body.get("detail"), dict) else {}
         rec = realtime.record_cutoff(kind, cause, detail)
-        sessions.log_live(session_id, "cutoff", rec)
+        # A CONNECT THAT NEVER OPENED GETS ITS OWN EVENT NAME, not "cutoff".
+        # On 2026-09-10 a drive spent its whole length on "Connecting…" and the
+        # only trace was the ABSENCE of a session_started -- which says a
+        # session did not start and nothing about why. Filing this under
+        # `cutoff` would bury the answer among barge-ins; it is a different
+        # thing and it is the thing somebody will grep for.
+        if kind == "connect_failed":
+            sessions.log_live(session_id, "connect_failed", rec)
+            d = rec.get("detail") if isinstance(rec.get("detail"), dict) else detail
+            print(f"[realtime] live connect FAILED at step "
+                  f"{(d or {}).get('step')!r}: {(d or {}).get('error')!r}",
+                  flush=True)
+        else:
+            sessions.log_live(session_id, "cutoff", rec)
         return {"ok": True}
     except Exception as e:
         print(f"[realtime] cutoff report failed: {type(e).__name__}: {e}", flush=True)
@@ -910,9 +924,49 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
     # calls ran 40.1, 12.9, 48.5 and 27.1 seconds; the cost being removed here
     # is the driver hearing the answer to a question they abandoned, and the
     # session spending a response on it.
-    work = asyncio.create_task(run_in_threadpool(
-        realtime.run_tool, name, args, _visual_key(session_id), where,
-        body.get("spoken")))
+    # THE SHADOW PANEL, AS CONTEXT FOR A QUESTION A DRIVER ASKED.
+    #
+    # Fetched HERE and handed down as a plain dict, because app.py is
+    # the only module allowed to import `teachers` and realtime.py must
+    # not. That is what keeps the boundary checkable: a teacher's
+    # opinion reaches RIO through exactly one place -- the result of a
+    # tool call the driver's own question triggered -- and it gets
+    # there as an argument somebody had to pass, not as an import
+    # anything could make.
+    #
+    # Nothing PROACTIVE reads this. No warning, no nav announcement, no
+    # band, no line RIO says on her own initiative.
+    # tools/teacher_firewall_selftest.py asserts that this call is the
+    # only caller of context_for anywhere in the repo.
+    tctx = None
+    if teacher_panel is not None:
+        try:
+            tctx = teacher_panel.context_for(_visual_key(session_id))
+        except Exception as e:
+            print(f"[teachers] context unavailable: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+    # THE TEACHERS YIELD FOR THE LENGTH OF THE TOOL CALL. This is the path a
+    # driver is actually waiting through -- look() and the reasoning turn --
+    # and it is the one the measurement was taken on. See _rio_has_the_gpu.
+    _gpu = _rio_has_the_gpu()
+    _gpu.__enter__()
+
+    async def _run_tool():
+        try:
+            return await run_in_threadpool(
+                realtime.run_tool, name, args, _visual_key(session_id), where,
+                body.get("spoken"), tctx)
+        finally:
+            # Released when the WORK ends, not when the request does: an
+            # abandoned call still finishes into nothing on the GPU, and the
+            # teachers should stay out of its way until it really is over.
+            try:
+                _gpu.__exit__(None, None, None)
+            except Exception:
+                pass
+
+    work = asyncio.create_task(_run_tool())
 
     async def _abandoned():
         while True:
@@ -983,6 +1037,26 @@ def scene_endpoint(session_id: str = Query(default=None)):
     return visual_qa.scene_graph(_visual_key(session_id))
 
 
+def _rio_has_the_gpu():
+    """While a driver is waiting on an answer, the teachers take no new work.
+
+    Measured: one observer forward pass is 368 ms with both teachers idle and
+    704 ms at p50 with both inferring. The panel is shadow and the driver is
+    not, so RIO's answering paths hold the card for their own length. See
+    teachers/panel.hold_gpu -- and note the direction, which is the same as
+    every other line in this file: app.py tells the panel something, and the
+    panel tells app.py nothing back.
+
+    A no-op when the panel is not installed, so nothing here depends on it.
+    """
+    if teacher_panel is None:
+        return contextlib.nullcontext()
+    try:
+        return teacher_panel.hold_gpu()
+    except Exception:
+        return contextlib.nullcontext()
+
+
 @app.post("/ask")
 async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=None)):
     """A visual question in text, answered in text. No microphone, no TTS.
@@ -995,7 +1069,10 @@ async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=N
     if not question:
         return {"error": "no question"}
 
-    route, va = await run_in_threadpool(_route_and_prepare, question, session_id)
+    # RIO IS ANSWERING; THE TEACHERS WAIT. See _rio_has_the_gpu.
+    with _rio_has_the_gpu():
+        route, va = await run_in_threadpool(_route_and_prepare, question,
+                                            session_id)
     nav_action = (route or {}).get("navigation")
     if nav_action:
         # Same answer /talk speaks, in text: the destination path is fully
@@ -1012,7 +1089,8 @@ async def ask_endpoint(body: dict = Body(...), session_id: str = Query(default=N
             "request_type", "non_visual_question"), "visual": False,
             "route": route}
 
-    reply = await run_in_threadpool(va.text)
+    with _rio_has_the_gpu():
+        reply = await run_in_threadpool(va.text)
     sessions.log_visual_qa(session_id, va.meta)
     return {"reply": reply, "request_type": route["request_type"],
             "visual": True, "meta": va.meta}

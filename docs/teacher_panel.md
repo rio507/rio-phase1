@@ -713,6 +713,83 @@ failed.
 | the two venvs | `/opt/teachers/venvs` (container layer, rebuilt by boot.sh) |
 | HF token | `/workspace/teachers/secrets.env` (volume, outside the worktree) |
 
+## 10d. RIO may draw on them. They may not write her lines.
+
+The boundary moved once, deliberately, and this is where it is now.
+
+When a driver **asks** — "what's that car doing?", "is it safe to merge?" — the
+`look` tool's result may carry what the two models made of the same instant:
+each model's critical actor (with the RF-DETR track it was pinned to), its own
+reasoning, Alpamayo's derived driving decision, Cosmos's physics and
+plausibility — labelled by source and age, next to Qwen's observation and next
+to the pipeline's **measured** state.
+
+She forms her own read from all of it and says it in one or two passenger
+sentences. The rules travel with the block *and* live in the session
+instructions, because a rule first read mid-turn with a driver waiting is a
+rule that gets skimmed:
+
+* never quote or paraphrase line by line, never name the models
+* observation and suggestion, **never a command** — never "brake", never "steer"
+* the measured state is geometry and **wins** where a teacher disagrees
+* never contradict or soften a warning that is already running
+* for merging, turning, lane changes or cross traffic, say plainly what the
+  forward camera cannot see — *"I can't see your left"*
+* a field that is not there is something she does not know
+
+**Everything proactive is unchanged.** No warning, no nav callout, no band, no
+line she says on her own initiative can see a teacher value. The firewall now
+states that as a countable fact: `context_for` — the only function that hands
+readings out for use — has **exactly one caller in the repo**, the tool
+endpoint a driver's question arrives through, and `realtime.py` still imports
+nothing from `teachers` (the block is passed in as a plain dict by `app.py`).
+
+### The freshness gate omits everything today, and that is a decision to make
+
+`config.TEACHER_CONTEXT_FRESH_S` is **2.0 s**, measured from t0 — the instant
+the frames were taken — because what matters is the age of the road. At 13 m/s
+two seconds is twenty-six metres.
+
+But Alpamayo answers in ~4–7 s and Cosmos in ~8–10 s. **A reading is already
+older than the gate by the time it exists**, so at 2.0 the block is empty every
+time and RIO answers from the camera and the measured state alone — exactly as
+she did before this was built.
+
+That is not a bug in the gate; it is what the gate is for. The number is a real
+choice and it is left strict on purpose, with the alternatives written down in
+the config and the consequence asserted in
+`tools/teacher_answer_selftest.py` so nobody makes the choice by accident:
+
+| | covers | road at 13 m/s |
+|---|---|---|
+| 2.0 s (shipped) | nothing — block always empty | 26 m |
+| 6.0 s | Alpamayo only | 78 m |
+| 10.0 s | both, usually | 130 m |
+
+## 10e. The teachers yield the card
+
+Measured on this pod: one observer forward pass costs **368 ms** with both
+teachers idle and **704 ms at p50** (1379 ms worst) with both inferring —
+**1.9×**, on exactly the call a driver waits through when they ask what RIO can
+see.
+
+So RIO's answering paths hold the card for their own length
+(`panel.hold_gpu()`, entered from `/ask` and the realtime tool call) and the
+teacher clients take no new work while a hold is open. A job already in flight
+is not preempted — it is in another process and there is nothing to preempt it
+with — so what this buys is that no *new* teacher inference starts during an
+answer.
+
+The yield is a one-way door like every other entry on this surface: `app.py`
+tells the panel to wait; the panel tells `app.py` nothing back. The firewall
+asserts that the function calls `hold_gpu` and nothing else, because a yield
+that also fetched a reading would be a hole in the isolation that the
+per-function rule would not see.
+
+**It was not the cause of the Ava callouts.** Dictation is a request to the
+remote realtime session; the local card is not on that path at all, and
+`tools/nav_voice_selftest.js` asserts it structurally.
+
 ## 11. What is deliberately not here
 
 * **No training.** The corpus is schema'd so it can be one later.

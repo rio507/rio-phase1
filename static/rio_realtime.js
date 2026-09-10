@@ -34,6 +34,68 @@
 
   var CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
 
+  /* HOW LONG EACH STEP OF A CONNECT MAY TAKE, AND WHY THERE ARE NUMBERS HERE
+   * AT ALL.
+   *
+   * On 2026-09-10 the talk button sat on "Connecting…" for a whole drive and
+   * never moved. The session log for that drive has no `session_started` and
+   * no `session_failed` -- so the mint never completed -- and the button had
+   * no way to say so, because NOT ONE STEP OF THIS PATH HAD A DEADLINE.
+   *
+   * `fetch` has no default timeout worth the name (Chrome will wait minutes),
+   * getUserMedia waits on a human, and the SDP exchange with api.openai.com
+   * waits on a network this pod does not control. Any one of them hanging
+   * produced an indefinite "Connecting…" with no reason, no failure, and no
+   * fallback to hold-to-talk -- and nothing in any log to say which.
+   *
+   * So every step is bounded and every step is NAMED. A connect that fails now
+   * fails with "mint: timed out after 10s", which is a sentence a driver can
+   * read and an engineer can act on.
+   *
+   * The microphone is the exception and deliberately so: it is waiting on a
+   * person to answer a permission prompt, and a person is allowed to take
+   * longer than a network. It gets a minute and its own progress state, so
+   * the screen says "allow the microphone" rather than "stand by". */
+  var CONNECT_BUDGET_MS = {
+    mint: 10000,        // POST /realtime/session — our own server, loopback
+    mic: 60000,         // a human answering a permission prompt
+    voice: 8000,        // the ElevenLabs relay, where that backend is in use
+    offer: 8000,        // createOffer + setLocalDescription, all local
+    negotiate: 20000,   // the SDP exchange with api.openai.com
+    answer: 8000,       // setRemoteDescription, local again
+  };
+
+  /* Race a step against its budget, and name it in the failure.
+   *
+   * There is no way to ABORT most of these -- getUserMedia has no signal in
+   * older Safari, and a peer connection's negotiation is not cancellable --
+   * so the loser is abandoned rather than stopped, exactly as the connect
+   * canceller in index.html abandons a connect it no longer wants. What
+   * matters is that the CALLER stops waiting and the driver is told. */
+  function step(name, promise, onProgress) {
+    var ms = CONNECT_BUDGET_MS[name] || 10000;
+    if (onProgress) { try { onProgress(name); } catch (e) {} }
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        reject(new Error(name + ': timed out after ' + Math.round(ms / 1000) + 's'));
+      }, ms);
+      Promise.resolve(promise).then(function (v) {
+        if (done) return;
+        done = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        // Every failure carries its step, so "connecting" can never again be
+        // the last thing anybody knows.
+        var msg = (e && e.message) ? e.message : String(e);
+        reject(new Error(msg.indexOf(name + ':') === 0 ? msg : name + ': ' + msg));
+      });
+    });
+  }
+
   /* Echo cancellation is not optional in a car. RIO's voice comes out of the
      same box the microphone is in, so without it the loudest thing the
      detector hears while she is talking is her -- she interrupts herself, and
@@ -3447,14 +3509,21 @@
     var element = opts.element;
     var session = null;
 
-    return fetch(url('/realtime/session'), { method: 'POST' })
-      .then(function (r) { return r.json(); })
+    /* Told which step is running, so the button can say "allow the
+       microphone" instead of "stand by" for the one step that is waiting on a
+       person. Optional: a caller that does not care passes nothing. */
+    var progress = opts.onProgress || null;
+
+    return step('mint', fetch(url('/realtime/session'), { method: 'POST' })
+        .then(function (r) { return r.json(); }), progress)
       .then(function (j) {
         if (!j || j.error || !j.client_secret) {
-          throw new Error((j && j.error) || 'no session');
+          throw new Error('mint: ' + ((j && j.error) || 'no session'));
         }
         session = j;
-        return navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS });
+        return step('mic',
+                    navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS }),
+                    progress);
       })
       .then(function (mic) {
         var touch = isTouchDevice();
@@ -3731,27 +3800,33 @@
           });
         }
 
-        return voiceReady
-          .then(function () { return pc.createOffer(); })
-          .then(function (offer) { return pc.setLocalDescription(offer).then(function () { return offer; }); })
-          .then(function (offer) {
-            return fetch(CALLS_URL + '?model=' + encodeURIComponent(session.model), {
-              method: 'POST',
-              headers: {
-                'Authorization': 'Bearer ' + session.client_secret,
-                'Content-Type': 'application/sdp',
-              },
-              body: offer.sdp,
-            });
+        return step('voice', voiceReady, progress)
+          .then(function () {
+            return step('offer', pc.createOffer().then(function (offer) {
+              return pc.setLocalDescription(offer).then(function () { return offer; });
+            }), progress);
           })
-          .then(function (r) {
-            if (!r.ok) return r.text().then(function (t) {
-              throw new Error('realtime call ' + r.status + ': ' + t.slice(0, 160));
-            });
-            return r.text();
+          .then(function (offer) {
+            return step('negotiate',
+              fetch(CALLS_URL + '?model=' + encodeURIComponent(session.model), {
+                method: 'POST',
+                headers: {
+                  'Authorization': 'Bearer ' + session.client_secret,
+                  'Content-Type': 'application/sdp',
+                },
+                body: offer.sdp,
+              }).then(function (r) {
+                if (!r.ok) return r.text().then(function (t) {
+                  throw new Error('realtime call ' + r.status + ': '
+                                  + t.slice(0, 160));
+                });
+                return r.text();
+              }), progress);
           })
           .then(function (answer) {
-            return pc.setRemoteDescription({ type: 'answer', sdp: answer });
+            return step('answer',
+                        pc.setRemoteDescription({ type: 'answer', sdp: answer }),
+                        progress);
           })
           .then(function () {
             var handle = {
@@ -3806,6 +3881,15 @@
      has never heard of the conversation panel and must not have to. */
   var active = null;
 
+  /* Test seams. The connect path cannot be driven end to end without a
+     browser, a microphone and a network -- but the thing that actually failed
+     is the ABSENCE of deadlines, and that is testable on its own. */
+  function _connectBudgets() {
+    var out = {};
+    for (var k in CONNECT_BUDGET_MS) out[k] = CONNECT_BUDGET_MS[k];
+    return out;
+  }
+
   root.RIO = root.RIO || {};
   root.RIO.realtime = {
     createController: createController,
@@ -3820,10 +3904,19 @@
     active: function () { return active; },
     /* Tests and the panel: pretend a session is open, or that none is. */
     _setActive: function (h) { active = h; },
+    /* THE CONNECT DEADLINES, exposed so the node suite can drive them.
+       The connect path itself needs a browser, a microphone and a network --
+       but what actually failed on 2026-09-10 was the ABSENCE of these, and
+       that is testable without any of the three. */
+    _connectBudgets: _connectBudgets,
+    _step: step,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController, navStatus: navStatus,
+                       // The connect deadlines, for tools/realtime_selftest.js.
+                       // See the export block above for why these are seams.
+                       _connectBudgets: _connectBudgets, _step: step,
                        navDirections: navDirections,
                        noteFix: noteFix, currentFix: currentFix,
                        startNavigation: startNavigation,

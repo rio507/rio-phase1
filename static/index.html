@@ -1094,6 +1094,12 @@
     background: var(--warn-soft); border-color: var(--warn-line); color: var(--warn-text);
   }
   #mic[data-state="connecting"] .mic-dot { background: var(--warn); animation: livepulse 1.2s ease-in-out infinite; }
+  /* A connect that failed. Warn-coloured and STILL, against connecting's
+     pulse: the difference a driver needs to see at a glance is "it is trying"
+     against "it stopped trying", and a pulse is what says the first. */
+  #mic[data-state="failed"] { border-color: var(--warn-line); }
+  #mic[data-state="failed"] .mic-dot { background: var(--warn); animation: none; }
+  #mic[data-state="failed"] .mic-hint { display: block; color: var(--warn-text); }
 
   /* An open live session. Deliberately not the recording red: the driver is
      not being recorded into a clip, they are in a conversation, and the one
@@ -2636,6 +2642,12 @@ const MIC_STATES = {
   hold:       { label: 'Hold to talk',    hint: '', aria: 'Hold to talk to RIO' },
   recording:  { label: 'Release to send', hint: '', aria: 'Recording — release to send' },
   connecting: { label: 'Connecting…',     hint: 'stand by', aria: 'Connecting to RIO' },
+  /* A CONNECT THAT FAILED, SAID OUT LOUD. Before this the only two outcomes
+     were "listening" and an indefinite "Connecting…", and a drive spent the
+     whole of one on the second with no reason anywhere. The label carries the
+     step that failed; a tap tries again. */
+  failed:     { label: 'Talk unavailable', hint: 'hold to talk',
+                aria: 'Live conversation failed — hold the button to talk' },
   listening:  { label: 'Listening',       hint: 'tap to end', aria: 'RIO is listening — tap to end the conversation' },
   speaking:   { label: 'Speaking',        hint: 'tap to end', aria: 'RIO is speaking — tap to end the conversation' },
 };
@@ -2871,6 +2883,14 @@ function stopLiveFrames() {
  * live session is worse than no diagnostic. */
 const LIVE_REPORTED = {
   LIVE_CUTOFF: 'cutoff',
+  /* A CONNECT THAT NEVER OPENED, and which step it died on.
+   *
+   * On 2026-09-10 the talk button sat on "Connecting…" for a whole drive. The
+   * drive's log has a session_start, frame marks, a session_end -- and no
+   * `session_started`, because the mint never completed. That absence says a
+   * session did not start and NOTHING about why: the browser knew, and had
+   * nowhere to put it. This is the somewhere. */
+  LIVE_CONNECT_FAILED: 'connect_failed',
   /* NEWEST WINS, in the drive's own record.
    *
    * "she answered the question before last" is a sentence about a drive, and
@@ -2922,6 +2942,11 @@ function reportLive(ev) {
         detail: {
           response_id: ev.response_id || null,
           reason: ev.reason || null,
+          // Which step of the connect failed: mint, mic, voice, offer,
+          // negotiate, answer. The whole point of the event.
+          step: ev.step || null,
+          error: ev.error || null,
+          backend: ev.backend || null,
           detail: ev.detail || null,
           said_chars: ev.said_chars === undefined ? null : ev.said_chars,
           by: ev.by || null,
@@ -3111,11 +3136,27 @@ async function toggleLive() {
   liveBusy = true;
   setMicState('connecting');
   const gen = ++liveGen;
+  let connectStep = 'starting';
   try {
     live = await RIO.realtime.connect({
       arbiter: RIO.speech,
       url: RIO.url,
       element: player,
+      /* WHICH STEP IS RUNNING. One of them waits on a person answering a
+         microphone prompt and the rest wait on a network; a driver who is
+         being asked for permission should be told that rather than "stand
+         by". It is also what names the failure if one times out. */
+      onProgress: (name) => {
+        connectStep = name;
+        if (gen !== liveGen) return;
+        const hint = document.getElementById('michint');
+        if (hint) {
+          hint.textContent = name === 'mic' ? 'allow the microphone'
+            : name === 'negotiate' ? 'opening the line'
+            : name === 'mint' ? 'starting the session'
+            : 'stand by';
+        }
+      },
       onEvent: (ev) => {
         // Still reported below whatever happens; only the screen is disowned.
         const mine = (gen === liveGen);
@@ -3170,10 +3211,23 @@ async function toggleLive() {
     live = null;
     stopLiveFrames();
     stopBusWatch();
-    setMicState('hold');
-    obs.textContent = 'Live conversation unavailable (' +
-      (e && e.message ? e.message : e) + ') — hold to talk instead.';
-    console.warn('[live] falling back to hold-to-talk:', e);
+    const why = (e && e.message ? e.message : String(e));
+    /* THE STATE IS 'failed', NOT 'hold'. Hold-to-talk still works and is what
+       a tap now does -- but the button has to say that something went wrong,
+       because the failure the driver actually met was a button that said
+       "Connecting…" forever and told them nothing. */
+    setMicState('failed');
+    obs.textContent = 'Live conversation unavailable — ' + why
+      + '. Hold the button to talk instead.';
+    /* AND IT GOES IN THE DRIVE'S LOG. The night this broke, the only record
+       was the absence of a session_started -- which says a session did not
+       start and nothing at all about why. reportLive lands in the session
+       JSONL through /realtime/cutoff. */
+    try {
+      reportLive({ type: 'LIVE_CONNECT_FAILED', step: connectStep,
+                   error: why, backend: 'openai_realtime' });
+    } catch (e2) {}
+    console.warn('[live] connect failed at step ' + connectStep + ':', e);
   } finally {
     liveBusy = false;
   }

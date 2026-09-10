@@ -963,6 +963,53 @@ def client() -> OpenAI:
         return _client
 
 
+# --- what she may do with the second opinions -------------------------------
+#
+# Stated in the SESSION instructions and not only in the tool result, because
+# the tool result arrives mid-turn with a driver waiting: rules read for the
+# first time under that pressure are rules that get skimmed. This is here so
+# the policy is already hers before the first question of the drive.
+TEACHER_ADDENDUM = """
+SECOND OPINIONS, AND WHAT THEY ARE FOR.
+
+Two driving models watch the same road you do. They are not part of you and
+they do not speak. When you use the look tool, its result may carry what they
+made of the same instant, each labelled with its source and how many seconds
+old it is, next to what the camera saw and next to the pipeline's own MEASURED
+state — the band, the gap, the time-to-contact, the speed.
+
+ANSWERING, NEVER ANNOUNCING. They reach you only when the driver has asked you
+something. You never raise them yourself, you never mention that they exist,
+and there is no situation in which you say something because a second opinion
+said it.
+
+FORM YOUR OWN READ. Take the camera, the measured state and the second
+opinions together and say what YOU make of it, in one or two short sentences,
+the way a passenger would. Never quote them, never work through them line by
+line, never name them. The driver asked you.
+
+WEIGH THEM CORRECTLY. The measured state is geometry and it is what your
+warnings rest on. The second opinions are models nobody has validated on this
+car. Where they disagree, the measurement wins and you do not argue with it.
+If a warning is already running, you do not contradict it and you do not
+soften it.
+
+OBSERVATION AND SUGGESTION, NEVER A COMMAND. "That van's brake lights are on
+and the gap's closing" is yours to say. "Brake" is not. You do not tell a
+driver what to do with the controls.
+
+SAY WHAT YOU CANNOT SEE. You have one camera and it points forward. For
+anything about merging, changing lane, turning, or cross traffic, say plainly
+that you cannot see beside or behind the car — "I can't see your left" — and
+then say what you can about the road ahead.
+
+WHAT IS NOT THERE, YOU DO NOT KNOW. A reading more than a couple of seconds
+old is left out of the result on purpose, because it is about a different
+piece of road. If a field is missing, you have no opinion about it. Do not
+fill it in.
+"""
+
+
 def instructions() -> str:
     """RIO's personality, plus what is only true when she is being heard.
 
@@ -980,7 +1027,8 @@ def instructions() -> str:
     instruction and the enforcement being two expressions of one list is what
     stops them drifting.
     """
-    parts = [rio_prompts.live_prompt(), LIVE_ADDENDUM.strip()]
+    parts = [rio_prompts.live_prompt(), LIVE_ADDENDUM.strip(),
+             TEACHER_ADDENDUM.strip()]
     if config.VOICE_BACKEND == "elevenlabs":
         tags = voice_tags.instruction()
         if tags:
@@ -1642,8 +1690,90 @@ def is_generic_scene_question(q: str, spoken: str = None) -> bool:
     return False
 
 
+# --- the shadow panel, as CONTEXT for a question a driver asked -------------
+#
+# Words that mean the answer depends on something a forward camera cannot see.
+# Cross traffic, a merge, a turn: in every one of them the thing that decides
+# the answer is beside or behind the car, and RIO has one camera pointing
+# forward. She says so, in her own words, every time.
+_BLIND_SPOT_WORDS = (
+    "merge", "merging", "pull out", "pulling out", "change lane",
+    "changing lane", "lane change", "turn", "turning", "left", "right",
+    "cross", "crossing", "junction", "intersection", "roundabout",
+    "overtake", "overtaking", "pass ", "passing", "reverse", "reversing",
+    "back out", "behind",
+)
+
+
+def needs_field_of_view_caveat(question: str) -> bool:
+    """Does answering this depend on what the forward camera cannot see?"""
+    q = " " + (question or "").lower() + " "
+    return any(w in q for w in _BLIND_SPOT_WORDS)
+
+
+def teacher_context(teachers: dict, question: str) -> dict:
+    """The teacher block, labelled, with the rules for using it. -> {} if none.
+
+    EVERY FIELD IS LABELLED BY SOURCE AND AGE, and that is not decoration. RIO
+    is being handed three kinds of thing at once -- what the camera model saw,
+    what two driving models inferred, and what the deterministic pipeline
+    MEASURED -- and they do not carry the same weight. The band, the gap and
+    the TTC are measurements from geometry RIO's warnings already rest on. The
+    teachers are opinions from models nobody has validated on this car. She
+    should be able to tell them apart without being told which is which every
+    time, which means the block has to say.
+    """
+    readings = (teachers or {}).get("readings") or {}
+    if not readings and not (teachers or {}).get("dropped_stale"):
+        return {}
+    out = {
+        "note": ("Second opinions from two driving models that are NOT part of "
+                 "your loop. They see the same frames you do. They are context "
+                 "for your own read, never a script."),
+        "readings": readings,
+        "fresh_within_s": (teachers or {}).get("fresh_within_s"),
+    }
+    dropped = (teachers or {}).get("dropped_stale") or []
+    if dropped:
+        # SAID, NOT SILENT. "The teachers had nothing fresh" is a fact she can
+        # use; a quietly missing block is one she would have to guess about.
+        out["omitted_stale"] = dropped
+    state = (teachers or {}).get("measured")
+    if state:
+        out["measured"] = {
+            "note": ("This half is MEASURED by the deterministic pipeline, not "
+                     "inferred by a model. Where it disagrees with a teacher, "
+                     "it wins."),
+            "band": state.get("band"), "gap_m": state.get("gap_m"),
+            "ttc_s": state.get("ttc_s"), "speed_ms": state.get("speed_ms"),
+            "speed_source": state.get("speed_source"),
+            "age_s": state.get("age_s"),
+        }
+    rules = [
+        "Form YOUR OWN read from the camera, the measured state and these "
+        "second opinions together. Say it in ONE or TWO short sentences, as a "
+        "passenger would.",
+        "NEVER quote or paraphrase these line by line, and never name the "
+        "models. The driver asked you, not them.",
+        "Observation and suggestion only. Never a command, never an "
+        "instruction to brake, steer or accelerate.",
+        "If a warning is already running, do not contradict it and do not "
+        "soften it.",
+        "Anything not in these fields, you do not know. Do not fill it in.",
+    ]
+    if needs_field_of_view_caveat(question):
+        rules.append(
+            "This question depends on what is BESIDE or BEHIND the car, and "
+            "you have one camera pointing forward. Say plainly that you "
+            "cannot see there — 'I can't see your left' — before or with "
+            "whatever you can say about the road ahead.")
+        out["field_of_view"] = "forward camera only; no side or rear view"
+    out["rules"] = rules
+    return out
+
+
 def look(question: str, session_key: str = "default",
-         spoken: str = None) -> dict:
+         spoken: str = None, teachers: dict = None) -> dict:
     """RIO's eyes: the existing visual pipeline, called from a live session.
 
     Nothing new is built here. `visual_qa.answer()` is the same path the
@@ -1731,6 +1861,15 @@ def look(question: str, session_key: str = "default",
                 # makes "never a raw caption" a check rather than a hope. A
                 # line that fails goes back to being composed by her, which is
                 # slower and still correct.
+                # THE TEACHERS, WHERE THEY CAN CHANGE THE ANSWER.
+                #
+                # Attached to the composed branch and NOT to the direct one:
+                # the direct branch means the observer's sentence has already
+                # been spoken out loud, word for word, and there is no answer
+                # left to form. Handing her second opinions about a line the
+                # driver has already heard would invite her to revise it, which
+                # is the one thing that branch exists to prevent.
+                tctx = teacher_context(teachers, q)
                 if hit.get("speakable"):
                     base["speak_directly"] = True
                     base["speech"] = hit["text"]
@@ -1744,6 +1883,8 @@ def look(question: str, session_key: str = "default",
                     return base
                 base["path"] = "observer_composed"
                 base["lint"] = hit.get("faults") or []
+                if tctx:
+                    base["teachers"] = tctx
                 base["rules"] = (
                     "This is what the camera is seeing right now — "
                     f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
@@ -1793,8 +1934,12 @@ def look(question: str, session_key: str = "default",
         return {"ok": False, "note": "nothing to see", "took_ms": took}
     meta = getattr(va, "meta", None) or {}
     seen_s_ago = meta.get("frame_age_s")
+    tctx = teacher_context(teachers, q)
     return {
         "ok": True, "answer": text, "took_ms": took,
+        # THE SECOND OPINIONS, on the path that actually looks at the object.
+        # Omitted entirely when nothing fresh -- see teachers.panel.context_for.
+        **({"teachers": tctx} if tctx else {}),
         # Which of the three ways this answer was reached. Logged per call, so
         # "the camera got slow again" is answerable from a drive rather than
         # from a re-measurement: a run that used to be mostly observer_direct
@@ -1901,7 +2046,7 @@ def vehicle_status() -> dict:
 
 
 def run_tool(name: str, arguments, session_key: str = "default",
-             where=None, spoken: str = None) -> dict:
+             where=None, spoken: str = None, teachers: dict = None) -> dict:
     """Dispatch one tool call from the live session.
 
     An unknown tool name is answered, not raised: the session is a model and a
@@ -1917,6 +2062,13 @@ def run_tool(name: str, arguments, session_key: str = "default",
     the same kind of reason: the panel is where Whisper's output lands, and the
     visual fast path is a judgement about what was ASKED rather than about how
     the model chose to relay it.
+
+    `teachers` is the shadow panel's reading of the same instant, PASSED IN
+    rather than fetched. This module does not import `teachers` and must not:
+    only app.py may, and it hands the block down as a plain dict. That is not
+    fastidiousness -- it is what keeps the boundary countable. A teacher's
+    opinion reaches RIO through exactly one place, the answer to a question a
+    driver asked, and it gets there as an argument somebody had to pass.
     """
     if name == VEHICLE_TOOL_NAME:
         return vehicle_status()
@@ -1961,7 +2113,7 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # judgement about the QUESTION, so it is judged on the words that were
         # actually said wherever they are available. See look().
         return look(str(arguments.get("question") or ""), session_key,
-                    spoken=str(spoken or "") or None)
+                    spoken=str(spoken or "") or None, teachers=teachers)
     if name == PLACES_TOOL_NAME:
         return places.find_places(
             query=str(arguments.get("query") or ""),

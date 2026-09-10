@@ -38,6 +38,38 @@ import urllib.request
 
 import config
 
+# HOW MANY THINGS RIO IS DOING THAT A DRIVER IS WAITING ON. Module level and
+# shared by both clients, because the card is shared. Re-entrant by count: two
+# overlapping questions must not have the first one's exit resume the teachers
+# under the second.
+_HOLD = {"n": 0, "held_s": 0.0, "holds": 0, "since": 0.0}
+
+
+def hold_gpu():
+    """Context manager: no teacher starts new work while this is open."""
+    return _Hold()
+
+
+class _Hold:
+    def __enter__(self):
+        if _HOLD["n"] == 0:
+            _HOLD["since"] = time.time()
+        _HOLD["n"] += 1
+        _HOLD["holds"] += 1
+        return self
+
+    def __exit__(self, *exc):
+        _HOLD["n"] = max(0, _HOLD["n"] - 1)
+        if _HOLD["n"] == 0 and _HOLD["since"]:
+            _HOLD["held_s"] += time.time() - _HOLD["since"]
+            _HOLD["since"] = 0.0
+        return False
+
+
+def hold_status():
+    return {"held": _HOLD["n"], "holds": _HOLD["holds"],
+            "held_s": round(_HOLD["held_s"], 2)}
+
 
 class TeacherClient:
     """The RIO-side half of one teacher service."""
@@ -62,6 +94,7 @@ class TeacherClient:
             "submitted": 0, "evicted": 0, "stale_dropped": 0, "sent": 0,
             "ok": 0, "failed": 0, "streak": 0, "backoff_until": 0.0,
             "last_error": None, "last_ok_at": 0.0, "busy": False,
+            "yielded": 0,
         }
         self.info = {}              # whatever /health last said about the model
 
@@ -119,8 +152,25 @@ class TeacherClient:
             print(f"[teachers.{self.name}] delivery failed: "
                   f"{type(e).__name__}: {e}", flush=True)
 
+    def paused(self) -> bool:
+        """Is RIO using the GPU for something a driver is waiting on?"""
+        return _HOLD["n"] > 0
+
     def _take(self):
         """The next job worth doing, dropping any that have gone stale."""
+        # THE TEACHERS YIELD. Measured on this pod: one observer forward pass
+        # is 368 ms with the teachers idle and 704 ms (p50, 1379 max) with both
+        # of them inferring -- 1.9x, on the call a driver is waiting through
+        # when they ask what RIO can see. The teachers are shadow and the
+        # driver is not, so while RIO is answering they stop taking work.
+        #
+        # A job already in flight is NOT preempted: it is inside another
+        # process and there is nothing to preempt it with. What this buys is
+        # that no NEW teacher inference starts during an answer, which is the
+        # difference between one overlapping pass and an unbounded queue of
+        # them.
+        if self.paused():
+            return None
         max_age = float(getattr(config, "TEACHER_FRAME_MAX_AGE_S", 1.0))
         now = time.time()
         with self._lock:
@@ -157,6 +207,10 @@ class TeacherClient:
                 self.health(timeout_s=2.0)
             while not self._stop.is_set():
                 if time.time() < self.stats["backoff_until"]:
+                    break
+                if self.paused():
+                    with self._lock:
+                        self.stats["yielded"] += 1
                     break
                 job = self._take()
                 if job is None:

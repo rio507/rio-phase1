@@ -2439,6 +2439,86 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
 //
 // Nothing is stubbed here except the browser itself. static/rio_nav.js is
 // loaded as written — the same routing, the same tracker, the same bus — with
+
+/* ---------------------------------------------------------------------------
+ * A CONNECT THAT NEVER OPENS
+ * ---------------------------------------------------------------------------
+ * On 2026-09-10 the talk button sat on "Connecting…" for a whole drive and
+ * never moved. The drive's log has a session_start, frame marks and a
+ * session_end -- and no `session_started`, so the mint never completed. The
+ * button had no way to say so, because NOT ONE STEP OF THE CONNECT PATH HAD A
+ * DEADLINE: fetch waits minutes, getUserMedia waits on a human, and the SDP
+ * exchange waits on a network this pod does not control.
+ *
+ * Every step is bounded and named now. This drives each one hanging and
+ * asserts the connect gives up, says which step, and does it inside the
+ * budget rather than at some point after the drive is over. */
+function runConnectDeadlines() {
+  section('a connect that never opens gives up, and says where');
+  const RT = require('../static/rio_realtime.js');
+  const budgets = RT._connectBudgets && RT._connectBudgets();
+  ok(budgets && budgets.mint && budgets.mic && budgets.negotiate,
+     'every step of the connect has a budget: '
+     + JSON.stringify(budgets || {}));
+  ok(budgets.mic > budgets.mint,
+     'and the microphone gets the longest one (' + budgets.mic + 'ms vs '
+     + budgets.mint + 'ms) -- it is waiting on a person answering a '
+     + 'permission prompt, and a person is allowed to take longer than a '
+     + 'network');
+
+  const step = RT._step;
+  ok(typeof step === 'function', 'the step wrapper is reachable for testing');
+  if (typeof step !== 'function') return Promise.resolve();
+
+  /* Driven on a step whose budget is small, so the suite does not sit out ten
+     real seconds to prove a timeout fires. `voice` is 8 s; the assertion that
+     matters is that it fires AT ALL and names itself, and the shipped numbers
+     are asserted above. */
+  const started = Date.now();
+  const never = new Promise(function () {});
+  return step('mint', never)
+    .then(function () { ok(false, 'a hung step must not resolve'); },
+          function (e) {
+            const took = Date.now() - started;
+            ok(/^mint:/.test(e.message),
+               'a hung step fails NAMED: ' + JSON.stringify(e.message));
+            ok(/timed out/.test(e.message),
+               'and says it timed out rather than something vaguer');
+            ok(took <= budgets.mint + 2000,
+               'inside its budget (' + took + 'ms vs ' + budgets.mint + 'ms) '
+               + '-- the failure this replaces was unbounded');
+          })
+    .then(function () {
+      // A step that REJECTS keeps its own message and gains the step name.
+      return step('negotiate', Promise.reject(new Error('realtime call 401: no')))
+        .then(function () { ok(false, 'a rejected step must not resolve'); },
+              function (e) {
+                ok(/^negotiate: realtime call 401/.test(e.message),
+                   'a real failure is prefixed with its step, not replaced: '
+                   + JSON.stringify(e.message));
+              });
+    })
+    .then(function () {
+      // ...and a step that already names itself is not double-prefixed.
+      return step('mint', Promise.reject(new Error('mint: no session')))
+        .then(function () { ok(false, 'must not resolve'); },
+              function (e) {
+                ok(e.message === 'mint: no session',
+                   'and one that already names itself is left alone: '
+                   + JSON.stringify(e.message));
+              });
+    })
+    .then(function () {
+      const seen = [];
+      return step('mic', Promise.resolve('ok'), function (n) { seen.push(n); })
+        .then(function () {
+          ok(seen.join(',') === 'mic',
+             'the progress callback names the step as it starts, so the '
+             + 'button can say "allow the microphone" instead of "stand by"');
+        });
+    });
+}
+
 // a DOM that answers "no such element" to everything, a fetch that speaks
 // HTTP, and a Geolocation that reports one fixed position. The destination is
 // resolved by the running server, against whichever provider it is configured
@@ -4070,6 +4150,7 @@ function speaking(h, rid, said) {
 
 
 await noiseSection();
+await runConnectDeadlines();
 
 const serverArg = process.argv.indexOf('--server');
 if (serverArg >= 0) {

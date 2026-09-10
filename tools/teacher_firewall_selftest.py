@@ -116,6 +116,15 @@ APP_TEACHER_FUNCTIONS = {
     "teachers_event_endpoint",
     # The websocket handler's inner worker, where the frame hook lives.
     "worker",
+    # THE ONE DOOR THE TEACHERS' WORDS COME THROUGH: a tool call a driver's
+    # own question triggered. Everything about that path is checked by rule F.
+    "realtime_tool_endpoint",
+    # THE YIELD, and it is a one-way door like every other entry here. app.py
+    # tells the panel "a driver is waiting, take no new work"; the panel tells
+    # app.py nothing back. What crosses the boundary is a context manager, not
+    # a reading -- asserted below, because a function that returned teacher
+    # DATA from here would be a hole in rule B that rule C would not see.
+    "_rio_has_the_gpu",
 }
 
 # D. What none of those may reach out to. Module-level names whose appearance
@@ -133,12 +142,27 @@ MOUTH_CALLS = {
 
 # The modules that must never mention the teachers at all -- not import them,
 # not name them in a string, not have a commented-out call. These are the loop.
+# THE PROACTIVE LOOP: may not so much as NAME a teacher. These are the paths
+# RIO takes on her own initiative -- what she sees, what she decides, what she
+# says without being asked -- and the panel must be invisible to all of them.
 LOOP_MODULES = [
-    "observer.py", "vision.py", "visual_qa.py", "realtime.py", "router.py",
+    "observer.py", "vision.py", "visual_qa.py", "router.py",
     "voice.py", "voice_dialogue.py", "voice_tags.py", "persona.py",
     "rio_prompts.py", "llm_interface.py", "resolve.py", "enrich.py",
     "frameselect.py", "perceive.py", "insights.py",
 ]
+
+# realtime.py is NOT in that list any more, and the reason is the whole of the
+# change: look() may now carry the two models' reading of the same instant, so
+# RIO can form her own read from the camera, the measured state and two second
+# opinions together. It therefore names them, in the tool result and in the
+# session instructions.
+#
+# What it may still never do is REACH them. The block is passed in as a plain
+# dict by app.py; realtime.py imports nothing from `teachers` and has no way
+# to ask for a reading. That is asserted separately, in rule F3, because it is
+# a different and stronger claim than "does not mention".
+RECIPIENT_MODULES = ["realtime.py"]
 LOOP_DIRS = ["headway", "navigation"]
 
 # E. What the browser half may not name.
@@ -201,6 +225,38 @@ def enclosing_functions(tree):
 
 
 # ---------------------------------------------------------------------------
+def strip_py_comments(src: str) -> str:
+    """Python with comments and docstrings removed, via the tokenizer.
+
+    Same lesson as strip_js_comments: a rule that cannot tell a comment from a
+    call fails on its own documentation and teaches everyone to stop writing
+    it down.
+    """
+    import io
+    import tokenize
+
+    out = []
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+    except (tokenize.TokenError, IndentationError):
+        return src
+    prev_type = None
+    for tok in toks:
+        if tok.type == tokenize.COMMENT:
+            continue
+        # A bare string expression is a docstring; a string after `=` or `(`
+        # is data and stays.
+        if tok.type == tokenize.STRING and prev_type in (
+                tokenize.INDENT, tokenize.NEWLINE, tokenize.NL, None):
+            continue
+        out.append(tok.string)
+        if tok.type not in (tokenize.NL, tokenize.NEWLINE):
+            prev_type = tok.type
+        else:
+            prev_type = tok.type
+    return " ".join(out)
+
+
 def strip_js_comments(src: str) -> str:
     """JavaScript with // and /* */ removed, and string literals kept.
 
@@ -393,7 +449,7 @@ def rule_c_and_d():
 
     # The endpoints that READ a teacher value must not also touch a mouth.
     readers = ["teachers_state_endpoint", "teachers_status_endpoint",
-               "teachers_health_refresh_endpoint"]
+               "teachers_health_refresh_endpoint", "_rio_has_the_gpu"]
     for name in readers:
         fn = funcs.get(name)
         if fn is None:
@@ -408,6 +464,19 @@ def rule_c_and_d():
         bad = (named & MOUTHS) | (named & MOUTH_CALLS)
         ok(not bad, f"{name} reads the panel and touches no mouth"
                     + (f" — FOUND {sorted(bad)}" if bad else ""))
+
+    section("D1b. the yield hands back a context manager, not a reading")
+    fn = funcs.get("_rio_has_the_gpu")
+    ok(fn is not None, "_rio_has_the_gpu exists")
+    if fn is not None:
+        called = {n.func.attr for n in ast.walk(fn)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+        ok(called <= {"hold_gpu", "nullcontext"},
+           f"it calls hold_gpu and nothing else on the panel ({sorted(called)}) "
+           f"— a yield that also fetched a reading would be a hole in rule B "
+           f"that rule C could not see")
+        ok(not any(isinstance(n, ast.Subscript) for n in ast.walk(fn)),
+           "and it reads no field off anything the panel returned")
 
     section("D2. the panel has no way to speak, by construction")
     # There is no function anywhere in teachers/ whose name or body reaches a
@@ -438,6 +507,99 @@ def rule_c_and_d():
     exported = [n for n in dir(panel) if not n.startswith("_")]
     ok("state" in exported and "status" in exported,
        f"the read-only surface is what the dashboard uses ({len(exported)} names)")
+
+
+# The paths RIO can take on her OWN initiative. A teacher value reaching any of
+# these is the thing the whole panel promised not to do.
+PROACTIVE_FUNCTIONS = [
+    "headway_frame_endpoint", "headway_ws_endpoint", "nav_voice_endpoint",
+    "headway_voice_endpoint", "nav_event_endpoint", "talk",
+]
+
+
+def rule_f():
+    section("F. the teachers reach ONE thing: a question the driver asked")
+    # THE BOUNDARY MOVED, ON PURPOSE, AND THIS IS WHERE IT IS NOW.
+    #
+    # look() may carry the two models' reading of the same instant, so RIO can
+    # form her own read from the camera, the measured state and two second
+    # opinions together. That is a real change: a teacher's opinion can now
+    # affect words a driver hears.
+    #
+    # What has NOT changed is everything proactive. No warning, no nav
+    # announcement, no band, no health line, no sentence RIO produces on her
+    # own initiative may see a teacher value. The narrow way to say that is:
+    # `context_for` -- the only function that hands teacher readings out for
+    # use -- has exactly one caller in the repo, and it is the tool endpoint a
+    # driver's question arrives through.
+    path = REPO / "app.py"
+    tree = parse(path)
+    owner = enclosing_functions(tree)
+    callers = sorted({owner.get(n, "<module>")
+                      for n in ast.walk(tree)
+                      if isinstance(n, ast.Call)
+                      and isinstance(n.func, ast.Attribute)
+                      and n.func.attr == "context_for"})
+    ok(callers == ["realtime_tool_endpoint"],
+       f"context_for has exactly one caller, the tool endpoint ({callers})")
+
+    # And nowhere else in the repo calls it either.
+    others = []
+    for p2 in sorted(REPO.rglob("*.py")):
+        rel = p2.relative_to(REPO)
+        if rel.parts[0] in ("teachers", "runs", "training_data", "weights"):
+            continue
+        if p2.name.endswith(".bak") or ".pre-" in p2.name or rel.parts[0] == "tools":
+            continue
+        if str(rel) == "app.py":
+            continue
+        try:
+            src = p2.read_text()
+        except Exception:
+            continue
+        # A CALL, not a mention. realtime.py's comments point at
+        # `teachers.panel.context_for` to say where the block came from, and a
+        # text grep would read the explanation as the violation.
+        if "context_for(" in strip_py_comments(src):
+            others.append(str(rel))
+    ok(not others,
+       f"and no other module mentions it{' — FOUND ' + str(others) if others else ''}")
+
+    section("F2. nothing proactive can see a teacher value")
+    for name in PROACTIVE_FUNCTIONS:
+        fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and node.name == name:
+                fn = node
+                break
+        if fn is None:
+            continue
+        named = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Attribute):
+                named.add(node.attr)
+            elif isinstance(node, ast.Name):
+                named.add(node.id)
+        # on_frame and hold_gpu are one-way: app.py TELLS the panel something.
+        # Reading anything back is what is forbidden.
+        reads = named & {"context_for", "state", "status"}
+        ok(not reads,
+           f"{name} tells the panel things and reads none back"
+           + (f" — FOUND {sorted(reads)}" if reads else ""))
+
+    section("F3. realtime.py still cannot reach the teachers itself")
+    rt = (REPO / "realtime.py").read_text()
+    rtree = ast.parse(rt)
+    imports = [m for m, _, _ in imported_modules(rtree)
+               if m.split(".")[0] == "teachers"]
+    ok(not imports,
+       f"realtime.py imports nothing from teachers ({imports}) — the block is "
+       f"PASSED IN as a plain dict, which is what keeps one door countable")
+    ok("teachers: dict = None" in rt,
+       "look() and run_tool take it as an argument")
+    ok("def teacher_context(" in rt,
+       "and the labelling and the rules live there, with the answer")
 
 
 def rule_e():
@@ -481,6 +643,7 @@ def main():
     rule_a()
     rule_b()
     rule_c_and_d()
+    rule_f()
     rule_e()
 
     print("\n" + "=" * 72)
