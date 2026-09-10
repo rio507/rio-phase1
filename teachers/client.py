@@ -83,17 +83,41 @@ class TeacherClient:
     def submit(self, job: dict) -> bool:
         """Offer a keyframe. -> was it accepted into a slot?
 
-        Called on the frame path. Takes a lock held only for a list operation.
+        Called on the frame path. Takes a lock held only for a list operation;
+        the eviction it may cause is REPORTED off this thread, below.
         """
+        evicted = None
         with self._lock:
             if len(self._slots) >= self.depth:
                 # NEWEST WINS. The evicted job describes a road already driven.
-                self._slots.pop(0)
+                evicted = self._slots.pop(0)
                 self.stats["evicted"] += 1
             self._slots.append(job)
             self.stats["submitted"] += 1
+        if evicted is not None:
+            # EVERY SUBMITTED JOB PRODUCES EXACTLY ONE OUTCOME PER MODEL, and
+            # this is why. The panel assembles a corpus row when every model
+            # has reported on a keyframe; a job dropped here would otherwise
+            # leave that row waiting forever for an answer that is never
+            # coming, and the row -- including the OTHER model's real reading
+            # of the same instant -- would be lost.
+            self._report(evicted, "evicted")
         self._wake.set()
         return True
+
+    def _report(self, job, why):
+        """Tell the panel this job will never run. Never on the frame path."""
+        threading.Thread(
+            target=self._deliver, name=f"teacher:{self.name}:drop",
+            args=(job, {"ok": False, "error": why, "not_run": True,
+                        "latency_ms": 0.0}), daemon=True).start()
+
+    def _deliver(self, job, reading):
+        try:
+            self._on_reading(self.name, job, reading)
+        except Exception as e:
+            print(f"[teachers.{self.name}] delivery failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
 
     def _take(self):
         """The next job worth doing, dropping any that have gone stale."""
@@ -110,15 +134,27 @@ class TeacherClient:
                 age = now - float(job.get("t0") or now)
                 if age > max_age * 2.0:
                     self.stats["stale_dropped"] += 1
+                    self._report(job, "stale_dropped")
                     continue
                 return job
         return None
 
     # -- the worker ---------------------------------------------------------
+    # How often an idle worker re-asks its service what it is. A service
+    # started AFTER the panel -- which is the normal order, since boot.sh
+    # brings uvicorn up first -- would otherwise show "not loaded" on the card
+    # for the whole drive, because health was probed once at start-up.
+    HEALTH_EVERY_S = 20.0
+
     def _loop(self):
+        last_health = 0.0
         while not self._stop.is_set():
             self._wake.wait(timeout=1.0)
             self._wake.clear()
+            if (not self.info.get("loaded")
+                    and time.time() - last_health > self.HEALTH_EVERY_S):
+                last_health = time.time()
+                self.health(timeout_s=2.0)
             while not self._stop.is_set():
                 if time.time() < self.stats["backoff_until"]:
                     break
@@ -157,13 +193,9 @@ class TeacherClient:
         reading["queue_ms"] = round((t_send - float(job.get("submitted_at")
                                                     or t_send)) * 1000.0, 1)
         reading["freshness_s"] = round(time.time() - float(job.get("t0") or t_send), 2)
-        try:
-            self._on_reading(self.name, job, reading)
-        except Exception as e:
-            # A reading that cannot be filed is a reading lost, never a worker
-            # thread lost. The next keyframe still gets one.
-            print(f"[teachers.{self.name}] delivery failed: "
-                  f"{type(e).__name__}: {e}", flush=True)
+        # A reading that cannot be filed is a reading lost, never a worker
+        # thread lost. The next keyframe still gets one.
+        self._deliver(job, reading)
 
     def _post(self, job):
         body = json.dumps(self._payload(job)).encode()

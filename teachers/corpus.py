@@ -107,7 +107,8 @@ def _write(kf, readings, associations):
     # accompanying content is "connection refused". On a volume with a quota,
     # that is the difference between a shadow feature and an outage.
     n_frames = 0
-    any_reading = any((readings.get(m) or {}).get("ok") for m in schema.MODELS)
+    any_reading = any(not (readings.get(m) or {}).get("not_run")
+                      for m in schema.MODELS)
     if any_reading and getattr(config, "TEACHER_CORPUS_KEEP_FRAMES", True):
         fdir = d / "frames" / kf["kf_id"]
         fdir.mkdir(parents=True, exist_ok=True)
@@ -146,6 +147,8 @@ def _write(kf, readings, associations):
                      for m in schema.MODELS},
         "associations": {m: (associations.get(m) or {}) for m in schema.MODELS},
         "tracks": kf.get("tracks") or [],
+        "models_ran": [m for m in schema.MODELS
+                       if not (readings.get(m) or {}).get("not_run")],
     }
     # Said on the row rather than inferred from the null paths, because "the
     # pictures were not kept" and "the pictures could not be written" are
@@ -165,15 +168,30 @@ def _write(kf, readings, associations):
     return {"ok": True, "kf_id": kf["kf_id"], "frames": n_frames}
 
 
-def _clean_reading(rec: dict) -> dict:
-    """Exactly the schema's fields, in the schema's order, plus nothing.
+# Keys the PANEL puts on a reading for its own bookkeeping. Not the model's,
+# not part of the row format, and a corpus reader should not have to wonder
+# whether they are.
+_WORKING_KEYS = frozenset({"at", "t0", "kf_id", "fresh", "age_s", "not_run"})
 
-    A reading arrives carrying working keys the panel put on it (kf_id, at).
-    Those are not part of the row format and a corpus reader should not have to
-    wonder whether they are. The MODEL's own output is never touched: `raw` is
-    copied straight through.
+
+def _clean_reading(rec: dict) -> dict:
+    """The schema's fields in the schema's order, and everything else in `extra`.
+
+    "Every field the model offers, verbatim" has to survive the schema not
+    having thought of it. A service reports things the named fields do not
+    cover -- per-stage timings, `cameras: 1`, `frames_as: video`,
+    `ego_synthetic` -- and every one of them is a fact about how the reading
+    was produced that a training run may want to filter on. Dropping them for
+    being unanticipated is exactly the failure a versioned schema is supposed
+    to prevent, so they go in `extra` instead and the named fields stay stable.
+
+    The MODEL's own output is never touched either way: `raw` is copied
+    straight through.
     """
     out = {k: rec.get(k) for k in schema.READING_FIELDS}
+    extra = {k: v for k, v in rec.items()
+             if k not in schema.READING_FIELDS and k not in _WORKING_KEYS}
+    out["extra"] = extra
     return out
 
 

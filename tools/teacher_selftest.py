@@ -69,7 +69,7 @@ def section(name):
 class FakeTeacher:
     """One thread, one port, and a knob for every way a model can misbehave."""
 
-    def __init__(self, name, port, delay=0.0):
+    def __init__(self, name, port, delay=0.0):   # delay: how slow this one is
         self.name = name
         self.port = port
         self.delay = delay
@@ -131,6 +131,14 @@ class FakeTeacher:
                             "pixels": None}
                            if self.name == "alpamayo1.5" else None),
             "gpu": {"vram_reserved_mb": 24000.0},
+            # Fields the schema never named, which the REAL services do send.
+            # Here so the corpus's `extra` passthrough is exercised rather
+            # than assumed -- it is the thing that stops "every field the
+            # model offers, verbatim" quietly meaning "every field somebody
+            # thought of in advance".
+            "timings_ms": {"rollout_ms": 900.0, "scene_ms": 110.0},
+            "cameras": 1,
+            "code_revision": "36aeb4c",
         }
 
     def stop(self):
@@ -555,6 +563,103 @@ def run_flow_and_corpus():
     corpus_mod.close(key)
 
 
+def run_desync():
+    section("G. two teachers at different speeds — the corpus must not thin out")
+    # THE BUG THIS EXISTS FOR. Each teacher has its own queue and its own
+    # eviction, so a fast one runs keyframes 10, 11, 12 while a slow one runs
+    # 10 and then 13. The row used to be written when both models' LATEST
+    # readings named the same keyframe -- true only while they stay in step,
+    # which they stop doing within seconds. The corpus quietly thinned to
+    # almost nothing a minute into any real drive.
+    panel.reset_all()
+    panel.stop()
+    fast = FakeTeacher("alpamayo1.5", 18921, delay=0.02)
+    slow = FakeTeacher("cosmos-reason2", 18922, delay=0.9)
+    config.TEACHER_ALPAMAYO_URL = "http://127.0.0.1:18921"
+    config.TEACHER_COSMOS_URL = "http://127.0.0.1:18922"
+    floor = config.TEACHER_KEYFRAME_FLOOR_S
+    gap = config.TEACHER_KEYFRAME_MIN_GAP_S
+    config.TEACHER_KEYFRAME_FLOOR_S = 0.12
+    config.TEACHER_KEYFRAME_MIN_GAP_S = 0.05
+    panel.start()
+
+    key = "desync"
+    framebuf.drop_ring(key)
+    import shutil
+
+    shutil.rmtree(corpus_mod.session_dir(key), ignore_errors=True)
+    for i in range(40):
+        egomotion.note_speed(key, 12.0, "obd", at=time.time() - 3.0 + i * 0.1)
+
+    raised = 0
+    for _ in range(60):
+        ring, _ = push_window(key, n=5, spacing=0.1)
+        if panel.on_frame(key, RESULT, ring):
+            raised += 1
+        time.sleep(0.05)
+    ok(raised >= 8, f"the drive raised {raised} keyframes while one teacher "
+                    f"took 45x as long as the other")
+
+    deadline = time.time() + 40
+    while time.time() < deadline:
+        if not panel.status()["services"]["cosmos-reason2"]["queued"] \
+                and not panel.status()["services"]["cosmos-reason2"]["busy"]:
+            break
+        time.sleep(0.5)
+    time.sleep(1.5)
+    rows = corpus_mod.read_rows(key)
+    svc = panel.status()["services"]
+    evicted = svc["cosmos-reason2"]["evicted"] + svc["cosmos-reason2"]["stale_dropped"]
+    ran = svc["cosmos-reason2"]["ok"]
+    print(f"       raised {raised} · slow teacher ran {ran}, dropped {evicted} "
+          f"· rows {len(rows)}")
+    ok(len(rows) >= 2,
+       f"rows are still written when the two go out of step ({len(rows)})")
+    ok(len(rows) == raised,
+       f"one row per keyframe, still ({len(rows)} rows, {raised} raised) — "
+       f"under the old rule almost all of these were lost the moment the two "
+       f"models stopped being on the same keyframe")
+    both = [r for r in rows if len(r["models_ran"]) == 2]
+    solo = [r for r in rows if len(r["models_ran"]) == 1]
+    ok(len(both) == ran,
+       f"{len(both)} rows are COMPARISONS — one per keyframe the slower "
+       f"teacher actually ran ({ran})")
+    ok(len(solo) == evicted,
+       f"and {len(solo)} carry the faster teacher's reading alone, one per "
+       f"keyframe the slower one dropped ({evicted}) — a real reading of a "
+       f"real window, kept, and marked so an analysis can filter it out")
+    for row in rows:
+        bad = schema.validate_row(row)
+        ok(not bad, f"row {row['seq']} validates" + (f" — {bad[:3]}" if bad else ""))
+        for m in schema.MODELS:
+            r = row["readings"][m]
+            if m in row["models_ran"]:
+                ok(r["ok"] and r["scene"],
+                   f"row {row['seq']}: {m} ran and has a reading")
+            else:
+                ok(not r["ok"] and r["error"],
+                   f"row {row['seq']}: {m} did not run, and the row says why "
+                   f"({r['error']})")
+    ok(len(rows) + 0 == raised and evicted > 0,
+       f"every raised keyframe is accounted for: {len(rows)} rows, of which "
+       f"{len(both)} comparisons, against {raised} raised and {evicted} "
+       f"dropped by the slow teacher")
+
+    section("G2. the extras the service reported survive to the corpus")
+    if rows:
+        extra = rows[0]["readings"]["alpamayo1.5"].get("extra") or {}
+        ok("timings_ms" in extra or extra != {},
+           f"a field the schema never named is kept rather than dropped "
+           f"({sorted(extra)[:4]})")
+
+    config.TEACHER_KEYFRAME_FLOOR_S = floor
+    config.TEACHER_KEYFRAME_MIN_GAP_S = gap
+    panel.stop()
+    fast.stop()
+    slow.stop()
+    corpus_mod.close(key)
+
+
 def run_association():
     section("F. association — deterministic, and allowed to abstain")
     cases = [
@@ -650,6 +755,7 @@ def main():
         run_stale()
         run_service_isolation()
         run_flow_and_corpus()
+        run_desync()
         run_association()
         if args.live:
             run_live(args.alpamayo, args.cosmos)

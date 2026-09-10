@@ -361,10 +361,26 @@ list of complaints rather than raising, because the writer never validates — a
 row that is wrong should still be written, or the evidence of the bug goes with
 it.
 
-Rows are written when **both** teachers have answered. A partial row is a row
-somebody has to merge later, and merging by keyframe id after the fact is
-exactly the chore that makes a corpus go unused. A model that *failed* writes a
-row with `ok: false` and its error, which is data.
+Rows are assembled **by keyframe id**, and written when every model has
+*reported* on that keyframe — answered it, failed it, or been told by its own
+client that the job was thrown away. That last case is why eviction and
+stale-drop report back rather than dropping silently: without it a row would
+wait forever for an answer that is never coming, and the *other* model's real
+reading of the same instant would go with it.
+
+It has to work that way because **the two teachers do not stay in step**. Each
+has its own queue and its own newest-wins eviction, so a fast one runs
+keyframes 10, 11, 12 while a slow one runs 10 and then 13. A rule of "write
+when both models' latest readings name the same keyframe" is true for the first
+few seconds of a drive and almost never again — the corpus would quietly thin
+to nothing.
+
+So `models_ran` is on every row. Usually both; not always. A row with one name
+still carries a real reading of a real window and is worth keeping — an
+analysis that wants *comparisons* filters on `len(models_ran) == 2` rather than
+discovering the difference by surprise. A model that ran and *failed* writes
+`ok: false` with its error, which is data; a model that never ran writes
+`error: "evicted"` or `"stale_dropped"`, which is a different fact.
 
 ~100 kB a keyframe, ~180 MB an hour at the 2 s floor. Kept, because a corpus
 without the pictures is a corpus of opinions — **except** when neither teacher

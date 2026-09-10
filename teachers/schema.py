@@ -40,6 +40,16 @@ KEYFRAME_FIELDS = (
     "associations",     # dict — model name -> ASSOCIATION_FIELDS
     "tracks",           # list — the RF-DETR scene at t0, for the association
                         #        to be checkable without the pictures
+    "models_ran",       # list — which models actually produced a reading for
+                        #        this keyframe. USUALLY BOTH, and deliberately
+                        #        not always: the two teachers have their own
+                        #        queues and a slow one drops keyframes a fast
+                        #        one runs. A row with one name here still
+                        #        carries a real reading of a real window and is
+                        #        worth keeping; it is just not a COMPARISON,
+                        #        and an analysis that wants comparisons filters
+                        #        on len(models_ran) == 2 rather than
+                        #        discovering the difference by surprise.
 )
 
 # --- the 4-frame window ----------------------------------------------------
@@ -121,6 +131,12 @@ READING_FIELDS = (
                         #          "pixels": [[u,v] ...] | null}
                         #         DISPLAY ONLY. Nothing downstream reads it.
     "gpu",              # dict  — {"vram_mb": float, "device": str}
+    "extra",            # dict  — everything else the service reported, kept
+                        #         verbatim. Per-stage timings, cameras: 1,
+                        #         frames_as, ego_synthetic, code_revision. This
+                        #         field exists so "every field the model
+                        #         offers" survives the schema not having
+                        #         anticipated one.
 )
 
 # --- actor association -----------------------------------------------------
@@ -158,7 +174,7 @@ def blank_reading(model: str, model_id: str = "", revision: str = "",
         "latency_ms": 0.0, "queue_ms": 0.0, "freshness_s": 0.0,
         "raw": {}, "scene": "", "critical_actor": "", "attention": "",
         "reasoning": "", "thinking": None, "meta_action": None,
-        "trajectory": None, "gpu": {},
+        "trajectory": None, "gpu": {}, "extra": {},
     }
 
 
@@ -175,6 +191,8 @@ def validate_row(row: dict) -> list:
             bad.append(f"missing top-level key: {key}")
     if row.get("schema") != SCHEMA_VERSION:
         bad.append(f"schema {row.get('schema')!r} != {SCHEMA_VERSION!r}")
+    if not isinstance(row.get("models_ran"), list):
+        bad.append("models_ran is not a list")
     if row.get("trigger") not in TRIGGERS:
         bad.append(f"trigger {row.get('trigger')!r} not one of {TRIGGERS}")
 

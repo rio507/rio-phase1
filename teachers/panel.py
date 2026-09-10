@@ -110,6 +110,7 @@ def _state(key):
             "readings": {},        # model -> latest reading dict
             "assoc": {},           # model -> latest association dict
             "kf": {},              # kf_id -> the keyframe awaiting readings
+            "pending": {},         # kf_id -> {"readings", "assoc"} being gathered
             "spoken": None,        # {"text", "at", "kind"}
             "tally": {"keyframes": 0, "readings": 0, "agree": 0,
                       "agree_eligible": 0, "matched": 0, "actors": 0,
@@ -198,8 +199,12 @@ def _on_frame(session_key, result, ring):
         # and bounded, because two teachers can both fail to answer and a dict
         # keyed by keyframe id would otherwise be a slow leak across a drive.
         st["kf"][kf["kf_id"]] = kf
-        if len(st["kf"]) > 12:
-            for old in sorted(st["kf"])[:-12]:
+        # Deep enough to outlive the SLOWER teacher. Each keyframe here holds
+        # four frame references and the scene at t0; 24 of them is a couple of
+        # seconds of ring plus some dicts, and losing one to an eager trim
+        # costs a corpus row that both models answered.
+        if len(st["kf"]) > 24:
+            for old in sorted(st["kf"])[:-24]:
                 st["kf"].pop(old, None)
         clients = list(_clients.values())
 
@@ -264,14 +269,27 @@ def _on_reading(model: str, job: dict, reading: dict) -> None:
         key = job["kf_id"].rsplit("-", 1)[0]
 
     rec = schema.blank_reading(model)
-    rec.update({k: v for k, v in (reading or {}).items() if k in rec or k in
-                ("model_id", "revision", "precision", "gpu")})
+    # EVERYTHING THE SERVICE SENT, not a filtered subset. The named fields are
+    # what the card draws; anything else the service reported -- per-stage
+    # timings, `cameras: 1`, `frames_as: video`, `ego_synthetic` -- is a fact
+    # about how the reading was produced and belongs in the corpus. It lands in
+    # `extra` on the way to disk (teachers/corpus._clean_reading) rather than
+    # being dropped for not having been thought of when the schema was written.
+    rec.update(reading or {})
     rec["model"] = model
-    # WHEN THIS READING CAME BACK, not when its frame was taken. Both are on
-    # the record and they answer different questions: `freshness_s` is how old
-    # the ROAD was, this is how old the ANSWER is, and the card shows the first
-    # while the fade-out uses the second.
+    # WHEN THIS READING CAME BACK, and WHICH INSTANT it is about. Two clocks,
+    # two questions: `at` is how old the ANSWER is (the card's live dot),
+    # `t0` is the instant of the road it describes, and the age a driver
+    # actually cares about -- now minus t0 -- grows while the card sits there
+    # and can only be computed if t0 is on the record.
     rec["at"] = time.time()
+    rec["t0"] = float(job.get("t0") or rec["at"])
+    rec["kf_id"] = job["kf_id"]
+    # A job the client threw away before running it -- evicted by a newer
+    # keyframe, or gone stale while it waited. It is not a reading and must not
+    # replace one on the card; it exists so the accumulator below knows this
+    # model is never going to answer this keyframe.
+    not_run = bool(rec.get("not_run"))
 
     # Associate the named actor to a track. Done HERE, on the teacher's thread,
     # so the frame path never pays for it and so the association is stored with
@@ -292,42 +310,67 @@ def _on_reading(model: str, job: dict, reading: dict) -> None:
         except Exception:
             traj["pixels"] = None
 
+    kf_for_record = None
+    readings_copy = assoc_copy = None
     with _lock:
         st = _state(key)
-        st["readings"][model] = rec
-        st["assoc"][model] = a
-        if rec.get("ok"):
-            st["tally"]["readings"] += 1
-        if rec.get("critical_actor"):
-            st["tally"]["actors"] += 1
-            if a.get("matched"):
-                st["tally"]["matched"] += 1
-        # Agreement is only a question once BOTH models have answered about the
-        # SAME keyframe. Comparing the latest of each would silently compare
-        # two different instants whenever one model is a keyframe behind.
-        other = MODEL_NAMES[0] if model == MODEL_NAMES[1] else MODEL_NAMES[1]
-        oth_r = st["readings"].get(other) or {}
-        if oth_r.get("kf_id") == job["kf_id"] or _same_kf(st, other, job["kf_id"]):
-            st["tally"]["agree_eligible"] += 1
-            if assoc_mod.agree(a, st["assoc"].get(other)):
-                st["tally"]["agree"] += 1
-        rec["kf_id"] = job["kf_id"]
-        complete = all((st["readings"].get(m) or {}).get("kf_id") == job["kf_id"]
-                       for m in MODEL_NAMES)
-        kf_for_record = kf if complete else None
-        readings_copy = {m: dict(st["readings"].get(m) or {}) for m in MODEL_NAMES}
-        assoc_copy = {m: dict(st["assoc"].get(m) or {}) for m in MODEL_NAMES}
+        if not not_run:
+            st["readings"][model] = rec
+            st["assoc"][model] = a
+            if rec.get("ok"):
+                st["tally"]["readings"] += 1
+            if rec.get("critical_actor"):
+                st["tally"]["actors"] += 1
+                if a.get("matched"):
+                    st["tally"]["matched"] += 1
 
-    # WRITTEN WHEN BOTH HAVE ANSWERED, not when the first does. A corpus row
-    # with one column filled is a row that has to be merged later by whoever
-    # reads it, and merging by keyframe id after the fact is exactly the sort
-    # of chore that makes a corpus go unused.
+        # --- ONE ROW PER KEYFRAME, ASSEMBLED BY KEYFRAME ID ------------------
+        #
+        # THE BUG THIS REPLACES. The row used to be written when both models'
+        # LATEST readings named the same keyframe -- which is true only while
+        # the two of them stay in step, and they do not. They have their own
+        # queues and their own eviction, so a fast teacher runs keyframes 10,
+        # 11, 12 while a slow one runs 10 and then 13, and from keyframe 11
+        # onwards "both latest agree" is almost never true again. The corpus
+        # would have quietly thinned to nothing a minute into a drive.
+        #
+        # So readings are accumulated against the keyframe they belong to, and
+        # the row is written when every model has REPORTED on that keyframe --
+        # answered it, failed it, or been told it was thrown away.
+        slot = st["pending"].setdefault(job["kf_id"], {"readings": {}, "assoc": {}})
+        slot["readings"][model] = rec
+        slot["assoc"][model] = a
+        if all(m in slot["readings"] for m in MODEL_NAMES):
+            st["pending"].pop(job["kf_id"], None)
+            # Agreement is asked ONCE per keyframe, here, where both answers
+            # are about the same instant by construction. Only when both
+            # actually ran: a model that never saw the keyframe has not
+            # disagreed with anything.
+            if all(not slot["readings"][m].get("not_run") for m in MODEL_NAMES):
+                st["tally"]["agree_eligible"] += 1
+                if assoc_mod.agree(slot["assoc"][MODEL_NAMES[0]],
+                                   slot["assoc"][MODEL_NAMES[1]]):
+                    st["tally"]["agree"] += 1
+            # A keyframe NEITHER model ran is not a row. It is already counted
+            # as an eviction on the service strip, and a corpus full of "the
+            # queue was full" rows is a corpus nobody reads.
+            if any(not slot["readings"][m].get("not_run") for m in MODEL_NAMES):
+                kf_for_record = kf
+                readings_copy = {m: dict(slot["readings"][m]) for m in MODEL_NAMES}
+                assoc_copy = {m: dict(slot["assoc"][m]) for m in MODEL_NAMES}
+            st["kf"].pop(job["kf_id"], None)
+        # Bounded, because a model that dies mid-generation never reports and
+        # its slot would otherwise sit here for the rest of the drive.
+        if len(st["pending"]) > 16:
+            for old_id in sorted(st["pending"])[:-16]:
+                st["pending"].pop(old_id, None)
+
+    # WRITTEN WHEN EVERY MODEL HAS REPORTED, not when the first one does. A
+    # corpus row with one column filled is a row that has to be merged later by
+    # whoever reads it, and merging by keyframe id after the fact is exactly
+    # the sort of chore that makes a corpus go unused.
     if kf_for_record is not None:
         corpus_mod.write(kf_for_record, readings_copy, assoc_copy)
-
-
-def _same_kf(st, model, kf_id):
-    return (st["readings"].get(model) or {}).get("kf_id") == kf_id
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +402,15 @@ def state(session_key: str) -> dict:
         for m in MODEL_NAMES:
             r = dict(st["readings"].get(m) or schema.blank_reading(m))
             a = dict(st["assoc"].get(m) or {})
+            # TWO AGES, AND THE CARD SHOWS THE ONE THAT MATTERS. `age_s` is
+            # how long ago the ANSWER arrived. `freshness_s` is how old the
+            # ROAD in it is RIGHT NOW -- recomputed on every poll from t0, so
+            # it keeps growing while a card sits open, which is the whole
+            # point of showing it. The stored value was the age at arrival and
+            # would have frozen there.
             r["age_s"] = round(now - r["at"], 2) if r.get("at") else None
+            if r.get("t0"):
+                r["freshness_s"] = round(now - float(r["t0"]), 2)
             r["fresh"] = bool(r.get("at") and (now - r["at"]) <= fresh_s)
             out["models"][m] = {"reading": r, "association": a}
     t = out["tally"]
