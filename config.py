@@ -859,6 +859,23 @@ REALTIME_NOISE_TOKENS = (
     "cool", "alright", "sorry", "please", "there",
 )
 
+# ---------------------------------------------------------------------------
+# THE FRAME SOCKET'S IDLE CLOSE
+# ---------------------------------------------------------------------------
+# On 2026-09-09 the page stopped sending frames 40 s into a drive and this
+# socket stayed open until t=400.4 -- six minutes of a server holding a
+# session, a worker task and a frame slot for a client that had gone quiet, and
+# six minutes in which neither end said anything.
+#
+# Closing is the right action rather than a tidy one: the browser's `onclose`
+# is what starts a reconnect, so a close here is how a page suspended by iOS --
+# which cannot run its own timers to notice anything -- gets a working
+# transport back the moment it wakes.
+#
+# Well clear of a ping interval (5 s) and of any plausible pause between
+# frames; a client that is alive at all sends something inside this.
+HEADWAY_WS_IDLE_CLOSE_S = 30.0
+
 # How long a tool call may keep running for a turn that has been superseded.
 # Zero is the honest number on the client -- the AbortController fires at once
 # -- and this is the SERVER's grace: /realtime/tool watches for the client
@@ -1760,6 +1777,13 @@ OBSERVER_PERIOD_S = 1.0
 # this the fast path declines and the full path looks at the road NOW — the
 # refusal is the honesty, not a fallback that got unlucky.
 OBSERVER_FRESH_S = 2.0
+# ...and how old the newest frame in the ring may be before the observer stops
+# spending a forward pass on it at all. Same number, and it is a separate name
+# because they answer different questions: FRESH_S is "may this sentence be
+# SERVED", MAX_FRAME_AGE_S is "is this picture worth DESCRIBING". On a stalled
+# feed the first one was already right and the second one did not exist, so a
+# GPU pass went on a road the car had left minutes earlier.
+OBSERVER_MAX_FRAME_AGE_S = 2.0
 
 # The observer stops when nobody has asked to see anything for this long. It
 # costs GPU that detection, depth and lanes are also asking for.

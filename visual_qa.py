@@ -519,6 +519,19 @@ class VisualAnswer:
             frame, sel = frameselect.best_scene_frame(ring, ref_wall)
         self._frame = frame
         self.meta["frame_selection"] = sel
+        # WHICH PICTURE THIS ANSWER IS ABOUT, AND WHEN IT WAS TAKEN.
+        #
+        # `frame_selection` has carried the age since it was written, buried in
+        # a scoring breakdown nobody reads at answer time. Lifted here because
+        # it is the one fact the ANSWER needs to be honest about: a description
+        # of a road is true for a second or two at speed and false after ten,
+        # and "she said the road was clear" means different things depending on
+        # which picture she said it about. realtime.look() puts it in the tool
+        # result so the model can qualify an old one.
+        if frame is not None:
+            self.meta["frame_age_s"] = round(frame.age_s, 2)
+            self.meta["frame_wall_t"] = round(frame.wall_t, 3)
+            self.meta["frame_id"] = getattr(frame, "frame_id", None)
         self._graph = self._graph_for(frame, ring)
         t = self._stage("select_frame", t)
 

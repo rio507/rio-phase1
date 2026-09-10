@@ -1393,9 +1393,37 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
                 return
 
     task = asyncio.create_task(worker())
+    # THE SERVER'S OWN LIVENESS CHECK, and it is the other half of the
+    # browser's.
+    #
+    # On 2026-09-09 (session 738fbb82) the page stopped sending at t=40.4 and
+    # this socket stayed open until t=400.4 -- six minutes of a server holding
+    # a session, a worker task and a frame slot for a client that had gone
+    # quiet, and six minutes in which nothing on either end said so. The
+    # browser has a stall watchdog now; this is the same watchdog from the
+    # other side, and it matters independently: a page that has been suspended
+    # by iOS cannot run its own timers to notice.
+    #
+    # Closing is the RIGHT action rather than a polite one: the browser's
+    # onclose is what starts a reconnect, so a close here is how a suspended
+    # page gets a working transport back the moment it wakes.
+    idle_close = float(getattr(config, "HEADWAY_WS_IDLE_CLOSE_S", 30.0))
+    last_msg = time.time()
     try:
         while True:
-            msg = await ws.receive()
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=idle_close)
+            except asyncio.TimeoutError:
+                quiet = time.time() - last_msg
+                if quiet >= idle_close:
+                    print(f"[headway.ws] idle {quiet:.0f}s, closing "
+                          f"(received {stats['recv']})", flush=True)
+                    sessions.log_live(session_id, "headway_ws_idle", {
+                        "quiet_s": round(quiet, 1), "received": stats["recv"],
+                    })
+                    break
+                continue
+            last_msg = time.time()
             if msg.get("type") == "websocket.disconnect":
                 break
             data = msg.get("bytes")

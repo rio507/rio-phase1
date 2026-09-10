@@ -185,6 +185,39 @@
       });
   }
 
+  /* THE CAMERA CAME BACK, OR IT DID NOT.
+   *
+   * A MediaStreamTrack can end under a running page: another app takes the
+   * camera, iOS revokes it for a phone call, the device is unplugged. The
+   * element keeps its srcObject and reports videoWidth 0 from then on, so
+   * every capture silently returns nothing and the drive has no pictures with
+   * nothing anywhere saying why.
+   *
+   * This is the ONLY thing that can fix that, and it lives here for the same
+   * reason startFeed does: one acquisition, one file. It re-runs the same
+   * request against the same facing mode and re-attaches the element.
+   *
+   * A clip needs none of it -- there is no track to lose -- and says so by
+   * resolving true without touching anything.
+   */
+  function reacquire() {
+    var k = kind();
+    if (k !== CAMERA) return Promise.resolve(k !== NONE);
+    var v = byId('video');
+    // Release what is left before asking again: iOS will hand back the same
+    // dead track otherwise, and a second live track on one element is two
+    // camera pipelines for one picture.
+    try {
+      if (v && v.srcObject && v.srcObject.getTracks) {
+        v.srcObject.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+      }
+    } catch (e) {}
+    if (v) v.srcObject = null;
+    return startFeed().then(function (feed) {
+      return !!(feed && feed.stream);
+    }, function () { return false; });
+  }
+
   /* Release whatever startFeed acquired. A clip feed owns nothing, so this is
      a no-op for one — which is why callers can call it unconditionally. */
   function stopFeed(feed) {
@@ -204,7 +237,7 @@
     kind: kind, name: name, label: label, element: element,
     isClip: isClip, facing: function () { return state.facing; },
     setClip: setClip, useCamera: useCamera,
-    startFeed: startFeed, stopFeed: stopFeed,
+    startFeed: startFeed, stopFeed: stopFeed, reacquire: reacquire,
     onChange: onChange,
     // Tests, and the panel's own reset paths.
     _reset: function () { state.kind = CAMERA; state.clipUrl = ''; state.clipName = ''; },

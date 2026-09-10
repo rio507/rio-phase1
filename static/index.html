@@ -627,6 +627,20 @@
   /* ---- the headway HUD ----
      One pill per fact. They wrap inside their own share of the width rather
      than growing into the right-hand stack. */
+  /* The feed banner. Amber while it is trying, red once it has given up on
+     the camera itself -- the two states a driver would act on differently. */
+  .feed-state {
+    position: absolute; left: 0; right: 0; top: 0; z-index: 6;
+    padding: 6px 10px; font-size: 12px; letter-spacing: .04em;
+    text-transform: uppercase; text-align: center;
+    background: rgba(120, 78, 0, 0.88); color: #ffdca6;
+    border-bottom: 1px solid rgba(255, 184, 77, 0.5);
+  }
+  .feed-state.is-lost {
+    background: rgba(110, 20, 20, 0.9); color: #ffc9c9;
+    border-bottom-color: rgba(255, 90, 90, 0.55);
+  }
+
   #headwayhud {
     position: absolute; top: 14px; left: 16px;
     display: none; flex-wrap: wrap; gap: var(--gap-xs);
@@ -1735,6 +1749,14 @@
 
   <section class="panel stage-card">
     <div class="cam-wrap">
+      <!-- FEED LOST, SAID OUT LOUD ON THE GLASS.
+           On 2026-09-09 the frame push stopped 40 s into a drive and did not
+           come back for 442 s, and the only thing the driver could see was a
+           HUD that had stopped changing -- which is indistinguishable from an
+           empty road. rio_frames.js reports its own liveness now and this is
+           where it is shown. Not an error dialog: a strip, at the top of the
+           picture, that goes away by itself when frames come back. -->
+      <div id="feedstate" class="feed-state" hidden aria-live="polite"></div>
       <video id="video" autoplay playsinline muted></video>
       <img id="campreview" alt="">
       <video id="preview" style="display:none;" controls playsinline muted autoplay
@@ -4327,6 +4349,20 @@ document.addEventListener('DOMContentLoaded', () => {
      `applyResult`, and every warning is still decided server-side. */
   let stream = null;
 
+  /* The banner. Two states and an off, and it never traps a tap: it sits
+     above the picture and is `pointer-events: none` in effect because there is
+     nothing on it to press. */
+  function paintFeedState(state, detail) {
+    const el = document.getElementById('feedstate');
+    if (!el) return;
+    if (state === 'live' || state === 'idle') { el.hidden = true; return; }
+    el.hidden = false;
+    el.classList.toggle('is-lost', state === 'lost');
+    el.textContent = state === 'lost'
+      ? 'Camera feed lost — trying to get it back'
+      : 'Feed interrupted — reconnecting';
+  }
+
   function startStream(elFn, onStale) {
     if (stream) return stream;
     if (!(window.RIO && RIO.frames)) return null;
@@ -4343,6 +4379,32 @@ document.addEventListener('DOMContentLoaded', () => {
       source: () => { try { return RIO.source.kind(); } catch (e) { return 'camera'; } },
       onResult: j => applyResult(j, { el: elFn() }),
       onStale: onStale || (() => {}),
+      /* THE FEED'S OWN STATE, ON THE GLASS AND IN THE DRIVE LOG.
+         `live` clears the banner; `reconnecting` and `lost` put it up. The
+         driver's question is never "which of nine failure modes is this", it
+         is "is the car still looking", so there are two answers. */
+      onState: (state, detail) => {
+        paintFeedState(state, detail);
+        if (!RIO.driving) return;
+        try {
+          fetch(RIO.url('/session/mark')
+                + '&tag=FRAMES_STATE'
+                + '&note=' + encodeURIComponent(JSON.stringify(
+                    { state: state, was: (detail || {}).was,
+                      why: (detail || {}).why }).slice(0, 400)),
+                { method: 'POST' }).catch(() => {});
+        } catch (e) {}
+      },
+      /* The camera track ended under us -- another app took it, or iOS
+         revoked it. rio_frames.js cannot re-acquire a camera; RIO.source can,
+         and this is the only place that knows both. */
+      onTrackEnded: () => {
+        paintFeedState('lost', { why: 'track_ended' });
+        if (!RIO.source || !RIO.source.reacquire) return;
+        Promise.resolve(RIO.source.reacquire()).then(
+          () => { if (stream && stream.kick) stream.kick('track_reacquired'); },
+          () => {});
+      },
       onEvent: (name, detail) => {
         /* The transport's own bad news goes into the DRIVE's record, not only
            into a console nobody has open in a car. "the picture froze for a

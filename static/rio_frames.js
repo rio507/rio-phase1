@@ -57,6 +57,52 @@
  *
  * No policy lives here. This file moves pictures and reports numbers; what to
  * say about them is decided server-side, exactly as before.
+ *
+ * ---------------------------------------------------------------------------
+ * AND THEN, ON 2026-09-09, IT STOPPED AND NEVER STARTED AGAIN
+ * ---------------------------------------------------------------------------
+ * Session 738fbb82. The last frame the socket carried was idx 232 at t=40.4 s.
+ * The next result in the whole drive was idx 233 at t=482.7 -- a 442-SECOND
+ * GAP, in the middle of a drive that ran to 656 s.
+ *
+ * What the log says about it is mostly what it does NOT say:
+ *
+ *   headway_ws_close     t=400.4, received 233, processed 232. The socket
+ *                        stayed OPEN for six minutes after the last frame.
+ *   FRAMES_WS_LOST       never emitted. onclose did not fire.
+ *   FRAMES_STALE         never emitted.
+ *   frame_age_ms         220 -> 469 -> 506 over the last three frames, with
+ *                        transport_ms going 148 -> 401.
+ *   the first frame back  frame_age_ms 1888.8, described as current.
+ *
+ * So this was not a network drop and not a server close. THE CAPTURE LOOP
+ * DIED, with the socket open and the page alive, and nothing anywhere was
+ * watching for that.
+ *
+ * It could die because of exactly one line: `schedule()` was called at the END
+ * of `tick()`, after `await once()`. A promise inside once() that never
+ * settles -- and canvas.toBlob on iOS does not fire its callback while the
+ * page is backgrounded, which is what a phone does at a red light when the
+ * driver glances at Maps -- means the next tick is never scheduled. Not late:
+ * never. The loop is one awaited promise away from being over for the drive,
+ * and there was no watchdog, no timeout, no reconnect and nothing on the HUD.
+ *
+ * Four things, and the first is the load-bearing one:
+ *
+ *   THE LOOP CANNOT DIE.     schedule() is in a `finally`, and the work inside
+ *                            a tick races a deadline. A tick that overruns is
+ *                            abandoned and counted; the loop goes on.
+ *   A WATCHDOG WATCHES IT.   Nothing sent for stall_ms while running is a
+ *                            stall, and a stall REBUILDS the pipeline --
+ *                            socket, canvas and all -- rather than hoping.
+ *   THE SOCKET IS PROVED.    Pings were already going out and nothing read the
+ *                            pongs. Three intervals with no pong is a dead
+ *                            socket however open it looks, and reconnects
+ *                            reset once one has carried frames for a while, so
+ *                            three drops over ten minutes no longer retire the
+ *                            transport for the rest of the drive.
+ *   THE DRIVER IS TOLD.      onState fires on every change between live, lost
+ *                            and reconnecting, and the HUD says so.
  */
 (function (root) {
   'use strict';
@@ -74,6 +120,23 @@
      worse than a drive at 4 fps. */
   var OPEN_BUDGET_MS = 4000;
   var PING_INTERVAL_MS = 5000;
+  /* No pong for this many ping intervals and the socket is dead however open
+     it looks. A TCP connection through a carrier NAT that has silently dropped
+     the flow stays `readyState === OPEN` forever. */
+  var PONG_MISSES = 3;
+  /* Nothing SENT for this long, while running, is a stall. Generous next to a
+     15 fps cadence and tight next to the 442 s the drive lost. */
+  var STALL_MS = 4000;
+  /* How long one tick's capture-and-encode may take before it is abandoned.
+     A tick that has not produced bytes in this long is not slow, it is stuck:
+     the drive's stall was canvas.toBlob never calling back at all. */
+  var TICK_BUDGET_MS = 2500;
+  /* A socket that has carried frames for this long has proved itself, and the
+     reconnect budget starts again. Without it three drops spread over a long
+     drive retire the transport permanently -- MAX_RECONNECTS was a lifetime
+     count with nothing ever resetting it. */
+  var HEALTHY_MS = 20000;
+  var SUPERVISOR_MS = 1000;
   /* Consecutive socket failures after which this page stops trying and stays
      on POST for the rest of the drive. Reconnecting forever against a proxy
      that strips upgrades is a battery leak with no upside. */
@@ -105,6 +168,22 @@
     for (var k in FALLBACK_TUNING) tuning[k] = FALLBACK_TUNING[k];
     for (var k2 in (cfg.tuning || {})) tuning[k2] = cfg.tuning[k2];
 
+    /* THE LIVENESS CONSTANTS, OVERRIDABLE. A stall watchdog whose period
+       cannot be shortened is a stall watchdog no test can drive: the shipped
+       values are seconds, and a suite that waited them out would take minutes
+       to assert a millisecond of logic. Same reason the tuning above arrives
+       from outside — the SHAPE is what is under test, not the number. */
+    var stallMs = cfg.stallMs || STALL_MS;
+    var tickBudgetMs = cfg.tickBudgetMs || TICK_BUDGET_MS;
+    var pingMs = cfg.pingIntervalMs || PING_INTERVAL_MS;
+    var pongMisses = cfg.pongMisses || PONG_MISSES;
+    var healthyMs = cfg.healthyMs === undefined ? HEALTHY_MS : cfg.healthyMs;
+    var superviseMs = cfg.superviseMs || SUPERVISOR_MS;
+    var maxReconnects = cfg.maxReconnects === undefined ? MAX_RECONNECTS
+                                                        : cfg.maxReconnects;
+    var reconnectBaseMs = cfg.reconnectBaseMs || 500;
+    var openDelayMs = cfg.openDelayMs === undefined ? 200 : cfg.openDelayMs;
+
     var ws = null;
     var wsOpen = false;
     var mode = 'post';            // 'ws' once the socket is carrying frames
@@ -133,6 +212,21 @@
     var offsetSec = null;
     var bestRtt = Infinity;
 
+    /* --- liveness ---------------------------------------------------------
+       Everything the supervisor needs to answer one question: is this
+       transport moving pictures RIGHT NOW? Nothing here existed on the drive
+       that lost 442 seconds, which is why nothing noticed. */
+    var lastSentAt = 0;           // when a frame last went on the wire
+    var lastResultAt = 0;         // ...and when one last came back
+    var openedAt = 0;             // when this socket opened
+    var pingsOut = 0;             // pings since the last pong
+    var supervisor = null;
+    var watchedEl = null;
+    var visibilityBound = false;
+    var feedState = 'idle';       // idle | live | reconnecting | lost
+    var stallRecoveries = 0;
+    var tickOverruns = 0;
+
     var stats = {
       sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
       skipped_capture: 0, bytes: 0, dropped_server: 0,
@@ -140,6 +234,17 @@
     };
 
     function note(name, detail) { try { onEvent(name, detail || {}); } catch (e) {} }
+
+    /* WHAT THE DRIVER IS LOOKING AT, and it is a state rather than an event.
+       A HUD that freezes and says nothing is worse than a HUD that says the
+       feed is gone: the first one is indistinguishable from an empty road. */
+    function setState(next, why) {
+      if (feedState === next) return;
+      var prev = feedState;
+      feedState = next;
+      note('FRAMES_STATE', { state: next, was: prev, why: why || null });
+      if (cfg.onState) { try { cfg.onState(next, { was: prev, why: why || null }); } catch (e) {} }
+    }
 
     function record(list, v) {
       list.push(v);
@@ -164,9 +269,11 @@
 
       ws.onopen = function () {
         wsOpen = true;
+        openedAt = now();
+        pingsOut = 0;
         if (openTimer) { clearTimeout(openTimer); openTimer = null; }
         ping();
-        pingTimer = setInterval(ping, PING_INTERVAL_MS);
+        pingTimer = setInterval(ping, pingMs);
       };
 
       ws.onmessage = function (e) {
@@ -185,6 +292,7 @@
           return;
         }
         if (msg.op === 'pong') {
+          pingsOut = 0;             // the far end is answering
           var c2 = epochSec(now());
           var rtt = c2 - msg.c;
           if (rtt >= 0 && rtt < bestRtt) {
@@ -211,6 +319,8 @@
         }
         // Anything else is a headway result.
         inflight = Math.max(0, inflight - 1);
+        lastResultAt = now();
+        setState('live', 'result');
         handleResult(msg);
       };
 
@@ -218,17 +328,35 @@
         wsOpen = false;
         if (openTimer) { clearTimeout(openTimer); openTimer = null; }
         if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+        /* A SOCKET THAT PROVED ITSELF EARNS THE BUDGET BACK.
+           MAX_RECONNECTS was a LIFETIME count with nothing resetting it, so a
+           ten-minute drive that dropped three times an hour apart retired the
+           transport for good and finished on the POST path at 1 fps. A socket
+           that carried frames for HEALTHY_MS did not fail because the network
+           refuses upgrades; it failed because a phone moved between cells. */
+        var lived = openedAt ? (now() - openedAt) : 0;
+        if (lived >= healthyMs && reconnects > 0) {
+          note('FRAMES_WS_HEALTHY_RESET', { lived_ms: Math.round(lived),
+                                            reconnects: reconnects });
+          reconnects = 0;
+        }
         ws = null;
         inflight = 0;
+        openedAt = 0;
         if (mode === 'ws') note('FRAMES_WS_LOST', { reconnects: reconnects });
         mode = 'post';
         if (!running) return;
-        if (++reconnects > MAX_RECONNECTS) {
+        if (++reconnects > maxReconnects) {
           giveUpOnSocket = true;
+          setState('live', 'post_fallback');
           note('FRAMES_WS_GIVEN_UP', { reconnects: reconnects });
           return;
         }
-        setTimeout(function () { if (running) openSocket(); }, 500 * reconnects);
+        setState('reconnecting', 'ws_closed');
+        /* Backoff, capped. 500 x n was unbounded in principle and is bounded
+           in practice only because the budget above used to be permanent. */
+        var delay = Math.min(8000, reconnectBaseMs * Math.pow(2, reconnects - 1));
+        setTimeout(function () { if (running) openSocket(); }, delay);
       };
 
       ws.onerror = function () { /* onclose does the work; this only silences it */ };
@@ -236,6 +364,16 @@
 
     function ping() {
       if (!wsOpen) return;
+      /* THE PONGS WERE ALWAYS COMING BACK AND NOTHING READ THEM. A flow
+         dropped by a carrier NAT leaves readyState OPEN indefinitely: the
+         page goes on calling send() into a socket that will never deliver
+         anything again, which looks exactly like a camera that stopped. */
+      if (pingsOut >= pongMisses) {
+        note('FRAMES_WS_UNANSWERED', { pings: pingsOut });
+        try { ws.close(); } catch (e) {}     // onclose does the reconnect
+        return;
+      }
+      pingsOut++;
       try { ws.send(JSON.stringify({ op: 'ping', c: epochSec(now()) })); } catch (e) {}
     }
 
@@ -277,15 +415,49 @@
       timer = setTimeout(tick, delay === undefined ? intervalMs() : delay);
     }
 
+    /* A PROMISE THAT MAY NEVER SETTLE, GIVEN A DEADLINE.
+       canvas.toBlob does not call back while an iOS page is backgrounded, and
+       blob.arrayBuffer() can sit on the same stall. Neither rejects. Racing
+       them against a timer turns "the drive is over" into "one frame was
+       skipped". */
+    function withBudget(promise, ms, label) {
+      return new Promise(function (resolve) {
+        var done = false;
+        var t = setTimeout(function () {
+          if (done) return;
+          done = true;
+          tickOverruns++;
+          note('FRAMES_TICK_OVERRUN', { budget_ms: ms, at: label });
+          resolve(null);
+        }, ms);
+        Promise.resolve(promise).then(function (v) {
+          if (done) return;
+          done = true; clearTimeout(t); resolve(v);
+        }, function () {
+          if (done) return;
+          done = true; clearTimeout(t); resolve(null);
+        });
+      });
+    }
+
     async function tick() {
       if (!running) return;
       var t0 = now();
       try {
-        await once();
+        /* THE WHOLE TICK, NOT JUST THE ENCODE. Whatever inside once() hangs --
+           the encode, the blob read, a getter on a dead video element -- the
+           loop is out of it inside TICK_BUDGET_MS. */
+        await withBudget(once(), tickBudgetMs, 'tick');
       } catch (e) { /* one bad frame never stops the loop */ }
-      // The next tick is the cadence MINUS what this one cost, so encoding
-      // does not silently halve the frame rate.
-      schedule(Math.max(0, intervalMs() - (now() - t0)));
+      finally {
+        /* IN A `finally`, AND THAT IS THE FIX.
+           This line used to be the last statement of the function, so an
+           awaited promise that never settled meant it never ran and the drive
+           had no more pictures -- 442 s of exactly that on session 738fbb82.
+           The next tick is the cadence MINUS what this one cost, so encoding
+           does not silently halve the frame rate. */
+        schedule(Math.max(0, intervalMs() - (now() - t0)));
+      }
     }
 
     /* ONE TICK. Returns without taking a picture whenever taking one would
@@ -318,7 +490,7 @@
       // were actually read out of the element, and before the encode, which
       // is part of the age and not outside it.
       var capturedAt = now();
-      var blob = await toBlob(cv);
+      var blob = await withBudget(toBlob(cv), tickBudgetMs, 'encode');
       if (!blob) { stats.skipped_capture++; return; }
 
       var s = speed();
@@ -335,19 +507,22 @@
           src: safeSource()
         });
         var hbytes = new TextEncoder().encode(header);
-        var body = new Uint8Array(await blob.arrayBuffer());
+        var bytes = await withBudget(blob.arrayBuffer(), tickBudgetMs, 'arraybuffer');
+        if (!bytes) { stats.skipped_capture++; return; }
+        var body = new Uint8Array(bytes);
         var out = new Uint8Array(4 + hbytes.length + body.length);
         new DataView(out.buffer).setUint32(0, hbytes.length, false);
         out.set(hbytes, 4);
         out.set(body, 4 + hbytes.length);
         inflight++;
-        try { ws.send(out); }
+        try { ws.send(out); lastSentAt = now(); }
         catch (e) { inflight = Math.max(0, inflight - 1); }
         return;
       }
 
       // --- the POST path, unchanged in shape and now stamped the same way ---
       inflight++;
+      lastSentAt = now();
       try {
         var fd = new FormData();
         fd.append('image', blob, 'frame.jpg');
@@ -429,12 +604,95 @@
       try { onResult(j); } catch (e) {}
     }
 
+    /* ---------------- the supervisor -------------------------------------
+     *
+     * ONE THING IT ASKS, ONCE A SECOND: has a picture gone on the wire
+     * recently? Everything that can go wrong with this transport ends up
+     * answering that question the same way, which is why it is the only
+     * question worth asking:
+     *
+     *   the loop died                   nothing sent
+     *   the camera track ended          grab() returns null, nothing sent
+     *   the element lost its stream     same
+     *   the socket died with no close   sends succeed into nothing, no
+     *                                   results, and inflight pins the pipe
+     *
+     * A stall REBUILDS rather than waits. The socket is closed (its onclose
+     * reconnects), the canvas is dropped so a fresh one is made against
+     * whatever the element is now, and inflight is released -- because a pipe
+     * held full by frames that will never be answered is a loop that will
+     * never take another picture, whatever else is fixed.
+     */
+    function stalled() {
+      if (!running) return false;
+      var since = now() - (lastSentAt || openedAt || 0);
+      return since > stallMs;
+    }
+
+    function recover(why) {
+      stallRecoveries++;
+      note('FRAMES_STALLED', {
+        why: why,
+        since_sent_ms: lastSentAt ? Math.round(now() - lastSentAt) : null,
+        since_result_ms: lastResultAt ? Math.round(now() - lastResultAt) : null,
+        inflight: inflight, mode: mode, ws_open: wsOpen,
+        recoveries: stallRecoveries,
+      });
+      setState('reconnecting', why);
+      inflight = 0;
+      maxInflight = 1;
+      canvas = null;                 // rebuilt against the element as it is now
+      if (ws) { try { ws.close(); } catch (e) {} }   // onclose reopens
+      // ...and kick the loop, in case the timer itself is what was lost.
+      if (timer) { clearTimeout(timer); timer = null; }
+      schedule(0);
+    }
+
+    function supervise() {
+      if (!running) return;
+      if (stalled()) { recover('no_frames_sent'); return; }
+      if (mode === 'ws' && wsOpen && lastResultAt
+          && (now() - lastResultAt) > stallMs * 2) {
+        // Frames are going out and nothing is coming back. Same symptom from
+        // the driver's seat, different half of the pipe.
+        recover('no_results');
+        return;
+      }
+      if (lastSentAt && (now() - lastSentAt) < stallMs) setState('live', 'sending');
+    }
+
+    /* THE CAMERA ITSELF CAN END, and on iOS it does: another app takes the
+       camera, the OS revokes it under a phone call, the track goes `ended` and
+       the element keeps its srcObject and reports videoWidth 0 forever. grab()
+       then returns null on every tick, silently, and stats.skipped_capture is
+       the only trace. */
+    function watchElement() {
+      var el = null;
+      try { el = element(); } catch (e) { el = null; }
+      if (!el || el === watchedEl) return;
+      watchedEl = el;
+      var stream = el.srcObject;
+      if (!stream || !stream.getVideoTracks) return;
+      stream.getVideoTracks().forEach(function (t) {
+        if (t.__rioWatched) return;
+        t.__rioWatched = true;
+        t.addEventListener('ended', function () {
+          note('FRAMES_TRACK_ENDED', { label: t.label || null });
+          setState('lost', 'track_ended');
+          if (cfg.onTrackEnded) { try { cfg.onTrackEnded(); } catch (e) {} }
+        });
+      });
+    }
+
     /* ---------------- lifecycle ------------------------------------------ */
 
     function start() {
       if (running) return;
       running = true;
       seq = 0; inflight = 0;
+      lastSentAt = now(); lastResultAt = 0; openedAt = 0; pingsOut = 0;
+      stallRecoveries = 0; tickOverruns = 0; watchedEl = null;
+      setState('reconnecting', 'starting');
       stats = { sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
                 skipped_capture: 0, bytes: 0, dropped_server: 0, ages: [], rtts: [] };
       maxInflight = 1; ageEma = null; starvedByInflight = 0;
@@ -442,16 +700,47 @@
       // The first tick waits for the socket's budget only if there is a socket
       // to wait for; with none, the POST path starts immediately and the drive
       // is never worse off than it was.
-      schedule(wsUrl && !giveUpOnSocket ? 200 : 0);
+      schedule(wsUrl && !giveUpOnSocket ? openDelayMs : 0);
+      if (supervisor === null) {
+        supervisor = setInterval(function () {
+          try { watchElement(); } catch (e) {}
+          try { supervise(); } catch (e) {}
+        }, superviseMs);
+      }
+      bindVisibility();
     }
 
     function stop() {
       running = false;
+      setState('idle', 'stopped');
+      if (supervisor !== null) { clearInterval(supervisor); supervisor = null; }
       if (timer) { clearTimeout(timer); timer = null; }
       if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       if (openTimer) { clearTimeout(openTimer); openTimer = null; }
       if (ws) { try { ws.close(); } catch (e) {} ws = null; }
       wsOpen = false; mode = 'post'; inflight = 0;
+    }
+
+    /* COMING BACK FROM THE BACKGROUND is the moment this transport is most
+       likely to be broken and least likely to notice: iOS throttles the
+       timers, may have ended the camera track, and canvas.toBlob was not
+       calling back for the whole time the page was hidden. So the return is
+       treated as a stall whether or not the clock says so. */
+    function bindVisibility() {
+      if (visibilityBound || !root.document || !root.document.addEventListener) return;
+      visibilityBound = true;
+      root.document.addEventListener('visibilitychange', function () {
+        if (!running) return;
+        if (root.document.visibilityState !== 'visible') {
+          note('FRAMES_HIDDEN', {});
+          return;
+        }
+        note('FRAMES_VISIBLE', {
+          since_sent_ms: lastSentAt ? Math.round(now() - lastSentAt) : null,
+        });
+        watchedEl = null;            // re-bind to whatever the element is now
+        recover('became_visible');
+      });
     }
 
     function pct(list, p) {
@@ -482,9 +771,21 @@
                           p99: pct(stats.ages, 0.99), n: stats.ages.length },
           rtt_ms: { p50: pct(stats.rtts, 0.5), best: bestRtt === Infinity
                     ? null : Math.round(bestRtt * 1000) },
-          clock_offset_s: offsetSec
+          clock_offset_s: offsetSec,
+          /* WHETHER PICTURES ARE MOVING, which is the question the drive of
+             2026-09-09 could not answer from anything in its log. */
+          state: feedState,
+          since_sent_ms: lastSentAt ? Math.round(now() - lastSentAt) : null,
+          since_result_ms: lastResultAt ? Math.round(now() - lastResultAt) : null,
+          stall_recoveries: stallRecoveries,
+          tick_overruns: tickOverruns,
+          reconnects: reconnects
         };
       },
+      state: function () { return feedState; },
+      /* For the page to call when it knows something this file cannot see --
+         a camera re-acquired, a source changed. */
+      kick: function (why) { if (running) recover(why || 'kicked'); },
       /* Test seam: the pacing controller with no camera and no socket. */
       _adaptRate: function (ageMs) { adaptRate(ageMs); return fps; },
       _adaptQuality: function (bytes) { adaptQuality(bytes); return quality; },

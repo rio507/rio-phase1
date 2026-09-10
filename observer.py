@@ -131,6 +131,28 @@ def _tick(key, state):
     frame = ring.latest()
     if frame is None:
         return False
+    # THE NEWEST FRAME IS NOT NECESSARILY A CURRENT ONE.
+    #
+    # `latest()` is the newest thing in the ring, which on a healthy feed is a
+    # picture from 200 ms ago and on a stalled one is whatever arrived before
+    # the transport died. On 2026-09-09 that was a frame from t=40 being held
+    # while the drive ran to t=656.
+    #
+    # fresh() already refuses to SERVE a description that old, so the answer
+    # was never wrong -- but the forward pass was still spent, once per new
+    # frame id, on a picture of a road the car left minutes ago. Gate it here
+    # too, and say so, because "the observer went quiet" and "the observer is
+    # describing history" are different faults with the same symptom.
+    stale_after = float(getattr(config, "OBSERVER_MAX_FRAME_AGE_S",
+                                config.OBSERVER_FRESH_S))
+    age = getattr(frame, "age_s", None) or 0.0
+    if age > stale_after:
+        with _lock:
+            state["stale_frames"] = state.get("stale_frames", 0) + 1
+            if state["stale_frames"] in (1, 10, 100):
+                print(f"[observer] {key}: newest frame is {age:.1f}s old "
+                      f"(> {stale_after:.1f}s) — not describing it", flush=True)
+        return False
     # The same frame twice is the same sentence twice, at the price of a
     # forward pass. Skipped -- which is also what makes a parked car cheap.
     last = state.get("record")
@@ -203,7 +225,7 @@ def start(session_key: str) -> bool:
             return False
         st = {"stop": threading.Event(), "last_used": time.time(),
               "record": None, "n": 0, "errors": 0, "started": time.time(),
-              "hold": 0, "unspeakable": 0}
+              "hold": 0, "unspeakable": 0, "stale_frames": 0}
         _sessions[key] = st
     st["thread"] = threading.Thread(target=_loop, args=(key, st),
                                     name=f"observer:{key}", daemon=True)
@@ -365,6 +387,13 @@ def status() -> dict:
     with _lock:
         return {key: {"observations": st["n"], "errors": st["errors"],
                       "held": st.get("hold", 0),
+                      # Ticks that found the newest frame already too old to
+                      # describe. Non-zero means the TRANSPORT is the problem
+                      # and the observer is doing the right thing about it --
+                      # a distinction the drive of 2026-09-09 had no way to
+                      # make, because a stalled feed and a stalled observer
+                      # look identical from the outside.
+                      "stale_frames": st.get("stale_frames", 0),
                       "idle_s": round(time.time() - st["last_used"], 1),
                       "has_record": bool(st.get("record")),
                       # WHAT it is holding and WHICH FRAME it came from. Added

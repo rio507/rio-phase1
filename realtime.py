@@ -1701,6 +1701,10 @@ def look(question: str, session_key: str = "default",
                     "fast_path": True,
                     "on_demand": bool(hit.get("on_demand")),
                     "seen_s_ago": hit["age_s"],
+                    # ...and the frame itself, so the two paths cite the same
+                    # thing in the same words.
+                    "frame_wall_t": hit.get("frame_wall_t"),
+                    "frame_id": hit.get("frame_id"),
                 }
                 # THE SECOND MODEL PASS, AND WHEN IT IS NOT WORTH ITS PRICE.
                 #
@@ -1777,6 +1781,8 @@ def look(question: str, session_key: str = "default",
         # not started, or the camera is not running. RIO says she cannot see
         # rather than describing a road she has not been shown.
         return {"ok": False, "note": "nothing to see", "took_ms": took}
+    meta = getattr(va, "meta", None) or {}
+    seen_s_ago = meta.get("frame_age_s")
     return {
         "ok": True, "answer": text, "took_ms": took,
         # Which of the three ways this answer was reached. Logged per call, so
@@ -1785,7 +1791,17 @@ def look(question: str, session_key: str = "default",
         # and is now mostly full_visual has a different problem from one that
         # is slow at every stage.
         "path": "full_visual",
-        "meta": getattr(va, "meta", None),
+        # WHEN THE PICTURE WAS TAKEN. The fast path has carried `seen_s_ago`
+        # since it was written and this one carried nothing, so an answer off a
+        # two-second-old frame and one off a stalled feed's last picture were
+        # the same shape of result. On 2026-09-09 the transport went 442 s
+        # without a frame; the ring emptied and look() said so honestly, but if
+        # it had held one stale picture instead there was nothing in this
+        # result to notice it by.
+        "seen_s_ago": seen_s_ago,
+        "frame_wall_t": meta.get("frame_wall_t"),
+        "frame_id": meta.get("frame_id"),
+        "meta": meta or None,
         "rules": (
             "FIRST ANSWER, AND IT IS SHORT: one or two sentences, in your own "
             "words, from what is here and nothing else. Do not research this "
@@ -1795,7 +1811,12 @@ def look(question: str, session_key: str = "default",
             "a landmark, a named building, an unusual vehicle — you may add ONE "
             "short clause offering it: 'want to know more about it?'. Not every "
             "time, and not for ordinary traffic or an empty road, where there "
-            "is nothing to offer and asking is noise."
+            "is nothing to offer and asking is noise.\n"
+            "`seen_s_ago` is how old the picture you are describing is. Under "
+            "two seconds, say it plainly. Older than that, say WHEN — 'a few "
+            "seconds ago there was...' — because at speed a road changes and a "
+            "stale description stated as current is the one way this answer "
+            "can be wrong."
         ),
     }
 
