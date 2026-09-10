@@ -818,6 +818,47 @@ REALTIME_COALESCE_TRAILERS = (
     "like", "about", "some", "any", "my", "your", "it's", "there's",
 )
 
+# ---------------------------------------------------------------------------
+# ROAD NOISE, AND THE ONE ANSWER IT GETS
+# ---------------------------------------------------------------------------
+# The coalescing above joins two fragments the TRANSCRIPT shows are one
+# sentence -- a dangling "and", an opener. That is the right test for a driver
+# taking a breath mid-question and it is no test at all for road noise, which
+# arrives as several complete little sentences with nothing joining them.
+# Session 738fbb82, t=180.97 to t=180.98 -- ten milliseconds:
+#
+#     "Hello."   "Hello."   "Thanks for your help."   "Got it."
+#
+# Twenty of those over one drive, from a phone on a mount at 11 m/s with the
+# windows down. The barge gate refused every one as a phantom so none of them
+# superseded -- but turn_detection.create_response is on, so the SERVER had
+# already created a response for each committed utterance, and each was an
+# answer to nothing stacked behind whatever she was saying.
+#
+# So fragments inside this window are ONE utterance whatever the words are.
+REALTIME_NOISE_COALESCE_MS = 2000
+# Above this many words a transcript carries a request in it and is a turn,
+# whatever it is made of. Four, because "Thanks for your help." is four and was
+# one of the fragments on the drive -- and "Turn left onto Ocean" is four too,
+# which is why the ceiling alone decides nothing: every word has to be in the
+# no-request list below as well.
+REALTIME_NOISE_MAX_WORDS = 4
+# One "Didn't catch that." per window, and one per this -- a rough road is a
+# rough road for minutes at a time, and a car that apologises every two seconds
+# is broken in a new way.
+REALTIME_NOISE_REPLY_COOLDOWN_MS = 12000
+REALTIME_NOISE_REPLY = "Didn't catch that."
+# The words that carry no request. A transcript is the road only if it is short
+# AND made of nothing else -- a length test alone swallows "What's that?",
+# which is three words and the most common real question in the car.
+REALTIME_NOISE_TOKENS = (
+    "uh", "um", "er", "erm", "mm", "mmm", "hmm", "huh", "ah", "oh", "eh",
+    "hey", "hello", "hi", "yeah", "yep", "yes", "no", "nope", "ok", "okay",
+    "right", "sure", "thanks", "thank", "you", "got", "it", "wow", "well",
+    "so", "like", "the", "a", "and", "for", "your", "help", "good", "nice",
+    "cool", "alright", "sorry", "please", "there",
+)
+
 # How long a tool call may keep running for a turn that has been superseded.
 # Zero is the honest number on the client -- the AbortController fires at once
 # -- and this is the SERVER's grace: /realtime/tool watches for the client

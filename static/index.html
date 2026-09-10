@@ -2572,6 +2572,16 @@ const LIVE_REPORTED = {
   LIVE_TURN_PHANTOM: 'turn_phantom',
   LIVE_BUS_HEALTH: 'bus_health',
   LIVE_TURN_COALESCED: 'turn_coalesced',
+  /* ROAD NOISE, in the drive's own record.
+     "she answered nothing four times in ten milliseconds" is a sentence about
+     session 738fbb82 and the log could say the first half of it — twenty
+     turn_phantom events — but not the second, because nothing recorded the
+     RESPONSES those refused transcripts still had created for them. These do. */
+  LIVE_TURN_FRAGMENT: 'turn_fragment',
+  LIVE_TURN_RECOVERED: 'turn_recovered',
+  LIVE_NOISE_REPLY: 'noise_reply',
+  LIVE_NOISE_DROPPED: 'noise_dropped',
+  LIVE_NOISE_SILENCED: 'noise_silenced',
   LIVE_TOOL_ABORTED: 'tool_aborted',
   LIVE_TOOL_RESULT_DISCARDED: 'tool_result_discarded',
   LIVE_DRIVER_COMMAND: 'driver_command',
@@ -2624,6 +2634,11 @@ function reportLive(ev) {
           text: ev.text || null,
           speaking: ev.speaking === undefined ? null : ev.speaking,
           since_audio_ms: ev.since_audio_ms === undefined ? null : ev.since_audio_ms,
+          // How many fragments this window swallowed, how long it spanned,
+          // and how long since the last "Didn't catch that."
+          n: ev.n === undefined ? null : ev.n,
+          span_ms: ev.span_ms === undefined ? null : ev.span_ms,
+          since_reply_ms: ev.since_reply_ms === undefined ? null : ev.since_reply_ms,
           // Output-bus health, when that is what is being reported.
           covered: ev.covered === undefined ? null : ev.covered,
           context: ev.context || null,

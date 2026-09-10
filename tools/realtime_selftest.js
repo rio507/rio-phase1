@@ -3574,6 +3574,176 @@ section('a cancel is a supersede only when a real new question exists');
 
 /* A phone-shaped session: the onset guard and the level meter exist only on a
    touch device, and they are two of the three gates that were bypassed. */
+/* --- ROAD NOISE, AND THE FIVE ANSWERS IT USED TO GET ----------------------
+ *
+ * Session 738fbb82, t=180.97 to 180.98 -- ten milliseconds, four transcripts:
+ *
+ *     "Hello."   "Hello."   "Thanks for your help."   "Got it."
+ *
+ * The barge gate refused all four as phantoms, so the turn counter was right
+ * and nothing superseded. What nothing touched was the response the SERVER
+ * had already created for each committed utterance
+ * (turn_detection.create_response is on), so four answers to nothing were
+ * created and queued behind whatever she was already saying.
+ *
+ * The harness cannot see the server, so the check is on the two things the
+ * CONTROLLER controls: how many response.create it asks for, and how many
+ * response.cancel it sends for the ones the server made anyway.
+ */
+function noiseHarness(opts) {
+  return harness(Object.assign({
+    bargeOnsetGuardMs: 0,
+    // Milliseconds instead of seconds, for the same reason every other value
+    // in this file is: the SHAPE of the decision is what is being checked.
+    turnPolicy: { noise_coalesce_ms: 40, noise_reply_cooldown_ms: 400 },
+  }, opts || {}));
+}
+
+/* One transcript arriving, with the detector firing behind it the way it does
+   on a phone: speech started, speech stopped, then the words. */
+function fragment(h, text) {
+  h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+  h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: text });
+}
+
+async function noiseSection() {
+section('road noise — five fragments, one answer at most');
+
+{
+  // THE DRIVE, REPRODUCED. Five fragments inside the window.
+  const h = noiseHarness();
+  const spoken = [];
+  h.arbiter.onEvent(ev => { if (ev.type === 'start' && ev.item) spoken.push(ev.item.text); });
+  ['Hello.', 'Hello.', 'Thanks for your help.', 'Got it.', 'Hey.']
+    .forEach(t => fragment(h, t));
+  await settle(10);
+
+  const frags = h.events.filter(e => e.type === 'LIVE_TURN_FRAGMENT');
+  ok(frags.length === 5,
+     'all five are recognised as fragments rather than questions — ' + frags.length);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_SUPERSEDED').length === 0,
+     'not one of them supersedes anything');
+  ok(h.sent.filter(e => e.type === 'response.create').length === 0,
+     'and not one response is asked for while they are arriving');
+
+  await settle(120);
+  const replies = h.events.filter(e => e.type === 'LIVE_NOISE_REPLY');
+  ok(replies.length === 1,
+     'when the window closes there is exactly ONE answer — ' + replies.length);
+  ok(replies.length === 1 && replies[0].n === 5,
+     '...and it knows it was answering five of them (' +
+     (replies.length ? replies[0].n : '?') + ')');
+  ok(spoken.length === 1 && /didn.t catch/i.test(spoken[0] || ''),
+     'the answer is the short one, said once — ' + JSON.stringify(spoken));
+  ok(h.controller.state().counters.fragments_coalesced === 5,
+     'and the drive log can be asked how much of this there was');
+}
+
+{
+  // NEVER A QUEUE OF APOLOGIES. Two windows back to back inside the cooldown.
+  const h = noiseHarness();
+  const spoken = [];
+  h.arbiter.onEvent(ev => { if (ev.type === 'start' && ev.item) spoken.push(ev.item.text); });
+  ['Hey.', 'Hey.'].forEach(t => fragment(h, t));
+  await settle(120);
+  ['Uh.', 'Hmm.', 'Yeah.'].forEach(t => fragment(h, t));
+  await settle(120);
+
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 1,
+     'a second window inside the cooldown gets no second apology');
+  const dropped = h.events.filter(e => e.type === 'LIVE_NOISE_DROPPED');
+  ok(dropped.length === 1,
+     '...and the drop is recorded rather than silent to the log too');
+  ok(spoken.length === 1,
+     'one line reached the mouth over both windows — ' + JSON.stringify(spoken));
+}
+
+{
+  // A REAL QUESTION AFTER THEM IS ANSWERED NORMALLY. This is the half that
+  // makes the rest safe: a filter that also eats questions is worse than the
+  // stacking it replaced.
+  const h = noiseHarness();
+  ['Hello.', 'Hey.', 'Got it.'].forEach(t => fragment(h, t));
+  await settle(10);
+  fragment(h, 'What is that building on the right?');
+  await settle(120);
+
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_FRAGMENT').length === 3,
+     'the three fragments are still fragments');
+  const q = h.events.filter(e => e.type === 'LIVE_TRANSCRIPT');
+  ok(q.length === 4, 'and every transcript is still logged, fragment or not');
+  ok(h.controller.state().counters.fragments_coalesced === 3
+     && h.controller.state().last_turn === 'What is that building on the right?',
+     'the question became the turn, and the noise did not — ' +
+     JSON.stringify(h.controller.state().last_turn));
+}
+
+{
+  // FRAGMENTS THAT ADD UP TO A QUESTION ARE A QUESTION. Semantic VAD cuts a
+  // driver into pieces on a rough road as readily as the road does.
+  const h = noiseHarness();
+  fragment(h, 'Hey.');
+  fragment(h, 'so what is');
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_RECOVERED').length === 1,
+     'the pieces are put back together rather than thrown away');
+  /* NO response.create FROM HERE. The second piece is a real turn, so the
+     server created a response for it the way it does for every committed
+     utterance; asking for a second one would be the stacking this whole
+     section is about, wearing a different hat. */
+  ok(h.sent.filter(e => e.type === 'response.create').length === 0,
+     '...and the controller asks for no response of its own');
+  ok(h.controller.state().last_turn === 'so what is',
+     '...the real words became the turn — '
+     + JSON.stringify(h.controller.state().last_turn));
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 0,
+     '...and never with "Didn\'t catch that"');
+}
+
+{
+  // A COMMAND IS EXEMPT AT ANY LENGTH. "stop" is four letters and is the most
+  // important thing anyone says in this car.
+  const h = noiseHarness();
+  fragment(h, 'Stop.');
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_FRAGMENT').length === 0,
+     'a one-word driver command is never treated as road noise');
+  ok(h.events.filter(e => e.type === 'LIVE_DRIVER_COMMAND').length === 1,
+     '...it is a command, and it is acted on');
+}
+
+{
+  // ...AND SO IS A SHORT REAL QUESTION. "What's that?" is three words and
+  // twelve characters, and it is the most common thing said in this car.
+  const h = noiseHarness();
+  fragment(h, "What's that?");
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_FRAGMENT').length === 0,
+     'a short question is a question, not a fragment');
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 0,
+     '...and gets a real answer rather than "Didn\'t catch that"');
+}
+
+{
+  // THE RESPONSE THE SERVER MADE ANYWAY. The controller cannot stop it being
+  // created; it can stop it being heard.
+  const h = noiseHarness();
+  fragment(h, 'Hello.');
+  h.controller.handle({ type: 'response.created', response: { id: 'r_noise' } });
+  await settle(10);
+  const cancels = h.sent.filter(e => e.type === 'response.cancel'
+                                && e.response_id === 'r_noise');
+  ok(cancels.length === 1,
+     'a response created for a fragment is cancelled by id');
+  ok(h.audio.muted === true,
+     '...and what is already in flight is muted, the way a barge-in does it');
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_SILENCED').length === 1,
+     '...and it is in the drive log, which is what session 738fbb82 could not say');
+}
+}
+
 function phoneHarness(opts) {
   opts = opts || {};
   const levels = { mic: -46, out: -18 };     // echo: quieter than the speaker
@@ -3898,6 +4068,8 @@ function speaking(h, rid, said) {
      'and with no backstop configured it never fires at all');
 }
 
+
+await noiseSection();
 
 const serverArg = process.argv.indexOf('--server');
 if (serverArg >= 0) {

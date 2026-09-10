@@ -634,6 +634,26 @@
                         that must be equal to `dictation_failures` from the
                         timeout branch: every disowned line accounted for. */
                      orphans_silenced: 0,
+                     /* ROAD NOISE, and the four numbers that say what it cost.
+                        Session 738fbb82 had twenty of these transcripts and
+                        four of them inside ten milliseconds; each committed
+                        utterance had a response created for it server-side,
+                        so each was an answer to nothing.
+
+                        fragments_coalesced   transcripts buffered rather than
+                                              answered one at a time
+                        fragments_recovered   ...that turned out to add up to a
+                                              real question after all
+                        noise_replies         "Didn't catch that." — at most
+                                              one per coalesce window, and one
+                                              per cooldown
+                        noise_replies_suppressed  the ones that would have been
+                                              a queue of apologies
+                        noise_responses_silenced  server-created answers to
+                                              fragments, cancelled by id */
+                     fragments_coalesced: 0, fragments_recovered: 0,
+                     noise_replies: 0, noise_replies_suppressed: 0,
+                     noise_responses_silenced: 0,
                      /* ...and the ones held over her opening syllable and then
                         allowed through, because the speech was still going. A
                         real interruption, a fifth of a second late. */
@@ -838,6 +858,18 @@
                           'for', 'with', 'at', 'on', 'in', 'is', 'are', 'was',
                           'were', 'near', 'by', 'from', 'that', 'like', 'about',
                           'some', 'any', 'my', 'your', "it's", "there's"],
+      /* ROAD NOISE, AND THE ONE ANSWER IT GETS. See the block above
+         noteFragment() for what these are and why each one is here. */
+      noise_coalesce_ms: 2000,
+      noise_max_words: 4,
+      noise_reply_cooldown_ms: 12000,
+      noise_reply: "Didn't catch that.",
+      noise_tokens: ['uh', 'um', 'er', 'erm', 'mm', 'mmm', 'hmm', 'huh', 'ah',
+                     'oh', 'eh', 'hey', 'hello', 'hi', 'yeah', 'yep', 'yes',
+                     'no', 'nope', 'ok', 'okay', 'right', 'sure', 'thanks',
+                     'thank', 'you', 'got', 'it', 'wow', 'well', 'so', 'like',
+                     'the', 'a', 'and', 'for', 'your', 'help', 'good', 'nice',
+                     'cool', 'alright', 'sorry', 'please', 'there'],
     };
     var turnPolicy = {};
     for (var tk in TURN_DEFAULTS) turnPolicy[tk] = TURN_DEFAULTS[tk];
@@ -905,6 +937,179 @@
         if (tail === trailers[j]) return true;
       }
       return false;
+    }
+
+    /* --- ROAD NOISE, AND THE FIVE ANSWERS IT USED TO GET --------------------
+     *
+     * WHAT THE DRIVE OF 2026-09-09 DID. Session 738fbb82, t=180.97 to 180.98
+     * -- ten milliseconds:
+     *
+     *     "Hello."               said_chars 0
+     *     "Hello."               said_chars 4
+     *     "Thanks for your help." said_chars 0
+     *     "Got it."              said_chars 85
+     *
+     * Four transcripts, none of them anything the driver said: a phone on a
+     * mount at 11 m/s with the windows down, and a transcriber doing its job
+     * on a second of road roar. At t=271.77, two more ("Hey.", "Hey."). Twenty
+     * over the drive.
+     *
+     * The barge gate refused every one of them as a phantom, which is what the
+     * `turn_phantom` events in that log are -- so not one of them superseded,
+     * and the counter was right. What the gate does NOT touch is the response
+     * the SERVER already created for each committed utterance
+     * (turn_detection.create_response is on, realtime.py:1030). Four
+     * commits, four responses, four answers to nothing, stacked behind
+     * whatever she was already saying.
+     *
+     * THE POLICY, and it is three rules:
+     *
+     *   COALESCE      Fragments inside noise_coalesce_ms are ONE utterance,
+     *                 whatever the words are. isContinuation() coalesces on
+     *                 LEXICAL cues -- an opener, a dangling conjunction -- and
+     *                 that is right for a driver taking a breath mid-question
+     *                 and useless for road noise, which produces four
+     *                 grammatical fragments with nothing joining them.
+     *
+     *   ANSWER ONCE   If the coalesced text is still unintelligible, one
+     *                 "Didn't catch that." and the rest go silently. Never a
+     *                 queue of them: a driver who said nothing and hears the
+     *                 car apologise five times has a car that is broken in a
+     *                 new way.
+     *
+     *   AND ONLY ONCE Even that one is on a cooldown, because a rough road is
+     *                 a rough road for minutes at a time.
+     *
+     * NEWEST-WINS IS UNTOUCHED. A real question is not a fragment, does not
+     * enter this buffer, and supersedes exactly as it did.
+     */
+    var noise = null;             // { text, first, last, n, timer }
+    var lastNoiseReplyAt = 0;
+    var silenceResponses = 0;     // responses to cancel on sight, by id
+
+    /* Is this transcript words, or is it the road?
+     *
+     * Deliberately NOT a confidence threshold: the transcriber does not send
+     * one on this path, and a length test alone would swallow "What's that?"
+     * -- three words, twelve characters, and the most common real question in
+     * the car. So the test is short AND made only of tokens that carry no
+     * request in them. "Turn left" is two words and survives; "Yeah, ok" is
+     * two words and does not.
+     */
+    /* Is there a REQUEST anywhere in these words? Length is not part of it:
+       five fragments of road noise joined together are nine words long and
+       still contain nothing to answer, which is exactly what the drive
+       produced ("Hello. Hello. Thanks for your help. Got it. Hey."). */
+    function noContentWords(text) {
+      var words = normWords(text);
+      if (!words.length) return true;
+      var noiseWords = policyList('noise_tokens', []);
+      for (var i = 0; i < words.length; i++) {
+        if (noiseWords.indexOf(words[i]) < 0) return false;
+      }
+      return true;
+    }
+
+    function unintelligible(text) {
+      var t = String(text == null ? '' : text).trim();
+      if (!t) return true;
+      // A question mark is a question, at any length.
+      if (t.indexOf('?') >= 0) return false;
+      var words = normWords(t);
+      if (!words.length) return true;
+      /* THE LENGTH TEST AND THE CONTENT TEST, and one alone is not enough.
+         Length alone swallows "What's that?", three words and the most common
+         real question in the car. Content alone would call a whole spoken
+         sentence noise the moment it happened to be made of common words. */
+      if (words.length > (turnPolicy.noise_max_words || 4)) return false;
+      return noContentWords(t);
+    }
+
+    /* One fragment into the buffer, and the window pushed out.
+     *
+     * The response the server created for it is cancelled on sight: she must
+     * not answer road noise even once, let alone five times. */
+    function noteFragment(text) {
+      var at = now();
+      if (!noise) noise = { text: '', first: at, last: at, n: 0 };
+      noise.text = (noise.text + ' ' + String(text || '')).trim();
+      noise.last = at;
+      noise.n++;
+      counters.fragments_coalesced++;
+      /* THE ANSWER IN FLIGHT IS LEFT ALONE, and that is deliberate.
+       *
+       * A fragment is by definition something nobody could confirm was a
+       * person, and half of them are her own voice off the windscreen. Ending
+       * her sentence on that evidence is the exact failure the echo gate was
+       * built to remove -- five long answers into an empty car, five cut off.
+       * If it really was a barge-in, bargeIn() has already muted and the barge
+       * path owns the cancel.
+       *
+       * What IS stopped is the response the SERVER creates for the committed
+       * utterance, cancelled by id the moment it is announced. That is the
+       * stacking this whole mechanism exists for, and it costs her nothing. */
+      silenceResponses++;
+      emit('LIVE_TURN_FRAGMENT', {
+        turn: turnSeq, n: noise.n, text: String(text || '').slice(0, 160),
+        span_ms: Math.round(noise.last - noise.first),
+      });
+      if (noise.timer) clearTimeout(noise.timer);
+      noise.timer = setTimeout(flushNoise, turnPolicy.noise_coalesce_ms || 2000);
+    }
+
+    /* The window closed. Either the fragments add up to something, or they
+     * were the road. */
+    function flushNoise() {
+      if (!noise) return;
+      var buf = noise;
+      noise = null;
+      if (buf.timer) clearTimeout(buf.timer);
+      silenceResponses = 0;
+      var joined = buf.text;
+
+      /* THREE FRAGMENTS THAT ADD UP TO A QUESTION are a question. Semantic VAD
+         cuts a driver into pieces on a rough road too, and the pieces are then
+         individually short and individually meaningless. */
+      /* NO LENGTH CEILING HERE, deliberately: a buffer is as long as the road
+         was rough, and what decides it is whether anything in it is a
+         request. */
+      if (!noContentWords(joined) && normWords(joined).length > 1) {
+        counters.fragments_recovered++;
+        emit('LIVE_TURN_RECOVERED', {
+          turn: turnSeq, n: buf.n, text: joined.slice(0, 200),
+          span_ms: Math.round(buf.last - buf.first),
+        });
+        turnSeq++;
+        lastTurnText = joined;
+        lastTurnAt = now();
+        transcriptFresh = true;
+        // Every fragment is already an item in the conversation; one response
+        // now answers all of them together.
+        try { send({ type: 'response.create' }); } catch (e) {}
+        return;
+      }
+
+      var since = now() - lastNoiseReplyAt;
+      if (lastNoiseReplyAt && since < (turnPolicy.noise_reply_cooldown_ms || 12000)) {
+        counters.noise_replies_suppressed++;
+        emit('LIVE_NOISE_DROPPED', {
+          turn: turnSeq, n: buf.n, text: joined.slice(0, 200),
+          since_reply_ms: Math.round(since),
+        });
+        return;
+      }
+      lastNoiseReplyAt = now();
+      counters.noise_replies++;
+      emit('LIVE_NOISE_REPLY', {
+        turn: turnSeq, n: buf.n, text: joined.slice(0, 200),
+        span_ms: Math.round(buf.last - buf.first),
+      });
+      /* ONE LINE, SPOKEN DIRECTLY. Not a response.create: asking the model
+         what to say about noise is asking it to invent a reason it could not
+         hear, and it is a round trip for four words that are always the same
+         four words. */
+      try { speakDirect(turnPolicy.noise_reply || "Didn't catch that."); }
+      catch (e) {}
     }
 
     /* --- IS THIS A REAL NEW QUESTION? --------------------------------------
@@ -1390,6 +1595,20 @@
         markOutOfBand(responseId);
         return;
       }
+      /* A RESPONSE THE SERVER CREATED FOR A FRAGMENT. It is an answer to road
+         noise; it never claims the mouth and it is cancelled by id, which is
+         the same pair of moves the orphan path below makes. */
+      if (silenceResponses > 0
+          && String(responseId || '').indexOf('direct:') !== 0) {
+        silenceResponses--;
+        markOutOfBand(responseId);
+        counters.noise_responses_silenced++;
+        try { send({ type: 'response.cancel', response_id: responseId }); }
+        catch (e) {}
+        try { audio.mute(); } catch (e) {}
+        emit('LIVE_NOISE_SILENCED', { response_id: responseId });
+        return;
+      }
       if (orphanOutOfBand > 0
           && String(responseId || '').indexOf('direct:') !== 0) {
         orphanOutOfBand--;
@@ -1468,7 +1687,15 @@
         priority: arbiter.P.CONVO,
         group: 'convo',
         id: 'live:' + (responseId || String(counters.responses)),
-        text: '',
+        /* USUALLY EMPTY, and for a directly-spoken line it must not be.
+           The model composes an ordinary answer as it goes, so there is no
+           text to hand over here and the echo gate learns the words from the
+           transcript deltas instead. A direct line has none of those -- it is
+           already written -- so without this the one place that sees
+           everything RIO says (the arbiter's `start`, which calls noteSaid)
+           never sees it, and "Didn't catch that." coming back through the
+           microphone on a rough road is not recognised as her own voice. */
+        text: opts.text || '',
         meta: { source: 'realtime', response_id: responseId },
         // No TTL: an answer does not expire on a clock the way a turn does.
         // The watchdog is long because a considered answer can run to several
@@ -2124,6 +2351,57 @@
         });
         real = false;
       }
+
+      /* ROAD NOISE, COALESCED RATHER THAN ANSWERED ONE FRAGMENT AT A TIME.
+       *
+       * Reached two ways, and both are the same event from the driver's seat:
+       * a transcript the phantom gate refused (`!real` after the block above,
+       * which is what the drive of 2026-09-09 produced twenty of), and one
+       * that is real enough but carries no request in it. Either way the
+       * SERVER has already created a response for the committed utterance and
+       * she is about to answer nothing.
+       *
+       * A driver command is exempt at any length: "stop" is two letters and is
+       * the most important thing anyone says in this car.
+       */
+      /* HER OWN VOICE IS NOT A FRAGMENT, and this test comes first.
+       *
+       * A transcript refused because it was RIO -- inside the onset guard,
+       * over the level margin, or her words verbatim -- is already handled:
+       * nothing is superseded and she carries on talking. Feeding it to the
+       * noise buffer would cancel the very answer it is an echo of, which is
+       * the bug the echo gate was built to remove. Only a transcript that
+       * failed the barge test for want of CONFIRMATION (nobody could tell
+       * whether anyone spoke) is a candidate for the buffer.
+       */
+      var herOwnVoice = !real && gate.why && gate.why !== 'no_confirmed_barge'
+                        && gate.why !== 'empty';
+      if (!cmd && !selfAnswered && !herOwnVoice
+          && (unintelligible(text)
+              || (!real && text && !cont && gate.why === 'no_confirmed_barge'))) {
+        noteFragment(text);
+        return;
+      }
+
+      /* A REAL TURN ENDS THE WINDOW, and takes what is in it.
+       *
+       * "Hey. ... so what is that building?" is one question with a rough road
+       * in the middle of it. The fragments are already items in the
+       * conversation and the model will read them either way; what must not
+       * happen is the buffer flushing afterwards and apologising for words the
+       * driver has just been answered about. */
+      if (noise) {
+        var buf0 = noise;
+        noise = null;
+        if (buf0.timer) clearTimeout(buf0.timer);
+        silenceResponses = 0;
+        counters.fragments_recovered++;
+        emit('LIVE_TURN_RECOVERED', {
+          turn: turnSeq, n: buf0.n,
+          text: (buf0.text + ' ' + String(text || '')).trim().slice(0, 200),
+          span_ms: Math.round(now() - buf0.first),
+        });
+      }
       if (real && !selfAnswered) {
         transcriptFresh = true;
         // A new turn from the driver. Whatever was outstanding is theirs to
@@ -2387,7 +2665,7 @@
       var line = (text || '').trim();
       if (stopped || !line) return false;
       var id = 'direct:' + (++directs);
-      beginResponse(id, { direct: true });
+      beginResponse(id, { direct: true, text: line });
       var entry = speaking;
       /* COULD NOT TAKE THE MOUTH, AND SAYS SO. `false` rather than a promise
          of `false`, because the caller has to know NOW: a line that is not
@@ -3024,6 +3302,12 @@
           response_id: speaking ? speaking.responseId : null,
           stopped: stopped,
           last_transcript: lastTranscript,
+          // The words that became the CURRENT turn -- which is not the same as
+          // the last transcript, because a fragment is a transcript and is not
+          // a turn. "the noise did not become the question" is a sentence
+          // about these two being different.
+          last_turn: lastTurnText,
+          noise_pending: noise ? noise.n : 0,
           // ...and the same words only while they are still THIS turn's.
           // This is what a tool call is given; see transcriptFresh.
           spoken_this_turn: transcriptFresh ? lastTranscript : '',
