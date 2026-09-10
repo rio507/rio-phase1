@@ -161,6 +161,37 @@
        this page animates for decoration. */
     --t-fast: 140ms;
 
+    /* ---- the teacher panel ----------------------------------------------
+       Two models watching, neither of them driving. They need colours that
+       are unmistakably NOT the car's opinion of itself: good/warn/danger mean
+       a measurement came back, and --accent means a control or a value RIO
+       produced. A teacher is a third thing -- a second opinion from outside
+       the loop -- so it gets a hue nothing else on this page uses.
+
+       Violet and magenta, chosen for distance from every existing hue rather
+       than for taste: 262 and 320 degrees, against accent's 216, good's 152,
+       warn's 38 and danger's 8. On the picture they are also drawn in
+       different STYLES (a dashed offset ring, a dotted bracket) so the two
+       teachers are still told apart at a glance by anyone who cannot separate
+       the hues.
+
+       They are deliberately dimmer than the safety colours. A shadow reading
+       must never be the brightest thing on a driving surface. */
+    --teach-a:      #a78bff;   /* Alpamayo 1.5 */
+    --teach-a-soft: rgba(167,139,255,0.10);
+    --teach-a-line: rgba(167,139,255,0.28);
+    --teach-a-dim:  rgba(167,139,255,0.55);
+
+    --teach-c:      #ef6fc4;   /* Cosmos-Reason2 */
+    --teach-c-soft: rgba(239,111,196,0.10);
+    --teach-c-line: rgba(239,111,196,0.28);
+    --teach-c-dim:  rgba(239,111,196,0.55);
+
+    /* The predicted-path ribbon. Fainter again than either teacher colour:
+       it is a 6.4 s guess drawn through a flat-road camera model, and it must
+       read as the least certain thing on the glass. */
+    --teach-ribbon: rgba(167,139,255,0.34);
+
     /* Tells the browser its own widgets are on a dark page. The <audio>
        element in the Voice Layer card used to be corrected with an
        invert()/hue-rotate() filter, which is a guess about what Chromium
@@ -1516,6 +1547,153 @@
      thing that keeps it off the picture at every scroll offset is that the
      picture starts above it and can only ever scroll further up. A feed placed
      below two rail cards would meet the control halfway down the page. */
+  /* ---------- the teacher panel ----------------------------------------
+     Two columns of a card that is explicitly not part of the loop. Everything
+     about it says so: the header carries the word "shadow", the readings sit
+     on the card's inset rather than on the stage, and no value in it is ever
+     drawn in a safety colour. See docs/teacher_panel.md. */
+  .teach-head { display: flex; align-items: baseline; gap: var(--gap-xs);
+                justify-content: space-between; margin-bottom: 14px; }
+  .teach-shadow {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t5); border: 1px solid var(--hairline);
+    border-radius: var(--r-pill); padding: 3px 9px; white-space: nowrap;
+  }
+
+  .teach-cols {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: var(--gap-s);
+  }
+
+  .teach-col {
+    background: var(--inset); border: 1px solid var(--hairline);
+    border-radius: var(--r-inset); padding: 12px 13px;
+    /* The one place a teacher's colour is used as a surface: a 2px edge on the
+       leading side, which is enough to own the column without tinting the
+       text inside it. */
+    border-left: 2px solid var(--hairline-strong);
+    display: flex; flex-direction: column; gap: 9px; min-width: 0;
+  }
+  .teach-col[data-model="alpamayo1.5"]   { border-left-color: var(--teach-a-line); }
+  .teach-col[data-model="cosmos-reason2"]{ border-left-color: var(--teach-c-line); }
+
+  .teach-name {
+    font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;
+    display: flex; align-items: center; gap: var(--gap-2xs);
+  }
+  .teach-col[data-model="alpamayo1.5"]    .teach-name { color: var(--teach-a); }
+  .teach-col[data-model="cosmos-reason2"] .teach-name { color: var(--teach-c); }
+  .teach-dot { width: 6px; height: 6px; border-radius: 50%;
+               background: currentColor; opacity: 0.35; flex: none; }
+  .teach-col.is-fresh .teach-dot { opacity: 1; animation: pulse 2.4s infinite; }
+
+  /* The three numbers every reading carries. Mono, because they are read as a
+     column down the two cards and compared against each other. */
+  .teach-meta {
+    display: flex; flex-wrap: wrap; gap: var(--gap-2xs) var(--gap-xs);
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t4);
+  }
+  .teach-meta b { color: var(--t3); font-weight: 500; }
+  .teach-meta .stale { color: var(--warn-text); }
+
+  .teach-field { min-width: 0; }
+  .teach-label {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5); margin-bottom: 3px;
+  }
+  .teach-text {
+    font-size: var(--fs-body); line-height: 1.45; color: var(--t2);
+    /* A reasoning trace can be four hundred words. The card shows the first
+       few lines and the full text is one tap away rather than pushing the
+       tally strip off the screen -- and the corpus has all of it regardless. */
+    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+    overflow: hidden; overflow-wrap: anywhere;
+  }
+  .teach-field.open .teach-text { -webkit-line-clamp: unset; overflow: auto;
+                                  max-height: 260px; }
+  .teach-text.empty { color: var(--t5); font-style: italic; }
+  .teach-more {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    color: var(--t4); background: none; border: 0; padding: 3px 0 0;
+  }
+  .teach-more:hover { color: var(--t2); }
+
+  /* The referenced actor: a chip that either names a track or says why not. */
+  .teach-actor {
+    display: inline-flex; align-items: center; gap: var(--gap-2xs);
+    font-family: var(--font-mono); font-size: var(--fs-micro);
+    letter-spacing: var(--ls-mono);
+    border: 1px solid var(--hairline-strong); border-radius: var(--r-chip);
+    padding: 4px 8px; color: var(--t3); max-width: 100%;
+  }
+  .teach-col[data-model="alpamayo1.5"] .teach-actor.matched {
+    border-color: var(--teach-a-line); background: var(--teach-a-soft);
+    color: var(--teach-a);
+  }
+  .teach-col[data-model="cosmos-reason2"] .teach-actor.matched {
+    border-color: var(--teach-c-line); background: var(--teach-c-soft);
+    color: var(--teach-c);
+  }
+  .teach-actor.unmatched { color: var(--t4); border-style: dashed; }
+
+  /* The tally strip. Three numbers about the panel as a whole, which is the
+     only place on this card where a count means anything -- one reading is an
+     anecdote and forty of them are a measurement. */
+  .teach-tally {
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: var(--gap-2xs) var(--gap);
+    margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--rule);
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase; color: var(--t5);
+  }
+  .teach-tally b { color: var(--t2); font-weight: 500; margin-left: 5px;
+                   text-transform: none; }
+  .teach-tally .teach-spacer { margin-left: auto; }
+
+  /* The layer switches, in the Drive card under the Headway/Layers control --
+     because that is where a driver already looks to change what is drawn on
+     the picture. Hidden entirely when the master Layers toggle is off: a
+     switch for a layer that cannot be drawn is a switch that does nothing. */
+  .teach-layers {
+    display: flex; flex-wrap: wrap; gap: var(--gap-2xs); margin-top: var(--gap-2xs);
+  }
+  body.layers-off .teach-layers { display: none; }
+  .teach-layer {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    background: transparent; border: 1px solid var(--hairline);
+    border-radius: var(--r-pill); padding: 5px 10px; color: var(--t5);
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .teach-layer::before {
+    content: ''; width: 7px; height: 7px; border-radius: 2px;
+    border: 1px solid currentColor; opacity: 0.6;
+  }
+  .teach-layer[aria-pressed="true"] { color: var(--t2);
+                                      border-color: var(--hairline-hover); }
+  .teach-layer[aria-pressed="true"]::before { background: currentColor; opacity: 1; }
+  .teach-layer[data-layer="actor-a"][aria-pressed="true"] { color: var(--teach-a); }
+  .teach-layer[data-layer="actor-c"][aria-pressed="true"] { color: var(--teach-c); }
+  .teach-layer[data-layer="path"][aria-pressed="true"]    { color: var(--teach-a-dim); }
+  /* Touch floor. Keyed off the portrait/narrow query rather than
+     `pointer: coarse`, so it matches the rule that already gives #drive and
+     .hud-btn their 56px -- and so it is testable in a headless browser, which
+     reports a mouse however small the viewport is. */
+
+  /* The service strip: which weights, at which precision, and whether the
+     process is answering. Small, and never absent -- a panel with an empty
+     column and no explanation is the thing this line exists to prevent. */
+  .teach-svc {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t5);
+    margin-top: 2px; overflow-wrap: anywhere;
+  }
+  .teach-svc .down { color: var(--warn-text); }
+
   @media (max-width: 1000px), (orientation: portrait) {
     .pipeline {
       flex-direction: column; flex-wrap: nowrap;
@@ -1523,6 +1701,13 @@
     }
     .rail, .stage, .stage-grid { display: contents; }
     .stage-card { order: -1; }
+    /* The Teachers card goes DIRECTLY under the picture, ahead of Drive and
+       Navigation. Two models' readings of the road are only worth anything
+       next to the road, and a card the driver has to scroll past two panels to
+       reach is a card nobody compares anything with. Both are order:-1, so
+       source order decides between them and the feed stays first. */
+    #teachcard { order: -1; }
+    .teach-layer { min-height: 44px; }
     #vehcol { max-width: none; }
 
     /* Drive-safe floors. On a desk these are pointer targets and the mockup's
@@ -1625,6 +1810,28 @@
               title="Live headway monitoring — 4 fps lead tracking with automatic voice">Headway</button>
       <button id="layers" type="button" aria-pressed="true"
               title="Toggle the perception overlay">Layers</button>
+    </div>
+
+    <!-- WHICH LAYERS, under the switch that turns layers on. The Layers button
+         above is still the master and still does exactly what it did; these
+         are the individual shadow layers underneath it, and the stylesheet
+         hides the whole row when the master is off -- a switch for something
+         that cannot be drawn is a switch that lies.
+
+         Written by static/rio_teachers.js, which also owns what they draw.
+         Nothing in this row can affect a warning: every layer it controls is a
+         teacher's opinion painted on the glass. -->
+    <div class="teach-layers" id="teachlayers" role="group"
+         aria-label="Teacher overlay layers">
+      <button class="teach-layer" type="button" data-layer="actor-a"
+              aria-pressed="true"
+              title="Ring the RF-DETR track Alpamayo named">Alpamayo actor</button>
+      <button class="teach-layer" type="button" data-layer="actor-c"
+              aria-pressed="true"
+              title="Ring the RF-DETR track Cosmos-Reason2 named">Cosmos actor</button>
+      <button class="teach-layer" type="button" data-layer="path"
+              aria-pressed="false"
+              title="Alpamayo's predicted 6.4 s path — display only">Predicted path</button>
     </div>
 
     <button id="drive">Start Drive</button>
@@ -1820,6 +2027,40 @@
       </div>
       <div id="drivestatus"></div>
     </div>
+  </section>
+
+  <!-- ============ TEACHERS ============
+       Two AV foundation models reading the same road as RIO, and driving none
+       of it. Alpamayo 1.5 (nvidia/Alpamayo-1.5-10B) and Cosmos-Reason2-8B run
+       in their own processes on their own ports over a keyframe every couple
+       of seconds; what they say is shown here, associated back to the RF-DETR
+       track each one named, and written to a corpus on the volume.
+
+       NOTHING IN THIS CARD IS IN THE LOOP. No reading reaches the arbiter, the
+       speech path, look() or the observer cache; Qwen3-VL-8B is still the
+       observer and still the only model whose sentences RIO may say. The
+       Perception card below is deliberately left exactly where it was, so the
+       comparison is on one screen. tools/teacher_firewall_selftest.py asserts
+       the isolation from the AST rather than from this comment.
+
+       Every node below is empty. static/rio_teachers.js fills all of it from
+       /teachers/state -- there is not one model name, prompt, number or
+       sentence written into this markup, for the same reason the Vehicle
+       Health column has no sensor names in it. -->
+  <section class="col panel" id="teachcard">
+    <div class="col-head teach-head">
+      <div>
+        <div class="col-title">Teachers</div>
+        <div class="col-sub" id="subteachers">Second opinions &middot; not in the loop</div>
+      </div>
+      <div class="teach-shadow" title="Read and recorded. Never spoken, never
+acted on, never consulted by the arbiter.">Shadow</div>
+    </div>
+
+    <div class="teach-cols" id="teachcols"></div>
+
+    <div class="teach-tally" id="teachtally"></div>
+    <div class="teach-svc" id="teachsvc"></div>
   </section>
 
   <div class="stage-grid">
@@ -3208,6 +3449,11 @@ document.addEventListener('DOMContentLoaded', () => {
     schedule();
     startHeadway();
     scheduleHeartbeat();
+    /* The teacher panel starts with the drive, and the DeviceMotion permission
+       is asked for HERE and only here: iOS grants it from a user gesture and
+       from nothing else, and this tap is the gesture. Declining is fine -- the
+       ego history falls back to speed alone and says so. */
+    if (RIO.teacherPanel) RIO.teacherPanel.start();
   }
 
   async function endDrive(opts) {
@@ -3233,6 +3479,10 @@ document.addEventListener('DOMContentLoaded', () => {
       } catch (e) {}
     }
     if (RIO.headway) { RIO.headway.stopWatch(); RIO.headway.resetHud(); }
+
+    // Stopped BEFORE the session id is cleared, so its last IMU batch and its
+    // last poll still carry the drive they belong to.
+    if (RIO.teacherPanel) RIO.teacherPanel.stop();
 
     // Clear session first so in-flight captures stop tagging themselves.
     RIO.sessionId = null;
@@ -4865,6 +5115,116 @@ document.addEventListener('DOMContentLoaded', () => {
     // Under the box, so it cannot collide with the object's own label above it.
     const ty = Math.min(px.y2 + 14, wrap.clientHeight - 2);
     drawLabel(bits.join(' · '), Math.max(2, px.x1), ty, color);
+
+    // Last, over everything the deterministic pipeline drew. Nothing above
+    // this line reads a teacher value; nothing below it writes one.
+    drawTeachers(m, r);
+  }
+
+  /* ---- the teacher layers ------------------------------------------------
+
+     THREE THINGS, ALL OF THEM OPINIONS, NONE OF THEM MEASUREMENTS.
+
+     Two rings, one per teacher, around the RF-DETR track that model named as
+     the most safety-relevant road user -- and a faint ribbon for Alpamayo's
+     predicted 6.4 s path.
+
+     They are drawn LAST, over the detector's boxes, and they are drawn in
+     styles that cannot be mistaken for one: Alpamayo gets a dashed ring
+     OUTSIDE the box, Cosmos gets a dotted ring inside it, and neither of them
+     ever uses a band colour. A driver glancing at this must never read a
+     shadow model's guess as the car's own judgement -- which is why the hues
+     are violet and magenta (nothing else on this page is), why the line is
+     thinner than the detector's, and why the ribbon is fainter again.
+
+     `teacherState` is written by static/rio_teachers.js from /teachers/state.
+     It is read here and NOWHERE else in the drawing path: no teacher value
+     feeds a box, a band, a colour or a decision. */
+  const TEACH = {
+    'alpamayo1.5':    { color: '#a78bff', dash: [6, 4], pad: 6, lw: 1.6 },
+    'cosmos-reason2': { color: '#ef6fc4', dash: [2, 4], pad: 2, lw: 1.6 },
+  };
+  let teacherState = null;
+  let teacherLayers = { 'actor-a': true, 'actor-c': true, path: false };
+
+  function teacherTracks() {
+    /* model -> matched track id, for the models whose layer is switched on. */
+    const out = {};
+    if (!teacherState || !teacherState.models) return out;
+    Object.keys(teacherState.models).forEach(m => {
+      const on = (m === 'alpamayo1.5') ? teacherLayers['actor-a']
+                                       : teacherLayers['actor-c'];
+      if (!on) return;
+      const a = (teacherState.models[m] || {}).association || {};
+      if (a.matched && a.track_id !== null && a.track_id !== undefined) {
+        out[m] = a.track_id;
+      }
+    });
+    return out;
+  }
+
+  function drawTeacherRing(px, style) {
+    ctx.save();
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.lw;
+    ctx.setLineDash(style.dash);
+    ctx.shadowColor = style.color;
+    ctx.shadowBlur = 6;
+    const p = style.pad;
+    ctx.strokeRect(px.x1 - p, px.y1 - p,
+                   (px.x2 - px.x1) + 2 * p, (px.y2 - px.y1) + 2 * p);
+    ctx.restore();
+  }
+
+  /* Alpamayo's predicted path. The polyline arrives in FRAME pixels, projected
+     server-side through headway/anchor.py's own camera model (teachers/
+     project.py) -- the same pinhole the ego corridor is drawn with, so the
+     ribbon and the corridor cannot disagree about where the road is.
+
+     Faint, and tapering: the far end of a 6.4 s prediction is where a degree
+     of pitch error becomes metres of ground, and the drawing should say that. */
+  function drawTeacherPath(m, pixels) {
+    if (!pixels || pixels.length < 2) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let i = 1; i < pixels.length; i++) {
+      const a = pixels[i - 1], b = pixels[i];
+      const t = i / pixels.length;
+      ctx.globalAlpha = 0.34 * (1 - t * 0.75);
+      ctx.lineWidth = Math.max(1, 7 * (1 - t * 0.8));
+      ctx.strokeStyle = TEACH['alpamayo1.5'].color;
+      ctx.beginPath();
+      ctx.moveTo(m.x(a[0]), m.y(a[1]));
+      ctx.lineTo(m.x(b[0]), m.y(b[1]));
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawTeachers(m, r) {
+    if (!teacherState) return;
+    const wanted = teacherTracks();
+    const models = Object.keys(wanted);
+    if (models.length) {
+      const objs = (r.scene_objects || []).filter(o => o && o.box);
+      models.forEach(name => {
+        const o = objs.find(x => x.id === wanted[name]);
+        if (!o) return;
+        // The box the DETECTOR has right now, not the one the teacher was
+        // shown: the reading is a second or two old and the car has moved, so
+        // ringing the stale box would put the ring beside the object. The
+        // track id is the durable thing; the pixels are not.
+        const px = { x1: m.x(o.box[0]), y1: m.y(o.box[1]),
+                     x2: m.x(o.box[2]), y2: m.y(o.box[3]) };
+        drawTeacherRing(px, TEACH[name] || TEACH['alpamayo1.5']);
+      });
+    }
+    if (teacherLayers.path) {
+      const a = (teacherState.models || {})['alpamayo1.5'] || {};
+      const traj = (a.reading || {}).trajectory;
+      if (traj && traj.pixels) drawTeacherPath(m, traj.pixels);
+    }
   }
 
   /* How long a headway result keeps the extrapolation loop running.
@@ -5199,6 +5559,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // Exposed for the same reason the stats are: this is the queue depth an
     // alignment problem shows up in.
     get pending() { return hwQueue.length; },
+    /* The teacher layers. WRITE ONLY, from static/rio_teachers.js: the overlay
+       reads this state to paint and never hands it back, so there is no path
+       from a teacher's opinion into anything that decides. */
+    teachers: function (state) { teacherState = state || null; redraw(); },
+    teacherLayers: function (layers) {
+      if (layers) Object.keys(layers).forEach(k => { teacherLayers[k] = !!layers[k]; });
+      redraw();
+      return Object.assign({}, teacherLayers);
+    },
   };
 });
 </script>
@@ -5246,6 +5615,12 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>
+<!-- The teacher panel. Last of the stage scripts and deliberately so: it reads
+     the frame transport's measured clock offset (rio_frames.js) and hands
+     state to the overlay, and it is the one file on this page that must be
+     removable without anything else noticing. Nothing above this line knows it
+     exists. -->
+<script src="/static/rio_teachers.js"></script>
 
 <!-- ---- Vehicle Health, in two halves that deliberately do not know about
      each other:
@@ -5306,8 +5681,17 @@ document.addEventListener('DOMContentLoaded', () => {
       set('subdialogue', short(m.dialogue) + ' · speaking');
       /* A degraded pod is a fact about what the driver is looking at: with no
          detector there are no candidate boxes and headway reports UNKNOWN for
-         every frame, and the Drive card is where that belongs. */
-      const missing = (h.degraded || []).map(d => d.component);
+         every frame, and the Drive card is where that belongs.
+
+         A TEACHER THAT IS NOT RUNNING IS NOT THAT. It is still worth having in
+         /health -- a pod whose services were never started must not look
+         identical to one where they are -- but it changes nothing about the
+         picture, the boxes or the warnings, and putting it here would make the
+         Drive card read as broken on every pod that simply does not run the
+         panel. The Teachers card says so itself, in its own service strip,
+         which is where a fact about the teachers belongs. */
+      const missing = (h.degraded || []).map(d => d.component)
+        .filter(c => !String(c).startsWith('teacher:'));
       set('subdrive', missing.length
         ? 'Visual input · degraded: ' + missing.join(', ')
         : 'Visual input · capture');
@@ -5353,6 +5737,60 @@ document.addEventListener('DOMContentLoaded', () => {
   if (RIO.bus) RIO.bus.on('speaking', e => {
     if (e.text) { spoken.textContent = e.text; spoken.classList.add('has-line'); }
   });
+});
+</script>
+
+<script>
+/* ---- The teacher panel's wiring. Every arrow in this block points INTO the
+   panel except the one that polls it for the card.
+
+   RIO.speech is the arbiter -- one mouth, and whatever it starts playing is
+   what RIO said. Reporting that to /teachers/spoken is what puts RIO's own
+   line in the corpus row next to two models' readings of the same 0.3 s of
+   road, which is the single most valuable column in the record. It is a
+   listener on an event that has already happened; nothing here can start,
+   stop, delay or change a spoken line. ---- */
+document.addEventListener('DOMContentLoaded', () => {
+  if (!(RIO.teachers && document.getElementById('teachcard'))) return;
+
+  RIO.teacherPanel = RIO.teachers.create({
+    sessionId: () => RIO.sessionId,
+    // The clock offset the frame transport measured against this server, so
+    // the IMU samples and the frames land on one ruler. See rio_teachers.js.
+    frameStats: () => (RIO.headway && RIO.headway.streamStats)
+      ? RIO.headway.streamStats() : null,
+  });
+
+  // Paint once on load so the card is not blank before a drive starts.
+  RIO.teacherPanel.refresh();
+
+  if (RIO.speech && RIO.speech.onEvent) {
+    RIO.speech.onEvent(ev => {
+      if (ev.type !== 'start') return;
+      const text = ev.item && ev.item.text;
+      if (text) RIO.teacherPanel.spoken(text, (ev.item && ev.item.kind) || 'speech');
+    });
+  }
+  // The server decides a nav announcement's exact wording, so this is the only
+  // place some spoken lines exist in full.
+  if (RIO.bus) RIO.bus.on('speaking', e => {
+    if (e.text) RIO.teacherPanel.spoken(e.text, 'nav');
+  });
+
+  // THE EVENTS WORTH A KEYFRAME that the frame path cannot see for itself.
+  // A band change it can (teachers/panel.py raises that one); a maneuver
+  // coming up and a driver asking a question it cannot.
+  if (RIO.bus) {
+    ['NAV_MANEUVER', 'NAV_ARRIVE', 'NAV_REROUTE'].forEach(name => {
+      RIO.bus.on(name, () => RIO.teacherPanel.event('nav'));
+    });
+  }
+  if (RIO.speech && RIO.speech.onEvent) {
+    // A driver question is the instant a second opinion is most worth having,
+    // and it is the one instant nothing on the frame path knows about.
+    document.addEventListener('rio:driver-question',
+      () => RIO.teacherPanel.event('question'));
+  }
 });
 </script>
 </body>

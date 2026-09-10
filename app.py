@@ -51,6 +51,22 @@ from powertrain_diag import monitors as powertrain_monitors
 import framebuf
 import router as request_router
 import visual_qa
+# THE TEACHER PANEL, AND THE ONLY LINE OF RIO THAT KNOWS IT EXISTS.
+#
+# `teachers.panel` is the whole surface: frames go in, ego samples go in, what
+# RIO said goes in, and a JSON object for the dashboard comes out. Nothing it
+# produces is read by the arbiter, the speech path, look() or the observer
+# cache -- see teachers/__init__.py, and tools/teacher_firewall_selftest.py,
+# which asserts that from the AST of this file rather than from this comment.
+#
+# Guarded because a shadow feature may not stop the server coming up. A pod
+# whose teacher services are not provisioned still drives.
+try:
+    from teachers import panel as teacher_panel
+except Exception as _teach_err:                       # pragma: no cover
+    teacher_panel = None
+    print(f"[teachers] unavailable: {type(_teach_err).__name__}: {_teach_err}",
+          flush=True)
 # Import order matters: perceive lends vision's resident Qwen3-VL to
 # headway.anchor at import time, so headway.live's anchor path finds a provider
 # already installed and never pulls a second copy of the weights.
@@ -183,8 +199,18 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=_warm_vision, name="vision-warm", daemon=True).start()
     threading.Thread(target=_reap_abandoned_sessions, name="session-reaper",
                      daemon=True).start()
+    if teacher_panel is not None:
+        try:
+            teacher_panel.start()
+        except Exception as e:
+            print(f"[teachers] start failed: {type(e).__name__}: {e}", flush=True)
     yield
     _stop_reaper.set()
+    if teacher_panel is not None:
+        try:
+            teacher_panel.stop()
+        except Exception:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -291,6 +317,23 @@ def health():
             "detail": "UFLDv2 is not loaded — headway uses the static trapezoid "
                       "corridor",
             "fix": "python -m tools.fetch_lane_weights"})
+    if teacher_panel is not None and getattr(config, "TEACHERS_ENABLED", False):
+        # A teacher that is not answering is DEGRADED, never an error: the
+        # panel is a shadow and the drive is unaffected. Named here so a pod
+        # whose services were never started stops looking identical to one
+        # where they are running -- which is the whole lesson of the missing
+        # RF-DETR above.
+        try:
+            for name, svc in (teacher_panel.status().get("services") or {}).items():
+                if not svc.get("loaded"):
+                    degraded.append({
+                        "component": f"teacher:{name}",
+                        "detail": (f"{name} is not answering on {svc.get('url')} "
+                                   f"— its column on the dashboard will be empty "
+                                   f"and no corpus row will be written"),
+                        "fix": "bash boot.sh teachers"})
+        except Exception:
+            pass
     if not _warm_done.is_set():
         degraded.append({
             "component": "warm",
@@ -1165,6 +1208,17 @@ async def headway_frame_endpoint(
             # must never cost the headway frame that has already been computed.
             print(f"[framebuf] push failed: {type(e).__name__}: {e}", flush=True)
 
+    # THE TEACHER PANEL'S ONLY TAP ON THE FRAME PATH. After the framebuf push
+    # and after the result is computed, so nothing here is inside the 250 ms
+    # frame budget and nothing here can change a warning. It decides for itself
+    # whether this instant is worth a keyframe; the usual answer is no, and the
+    # usual cost is a few float comparisons. It never raises -- see
+    # teachers/panel.on_frame -- and tools/teacher_timing_selftest.py asserts
+    # the fast loop does not move with both teachers running.
+    if teacher_panel is not None:
+        teacher_panel.on_frame(_visual_key(session_id), result,
+                               framebuf.peek_ring(_visual_key(session_id)))
+
     done = time.time()
     _cap = _opt_float(cap_t)
     result["frame_age_ms"] = None if _cap is None else round((done - _cap) * 1000.0, 1)
@@ -1387,6 +1441,12 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
                 sessions.log_lane_drift(session_id, result)
             if result.get("merge_promotions"):
                 sessions.log_merge_promotion(session_id, result)
+            # The same single tap as the POST path, in the same place relative
+            # to everything else: after the result, after the ring push, before
+            # the send. See the note there.
+            if teacher_panel is not None:
+                teacher_panel.on_frame(_visual_key(session_id), result,
+                                       framebuf.peek_ring(_visual_key(session_id)))
             try:
                 await ws.send_text(json.dumps(result))
             except Exception:
@@ -1478,6 +1538,107 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
                 "dropped": stats["evicted"],
                 "mean_frame_bytes": round(stats["bytes"] / stats["recv"]),
             })
+
+
+# ---------------------------------------------------------------------------
+# The teacher panel (docs/teacher_panel.md)
+# ---------------------------------------------------------------------------
+# FOUR ENDPOINTS, AND THE ARROWS ONLY GO ONE WAY.
+#
+#   GET  /teachers/state    the card reads what the two models said
+#   POST /teachers/ego      the phone's IMU arrives
+#   POST /teachers/spoken   the browser reports what RIO just said
+#   POST /teachers/event    something happened worth a keyframe
+#
+# Three of those write INTO the panel and one reads OUT of it, and the one that
+# reads out is read by a dashboard and by nothing else. There is deliberately
+# no endpoint, function or import anywhere that lets a teacher's reading reach
+# the arbiter, the speech path, look() or the observer cache -- which is the
+# whole shadow guarantee, and is asserted from the AST of this file by
+# tools/teacher_firewall_selftest.py.
+
+
+@app.get("/teachers/state")
+def teachers_state_endpoint(session_id: str = Query(default=None)):
+    """Everything the Teachers card draws. Read-only, and a copy."""
+    if teacher_panel is None:
+        return {"enabled": False, "reason": "not installed"}
+    return teacher_panel.state(_visual_key(session_id))
+
+
+@app.get("/teachers/status")
+def teachers_status_endpoint():
+    """Services, queues and drop counters — for /health and the selftests."""
+    if teacher_panel is None:
+        return {"enabled": False, "reason": "not installed"}
+    return teacher_panel.status()
+
+
+@app.post("/teachers/health_refresh")
+def teachers_health_refresh_endpoint():
+    """Re-ask both services what they are. Used after a service restart."""
+    if teacher_panel is None:
+        return {"enabled": False}
+    return teacher_panel.refresh_health()
+
+
+@app.post("/teachers/ego")
+async def teachers_ego_endpoint(body: dict = Body(...),
+                                session_id: str = Query(default=None)):
+    """A batch of DeviceMotion samples from the client.
+
+    DELIBERATELY NOT ON THE FRAME PATH. Ego samples arrive at ~20 Hz and frames
+    at 8-15; putting the IMU on the frame message would couple the two rates,
+    make a dropped frame into a hole in the motion history, and add bytes to
+    the one message whose size is being controlled to hold frame age down. One
+    small POST a second, off to the side, costs nothing and keeps both.
+
+    `offset_s` is the clock offset the frame transport already measured against
+    this process, sent by the client so the IMU and the frames land on the same
+    ruler rather than on two.
+    """
+    if teacher_panel is None:
+        return {"ok": False, "enabled": False}
+    out = teacher_panel.ingest_ego(_visual_key(session_id),
+                                   body.get("samples") or [],
+                                   float(body.get("offset_s") or 0.0))
+    return {"ok": True, **out}
+
+
+@app.post("/teachers/spoken")
+def teachers_spoken_endpoint(body: dict = Body(...),
+                             session_id: str = Query(default=None)):
+    """What RIO just said, reported by the page's own output arbiter.
+
+    THE DIRECTION IS THE POINT. A corpus row is worth much more with RIO's line
+    beside the two models' readings -- "she said 'ease off, that van is
+    slowing' and here is what two driving models made of the same 0.3 s" is the
+    row the whole exercise is for. So the speech path may tell the panel.
+
+    The panel may never tell the speech path anything, and there is no endpoint
+    that would let it. That asymmetry is what the firewall selftest checks.
+    """
+    if teacher_panel is None:
+        return {"ok": False, "enabled": False}
+    teacher_panel.note_spoken(_visual_key(session_id), body.get("text") or "",
+                              body.get("kind") or "speech")
+    return {"ok": True}
+
+
+@app.post("/teachers/event")
+def teachers_event_endpoint(body: dict = Body(...),
+                            session_id: str = Query(default=None)):
+    """Raise a keyframe on the next frame: nav | imu | question | manual.
+
+    A flag rather than an immediate keyframe -- the event knows the instant but
+    not the pixels, and the next frame is ~100 ms away with a full window
+    behind it. See teachers/panel.raise_event.
+    """
+    if teacher_panel is None:
+        return {"ok": False, "enabled": False}
+    kind = str(body.get("kind") or "manual")
+    teacher_panel.raise_event(_visual_key(session_id), kind)
+    return {"ok": True, "kind": kind}
 
 
 @app.post("/headway_reset")
@@ -2790,6 +2951,18 @@ def _teardown_session(session_id: str, reason: str = "closed") -> bool:
         pass
     framebuf.drop_ring(key)
     visual_qa.drop_session(key)
+    # The teacher panel's holdings go with the drive too: its ego ring, its
+    # pending keyframes, and the corpus file handle. A drive's corpus is
+    # complete when the drive is over, and an fd left open on a JSONL nobody is
+    # writing to is exactly the leak sessions.py was built to stop.
+    if teacher_panel is not None:
+        try:
+            teacher_panel.drop(key)
+            from teachers import corpus as teacher_corpus
+
+            teacher_corpus.close(key)
+        except Exception as e:
+            print(f"[teachers] teardown: {type(e).__name__}: {e}", flush=True)
     # The drive cycle ends with the drive. Note what does NOT happen here: no
     # diagnostic issue is cleared, no monitor counter is reset and no history is
     # dropped. A drive ending is not evidence that a tire was fixed, and a

@@ -186,6 +186,240 @@ rio_wait_healthy() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# The teacher panel's two services (docs/teacher_panel.md)
+# ---------------------------------------------------------------------------
+#
+#   bash boot.sh teachers          start both, wait for /health
+#   bash boot.sh teachers-stop     stop both
+#   bash boot.sh teachers-build    (re)build the two isolated environments
+#
+# THEY ARE NOT RIO AND THEY DO NOT LIVE IN RIO'S INTERPRETER. Alpamayo 1.5
+# wants Python 3.12, torch 2.8 and transformers 4.57.1; Cosmos-Reason2 wants
+# torch 2.9 and transformers 4.57.3; RIO runs 3.11 with torch 2.11. Those three
+# sets cannot coexist, which is why there are three environments and why the
+# panel talks to its models over a loopback socket instead of importing them.
+#
+# WHERE THINGS LIVE, AND WHY THERE:
+#   /workspace/teachers/src     the two pinned upstream checkouts. Persistent
+#                               volume: they are ~50 MB and re-cloning them on
+#                               every pod start is a network dependency at boot
+#                               for no benefit.
+#   /opt/teachers/venvs         the environments. CONTAINER LAYER, deliberately,
+#                               and rebuilt by this script -- exactly like the
+#                               pip packages in step 3 and the torch wheels in
+#                               step 4. They are ~14 GB each and they are
+#                               derived from a lockfile; the volume's quota is
+#                               better spent on weights.
+#   $HF_HOME                    the weights, on the volume, like Qwen3-VL's.
+#   /workspace/teachers/fp8     the FP8 checkpoints, on the volume, because
+#                               regenerating one takes 20 minutes and the L40S
+#                               pod loads them on every boot.
+#
+# NON-FATAL, everywhere. A pod with no teacher services drives exactly as it
+# did before the panel existed: /health reports them degraded, the Teachers
+# card says which one is not answering, and nothing else changes.
+TEACHERS_ROOT=/workspace/teachers
+TEACHERS_VENVS=/opt/teachers/venvs
+TEACHERS_LOGS=/opt/teachers/logs
+ALPAMAYO_REPO=https://github.com/NVlabs/alpamayo1.5.git
+ALPAMAYO_SHA=36aeb4c5938cbc2eb2aed33b22434773da4ab639
+COSMOS_REPO=https://github.com/nvidia-cosmos/cosmos-reason2.git
+COSMOS_SHA=a3b4a1db4065fe13c4b1f4d2fb8605bad647f4b9
+
+# The HF token for the gated nvidia/Cosmos-Reason2-8B repo. On the volume,
+# OUTSIDE the git worktree, and sourced rather than baked in -- see the header
+# of that file. Never echoed.
+[ -f "$TEACHERS_ROOT/secrets.env" ] && . "$TEACHERS_ROOT/secrets.env"
+
+teacher_pids() {
+    local pid comm
+    for pid in $(pgrep -f 'teachers.service.(alpamayo|cosmos)_service' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+        case "$comm" in
+            python|python3|python3.*) echo "$pid" ;;
+        esac
+    done
+}
+
+teachers_stop() {
+    local pids
+    pids=$(teacher_pids | tr '\n' ' ' | sed 's/ *$//')
+    if [ -z "$pids" ]; then
+        echo "   no teacher services running"
+        return 0
+    fi
+    echo "   stopping teachers: $pids"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for i in $(seq 1 20); do
+        [ -z "$(teacher_pids)" ] && break
+        sleep 0.5
+    done
+    pids=$(teacher_pids | tr '\n' ' ' | sed 's/ *$//')
+    if [ -n "$pids" ]; then
+        echo "   still up after 10s — SIGKILL: $pids"
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+    fi
+}
+
+teachers_clone() {
+    mkdir -p "$TEACHERS_ROOT/src" "$TEACHERS_LOGS"
+    local name url sha dir
+    for spec in "alpamayo1.5|$ALPAMAYO_REPO|$ALPAMAYO_SHA" \
+                "cosmos-reason2|$COSMOS_REPO|$COSMOS_SHA"; do
+        name=${spec%%|*}; url=${spec#*|}; sha=${url#*|}; url=${url%%|*}
+        dir="$TEACHERS_ROOT/src/$name"
+        if [ ! -d "$dir/.git" ]; then
+            echo "   cloning $name"
+            git clone --quiet "$url" "$dir" || { echo "   !! clone failed"; return 1; }
+        fi
+        # PINNED, and re-pinned on every run. A teacher whose inference code
+        # moved is a corpus whose rows are no longer comparable with the ones
+        # before it, and the only way to notice is to state the sha.
+        (cd "$dir" && git fetch --quiet origin "$sha" 2>/dev/null || true
+         git -C "$dir" checkout --quiet "$sha" 2>/dev/null) \
+            || echo "   !! could not pin $name to $sha"
+        echo "   $name @ $(git -C "$dir" rev-parse --short HEAD)"
+    done
+}
+
+teachers_build() {
+    log "teacher environments (isolated, container layer)"
+    export PATH="$HOME/.local/bin:$PATH"
+    if ! command -v uv > /dev/null 2>&1; then
+        echo "   installing uv"
+        curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    teachers_clone || return 1
+    mkdir -p "$TEACHERS_VENVS" "$TEACHERS_LOGS"
+    # Copy rather than hardlink: the uv cache is on the container layer and the
+    # checkouts are on a network volume, and hardlinks do not cross that.
+    export UV_LINK_MODE=copy UV_PYTHON_INSTALL_DIR=/opt/teachers/pythons
+
+    if [ ! -x "$TEACHERS_VENVS/alpamayo/bin/python" ]; then
+        echo "   building alpamayo env (python 3.12, torch 2.8)"
+        # --no-install-package flash-attn: flash-attn compiles from source
+        # against nvcc and takes half an hour. The upstream README documents
+        # SDPA as the supported fallback and the service asks for it by name.
+        ( cd "$TEACHERS_ROOT/src/alpamayo1.5" \
+          && uv venv --python 3.12 "$TEACHERS_VENVS/alpamayo" \
+          && VIRTUAL_ENV="$TEACHERS_VENVS/alpamayo" uv sync --active \
+               --no-install-package flash-attn ) \
+            > "$TEACHERS_LOGS/venv_alpamayo.log" 2>&1 \
+            || echo "   !! alpamayo env failed — see $TEACHERS_LOGS/venv_alpamayo.log"
+    fi
+    echo "   alpamayo: $("$TEACHERS_VENVS/alpamayo/bin/python" -c \
+        'import torch,transformers;print("torch",torch.__version__,"tf",transformers.__version__)' \
+        2>/dev/null || echo 'NOT BUILT')"
+
+    if [ ! -x "$TEACHERS_VENVS/cosmos/bin/python" ]; then
+        echo "   building cosmos env (python 3.12, torch 2.9)"
+        # No vendor package: Cosmos-Reason2 is a Qwen3-VL architecture and
+        # loads through plain transformers. The cosmos-reason2 checkout is here
+        # for its quantization recipe and its prompts, not for inference.
+        ( uv venv --python 3.12 "$TEACHERS_VENVS/cosmos" \
+          && uv pip install -q --python "$TEACHERS_VENVS/cosmos/bin/python" \
+               --extra-index-url https://download.pytorch.org/whl/cu128 \
+               --index-strategy unsafe-best-match \
+               "torch==2.9.0+cu128" "torchvision==0.24.0+cu128" \
+               "transformers==4.57.3" "accelerate==1.12.0" "pillow==12.0.0" \
+               "numpy<3" safetensors compressed-tensors ) \
+            > "$TEACHERS_LOGS/venv_cosmos.log" 2>&1 \
+            || echo "   !! cosmos env failed — see $TEACHERS_LOGS/venv_cosmos.log"
+    fi
+    echo "   cosmos:   $("$TEACHERS_VENVS/cosmos/bin/python" -c \
+        'import torch,transformers;print("torch",torch.__version__,"tf",transformers.__version__)' \
+        2>/dev/null || echo 'NOT BUILT')"
+}
+
+# Which weights each service loads. FP8 when a checkpoint is there, BF16
+# otherwise -- so the L40S pod picks up the quantized build automatically and
+# this box, where BF16 fits, keeps using it unless somebody built one.
+teacher_weights() {
+    local model=$1 fp8dir
+    case "$model" in
+        alpamayo) fp8dir="$TEACHERS_ROOT/fp8/alpamayo_fp8" ;;
+        cosmos)   fp8dir="$TEACHERS_ROOT/fp8/model_fp8" ;;
+    esac
+    if [ -n "${TEACHERS_PRECISION-}" ] && [ "$TEACHERS_PRECISION" = "bf16" ]; then
+        echo "bf16|"
+    elif [ -f "$fp8dir/config.json" ]; then
+        echo "fp8|$fp8dir"
+    else
+        echo "bf16|"
+    fi
+}
+
+teachers_start() {
+    log "teacher services"
+    mkdir -p "$TEACHERS_LOGS"
+    teachers_stop
+    local spec prec weights py port mod
+    for model in alpamayo cosmos; do
+        case "$model" in
+            alpamayo) py="$TEACHERS_VENVS/alpamayo/bin/python"; port=8801
+                      mod=teachers.service.alpamayo_service ;;
+            cosmos)   py="$TEACHERS_VENVS/cosmos/bin/python";   port=8802
+                      mod=teachers.service.cosmos_service ;;
+        esac
+        if [ ! -x "$py" ]; then
+            echo "   $model: no environment — run: bash boot.sh teachers-build"
+            continue
+        fi
+        spec=$(teacher_weights "$model"); prec=${spec%%|*}; weights=${spec#*|}
+        echo "   starting $model on :$port at $prec ${weights:+($weights)}"
+        # setsid + nohup, for exactly the reason rio_start is: the service has
+        # to outlive the shell that started it.
+        # shellcheck disable=SC2086
+        setsid env HF_HOME="$HF_HOME_DIR" nohup "$py" -m "$mod" \
+            --port "$port" --precision "$prec" \
+            ${weights:+--model "$weights"} \
+            > "$TEACHERS_LOGS/$model.log" 2>&1 < /dev/null &
+    done
+    echo "   loading (~40-90 s per model; watch: tail -f $TEACHERS_LOGS/*.log)"
+    local i loaded
+    for i in $(seq 1 90); do
+        loaded=0
+        for port in 8801 8802; do
+            curl -sf "http://127.0.0.1:$port/health" 2>/dev/null \
+                | grep -q '"loaded": *true' && loaded=$((loaded + 1))
+        done
+        [ "$loaded" -eq 2 ] && break
+        sleep 3
+    done
+    teachers_status
+}
+
+teachers_status() {
+    local port name body
+    for spec in "8801|alpamayo1.5" "8802|cosmos-reason2"; do
+        port=${spec%%|*}; name=${spec#*|}
+        printf '   %-16s ' "$name"
+        # Captured rather than piped. Under `set -o pipefail` a curl against a
+        # closed port fails the WHOLE pipeline, so a `| python | || echo`
+        # printed the fallback on top of python's own message -- two lines
+        # saying the same thing, one of them from a command that succeeded.
+        body=$(curl -s -m 5 "http://127.0.0.1:$port/health" 2>/dev/null || true)
+        if [ -z "$body" ]; then
+            echo "no answer on :$port"
+            continue
+        fi
+        printf '%s' "$body" | python3 -c 'import json,sys
+try:
+    h = json.load(sys.stdin)
+except Exception:
+    print("unreadable /health"); raise SystemExit
+print(("loaded  " if h.get("loaded") else "NOT LOADED  ")
+      + str(h.get("model_id") or "") + " @ " + str(h.get("precision") or "")
+      + "  vram=" + str(h.get("vram_reserved_mb")) + " MB"
+      + ("  " + str(h.get("load_error"))[:120] if h.get("load_error") else ""))'
+    done
+}
+
 rio_status() {
     local pids
     pids=$(rio_pidline)
@@ -207,9 +441,13 @@ case "${1-}" in
     stop)    log "stopping uvicorn"; rio_stop; exit 0 ;;
     start)   log "starting uvicorn on :$PORT"; rio_stop; rio_start
              log "health check"; rio_wait_healthy; exit $? ;;
-    status)  log "RIO on :$PORT"; rio_status; exit 0 ;;
+    status)  log "RIO on :$PORT"; rio_status
+             log "teachers"; teachers_status; exit 0 ;;
+    teachers)       teachers_start; exit $? ;;
+    teachers-stop)  log "stopping teacher services"; teachers_stop; exit 0 ;;
+    teachers-build) teachers_build; exit $? ;;
     "")      ;;
-    *)       echo "usage: bash boot.sh [restart|stop|start|status]" >&2; exit 2 ;;
+    *)       echo "usage: bash boot.sh [restart|stop|start|status|teachers|teachers-stop|teachers-build]" >&2; exit 2 ;;
 esac
 
 # `set -e` makes this script abort on the first failure, which is right -- but a
@@ -440,6 +678,19 @@ pip install --no-cache-dir playwright \
     || log "  !! playwright unavailable - output_bus_selftest and mobile_layout_selftest cannot run"
 
 # ---------------------------------------------------------------------------
+# 5e. The teacher panel's two environments (docs/teacher_panel.md)
+# ---------------------------------------------------------------------------
+# Two AV foundation models in shadow, each in its own Python. Deliberately NOT
+# fatal and deliberately late: a pod that comes up without them drives exactly
+# as it did before the panel existed, and the two `uv sync` runs are ~28 GB of
+# wheels that must not stand between a fresh pod and a working server.
+#
+# The services themselves are started AFTER uvicorn (step 8c), so a pod whose
+# weights are missing still gets a dashboard.
+log "teacher environments"
+teachers_build || log "  !! teacher environments unavailable - the panel's two columns will be empty"
+
+# ---------------------------------------------------------------------------
 # 6. Free port 8888
 # ---------------------------------------------------------------------------
 # RunPod starts JupyterLab on 8888, which is the port the proxy exposes and the
@@ -490,6 +741,14 @@ python -m tools.preflight || {
     echo "   !! this pod is INCOMPLETE — see the list above"
     echo "   !! for the repair commands: python -m tools.preflight --fix"
 }
+
+# ---------------------------------------------------------------------------
+# 8c. The teacher services
+# ---------------------------------------------------------------------------
+# After the server, because they are the shadow and it is the drive. FP8 if a
+# quantized checkpoint is on the volume, BF16 otherwise -- see teacher_weights.
+log "teacher services"
+teachers_start || log "  !! teacher services did not start - the panel's columns will be empty"
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code

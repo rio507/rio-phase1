@@ -447,6 +447,86 @@ def check_server():
           "> uvicorn.log 2>&1 &")
 
 
+def check_teachers():
+    """The shadow panel's two environments, its weights and its services.
+
+    EVERY LINE HERE IS NON-FATAL IN SPIRIT: a pod without the teacher panel
+    drives exactly as it did before the panel existed. What it cannot do is
+    tell you it is missing, which is the entire reason these checks are in the
+    same list as the detector's.
+    """
+    head("teacher panel (shadow — docs/teacher_panel.md)")
+    venvs = Path("/opt/teachers/venvs")
+    src = Path("/workspace/teachers/src")
+
+    for name, mods in (("alpamayo", ("torch", "transformers", "alpamayo1_5")),
+                       ("cosmos", ("torch", "transformers"))):
+        py = venvs / name / "bin" / "python"
+        ok = py.exists()
+        if ok:
+            import subprocess
+            probe = "import " + ",".join(mods)
+            ok = subprocess.call([str(py), "-c", probe],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL) == 0
+        check(ok, f"teacher env: {name}",
+              f"the {name} service cannot start, so its column on the "
+              f"Teachers card stays empty and no corpus row is written "
+              f"(the drive itself is unaffected)",
+              "bash /workspace/boot.sh teachers-build")
+
+    for name, sha in (("alpamayo1.5", "36aeb4c"), ("cosmos-reason2", "a3b4a1d")):
+        d = src / name
+        ok = (d / ".git").exists()
+        check(ok, f"teacher source: {name} @ {sha}",
+              f"{name}'s pinned inference code is missing — the environment "
+              f"cannot be rebuilt from it",
+              "bash /workspace/boot.sh teachers-build")
+
+    hub = Path(os.environ.get("HF_HOME", "/workspace/.cache/huggingface")) / "hub"
+    for repo, gb in (("models--nvidia--Alpamayo-1.5-10B", 20),
+                     ("models--nvidia--Cosmos-Reason2-8B", 15)):
+        d = hub / repo
+        size = 0
+        if d.exists():
+            for f in d.rglob("*"):
+                try:
+                    if f.is_file() and not f.is_symlink():
+                        size += f.stat().st_size
+                except OSError:
+                    pass
+        ok = size > gb * 0.8 * 1024 ** 3
+        pretty = repo.replace("models--", "").replace("--", "/")
+        check(ok, f"weights: {pretty} ({round(size / 1024 ** 3, 1)} GB)",
+              f"{pretty} is not cached — that teacher cannot load. "
+              f"Cosmos-Reason2 is a GATED repo and needs an HF token whose "
+              f"account has accepted the licence; Alpamayo needs it too, "
+              f"because it loads its tokenizer and VLM config from it.",
+              "hf download " + pretty)
+
+    tok = Path("/workspace/teachers/secrets.env")
+    check(tok.exists(), "HF token for the gated Cosmos repo",
+          "nvidia/Cosmos-Reason2-8B is gated; without a token NEITHER teacher "
+          "loads, because Alpamayo reads its tokenizer and VLM config from "
+          "that repo",
+          "write HF_TOKEN=... to /workspace/teachers/secrets.env "
+          "(outside the git worktree, and it must stay there)")
+
+    import urllib.request
+    for port, name in ((8801, "alpamayo1.5"), (8802, "cosmos-reason2")):
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/health", timeout=3) as r:
+                import json as _json
+                ok = bool(_json.loads(r.read().decode()).get("loaded"))
+        except Exception:
+            ok = False
+        check(ok, f"teacher service: {name} on :{port}",
+              f"{name} is not answering — its column stays empty and no "
+              f"corpus row is written for any keyframe",
+              "bash /workspace/boot.sh teachers")
+
+
 # ---------------------------------------------------------------------------
 
 def main():
@@ -468,6 +548,7 @@ def main():
     check_browser()
     check_weights()
     check_persistent()
+    check_teachers()
     check_server()
 
     missing = [r for r in _results if not r[0]]

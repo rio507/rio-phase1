@@ -3062,3 +3062,146 @@ NAV_VERIFY_DEPTH_MIN_M = 3.0
 # straddling a sign and the sky behind it — and the consistency check abstains
 # rather than acting on it.
 NAV_VERIFY_DEPTH_MIN_CONF = 0.35
+
+
+# ===========================================================================
+# TEACHER PANEL — two AV foundation models watching the same road, in shadow
+# ===========================================================================
+# docs/teacher_panel.md is the design. The short version, because every knob
+# below only makes sense against it:
+#
+# Alpamayo 1.5 and Cosmos-Reason2 are NOT part of RIO. They do not warn, they
+# do not speak, they do not answer a question, and nothing they produce reaches
+# the arbiter, the speech path, look(), or the observer cache. Qwen3-VL-8B
+# remains the observer and the only model whose sentences RIO may say. These
+# two are READ, RECORDED and DRAWN, so that a drive can be reviewed against
+# what two purpose-built driving models saw at the same instant -- and so that
+# the recording is a training corpus later.
+#
+# They also do not live in this process. Each runs in its own environment,
+# behind a loopback HTTP service with a bounded queue, so a teacher that hangs,
+# leaks or dies takes nothing with it. See tools/teacher_firewall_selftest.py,
+# which asserts all of the above from the AST rather than from this comment.
+TEACHERS_ENABLED = True
+
+# Where the two services listen. Loopback only -- these are not on the network,
+# they have no authentication, and they hand out model weights' opinions about
+# the road in front of a real car.
+TEACHER_ALPAMAYO_URL = "http://127.0.0.1:8801"
+TEACHER_COSMOS_URL = "http://127.0.0.1:8802"
+
+# --- cadence ---------------------------------------------------------------
+# A keyframe is the unit of everything here: one instant, one 4-frame window,
+# one ego history, two readings, one corpus row.
+#
+# TWO WAYS ONE HAPPENS. An EVENT -- a band change, a nav maneuver, an IMU jolt,
+# a driver question -- is the interesting instant and is why this exists at all.
+# The FLOOR is what stops a quiet motorway producing nothing to compare: a
+# keyframe every so often whether or not anything happened.
+TEACHER_KEYFRAME_FLOOR_S = 2.0
+# ...and a ceiling on how close together two keyframes may be however many
+# events fire. Without it a burst of band flapping at a junction would queue
+# faster than either model can answer, and every one of them would be dropped
+# stale a second later -- which is correct, and is also a lot of work done to
+# reach the same place as not asking.
+TEACHER_KEYFRAME_MIN_GAP_S = 1.0
+
+# --- freshness -------------------------------------------------------------
+# THE GATE THAT MAKES THIS SAFE TO LOOK AT. A reading is a claim about a
+# picture; a picture more than this old is a claim about a road the car has
+# left. Enforced twice -- when the keyframe is built (is t0 current?) and when
+# the job is picked up by the worker (is it still current?) -- because the
+# queue is where the second of delay actually accumulates.
+TEACHER_FRAME_MAX_AGE_S = 1.0
+# How long a reading stays on the dashboard before the card says so. Longer
+# than the frame gate on purpose: a 3 s old reading is still worth SEEING next
+# to the other model's, it is just not worth believing about the road NOW.
+TEACHER_READING_FRESH_S = 4.0
+
+# --- the shared input ------------------------------------------------------
+# Four frames at t0-0.3, t0-0.2, t0-0.1, t0 -- the window Alpamayo's own loader
+# builds (num_frames=4, time_step=0.1) and the window Cosmos is given too, so
+# the two readings are of the same instant and are directly comparable.
+TEACHER_WINDOW_FRAMES = 4
+TEACHER_WINDOW_STEP_S = 0.1
+# How far a real frame may sit from its nominal slot before the window stops
+# being the window the model expects.
+#
+# DERIVED, NOT TUNED. Past half a step (50 ms) the nearest frame to one slot is
+# nearer to its neighbour, so the "window" is no longer four evenly spaced
+# instants -- it is some frames counted twice and some skipped. 60 ms allows a
+# little jitter around that boundary and nothing more.
+#
+# What it does NOT do is refuse the keyframe. At the socket's 8-15 fps the
+# spacing is 65-125 ms and the worst slot error comes out at ~50 ms, so the
+# window is exact; at the POST fallback's 4 fps it comes out at 100 ms and the
+# window is marked `exact: false` in the row. Both are sent -- an inexact
+# window is still a real 0.3 s of road and still worth two readings. What must
+# never happen is one quietly meaning the other.
+TEACHER_WINDOW_SLOT_TOLERANCE_S = 0.06
+
+# Ego-motion history: 16 poses at 10 Hz ending at t0, in the ego frame at t0 --
+# again the shape Alpamayo's loader produces (num_history_steps=16).
+TEACHER_EGO_HISTORY_STEPS = 16
+TEACHER_EGO_HISTORY_STEP_S = 0.1
+# An ego sample older than this is not history, it is a different drive. The
+# client posts at ~1 Hz in batches of ~10 samples, so two missed posts is the
+# limit before the history is reconstructed from speed alone and marked as
+# such.
+TEACHER_EGO_SAMPLE_MAX_AGE_S = 3.0
+TEACHER_EGO_RING = 256                # ~25 s of 10 Hz samples
+
+# --- the services ----------------------------------------------------------
+# ONE JOB IN FLIGHT, ONE WAITING, NEWEST WINS. The same rule the frame
+# transport runs on and for the same reason: a queued keyframe is measured
+# against a road that has already gone past. Two rather than one so a model
+# that is mid-generation has something to start on the instant it finishes.
+TEACHER_QUEUE_DEPTH = 2
+TEACHER_HTTP_TIMEOUT_S = 90.0
+# A service that has failed this many times in a row is left alone until the
+# backoff expires. Neither model is load-bearing, and hammering a loopback
+# port that is not listening is noise in the log and nothing else.
+TEACHER_FAIL_BACKOFF_S = 15.0
+TEACHER_FAIL_STREAK = 3
+
+# --- recording -------------------------------------------------------------
+# Per drive session, on the persistent volume, schema'd so it is usable as a
+# training corpus later rather than as a debug dump now. See teachers/corpus.py
+# and TEACHER_CORPUS_SCHEMA in teachers/schema.py.
+TEACHER_CORPUS_ENABLED = True
+TEACHER_CORPUS_DIR = "/workspace/rio-phase1/training_data/teachers"
+# The four JPEGs are what makes a row trainable, and they are also the entire
+# size of it: ~24 kB each, ~100 kB a keyframe, ~180 MB an hour at the 2 s
+# floor. Kept, because a corpus without the pictures is a corpus of opinions.
+TEACHER_CORPUS_KEEP_FRAMES = True
+
+# --- what is asked ---------------------------------------------------------
+# ONE PROMPT SET, BOTH MODELS, WORD FOR WORD. The whole point of the panel is
+# that the two columns are answers to the same question; a prompt tuned for
+# one of them would make the comparison a comparison of prompts.
+TEACHER_PROMPTS = {
+    "scene": "Describe the scene.",
+    "critical_actor": (
+        "Which single road user is the most safety-relevant to the ego "
+        "vehicle right now, and why?"
+    ),
+    "attention": (
+        "What should the ego vehicle pay attention to in the next 2 seconds?"
+    ),
+}
+# Cosmos's extra question -- the one Alpamayo answers with its Chain-of-
+# Causation trace instead. Both columns therefore carry a reasoning trace of
+# the model's own kind, which is the thing worth comparing.
+TEACHER_COSMOS_PHYSICAL_PROMPT = (
+    "The video shows the view from a car's forward camera. What is moving in "
+    "this scene, what is about to happen next, and is that physically "
+    "plausible? Think step by step."
+)
+
+# Generation. Same numbers NVIDIA's own examples use, so a reading here is
+# comparable with a reading from the model card.
+TEACHER_TOP_P = 0.98
+TEACHER_TEMPERATURE = 0.6
+TEACHER_MAX_NEW_TOKENS = 256
+TEACHER_COSMOS_MAX_NEW_TOKENS = 1024   # it thinks in <think>...</think> first
+TEACHER_TRAJ_SAMPLES = 1               # display-only; 1 keeps VRAM at ~24 GB
