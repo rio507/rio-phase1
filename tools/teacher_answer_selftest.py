@@ -120,34 +120,41 @@ def run_freshness():
     ok(not realtime.teacher_context(None, "anything"),
        "and neither is None")
 
-    section("A2. the gate, and the fact it currently omits everything")
+    section("A2. the gate lets both teachers through; the AGE is what she weighs")
     ok(panel.CONTEXT_FRESH_S == config.TEACHER_CONTEXT_FRESH_S,
        f"the gate is config-driven ({panel.CONTEXT_FRESH_S}s), not a constant "
        f"buried in the plumbing")
-    # THE HONEST CONSEQUENCE, ASSERTED SO IT CANNOT BE FORGOTTEN.
+    # THE DECISION THIS ENCODES, so it cannot drift back by accident.
     #
     # Measured on the acceptance clip: Alpamayo answers in ~4-7 s and Cosmos in
-    # ~8-10 s. A reading is therefore ALREADY older than the two-second gate by
-    # the time it exists, so at the shipped value the block is empty every
-    # time and RIO answers from the camera and the measured state alone --
-    # which is exactly what she did before any of this was built.
+    # ~8-10 s. At the 2 s it shipped with, a reading was already stale by the
+    # time it existed and the block was empty every time -- the feature was
+    # inert. At 10 s both teachers reach look(), which is the point of having
+    # two of them.
     #
-    # That is not a bug in the gate. It is what the gate is for, and it is the
-    # honest consequence of asking a 10-billion-parameter model about a road a
-    # car is driving down. The number is a real decision and this test exists
-    # so nobody makes it by accident.
-    SLOWEST_TEACHER_S = 8.0
-    ok(panel.CONTEXT_FRESH_S < SLOWEST_TEACHER_S,
-       f"at {panel.CONTEXT_FRESH_S}s the gate is TIGHTER than the slower "
-       f"teacher's latency (~{SLOWEST_TEACHER_S}s), so the block will be "
-       f"empty in practice — raise config.TEACHER_CONTEXT_FRESH_S "
-       f"deliberately if that is not what is wanted")
-    late = block(age_s=panel.CONTEXT_FRESH_S + 0.1)
-    # ...and the mechanism itself is correct at whatever the number is.
+    # The cost is real and is paid somewhere specific: a ten-second reading is
+    # about 130 m of road at motorway speed. So the GATE decides what reaches
+    # her and the AGE decides what she does with it -- every reading carries
+    # its own age_s, and the instructions tell her to treat anything past about
+    # five seconds as background. Two jobs, and only the first is a number.
+    SLOWEST_TEACHER_S = 10.0
+    ok(panel.CONTEXT_FRESH_S >= SLOWEST_TEACHER_S,
+       f"the gate ({panel.CONTEXT_FRESH_S}s) covers the slower teacher "
+       f"(~{SLOWEST_TEACHER_S}s), so both readings actually reach an answer")
+    ctx = realtime.teacher_context(block(age_s=6.0), "what's that car doing?")
+    ok(len(ctx.get("readings") or {}) == 2,
+       "a six-second reading is IN the block — past the background threshold "
+       "but still about a road worth knowing about")
+    ok(all(r.get("age_s") is not None
+           for r in (ctx.get("readings") or {}).values()),
+       "and it carries its age, which is the whole mechanism: the gate is not "
+       "doing the weighing, she is")
     real = panel.context_for("no-such-session")
     ok(real == {},
        "a session with no readings at all yields an empty block, not a "
        "fabricated one")
+    ok(not realtime.teacher_context(block(age_s=1.0), "x").get("omitted_stale"),
+       "nothing is reported omitted when nothing was")
 
 
 def run_labelling():
@@ -263,7 +270,11 @@ def run_instructions():
             ("do not contradict", "never contradicts a running warning"),
             ("NEVER A COMMAND", "observation and suggestion only"),
             ("I can't see your left", "the field-of-view sentence"),
-            ("Do not fill it in", "and what is absent she does not invent")):
+            ("Do not fill it in", "and what is absent she does not invent"),
+            ("MIND THE AGE ON EACH ONE", "the age discipline is stated"),
+            ("about five seconds", "with the threshold in it"),
+            ("treat it as background",
+             "and what to do past it — background, not the road she is on")):
         ok(need in text, f"{why} ({need!r})")
     ok(len(text) < 20000,
        f"and the whole instruction set is still one a model will read "

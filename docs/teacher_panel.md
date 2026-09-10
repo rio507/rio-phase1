@@ -744,27 +744,36 @@ readings out for use — has **exactly one caller in the repo**, the tool
 endpoint a driver's question arrives through, and `realtime.py` still imports
 nothing from `teachers` (the block is passed in as a plain dict by `app.py`).
 
-### The freshness gate omits everything today, and that is a decision to make
+### The gate decides what reaches her; the age decides what she does with it
 
-`config.TEACHER_CONTEXT_FRESH_S` is **2.0 s**, measured from t0 — the instant
-the frames were taken — because what matters is the age of the road. At 13 m/s
-two seconds is twenty-six metres.
+`config.TEACHER_CONTEXT_FRESH_S` is **10.0 s**, measured from t0 — the instant
+the frames were taken — because what matters is the age of the road.
 
-But Alpamayo answers in ~4–7 s and Cosmos in ~8–10 s. **A reading is already
-older than the gate by the time it exists**, so at 2.0 the block is empty every
-time and RIO answers from the camera and the measured state alone — exactly as
-she did before this was built.
-
-That is not a bug in the gate; it is what the gate is for. The number is a real
-choice and it is left strict on purpose, with the alternatives written down in
-the config and the consequence asserted in
-`tools/teacher_answer_selftest.py` so nobody makes the choice by accident:
+It started at 2.0 s, which is the strict reading and which made the feature
+**inert**: Alpamayo answers in ~4–7 s and Cosmos in ~8–10 s, so a reading was
+already older than the gate by the time it existed and the block was empty
+every time.
 
 | | covers | road at 13 m/s |
 |---|---|---|
-| 2.0 s (shipped) | nothing — block always empty | 26 m |
+| 2.0 s | nothing — block always empty | 26 m |
 | 6.0 s | Alpamayo only | 78 m |
-| 10.0 s | both, usually | 130 m |
+| **10.0 s (shipped)** | **both** | **130 m** |
+
+Ten seconds is a hundred and thirty metres of road, and that cost is not
+absorbed by pretending otherwise — it is paid in the one place that can pay it.
+**Every reading in the block carries its own `age_s`**, and the session
+instructions tell RIO what to do with it:
+
+> MIND THE AGE ON EACH ONE. Every reading says how many seconds old it is.
+> Under about five seconds it is about the road you are on now. Older than
+> that, treat it as background — something that was true a moment ago and may
+> not be — and lean on the camera and the measured state instead.
+
+So the gate is a filter and the age is a weight. Two jobs, and only the first
+one is a number. Verified end to end at the shipped setting: both teachers'
+readings reach `look()` at 9.0 s, both pinned to the same RF-DETR track, with
+the measured state beside them at the same age.
 
 ## 10e. The teachers yield the card
 

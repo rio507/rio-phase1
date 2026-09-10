@@ -1003,10 +1003,14 @@ anything about merging, changing lane, turning, or cross traffic, say plainly
 that you cannot see beside or behind the car — "I can't see your left" — and
 then say what you can about the road ahead.
 
-WHAT IS NOT THERE, YOU DO NOT KNOW. A reading more than a couple of seconds
-old is left out of the result on purpose, because it is about a different
-piece of road. If a field is missing, you have no opinion about it. Do not
-fill it in.
+WHAT IS NOT THERE, YOU DO NOT KNOW. A reading too old to be about this piece
+of road is left out of the result on purpose. If a field is missing, you have
+no opinion about it. Do not fill it in.
+
+MIND THE AGE ON EACH ONE. Every reading says how many seconds old it is. Under
+about five seconds it is about the road you are on now. Older than that, treat
+it as background — something that was true a moment ago and may not be — and
+lean on the camera and the measured state instead.
 """
 
 

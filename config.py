@@ -3145,10 +3145,17 @@ TEACHER_READING_FRESH_S = 4.0
 #   6.0   covers Alpamayo only. The model that predicts a path and names an
 #         actor gets heard; the slower one does not.
 #
-# Left at the strict value deliberately: a number that quietly lets stale
-# opinions into an answer about a moving road should be chosen on purpose, not
-# inherited from a default somebody picked while writing the plumbing.
-TEACHER_CONTEXT_FRESH_S = 2.0
+# CHOSEN, not inherited. 10.0: both teachers' readings reach look(), which is
+# the point of having two of them. The cost is stated rather than hidden -- a
+# ten-second-old reading is about a hundred and thirty metres back at motorway
+# speed -- and it is paid for in the one place that can pay it: every reading
+# in the block carries its own `age_s`, and the session instructions tell RIO
+# to treat anything past about five seconds as BACKGROUND rather than as the
+# road she is looking at now.
+#
+# So the gate is what reaches her, and the age is what she weighs it by. Those
+# are two different jobs and only the first one is a number.
+TEACHER_CONTEXT_FRESH_S = 10.0
 
 # --- the shared input ------------------------------------------------------
 # Four frames at t0-0.3, t0-0.2, t0-0.1, t0 -- the window Alpamayo's own loader
