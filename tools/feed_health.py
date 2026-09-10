@@ -110,10 +110,15 @@ def report(path, stall_s=3.0):
                 print(f"    {tag}: {len(hits)}")
                 for m in hits[:6]:
                     print(f"      {m['t'] - t0:6.1f} s  {m['payload'].get('note','')[:110]}")
-        if not any(m["payload"].get("tag", "").startswith("FRAMES_") and
-                   m["payload"].get("tag") != "FRAMES_WS_READY" for m in marks):
-            print("    the page left no transport events at all — which on a "
-                  "drive with a stall in it is itself the finding")
+        told = any(m["payload"].get("tag", "").startswith("FRAMES_") and
+                   m["payload"].get("tag") != "FRAMES_WS_READY" for m in marks)
+        if gaps and not told:
+            # The finding, on a drive that stalled: not merely that the feed
+            # went, but that the page had nothing to say about it.
+            print("    ...and the page left no transport events at all, which "
+                  "on a drive with a stall in it is itself the finding")
+        elif not told:
+            print("    (no transport events — nothing went wrong to report)")
 
     # --- how old was the picture? -------------------------------------------
     ages = [r["payload"].get("frame_age_ms") for r in hw
@@ -154,7 +159,56 @@ def report(path, stall_s=3.0):
               f"max {max(chosen)} s")
     refused = sum(1 for r in vq if r["payload"].get("visual_unavailable"))
     print(f"    answers refused for want of a frame: {refused} of {len(vq)}")
+
+    _audio_section(rows, t0)
     return 0
+
+
+def _audio_section(rows, t0):
+    """What the output loopback did to her voice, over the drive.
+
+    On 2026-09-09 this was one event in 656 s -- covered true, context running,
+    zero failures, zero fallbacks -- which is a complete answer to "did the bus
+    fail" and no answer at all to "why is the speaker crackling". The numbers
+    that were missing are continuous: the receiver's concealment, the jitter
+    buffer's depth, and how much audio it had to invent or discard to hold two
+    clocks together.
+    """
+    bus = [r for r in rows if r.get("kind") == "live"
+           and (r.get("payload") or {}).get("kind") == "bus_health"]
+    print("\n  THE OUTPUT BUS")
+    if not bus:
+        print("    no bus health was reported at all")
+        return
+    with_audio = [r for r in bus if (r["payload"].get("audio") or {}).get("samples")]
+    print(f"    {len(bus)} report(s), {len(with_audio)} carrying loopback numbers")
+    if not with_audio:
+        print("    ...and none of them carried the loopback's own numbers, which "
+              "is the state session 738fbb82 was in: four booleans, all fine, "
+              "and nothing about the sound")
+        return
+    print("      at        rate  jitter  grow   drift  conceal  ins/rem  resync  backoff")
+    for r in with_audio:
+        a = r["payload"]["audio"]
+        print(f"    {r['t'] - t0:7.1f} s  {str(a.get('sample_rate') or '-'):>5}  "
+              f"{fmt(a.get('jitter_ms'), '', 1):>6}  "
+              f"{fmt(a.get('jitter_growth_ms'), '', 1):>5}  "
+              f"{fmt(a.get('drift_ms'), '', 1):>6}  "
+              f"{fmt(a.get('concealed'), '', 0):>7}  "
+              f"{a.get('inserted')}/{a.get('removed'):<6} "
+              f"{a.get('resyncs')}       "
+              f"{fmt(a.get('resync_backoff_ms'), ' ms', 0)}")
+    last = with_audio[-1]["payload"]["audio"]
+    span = with_audio[-1]["t"] - with_audio[0]["t"]
+    if span > 0 and last.get("drift_ms") is not None:
+        print(f"    net drift {last['drift_ms']} ms over {span:.0f} s "
+              f"({abs(last['drift_ms']) / (span / 60.0):.1f} ms/min), "
+              f"{last.get('resyncs')} resync(s), "
+              f"{last.get('resync_failures')} failed")
+    fell = [r for r in bus if r["payload"].get("to_destination")]
+    if fell:
+        print(f"    the bus was OFF the loopback for {len(fell)} report(s) — "
+              f"audible, and uncancelled")
 
 
 def main():

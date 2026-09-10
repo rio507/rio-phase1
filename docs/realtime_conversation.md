@@ -310,6 +310,33 @@ a local mute the moment `input_audio_buffer.speech_started` arrives — the
 server will stop her anyway, but a machine that talks over you for another beat
 after you have started is the most irritating thing an assistant can do.
 
+**And the road cuts her off, which is neither.** A phone on a mount at 11 m/s
+with the windows down produces transcripts. Session 738fbb82, t=180.97 to
+180.98 — ten milliseconds:
+
+```
+"Hello."   "Hello."   "Thanks for your help."   "Got it."
+```
+
+Twenty of those over one drive. The barge gate refused every one as a phantom,
+so nothing superseded and the turn counter was right — but
+`turn_detection.create_response` is on, so the SERVER had already created a
+response for each committed utterance, and each was an answer to nothing
+stacked behind whatever she was saying.
+
+So fragments inside `REALTIME_NOISE_COALESCE_MS` are ONE utterance whatever the
+words are, and the responses created for them are cancelled by id on sight.
+When the window closes: if the coalesced text carries a request, it becomes one
+turn and one response; if it does not, one "Didn't catch that." on a twelve
+second cooldown, and everything else goes silently. Two tests decide it and one
+alone is not enough — at most four words AND every word in the no-request list
+— because length alone swallows "What's that?", which is three words and the
+most common real question in the car. A driver command is exempt at any length.
+
+Her own voice never enters that buffer: a transcript refused because it was
+RIO is handled where it always was, and feeding it here would cancel the answer
+it is an echo of.
+
 ---
 
 ## One voice everywhere
@@ -365,6 +392,61 @@ same priority, same group, same TTL. Only the audio behind it changed. A gap
 warning is still P1 and still cuts RIO off mid-sentence; it now does so in her
 own voice, and the conversation is cancelled *before* the dictation starts,
 because both share one audio stream.
+
+### Two clocks, and the crackle between them
+
+Everything RIO says goes out through one Web Audio bus and back through a peer
+connection to itself, because that is the only render path iOS's echo canceller
+has a reference for (`static/rio_output.js`). The loopback has TWO INDEPENDENT
+CLOCKS in it: the AudioContext renders on its own, the `<audio>` element plays
+out on the audio device's. A receiver absorbs the difference in its jitter
+buffer, and a buffer with a steady bias either grows without bound or runs dry
+— and running dry is concealment, which on speech is a crackle. A few parts per
+million is inaudible at sixty seconds and a hundred milliseconds of accumulated
+error by the fifth minute, which is the shape the complaint had.
+
+`LIVE_BUS_HEALTH` was added for exactly that question and, on session 738fbb82,
+reported **once** in 656 seconds: covered true, context running, zero failures,
+zero fallbacks. A complete answer to "did the bus fail" and no answer at all to
+the one being asked, because everything that matters here is continuous rather
+than boolean.
+
+| measured | from | why it is the one |
+|---|---|---|
+| concealment | `concealedSamples − silentConcealedSamples` | samples invented to cover a buffer that ran dry, minus the ones nobody can hear. The crackle, counted. |
+| drift | `insertedSamplesForDeceleration − removedSamplesForAcceleration` | audio the receiver had to invent or discard to hold the two clocks together — the drift, measured by the component it happens to |
+| buffer depth | `jitterBufferDelay / jitterBufferEmittedCount` | and its GROWTH is the same drift seen from the other side |
+| device clock | `ctx.currentTime` vs `sink.currentTime` | the real thing on a phone, and meaningless in a container with no speaker. Reported as `clock_delta_ms`; nothing asserts it. |
+
+The cure is a **resync**: a rebuild of the loopback resets the jitter buffer.
+It is MAKE BEFORE BREAK — a second loopback is built on a spare sink element
+and proved playing before the bus moves onto it — and it never runs while a
+source is attached, because a seam mid-sentence is the fault arriving from the
+other direction. There are two sink elements for exactly this reason, and both
+are primed inside the Start Drive gesture: iOS will not start an element from a
+timer that has never been played inside a tap, so an unprimed spare is a resync
+that silently fails three minutes into every drive.
+
+And the context asks for 48 kHz. The loopback encodes opus at 48 whatever the
+context runs at, so a context at 44.1 puts a resampler in front of the encoder
+and another behind the decoder.
+
+**A cure that is not curing stops being applied.** The first 10-minute soak did
+twenty-five resyncs — one every thirty seconds, for the whole run — because
+this container conceals audio at a steady environmental rate whatever the
+loopback does, and a trigger on a total against a fixed floor fires forever.
+Twenty-five peer-connection rebuilds is not a fix for a crackle, it is a second
+source of them. So the gap doubles whenever a rebuild fails to reduce the
+concealment RATE, up to ten minutes, and resets the moment one works: a
+drifting clock is cured by a rebuild and the backoff never engages; a noisy
+output device is not, and the mechanism gets out of its way.
+
+And the counters are cumulative across rebuilds, which they were not: `getStats`
+belongs to the peer connection, so every resync reset them and the first
+10-minute run reported 12,010 concealed samples where the true total was an
+order of magnitude more.
+
+`python -m tools.output_bus_selftest --soak-s 600` is the acceptance run.
 
 **ElevenLabs is dormant, complete, and reachable** — under this backend. With
 `VOICE_BACKEND=openai_realtime` the server's TTS endpoints are the fallback

@@ -200,6 +200,62 @@ same code, a link that is not the constraint — it delivers 14.29 fps.
 
 ---
 
+## 4b. And then it stopped, and nothing noticed (2026-09-10)
+
+Session 738fbb82. The last frame the socket carried was idx 232 at t=40.4 s.
+The next result of any kind was idx 233 at **t=482.7** — a 442-second gap, in
+a drive that ran to 656 s. `python -m tools.feed_health` on that log:
+
+```
+stalls over 3 s: 2, 463 s total (89% of the span)
+  at   40.4 s  for  442.3 s   (frame 232 -> 233)
+  at  483.4 s  for   20.2 s   (frame 234 -> 235)
+the page left no transport events at all
+```
+
+The log's account is mostly negative space. `headway_ws_close` at t=400.4 —
+the socket was OPEN for six minutes after the last frame. `FRAMES_WS_LOST`
+never emitted; `onclose` never fired. So this was not a network drop and not a
+server close: **the capture loop died**, with the socket open and the page
+demonstrably alive (the conversation worked, the GPS watch kept re-arming, nav
+kept calling turns).
+
+It could die because of one line. `schedule()` was the last statement of
+`tick()`, after `await once()`, so a promise inside `once()` that never settles
+means the next tick is never scheduled — not late, never. `canvas.toBlob` does
+not call its callback while an iOS page is backgrounded, which is what a phone
+does at a red light when the driver glances at Maps. Neither path rejects.
+
+| | before | now |
+|---|---|---|
+| the loop | `schedule()` after the await | `schedule()` in a `finally`, and the whole tick races `TICK_BUDGET_MS` |
+| a stall | nothing watched for one | 4 s with nothing sent rebuilds the pipeline: socket closed, canvas dropped, inflight released, loop kicked |
+| the socket | pings went out, nothing read the pongs | three unanswered closes it — a flow dropped by a carrier NAT stays `readyState === OPEN` forever |
+| reconnects | `MAX_RECONNECTS` was a LIFETIME count | a socket that carried frames for 20 s earns the budget back |
+| the camera | a track going `ended` was silent skipped captures | watched, and `RIO.source.reacquire()` re-runs the one acquisition |
+| the background | nothing | `visibilitychange → visible` is treated as a stall whether or not the clock agrees |
+| the driver | a frozen HUD | a strip across the picture: "Feed interrupted — reconnecting", or "Camera feed lost" |
+| the server | held the socket for six minutes | `/headway_ws` closes after `HEADWAY_WS_IDLE_CLOSE_S`, which is what starts the browser's reconnect |
+
+**The encode moved off the main thread.** `createImageBitmap(videoEl)` is a
+GPU-side copy that transfers to a worker with no serialisation; the scale, the
+JPEG encode and the byte copy happen in `static/rio_frame_encoder.js`. This was
+done for the audio loopback's benefit (see *Two clocks* in
+docs/realtime_conversation.md) and it should be said plainly that the
+contention hypothesis **did not survive measurement**: a controlled pair of
+60-second runs, one with a 22 ms main-thread spin every 160 ms standing in for
+the old frame loop and one with nothing at all, came back 88,356 against 91,006
+concealed samples with identical drift and identical inserted/removed counts.
+Chromium renders WebAudio on its own thread and receives RTP on another. The
+worker is still worth having — it is real main-thread work removed, on a phone,
+for the whole of a drive — but it is not the crackle fix.
+
+`node tools/frame_transport_selftest.js` drives every failure above against a
+fake socket, a fake camera and a canvas whose `toBlob` never calls back, in
+about a second and with no server.
+
+---
+
 ## 5. WebRTC video-track ingest (item 1b) — assessed, not built
 
 The punch list asks for this to be assessed as the v2 path to a true 20–30 fps

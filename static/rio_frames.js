@@ -230,6 +230,10 @@
     var stats = {
       sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
       skipped_capture: 0, bytes: 0, dropped_server: 0,
+      // Which thread did the encode. A drive that is entirely on_thread is a
+      // drive where the worker never came up, which is worth knowing before
+      // the crackle is blamed on something else.
+      encoded_off_thread: 0, encoded_on_thread: 0,
       ages: [], rtts: []
     };
 
@@ -377,6 +381,87 @@
       try { ws.send(JSON.stringify({ op: 'ping', c: epochSec(now()) })); } catch (e) {}
     }
 
+    /* ---------------- the encoder worker ---------------------------------
+     *
+     * THE ENCODE IS NOT ON THIS THREAD ANY MORE, WHERE IT CAN BE.
+     *
+     * drawImage + toBlob + arrayBuffer, ten to fifteen times a second, on the
+     * same thread as the media pipeline that feeds the <audio> element the
+     * output bus plays out of. None of it is slow in isolation and all of it
+     * lands in the same place: a main thread that stalls for 20 ms at the
+     * wrong moment is a jitter buffer that runs dry, which is a crackle. See
+     * the note at the top of rio_output.js.
+     *
+     * `createImageBitmap(videoEl)` is a GPU-side copy that transfers to a
+     * worker with no serialisation; everything after it happens over there.
+     *
+     * AND IT IS ALWAYS ALLOWED NOT TO EXIST. OffscreenCanvas, transferable
+     * ImageBitmaps and Workers are not everywhere, and a browser without them
+     * takes exactly the path this file has always taken. The worker is PROVED
+     * with a ping before a single frame is trusted to it, because a worker
+     * that failed to load looks identical to one that is merely slow. */
+    var worker = null;
+    var workerReady = false;
+    var workerJobs = {};
+    var workerJobSeq = 0;
+    var workerMisses = 0;
+
+    function workerUsable() {
+      return !!(cfg.encoderUrl !== null && root.Worker && root.OffscreenCanvas
+                && root.createImageBitmap);
+    }
+
+    function startWorker() {
+      if (worker || !workerUsable()) return;
+      try {
+        worker = new root.Worker(cfg.encoderUrl || '/static/rio_frame_encoder.js');
+      } catch (e) { worker = null; return; }
+      worker.onmessage = function (e) {
+        var m = e.data || {};
+        if (m.op === 'pong') {
+          workerReady = true;
+          note('FRAMES_ENCODER_READY', {});
+          return;
+        }
+        var job = workerJobs[m.seq];
+        if (!job) return;
+        delete workerJobs[m.seq];
+        if (m.op === 'frame' && m.bytes) job.resolve(new Uint8Array(m.bytes));
+        else job.resolve(null);
+      };
+      worker.onerror = function () {
+        /* A worker that cannot run is not a failure to report loudly: the
+           encode simply happens here instead, exactly as it always did. */
+        note('FRAMES_ENCODER_LOST', {});
+        workerReady = false;
+        try { worker.terminate(); } catch (e) {}
+        worker = null;
+        for (var k in workerJobs) { workerJobs[k].resolve(null); }
+        workerJobs = {};
+      };
+      try { worker.postMessage({ op: 'ping' }); } catch (e) {}
+    }
+
+    /* One frame, encoded over there. Resolves null on any failure at all, and
+       the caller then takes the main-thread path for that frame. */
+    function encodeOffThread(el, w, h) {
+      if (!worker || !workerReady) return Promise.resolve(null);
+      var seq = ++workerJobSeq;
+      return root.createImageBitmap(el).then(function (bitmap) {
+        return new Promise(function (resolve) {
+          workerJobs[seq] = { resolve: resolve };
+          try {
+            worker.postMessage({ op: 'encode', seq: seq, bitmap: bitmap,
+                                 w: w, h: h, quality: quality }, [bitmap]);
+          } catch (e) {
+            delete workerJobs[seq];
+            try { bitmap.close(); } catch (x) {}
+            resolve(null);
+          }
+        });
+      }, function () { return null; });
+    }
+
     /* ---------------- capture -------------------------------------------- */
 
     /* Downscale on the way out. The camera hands over 1280x720 or better; the
@@ -462,6 +547,16 @@
 
     /* ONE TICK. Returns without taking a picture whenever taking one would
        mean queueing it — which is most of what this function is. */
+    /* The output size, which both encode paths need and only one of them used
+       to compute. */
+    function outSize(el) {
+      if (!el || !el.videoWidth || !el.videoHeight) return null;
+      var w = el.videoWidth, h = el.videoHeight;
+      var scale = Math.min(1, tuning.max_side_px / Math.max(w, h));
+      return { w: Math.max(2, Math.round(w * scale)),
+               h: Math.max(2, Math.round(h * scale)) };
+    }
+
     async function once() {
       if (mode === 'ws') {
         if (!wsOpen) { stats.skipped_buffer++; return; }
@@ -484,21 +579,63 @@
       }
 
       var el = element();
-      var cv = grab(el);
-      if (!cv) { stats.skipped_capture++; return; }
-      // THE CAPTURE INSTANT. Taken after drawImage, which is when the pixels
-      // were actually read out of the element, and before the encode, which
-      // is part of the age and not outside it.
-      var capturedAt = now();
-      var blob = await withBudget(toBlob(cv), tickBudgetMs, 'encode');
-      if (!blob) { stats.skipped_capture++; return; }
+      var size = outSize(el);
+      if (!size) { stats.skipped_capture++; return; }
+
+      /* THE WORKER PATH FIRST, when there is one. The capture instant is taken
+         after createImageBitmap for the same reason it used to be taken after
+         drawImage: that is when the pixels left the element. */
+      var body = null;
+      var capturedAt = null;
+      if (worker && workerReady) {
+        var jobId = workerJobSeq + 1;
+        var offP = encodeOffThread(el, size.w, size.h);
+        capturedAt = now();
+        body = await withBudget(offP, tickBudgetMs, 'worker_encode');
+        if (body) {
+          stats.encoded_off_thread++;
+          workerMisses = 0;
+        } else {
+          /* THE JOB IS ABANDONED, AND SO IS ITS SLOT. A timed-out encode
+             leaves an entry in workerJobs holding a resolver nobody will call,
+             and the ImageBitmap it was transferred is held with it — a
+             megabyte of GPU memory per lost frame. */
+          delete workerJobs[jobId];
+          /* ...AND A WORKER THAT KEEPS MISSING IS STOOD DOWN. Falling back
+             costs a whole tick budget before the main-thread path even
+             starts, so paying that on every frame is worse than never having
+             had a worker. */
+          if (++workerMisses >= 3) {
+            note('FRAMES_ENCODER_LOST', { misses: workerMisses });
+            workerReady = false;
+            try { worker.terminate(); } catch (e) {}
+            worker = null;
+            workerJobs = {};
+          }
+        }
+      }
+
+      if (!body) {
+        var cv = grab(el);
+        if (!cv) { stats.skipped_capture++; return; }
+        // THE CAPTURE INSTANT. Taken after drawImage, which is when the pixels
+        // were actually read out of the element, and before the encode, which
+        // is part of the age and not outside it.
+        capturedAt = now();
+        var blob = await withBudget(toBlob(cv), tickBudgetMs, 'encode');
+        if (!blob) { stats.skipped_capture++; return; }
+        var bytes0 = await withBudget(blob.arrayBuffer(), tickBudgetMs, 'arraybuffer');
+        if (!bytes0) { stats.skipped_capture++; return; }
+        body = new Uint8Array(bytes0);
+        stats.encoded_on_thread++;
+      }
 
       var s = speed();
       var capServer = (offsetSec === null) ? null : (epochSec(capturedAt) + offsetSec);
       seq++;
       stats.sent++;
-      stats.bytes += blob.size;
-      adaptQuality(blob.size);
+      stats.bytes += body.length;
+      adaptQuality(body.length);
 
       if (mode === 'ws' && wsOpen) {
         var header = JSON.stringify({
@@ -507,9 +644,6 @@
           src: safeSource()
         });
         var hbytes = new TextEncoder().encode(header);
-        var bytes = await withBudget(blob.arrayBuffer(), tickBudgetMs, 'arraybuffer');
-        if (!bytes) { stats.skipped_capture++; return; }
-        var body = new Uint8Array(bytes);
         var out = new Uint8Array(4 + hbytes.length + body.length);
         new DataView(out.buffer).setUint32(0, hbytes.length, false);
         out.set(hbytes, 4);
@@ -525,7 +659,7 @@
       lastSentAt = now();
       try {
         var fd = new FormData();
-        fd.append('image', blob, 'frame.jpg');
+        fd.append('image', new Blob([body], { type: 'image/jpeg' }), 'frame.jpg');
         fd.append('v_host', s.v === null ? '' : String(s.v));
         fd.append('v_host_age_s', String(s.age));
         if (capServer !== null) fd.append('cap_t', String(capServer));
@@ -694,7 +828,10 @@
       stallRecoveries = 0; tickOverruns = 0; watchedEl = null;
       setState('reconnecting', 'starting');
       stats = { sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
-                skipped_capture: 0, bytes: 0, dropped_server: 0, ages: [], rtts: [] };
+                skipped_capture: 0, bytes: 0, dropped_server: 0,
+                encoded_off_thread: 0, encoded_on_thread: 0, ages: [], rtts: [] };
+      workerMisses = 0;
+      startWorker();
       maxInflight = 1; ageEma = null; starvedByInflight = 0;
       openSocket();
       // The first tick waits for the socket's budget only if there is a socket
@@ -766,6 +903,9 @@
           skipped_buffer: stats.skipped_buffer,
           skipped_capture: stats.skipped_capture,
           dropped_server: stats.dropped_server,
+          encoded_off_thread: stats.encoded_off_thread,
+          encoded_on_thread: stats.encoded_on_thread,
+          encoder: worker ? (workerReady ? 'worker' : 'starting') : 'main',
           mean_bytes: stats.sent ? Math.round(stats.bytes / stats.sent) : null,
           frame_age_ms: { p50: pct(stats.ages, 0.5), p90: pct(stats.ages, 0.9),
                           p99: pct(stats.ages, 0.99), n: stats.ages.length },

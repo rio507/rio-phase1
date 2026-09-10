@@ -885,7 +885,17 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # phantom transcripts and output-bus health
                              "why", "text", "speaking", "since_audio_ms",
                              "covered", "context", "to_destination",
-                             "bus_failures", "fallbacks")})
+                             "bus_failures", "fallbacks",
+                             # ...and road noise: how many fragments one window
+                             # swallowed, how long it spanned, and how long
+                             # since the last "Didn't catch that".
+                             "n", "span_ms", "since_reply_ms",
+                             # THE LOOPBACK'S OWN NUMBERS. The four booleans
+                             # above are what this could say on 2026-09-09, and
+                             # they said the bus was fine -- which was true and
+                             # was not the question. Concealment, jitter depth
+                             # and clock drift are the question.
+                             "audio")})
         _cutoffs["recent"].append(rec)
         if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
             _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]

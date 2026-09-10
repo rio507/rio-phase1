@@ -497,9 +497,208 @@ def run_unlock(page):
        "and no element was left holding the silent buffer")
 
 
+# ---------------------------------------------------------------------------
+# THE SOAK: ten minutes of loopback, and what the two clocks did to each other
+# ---------------------------------------------------------------------------
+# The complaint after the drive of 2026-09-09 was that the iPhone speaker
+# starts crackling after a few minutes, and LIVE_BUS_HEALTH -- added for
+# exactly that question -- reported ONCE in 656 seconds: covered true, context
+# running, zero failures, zero fallbacks. A complete answer to "did the bus
+# fail" and no answer at all to the question being asked.
+#
+# What was missing is continuous, not boolean. The loopback has two independent
+# clocks in it: the AudioContext renders on its own and the <audio> element
+# plays out on the audio device's. A receiver absorbs the difference in its
+# jitter buffer, and a jitter buffer with a steady bias either grows without
+# bound or runs dry -- and running dry is concealment, which on speech is
+# exactly the sound described. A few parts per million is inaudible at sixty
+# seconds and a hundred milliseconds of error by the fifth minute, which is why
+# the complaint has the shape it has.
+#
+# THIS IS THE TEST THAT CAN SEE IT, and it can only be this shape: a short
+# check cannot observe a fault whose whole character is that it accumulates.
+# Ten minutes of real loopback in a real browser, sampling pcB.getStats() and
+# the two clocks once a second, with audio actually flowing -- silence gives
+# the receiver nothing to conceal and would pass while proving nothing.
+#
+# Headless Chromium is not an iPhone. What it can show is that the mechanism
+# holds over the timescale the fault has, and that the numbers now exist to
+# ask.
+SOAK_START = """
+() => {
+  window.__soak = { samples: [], events: [] };
+  RIO.output.onEvent((kind, detail) => {
+    window.__soak.events.push({ kind: kind, detail: detail,
+                                at: Math.round(performance.now()) });
+  });
+  return true;
+}
+"""
+
+# AUDIO, NOT SILENCE. A clip every few seconds, so the receiver has speech to
+# conceal when its buffer runs dry -- concealment during silence is concealed
+# with more silence and is counted separately by the spec for that reason.
+SOAK_TICK = """
+async (url) => {
+  const o = RIO.output;
+  const st = o.state();
+  window.__soak.samples.push({
+    at: Math.round(performance.now()),
+    h: Object.assign({}, st.health),
+    covered: !!st.covered, context: st.context,
+  });
+  return st.health;
+}
+"""
+
+SOAK_PLAY = """
+async (url) => {
+  try { await RIO.output.playUrl(url).play(); } catch (e) {}
+  return true;
+}
+"""
+
+
+def run_soak(page, clip, seconds):
+    section(f"{seconds / 60:.0f} minutes of loopback — underruns and drift")
+    page.evaluate(SOAK_START)
+
+    t = 0
+    step = 2
+    while t < seconds:
+        # One clip about every six seconds, so there is speech in the buffer
+        # rather than a silence the receiver can conceal for free.
+        if t % 6 == 0:
+            page.evaluate(SOAK_PLAY, clip)
+        page.evaluate("async () => { await RIO.output.sample(); }")
+        page.evaluate(SOAK_TICK, clip)
+        page.wait_for_timeout(step * 1000)
+        t += step
+
+    data = page.evaluate("() => window.__soak")
+    samples = [s for s in data["samples"] if s.get("h")]
+    if not samples:
+        ok(False, "the soak collected samples")
+        return
+
+    last = samples[-1]["h"]
+    span_s = (samples[-1]["at"] - samples[0]["at"]) / 1000.0
+    drifts = [abs(s["h"].get("drift_ms") or 0) for s in samples]
+    jitters = [s["h"].get("jitter_ms") for s in samples
+               if s["h"].get("jitter_ms") is not None]
+    growth = [abs(s["h"].get("jitter_growth_ms") or 0) for s in samples]
+    resyncs = [e for e in data["events"] if e["kind"] == "resync"]
+
+    print(f"    {len(samples)} samples over {span_s:.0f} s")
+    print(f"    sample rate        {last.get('sample_rate')} Hz")
+    print(f"    concealed samples  {last.get('concealed_total')} over the run "
+          f"(events {last.get('concealment_events_total')}); "
+          f"{last.get('concealed')} on the current loopback")
+    print(f"    stretched/dropped  +{last.get('inserted')} / "
+          f"-{last.get('removed')}")
+    print(f"    packets lost       {last.get('packets_lost')}")
+    print(f"    jitter buffer      {last.get('jitter_ms')} ms "
+          f"(moved {last.get('jitter_growth_ms')} ms, "
+          f"max {max(growth) if growth else 0} ms)")
+    print(f"    drift (net)        {last.get('drift_ms')} ms "
+          f"({last.get('drift_ppm')} ppm) — from inserted/removed samples")
+    print(f"    device clock delta {last.get('clock_delta_ms')} ms "
+          f"({last.get('clock_delta_ppm')} ppm) — advisory; no speaker here")
+    whys = {}
+    for e in resyncs:
+        w = e["detail"].get("why", "?")
+        whys[w] = whys.get(w, 0) + 1
+    backoffs = [e for e in data["events"] if e["kind"] == "resync_backoff"]
+    print(f"    resyncs            {len(resyncs)} "
+          f"({', '.join(f'{v}x {k}' for k, v in whys.items()) or 'none needed'}), "
+          f"backed off {len(backoffs)}x to "
+          f"{last.get('resync_backoff_ms')} ms")
+
+    ok(last.get("sample_rate") == 48000,
+       f"the context runs at the rate the loopback encodes at "
+       f"({last.get('sample_rate')} Hz) — no resampler in front of opus")
+
+    # DRIFT, BOUNDED, and this is the number the fix is about.
+    # 
+    # Measured by the jitter buffer rather than by the two clocks: every
+    # sample the receiver invented to slow down or discarded to speed up is a
+    # sample of accumulated clock difference it had to absorb, and the net is
+    # the drift in milliseconds. See the note by `drift_ms` in rio_output.js
+    # for why the obvious measurement (ctx.currentTime against
+    # sinkEl.currentTime) is not the one asserted: it reads the OUTPUT
+    # DEVICE's clock, and a container has no output device.
+    # 
+    # Measured here, idle, over sixty seconds: 16.3 ms of net correction,
+    # about 270 ppm. Over ten minutes that is ~160 ms of accumulated
+    # difference with nothing to reset it — which is the timescale the
+    # complaint has, and is what the resync exists to keep bounded.
+    per_min = abs(last.get("drift_ms") or 0) / max(1.0, span_s / 60.0)
+    ok(per_min < 60,
+       f"drift stayed bounded: {last.get('drift_ms')} ms net over {span_s:.0f} s "
+       f"({per_min:.0f} ms/min, {last.get('drift_ppm')} ppm)")
+    ok(max(growth) < 150 if growth else True,
+       f"and the jitter buffer did not run away: max "
+       f"{max(growth) if growth else 0} ms of movement")
+    ok((last.get("packets_lost") or 0) == 0,
+       f"nothing was lost on a connection that never leaves the device "
+       f"({last.get('packets_lost')})")
+
+    # CONCEALMENT. NOT ASSERTED AGAINST ZERO, and the reason is measured
+    # rather than assumed.
+    # 
+    # This container conceals audio with the page completely idle: 91,006
+    # samples over sixty seconds with nothing running but the loopback. It is
+    # not the mechanism — a controlled pair of runs, one with a 22 ms
+    # main-thread spin every 160 ms standing in for the frame loop and one
+    # with nothing, came back 88,356 against 91,006 with identical drift and
+    # identical inserted/removed counts. Main-thread work does not move it,
+    # because Chromium renders WebAudio on its own thread and receives RTP on
+    # another. What moves it is having no audio output device, which is what a
+    # container is.
+    # 
+    # So the assertion is the one the environment cannot fake: concealment
+    # must not ACCELERATE. A steady floor is the null sink; a rate that climbs
+    # through the run is a buffer losing ground, which is the fault.
+    # ...on the RUNNING TOTAL, because the per-link counter resets on every
+    # rebuild and comparing thirds of it compares different peer connections.
+    thirds = max(1, len(samples) // 3)
+    at1 = samples[thirds - 1]["h"].get("concealed_total") or 0
+    at2 = samples[2 * thirds - 1]["h"].get("concealed_total") or 0
+    early_rate = at1
+    late_rate = (last.get("concealed_total") or 0) - at2
+    ok(late_rate <= max(early_rate * 2, 48000),
+       f"concealment did not accelerate: {early_rate} samples in the first "
+       f"third, {late_rate} in the last")
+
+    # AND THE CURE STOPPED WHEN IT STOPPED WORKING. Twenty-five rebuilds in
+    # thirteen minutes, which is what this did before the backoff, is not a fix
+    # for a crackle -- it is a second source of them.
+    ok(len(resyncs) <= 8,
+       f"the resync did not run away: {len(resyncs)} rebuild(s) in "
+       f"{span_s:.0f} s")
+
+    ok(all(s["covered"] for s in samples),
+       "the loopback carried the audio for every sample of it")
+    ok(all(s["context"] == "running" for s in samples),
+       "and the context never suspended")
+    fails = [e for e in data["events"] if e["kind"] == "resync_failed"]
+    ok(not fails,
+       f"no resync failed for want of a primed sink element ({len(fails)})")
+    # AND THE CURE RAN, WITHOUT A GAP. A resync that never fires over ten
+    # minutes proves nothing about a resync; one that fires and leaves the bus
+    # uncovered for a sample would be worse than the drift.
+    if resyncs:
+        ok(all(s["covered"] for s in samples),
+           f"{len(resyncs)} resync(s) happened and not one of them left the "
+           f"bus uncovered — make before break")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8888/")
+    ap.add_argument("--soak-s", type=float, default=0.0,
+                    help="run the long loopback soak for this many seconds "
+                         "(600 is the acceptance run)")
     args = ap.parse_args()
 
     try:
@@ -592,6 +791,8 @@ def main():
         run_unlock(page)
         run_bus_watch(page, errors)
         run_connect_cancel(page, errors)
+        if args.soak_s > 0:
+            run_soak(page, clip, args.soak_s)
 
         ok(not errors, "no uncaught page errors" +
            ("" if not errors else ": " + "; ".join(errors[:3])))

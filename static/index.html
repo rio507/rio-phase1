@@ -2057,7 +2057,16 @@ window.RIO = (function () {
          that iOS will not start outside a tap either. Failing here is not
          fatal — every caller keeps the element path it already had. */
       try {
-        if (window.RIO && RIO.output) RIO.output.unlock();
+        if (window.RIO && RIO.output) {
+          RIO.output.unlock();
+          /* BOTH sink elements, played inside this tap. The loopback drifts
+             against the output device's clock over minutes and is rebuilt onto
+             the SPARE sink to cure it — and iOS will not start an element from
+             a timer unless it has been played once inside a gesture. An
+             unprimed spare is a resync that silently fails every time, three
+             minutes into every drive, which is exactly when it is needed. */
+          if (RIO.output.prime) RIO.output.prime(silentWavUrl());
+        }
       } catch (e) { /* the bus stays down; audio still plays the old way */ }
     },
     playReply(player, blob) {
@@ -2667,6 +2676,8 @@ function reportLive(ev) {
           to_destination: ev.to_destination === undefined ? null : ev.to_destination,
           bus_failures: ev.bus_failures === undefined ? null : ev.bus_failures,
           fallbacks: ev.fallbacks === undefined ? null : ev.fallbacks,
+          // The loopback's own numbers: concealment, jitter depth, clock drift.
+          audio: ev.audio || null,
           by: ev.by || ev.second || null,
         },
       }),
@@ -2694,15 +2705,36 @@ function reportLive(ev) {
  * so afterwards. */
 let busWatch = null;
 let busLast = '';
+let busLastAt = 0;
+/* How often the numbers go up even when nothing changed. A drift trend is the
+   only shape this fault has, and a trend needs more than one point. */
+const BUS_HEARTBEAT_MS = 60000;
 
 function busHealth(force) {
   if (!(window.RIO && RIO.output && RIO.output.state)) return;
   let st;
   try { st = RIO.output.state(); } catch (e) { return; }
+  /* ON CHANGE, AND THAT WAS THE PROBLEM WITH IT.
+   *
+   * The four booleans below change once a drive if they change at all, so
+   * session 738fbb82 posted exactly ONE bus_health event in 656 seconds --
+   * which is a complete answer to "did the bus fail" (no) and no answer at all
+   * to "why is the speaker crackling". The numbers that were missing are
+   * continuous, not boolean: the receiver's concealment, the jitter buffer's
+   * depth, and the distance between the two clocks.
+   *
+   * So: still on change for the booleans, and ALSO on a slow heartbeat, so a
+   * drive carries a series rather than a single frame. A minute apart is
+   * nothing next to a drive and is enough to see a drift trend, which is the
+   * only shape this fault has. */
+  const h = st.health || {};
   const key = [st.covered, st.ready, st.context, st.to_destination,
-               (st.stats || {}).bus_failures, (st.stats || {}).fallbacks].join('|');
-  if (!force && key === busLast) return;
+               (st.stats || {}).bus_failures, (st.stats || {}).fallbacks,
+               h.resyncs, h.resync_failures, h.resync_backoff_ms].join('|');
+  const due = (performance.now() - busLastAt) >= BUS_HEARTBEAT_MS;
+  if (!force && key === busLast && !due) return;
   busLast = key;
+  busLastAt = performance.now();
   reportLive({
     type: 'LIVE_BUS_HEALTH',
     covered: !!st.covered,
@@ -2710,12 +2742,28 @@ function busHealth(force) {
     to_destination: !!st.to_destination,
     bus_failures: (st.stats || {}).bus_failures || 0,
     fallbacks: (st.stats || {}).fallbacks || 0,
+    // ...and what the loopback is actually doing to her voice.
+    audio: {
+      sample_rate: h.sample_rate, jitter_ms: h.jitter_ms,
+      jitter_growth_ms: h.jitter_growth_ms,
+      drift_ms: h.drift_ms, drift_ppm: h.drift_ppm,
+      clock_delta_ms: h.clock_delta_ms, clock_delta_ppm: h.clock_delta_ppm,
+      concealed: h.concealed_total, concealment_events: h.concealment_events_total,
+      concealed_link: h.concealed,
+      inserted: h.inserted, removed: h.removed,
+      total_samples: h.total_samples, packets_lost: h.packets_lost,
+      base_latency_ms: h.base_latency_ms, output_latency_ms: h.output_latency_ms,
+      resyncs: h.resyncs, resync_failures: h.resync_failures,
+      resync_backoff_ms: h.resync_backoff_ms,
+      since_s: h.since_s, samples: h.samples,
+    },
   });
 }
 
 function startBusWatch() {
   if (busWatch !== null) return;
   busLast = '';
+  busLastAt = 0;
   busHealth(true);                       // the opening state, always recorded
   busWatch = setInterval(busHealth, 1000);
 }
@@ -3512,8 +3560,14 @@ document.addEventListener('DOMContentLoaded', () => {
   function unlock() {
     if (unlocked) return;
     unlocked = true;
-    // The shared output wants the same gesture these elements do.
-    try { if (window.RIO && RIO.output) RIO.output.unlock(); } catch (e) {}
+    // The shared output wants the same gesture these elements do — and so
+    // does its spare sink, which a resync will need minutes from now.
+    try {
+      if (window.RIO && RIO.output) {
+        RIO.output.unlock();
+        if (RIO.output.prime) RIO.output.prime(RIO.silentAudioUrl());
+      }
+    } catch (e) {}
     const els = CLIP_IDS.map(id => clips[id]).concat([tts]);
     els.forEach(a => primeSilently(a));
   }
@@ -4371,8 +4425,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // session on every other call and it is what puts it on this one.
     const wsUrl = (loc.protocol === 'https:' ? 'wss://' : 'ws://')
       + loc.host + RIO.url('/headway_ws');
+    const encoderEl = document.getElementById('encoderjs');
     stream = RIO.frames.create({
       wsUrl: wsUrl,
+      // The stamped worker URL; see the note by #encoderjs. Null would mean
+      // "no worker", which is not what a missing element should mean — the
+      // transport's own default is the unstamped path and still correct.
+      encoderUrl: (encoderEl && encoderEl.getAttribute('src')) || undefined,
       postUrl: RIO.url('/headway_frame'),
       element: elFn,
       speed: speed,
@@ -5175,6 +5234,15 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_realtime.js"></script>
 <script src="/static/rio_speak.js"></script>
 <script src="/static/rio_frames.js"></script>
+<!-- THE ENCODER WORKER'S URL, STAMPED LIKE EVERY OTHER ASSET.
+     `new Worker('/static/rio_frame_encoder.js')` is a fetch the page makes at
+     runtime, so app._stamp_assets never sees it and a browser can hold
+     yesterday's encoder against today's transport — the exact two-programs
+     failure the stamping exists to prevent, in the one file it was going to
+     miss. A script tag with a type no browser executes is not run and IS
+     stamped, so the URL below is the versioned one and the transport reads it
+     off this element. -->
+<script id="encoderjs" type="text/rio-worker" src="/static/rio_frame_encoder.js"></script>
 <script src="/static/rio_navcore.js"></script>
 <script src="/static/rio_navplan.js"></script>
 <script src="/static/rio_nav.js"></script>
