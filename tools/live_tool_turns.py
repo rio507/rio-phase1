@@ -697,6 +697,27 @@ def report_drive(turn, notes, t0):
     audio = [n for n in notes if n.get("note") == "nav_audio"]
     other = [n["ev"]["type"] for n in notes if n.get("note") == "nav"
              and not n["ev"].get("call_type")]
+    # WHERE EACH MANEUVER SITS ON THE ROUTE, so a tier that was never
+    # REACHABLE can be told from one that was reached late.
+    #
+    # NAV_MANEUVER_SELECTED carries `along_m`. The road available for a
+    # maneuver's approach is the distance from the one before it -- or from the
+    # start of the route for the first -- and a maneuver whose leg is shorter
+    # than its own tier does not become the active maneuver until the car is
+    # already inside that tier. "Landed at the tier" is then not a thing that
+    # can be true of it, and flagging it late is flagging a fiction. Same
+    # carve-out tools/nav_drive_replay.js makes in its cadence table.
+    along = {}
+    for n in notes:
+        ev = n.get("ev") or {}
+        if n.get("note") == "nav" and ev.get("type") == "NAV_MANEUVER_SELECTED":
+            if ev.get("along_m") is not None:
+                along[ev.get("maneuver_id")] = float(ev["along_m"])
+    ordered = sorted(along.items(), key=lambda kv: kv[1])
+    legs, prev_at = {}, 0.0
+    for mid, at in ordered:
+        legs[mid] = at - prev_at
+        prev_at = at
     calls = spoken or planned
     imminent = []
     print(f"\n  [driving {turn['drive_s']:.0f}s]   ({turn['want']})")
@@ -708,9 +729,24 @@ def report_drive(turn, notes, t0):
         # the number on every call. Printing it is the difference between a
         # recording that proves the turns were CALLED and one that proves they
         # were called WHERE THEY SHOULD BE.
-        ladder = config.NAV_TIER_DISTANCES_M.get(
-            c.get("road_class") or "SURFACE") or {}
-        floor = ladder.get(c.get("call_type"))
+        # THE TIER THE ROUTE ITSELF CARRIED, not one re-derived from config.
+        # The planner puts `at_m` on every call it makes, off
+        # `maneuver.speech.tiers` -- which is what the SERVER wrote for that
+        # maneuver's road class. Reading config here instead would print the
+        # table this process happens to hold, which is a different claim and
+        # is silently wrong the moment a route was built before a change.
+        floor = c.get("at_m")
+        if floor is None:
+            for q in planned:
+                if (q.get("maneuver_id") == c.get("maneuver_id")
+                        and q.get("call_type") == c.get("call_type")
+                        and q.get("at_m") is not None):
+                    floor = q.get("at_m")
+                    break
+        if floor is None:
+            ladder = config.NAV_TIER_DISTANCES_M.get(
+                c.get("road_class") or "SURFACE") or {}
+            floor = ladder.get(c.get("call_type"))
         # THE DISTANCE LIVES ON THE PLANNER'S EVENT, NOT THE ARBITER'S.
         # The planner knows where the car was when it decided the call was
         # due and puts to_maneuver_m on EARLY_GUIDANCE/NEAR_TURN/etc;
@@ -724,19 +760,58 @@ def report_drive(turn, notes, t0):
                 if (q.get("maneuver_id") == c.get("maneuver_id")
                         and q.get("call_type") == c.get("call_type")):
                     m = q.get("to_maneuver_m")
+                    fill = {}
                     if c.get("tta_s") is None and q.get("tta_s") is not None:
-                        c = dict(c, tta_s=q.get("tta_s"))
+                        fill["tta_s"] = q.get("tta_s")
+                    # ...AND THE SPEED, which the lateness tolerance is a
+                    # function of. Without it every call was judged against a
+                    # 15 m floor, and one tick at 25 mph is 11.2 m -- so a
+                    # call one tick late read as on time and one two ticks
+                    # late read as one.
+                    if c.get("speed_ms") is None and q.get("speed_ms") is not None:
+                        fill["speed_ms"] = q.get("speed_ms")
+                    if fill:
+                        c = dict(c, **fill)
                     break
         where = ""
         if m is not None:
             where = f"  @ {float(m):6.1f} m"
             if floor:
-                where += f"  (floor {floor:.0f} m)"
+                # WHERE IT WAS DUE, WHERE IT LANDED, AND THE DIFFERENCE --
+                # which is the whole of a cadence review and is what the
+                # replay's table prints. One tick of travel is the allowance:
+                # a threshold is only ever CHECKED on a tick, so a call fires
+                # on the first tick at or inside its distance.
+                d = float(m) - float(floor)
+                tick = max(15.0, float(c.get("speed_ms") or 0) * 2)
+                leg = legs.get(c.get("maneuver_id"))
+                # No room for this tier on this leg: the call could not have
+                # been made at it, and was not late for not being.
+                cramped = leg is not None and leg < float(floor) + tick
+                flag = ""
+                if d < -tick:
+                    flag = "  <-- no room on a %.0f m leg" % leg if cramped \
+                           else "  <-- LATE"
+                where += (f"  (due {float(floor):.0f} m, "
+                          f"{'+' if d >= 0 else ''}{d:.0f} m{flag})")
             if c.get("tta_s") is not None:
                 where += f"  {float(c['tta_s']):.1f}s out"
         print(f"      {c.get('call_type'):>8}  {c.get('text')!r}"
               + (f"  ({c.get('anchor_label')})" if c.get("anchor_label") else "")
               + where)
+    # A SUPPRESSED CALL IS A DECISION, and it was invisible here: the >10 s
+    # rule drops a junction confirmation whenever the near call was recent
+    # enough that repeating it would be noise, and "she did not say it" and
+    # "she decided not to say it" are different findings.
+    for q in planned:
+        if not q.get("skipped"):
+            continue
+        detail = q.get("skipped")
+        if q.get("since_near_s") is not None:
+            detail += f", {q['since_near_s']}s since the near call"
+        print(f"      {str(q.get('call_type')):>8}  (not said: {detail})"
+              + (f"  @ {float(q['to_maneuver_m']):6.1f} m"
+                 if q.get("to_maneuver_m") is not None else ""))
     if len(planned) != len(spoken):
         print(f"      planned {len(planned)}, spoken {len(spoken)}")
     if audio:
