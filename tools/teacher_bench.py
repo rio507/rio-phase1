@@ -57,6 +57,11 @@ FP8_PATHS = {
 }
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# The pod this has to live on, and what is already on it. Stated here so the
+# table's verdict is arithmetic anyone can check rather than a judgement.
+L40S_GB = 48
+RIO_GB = 18
+
 
 def make_keyframe(n=4, w=640, h=480):
     """One synthetic keyframe, identical for every run of every model.
@@ -154,7 +159,8 @@ def bench_one(model, precision, runs, port=None, weights=None, keep=False):
             out["error"] = health.get("load_error") or health.get("error") \
                 or "did not load"
             return out
-        out["vram_after_load_mb"] = health.get("vram_reserved_mb")
+        out["weights_mb"] = health.get("weights_mb")
+        out["vram_after_load_mb"] = health.get("vram_now_mb")
         out["model_id"] = health.get("model_id")
         out["revision"] = health.get("revision")
 
@@ -175,6 +181,7 @@ def bench_one(model, precision, runs, port=None, weights=None, keep=False):
                    "latency_ms": res.get("latency_ms"),
                    "timings_ms": res.get("timings_ms"),
                    "vram_reserved_mb": (res.get("gpu") or {}).get("vram_reserved_mb"),
+                   "vram_now_mb": (res.get("gpu") or {}).get("vram_now_mb"),
                    "vram_peak_mb": (res.get("gpu") or {}).get("vram_peak_mb"),
                    "error": res.get("error")}
             if i == 0:
@@ -220,9 +227,9 @@ def summarise(out):
 def render(results):
     """The table, in Markdown, because that is what a report needs."""
     lines = [
-        "| model | precision | weights VRAM after load | VRAM peak in use | "
-        "latency p50 | p90 | load |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| model | precision | weights | held between keyframes | "
+        "peak in inference | latency p50 | p90 | load |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for r in results:
         if r.get("error"):
@@ -231,19 +238,42 @@ def render(results):
             continue
         lines.append(
             f"| {r['model']} | {r['precision']} | "
+            f"{r.get('weights_mb', '—')} MB | "
             f"{r.get('vram_after_load_mb', '—')} MB | "
             f"{r.get('vram_reserved_mb', '—')} MB | "
             f"{r.get('latency_p50_ms', '—')} ms | "
             f"{r.get('latency_p90_ms', '—')} ms | "
             f"{r.get('load_s', '—')} s |")
-    total = {}
+    total, weights = {}, {}
     for r in results:
         p = r["precision"]
+        if r.get("vram_reserved_mb"):
+            total[p] = total.get(p, 0) + r["vram_reserved_mb"]
+        if r.get("weights_mb"):
+            weights[p] = weights.get(p, 0) + r["weights_mb"]
+    for p in sorted(total):
+        lines.append(f"| **both** | **{p}** | **{round(weights.get(p, 0))} MB** "
+                     f"| | **{round(total[p])} MB** | | | |")
+
+    # THE QUESTION THIS TOOL EXISTS TO ANSWER, answered rather than left as an
+    # exercise. A budget is a peak, not a weight: a model that holds 10 GB and
+    # balloons to 20 GB during inference needs 20 GB of card.
+    lines += ["", f"**Does it fit on an L40S?** {L40S_GB} GB, of which RIO's "
+                  f"live stack (Qwen3-VL-8B, Depth-Anything, UFLDv2, RF-DETR) "
+                  f"holds about {RIO_GB} GB — so roughly "
+                  f"{L40S_GB - RIO_GB} GB is available.", ""]
+    budget_mb = (L40S_GB - RIO_GB) * 1024
+    for p in sorted(total):
+        fits = total[p] <= budget_mb
+        lines.append(f"- both at **{p}**: {round(total[p])} MB peak — "
+                     f"{'fits' if fits else 'DOES NOT FIT'}")
+    for r in results:
         v = r.get("vram_reserved_mb")
-        if v:
-            total[p] = total.get(p, 0) + v
-    for p, v in sorted(total.items()):
-        lines.append(f"| **both** | **{p}** | | **{round(v)} MB** | | | |")
+        if not v:
+            continue
+        lines.append(f"- {r['model']} alone at **{r['precision']}**: "
+                     f"{round(v)} MB peak — "
+                     f"{'fits' if v <= budget_mb else 'DOES NOT FIT'}")
     return "\n".join(lines)
 
 

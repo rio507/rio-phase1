@@ -194,7 +194,7 @@ def vram_mb():
 
 
 def vram_reserved_mb():
-    """What the process is HOLDING, which is the number that fills a card.
+    """The PEAK the allocator has ever reserved, since the last reset.
 
     Different from max_memory_allocated on purpose: the allocator keeps freed
     blocks, so "how much does this model need" and "how much of the GPU is
@@ -210,6 +210,44 @@ def vram_reserved_mb():
         return 0.0
 
 
+def vram_now_mb():
+    """What the process is holding RIGHT NOW.
+
+    THE NUMBER AN L40S BUDGET ACTUALLY NEEDS, and it is not the same as the
+    peak. `max_memory_reserved` is a high-water mark that is never reset, so it
+    includes whatever the LOAD spiked to -- and loading an FP8 checkpoint
+    spikes hard, because compressed-tensors materialises each layer before
+    placing it. Reporting only the peak made FP8 look like it needed MORE card
+    than BF16 while its weights are a third smaller, which is true of the load
+    and false of the drive.
+
+    So: three numbers, and they answer three questions. `weights_mb` is what
+    the model costs to hold, `vram_now_mb` is what the process is sitting on
+    between keyframes, and `vram_reserved_mb` is the worst it has ever been.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0.0
+        return round(torch.cuda.memory_reserved() / (1024 ** 2), 1)
+    except Exception:
+        return 0.0
+
+
+def reset_vram_peak():
+    """Forget the load's high-water mark, so inference is measured on its own."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            return True
+    except Exception:
+        pass
+    return False
+
+
 class Service:
     """Subclass this: implement `load()`, `infer(payload)` and `describe()`."""
 
@@ -220,6 +258,7 @@ class Service:
         self.loaded = False
         self.load_error = None
         self.started_at = time.time()
+        self.weights_mb = None
         self.stats = {"infer": 0, "ok": 0, "failed": 0, "busy": 0,
                       "last_error": None, "last_latency_ms": None}
 
@@ -241,6 +280,11 @@ class Service:
             self.load()
             self.loaded = True
             self.load_error = None
+            # WHAT THE WEIGHTS COST, captured before a single inference has
+            # allocated anything -- and then the peak is reset, so every
+            # number after this describes the drive rather than the load.
+            self.weights_mb = vram_now_mb()
+            reset_vram_peak()
         except Exception as e:
             self.load_error = f"{type(e).__name__}: {e}"
             traceback.print_exc()
@@ -253,6 +297,7 @@ class Service:
              "inflight": self.bound.inflight, "queue_depth": self.bound.depth,
              "refused": self.bound.refused,
              "vram_peak_mb": vram_mb(), "vram_reserved_mb": vram_reserved_mb(),
+             "vram_now_mb": vram_now_mb(), "weights_mb": self.weights_mb,
              "stats": dict(self.stats)}
         d.update(self.describe())
         return d
@@ -277,7 +322,9 @@ class Service:
             self.stats["last_latency_ms"] = out["latency_ms"]
             out.setdefault("kf_id", payload.get("kf_id"))
             out["gpu"] = {"vram_peak_mb": vram_mb(),
-                          "vram_reserved_mb": vram_reserved_mb()}
+                          "vram_reserved_mb": vram_reserved_mb(),
+                          "vram_now_mb": vram_now_mb(),
+                          "weights_mb": self.weights_mb}
             out.update(self.describe())
             return out
 

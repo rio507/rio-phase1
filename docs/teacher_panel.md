@@ -542,6 +542,67 @@ A recipe check that invents its own inputs is not a check.
 and BF16 otherwise, so the L40S pod loads the quantized build and this one does
 not have to.
 
+## 10b. VRAM and latency — and why FP8 is off by default
+
+Measured on the H200 with `tools/teacher_bench.py --all`, one configuration at
+a time, over a fixed synthetic keyframe, first run discarded:
+
+| model | precision | weights | held between keyframes | peak in inference | p50 | p90 | load |
+|---|---|---|---|---|---|---|---|
+| Alpamayo 1.5 | bf16 | 21408 MB | 21408 MB | 21756 MB | 2857 ms | 3039 ms | 60 s |
+| Alpamayo 1.5 | fp8 | 14784 MB | 14784 MB | **25932 MB** | **18905 ms** | 19286 ms | 45 s |
+| Cosmos-Reason2 | bf16 | 16760 MB | 16760 MB | 17040 MB | 3633 ms | 4622 ms | 48 s |
+| Cosmos-Reason2 | fp8 | 10146 MB | 10146 MB | **19798 MB** | **5906 ms** | 7075 ms | 33 s |
+| **both** | **bf16** | **38168 MB** | | **38796 MB** | | | |
+| **both** | **fp8** | **24930 MB** | | **45730 MB** | | | |
+
+**FP8 makes both teachers worse here, and the weight saving is real but
+useless.** The checkpoints are correct — Alpamayo's weights drop 21.4 → 14.8 GB
+and Cosmos's 16.8 → 10.1 GB — but they are served through plain
+`transformers` + `compressed-tensors`, which **dequantizes on the fly**. So the
+peak *during inference* goes **up** (21.8 → 25.9 GB, 17.0 → 19.8 GB) and
+latency goes up with it: Cosmos 1.6× slower, Alpamayo **6.6×** slower.
+
+That is not a defect in the recipe. NVIDIA's own README says the deployment
+path is vLLM (`vllm>=0.11.0`), where the FP8 kernels are fused; the recipe is
+aimed there. In this serving path it is a pessimisation, so `boot.sh` now
+defaults to **BF16 even when an FP8 checkpoint exists**, and FP8 is opt-in via
+`TEACHERS_PRECISION=fp8`. The checkpoints stay on the volume because the moment
+either teacher is served through vLLM they become the right thing to load.
+
+Three VRAM numbers, not one, because they answer different questions — and
+because reporting only the peak initially made FP8 look like it needed *more*
+card than BF16 even at rest, which is true of the load and false of the drive.
+`max_memory_reserved` is a high-water mark that is never reset, and loading an
+FP8 checkpoint spikes hard while `compressed-tensors` materialises each layer.
+The service resets the peak once the weights are down, so every number after
+that describes the drive.
+
+### The L40S answer
+
+48 GB, of which RIO's live stack (Qwen3-VL-8B, Depth-Anything, UFLDv2, RF-DETR)
+holds about 18 GB — roughly **30 GB available**. A budget is a *peak*, not a
+weight: a model that holds 10 GB and balloons to 20 GB during inference needs
+20 GB of card.
+
+| | peak | fits in 30 GB? |
+|---|---|---|
+| both, bf16 | 38.8 GB | **no** |
+| both, fp8 | 45.7 GB | **no** |
+| Cosmos alone, bf16 | 17.0 GB | yes |
+| Alpamayo alone, bf16 | 21.8 GB | yes |
+
+**Both teachers do not fit on an L40S beside the live stack, at either
+precision, and FP8 does not change that** — it makes it worse. What fits is
+*one* teacher, at BF16. Cosmos alone leaves the most headroom (17.0 GB of 30);
+Alpamayo alone fits with 8 GB spare and is the one that also predicts a
+trajectory.
+
+The panel already degrades correctly into that shape: a teacher that is not
+running shows as not answering on the card, `/health` reports it degraded, and
+every corpus row records `models_ran` so a one-teacher drive is
+self-describing rather than silently different.
+
 ## 11. What is deliberately not here
 
 * **No training.** The corpus is schema'd so it can be one later.

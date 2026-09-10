@@ -323,10 +323,24 @@ teachers_build() {
         # --no-install-package flash-attn: flash-attn compiles from source
         # against nvcc and takes half an hour. The upstream README documents
         # SDPA as the supported fallback and the service asks for it by name.
+        # compressed-tensors is added AFTER the sync, with torch and
+        # transformers named explicitly so the resolver cannot move them. It is
+        # what LOADS an FP8 checkpoint -- without it the service starts fine at
+        # BF16 and fails with "compressed_tensors is not installed" the moment
+        # a quantized checkpoint appears on the volume, which is exactly when
+        # nobody is expecting a new failure.
+        #
+        # Explicit pins because this is the step that destroyed this venv once:
+        # `uv pip install llmcompressor` unpinned resolved to a version wanting
+        # transformers 5.x and took torch to cu130 with it. The quantizer lives
+        # in its own PEP-723 environment now for that reason; only the small
+        # runtime half belongs here.
         ( cd "$TEACHERS_ROOT/src/alpamayo1.5" \
           && uv venv --python 3.12 "$TEACHERS_VENVS/alpamayo" \
           && VIRTUAL_ENV="$TEACHERS_VENVS/alpamayo" uv sync --active \
-               --no-install-package flash-attn ) \
+               --no-install-package flash-attn \
+          && uv pip install -q --python "$TEACHERS_VENVS/alpamayo/bin/python" \
+               "compressed-tensors==0.13.0" "torch==2.8.0" "transformers==4.57.1" ) \
             > "$TEACHERS_LOGS/venv_alpamayo.log" 2>&1 \
             || echo "   !! alpamayo env failed — see $TEACHERS_LOGS/venv_alpamayo.log"
     fi
@@ -354,18 +368,30 @@ teachers_build() {
         2>/dev/null || echo 'NOT BUILT')"
 }
 
-# Which weights each service loads. FP8 when a checkpoint is there, BF16
-# otherwise -- so the L40S pod picks up the quantized build automatically and
-# this box, where BF16 fits, keeps using it unless somebody built one.
+# Which weights each service loads.
+#
+# BF16 BY DEFAULT, EVEN WHERE AN FP8 CHECKPOINT EXISTS -- and that is the
+# opposite of what this function did when it was written, because the
+# measurement came out the opposite way to the expectation.
+#
+# The FP8 checkpoints are real and their weights really are a third smaller.
+# But they are loaded here through plain transformers + compressed-tensors,
+# which DEQUANTIZES on the fly: latency roughly doubled for Cosmos and went up
+# sevenfold for Alpamayo, and the peak during inference went UP, not down. See
+# docs/teacher_panel.md §10b for the table. NVIDIA's recipe is aimed at vLLM,
+# where the FP8 kernels are fused; in this serving path it is a pessimisation.
+#
+# So FP8 is opt-in, by TEACHERS_PRECISION=fp8, and the checkpoints stay on the
+# volume because the moment either teacher is served through vLLM they become
+# the right thing to load. Choosing it silently would have made the everyday
+# pod slower in exchange for a memory saving it does not actually get.
 teacher_weights() {
     local model=$1 fp8dir
     case "$model" in
         alpamayo) fp8dir="$TEACHERS_ROOT/fp8/alpamayo_fp8" ;;
         cosmos)   fp8dir="$TEACHERS_ROOT/fp8/model_fp8" ;;
     esac
-    if [ -n "${TEACHERS_PRECISION-}" ] && [ "$TEACHERS_PRECISION" = "bf16" ]; then
-        echo "bf16|"
-    elif [ -f "$fp8dir/config.json" ]; then
+    if [ "${TEACHERS_PRECISION-bf16}" = "fp8" ] && [ -f "$fp8dir/config.json" ]; then
         echo "fp8|$fp8dir"
     else
         echo "bf16|"
