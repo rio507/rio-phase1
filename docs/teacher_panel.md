@@ -518,9 +518,25 @@ provide.
 
 **What `precision: "fp8"` means on a reading:** the language backbone's Linear
 weights are FP8. Not the vision tower, not the KV cache, and for Alpamayo not
-the diffusion expert — that stays BF16, so the predicted trajectory is computed
-at full precision from a quantized trace. Written down because "FP8" on a
-dashboard is otherwise a claim nobody can check.
+the diffusion action expert — that stays BF16, so the predicted trajectory is
+computed at full precision from a quantized trace. For Alpamayo that is 398
+modules quantized and 581 excluded (176 vision tower, 397 expert, 7 action
+projections, 1 `lm_head`).
+
+Written down because "FP8" on a dashboard is otherwise a claim nobody can
+check — and because the first build got it wrong. The ignore list was adapted
+from NVIDIA's Cosmos recipe, where the vision tower is `visual.*`; in Alpamayo
+the whole VLM is nested one level down and it is `vlm.model.visual.*`.
+`compressed_tensors` matches with `re.match`, which is **anchored at the start**,
+so `re:visual.*` matched nothing and the first checkpoint quantized all 176
+vision-tower layers and all 397 expert layers while its own `config.json`
+recorded a five-entry ignore list.
+
+The selftest did not catch it because it simulated the matcher — `re.search`
+against module names the test itself made up. It now uses
+`compressed_tensors.utils.match._match_name`, the library's own function,
+against the module names read out of the shipped `model.safetensors.index.json`.
+A recipe check that invents its own inputs is not a check.
 
 `boot.sh teachers` picks FP8 automatically when a checkpoint is on the volume
 and BF16 otherwise, so the L40S pod loads the quantized build and this one does

@@ -89,16 +89,45 @@ if os.path.isdir(ALPAMAYO_SRC):
 MODEL_ID = "nvidia/Alpamayo-1.5-10B"
 REVISION = "7aba8293c09993f2e125c6819df05d7fa3e873ea"
 
+# WRITTEN AGAINST THE MODEL'S REAL MODULE NAMES, AND ANCHORED CORRECTLY.
+#
+# compressed_tensors matches an ignore pattern with `re.match`, which is
+# ANCHORED AT THE START of the module name. The first version of this list was
+# copied from NVIDIA's Cosmos recipe, where the vision tower is `visual.*` and
+# `model.visual.*` -- and in Alpamayo it is `vlm.model.visual.*`, because the
+# whole VLM is nested one level down under the action model. So `re:visual.*`
+# matched NOTHING, and the first FP8 build quantized all 176 vision-tower
+# layers and all 397 layers of the action expert while the checkpoint's own
+# config.json quietly recorded an ignore list of five entries.
+#
+# That is the exact failure mode this list is supposed to prevent, so the
+# selftest now checks these patterns with compressed_tensors' OWN matcher
+# against the module names read out of the real weight index -- not with
+# `re.search` against names chosen by whoever wrote the test.
+#
+# The names, from model.safetensors.index.json:
+#     vlm.*                    575 modules  (the Cosmos-Reason2 backbone)
+#       vlm.model.visual.*     176          the vision tower
+#       vlm.lm_head              1
+#     expert.*                 397 modules  the diffusion action expert
+#     action_in_proj.*           6
+#     action_out_proj            1
 IGNORE = [
+    # The output projection. A rounding error of the parameter count, and
+    # measurable quality if you round it. NVIDIA's own recipe excludes it.
     "re:.*lm_head",
-    "re:visual.*",
-    "re:model.visual.*",
-    "re:.*mlp.gate$",
-    "re:.*diffusion.*",
-    "re:.*action_expert.*",
-    "re:.*action_in_proj.*",
-    "re:.*action_out_proj.*",
-    "re:.*traj.*",
+    # The vision tower, at any nesting depth. It is the part that has to read a
+    # 40-metre car out of thirty pixels.
+    "re:.*visual\\..*",
+    # MoE routing, if this backbone ever has any: a router that rounds picks a
+    # DIFFERENT expert, which is not a small error.
+    "re:.*mlp\\.gate$",
+    # The diffusion action expert and the projections either side of it -- the
+    # trajectory head. Small, and the only numeric output either teacher
+    # produces. `expert\.` rather than `expert` so a future MoE's `experts.N`
+    # is not swept up by accident.
+    "re:.*expert\\..*",
+    "re:.*action_.*",
 ]
 
 

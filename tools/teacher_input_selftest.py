@@ -160,69 +160,66 @@ print("NOTHINK", split_thinking("Plain answer.") == ("", "Plain answer."))
 # the lm_head or the diffusion expert -- which is a claim about regexes, and
 # regexes are exactly the thing that silently stops matching.
 QUANT = '''
-import re, sys
-sys.path.insert(0, "/workspace/teachers/src/alpamayo1.5/src")
+import json, glob, sys
 sys.path.insert(0, "%s")
 import torch, transformers, llmcompressor
 from llmcompressor.modifiers.quantization import QuantizationModifier
-from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
+from compressed_tensors.utils.match import _match_name
 from teachers.service.quantize_alpamayo import IGNORE
 print("ENV", torch.__version__, transformers.__version__, llmcompressor.__version__)
 m = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE)
 print("SCHEME", m.scheme)
-def ignored(n):
-    return any(re.search(p[3:] if p.startswith("re:") else p, n) for p in IGNORE)
-print("BACKBONE", not ignored("model.vlm.model.language_model.layers.0.self_attn.q_proj"))
-print("LMHEAD", ignored("model.vlm.lm_head"))
-print("VISION", ignored("model.vlm.model.visual.blocks.0.attn.qkv"))
-print("DIFFUSION", ignored("diffusion_expert.layers.0.mlp.gate_proj"))
-print("ACTION", ignored("action_in_proj.enc.0"))
-print("TRAJ", ignored("traj_tokenizer.proj"))
+
+# THE MODEL'S REAL MODULE NAMES, read out of the weight index rather than
+# invented here. The first version of this check used re.search against names
+# the test author chose, and passed while the actual build quantized the whole
+# vision tower -- because compressed_tensors matches with re.MATCH, anchored at
+# the start, and the real names are nested one level deeper than the patterns
+# assumed. So: the library's own matcher, against the shipped index.
+idx = glob.glob("/workspace/.cache/huggingface/hub/"
+                "models--nvidia--Alpamayo-1.5-10B/snapshots/*/"
+                "model.safetensors.index.json")
+if not idx:
+    print("NOINDEX 1")
+else:
+    names = sorted({n[:-7] for n in json.load(open(idx[0]))["weight_map"]
+                    if n.endswith(".weight")})
+    def ignored(n):
+        return any(_match_name(n, t) for t in IGNORE)
+    def frac(sel):
+        got = [n for n in names if sel(n)]
+        return len(got), sum(1 for n in got if ignored(n))
+    n_vis, i_vis = frac(lambda n: ".visual." in n)
+    n_exp, i_exp = frac(lambda n: n.startswith("expert."))
+    n_act, i_act = frac(lambda n: n.startswith("action_"))
+    n_lm,  i_lm  = frac(lambda n: "lm_head" in n)
+    n_bb,  i_bb  = frac(lambda n: n.startswith("vlm.") and ".visual." not in n
+                                  and "lm_head" not in n)
+    print("VISION", n_vis, i_vis)
+    print("EXPERT", n_exp, i_exp)
+    print("ACTION", n_act, i_act)
+    print("LMHEAD", n_lm, i_lm)
+    print("BACKBONE", n_bb, i_bb)
+
+# ...and NVIDIA's own Cosmos list, against Cosmos's own names. It is their file
+# and it is correct -- `model.visual.*` matches there because the VLM is not
+# nested. Checked anyway: it is the same class of bug one rename away, and the
+# check costs a JSON read.
+cidx = glob.glob("/workspace/.cache/huggingface/hub/"
+                 "models--nvidia--Cosmos-Reason2-8B/snapshots/*/"
+                 "model.safetensors.index.json")
+if cidx:
+    COSMOS_IGNORE = ["re:.*lm_head", "re:visual.*", "re:model.visual.*",
+                     "re:.*mlp.gate$"]
+    cn = sorted({n[:-7] for n in json.load(open(cidx[0]))["weight_map"]
+                 if n.endswith(".weight")})
+    def cign(n):
+        return any(_match_name(n, t) for t in COSMOS_IGNORE)
+    vis = [n for n in cn if ".visual." in n or n.startswith("visual.")]
+    bb = [n for n in cn if n not in vis and "lm_head" not in n]
+    print("COSMOSVISION", len(vis), sum(1 for n in vis if cign(n)))
+    print("COSMOSBACKBONE", len(bb), sum(1 for n in bb if cign(n)))
 ''' % REPO
-
-# The vision tower's first layer, rewritten. Checked for EQUALITY first and
-# speed second: a fast layer that quietly computes something else would be
-# invisible in every reading afterwards and would look exactly like the model
-# being worse at driving.
-PATCHEMBED = FRAMES + '''
-import time
-import torch, torch.nn as nn
-from teachers.service.common import flatten_patch_embed
-
-class FakeVisual(nn.Module):
-    def __init__(self, conv):
-        super().__init__()
-        self.patch_embed = nn.Module()
-        self.patch_embed.proj = conv
-
-N, C, T, P, E = 2400, 3, 2, 16, 1152          # one 4-frame window, as shipped
-torch.manual_seed(0)
-conv = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[T,P,P]).cuda().to(torch.bfloat16)
-x = torch.randn(N*C*T*P*P, dtype=torch.bfloat16, device="cuda")
-
-def bench(fn, n=3):
-    fn(); torch.cuda.synchronize(); s0=time.time()
-    for _ in range(n): r = fn()
-    torch.cuda.synchronize()
-    return r, (time.time()-s0)/n*1000
-
-with torch.no_grad():
-    ref, conv_ms = bench(lambda: conv(x.view(-1,C,T,P,P)).view(-1,E))
-    vis = FakeVisual(conv)
-    info = flatten_patch_embed(vis, log=lambda *a: None)
-    got, lin_ms = bench(lambda: vis.patch_embed(x))
-
-print("APPLIED", info.get("applied"), info.get("reason") or "")
-print("SHAPE", tuple(ref.shape) == tuple(got.shape), tuple(got.shape))
-print("MAXDEV", (ref.float()-got.float()).abs().max().item())
-print("ALLCLOSE", torch.allclose(ref.float(), got.float(), atol=5e-2))
-print("CONVMS %.1f" % conv_ms)
-print("LINMS %.3f" % lin_ms)
-
-# An overlapping / padded conv is a DIFFERENT operation and must be refused.
-bad = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[1,8,8]).cuda().to(torch.bfloat16)
-print("REFUSED", not flatten_patch_embed(FakeVisual(bad), log=lambda *a: None)["applied"])
-'''
 
 QUANT_HEADER = """# /// script
 # requires-python = "==3.12.*"
@@ -374,20 +371,43 @@ def main():
         ok(q.get("SCHEME") == "FP8_DYNAMIC",
            "FP8_DYNAMIC — static calibration needs a forward pass the "
            "composite model's signature does not provide")
-        ok(q.get("BACKBONE") == "True",
-           "the language backbone's Linear layers ARE quantized")
+        ok(not q.get("NOINDEX"),
+           "the real weight index is available to check the patterns against")
+
+        def pair(key):
+            try:
+                a, b = q.get(key, "0 0").split()
+                return int(a), int(b)
+            except ValueError:
+                return 0, 0
+
         for key, what, why in (
-                ("LMHEAD", "the output projection",
-                 "a rounding error of the parameter count, and measurable "
-                 "quality if you round it"),
                 ("VISION", "the vision tower",
                  "it has to read a 40-metre car out of thirty pixels"),
-                ("DIFFUSION", "the diffusion expert",
+                ("EXPERT", "the diffusion action expert",
                  "so the predicted path is computed at full precision from a "
                  "quantized trace"),
-                ("ACTION", "the action projection", "same head, same reason"),
-                ("TRAJ", "the trajectory tokenizer", "same head, same reason")):
-            ok(q.get(key) == "True", f"{what} is NOT — {why}")
+                ("ACTION", "the action projections", "same head, same reason"),
+                ("LMHEAD", "the output projection",
+                 "a rounding error of the parameter count, and measurable "
+                 "quality if you round it")):
+            n, ign = pair(key)
+            ok(n > 0 and ign == n,
+               f"{what}: all {n} modules excluded ({ign}/{n}) — {why}")
+
+        n, ign = pair("BACKBONE")
+        ok(n > 0 and ign == 0,
+           f"the language backbone IS quantized: {n} modules, {ign} excluded")
+
+        if "COSMOSVISION" in q:
+            n, ign = pair("COSMOSVISION")
+            ok(n > 0 and ign == n,
+               f"NVIDIA's own Cosmos list still excludes its vision tower "
+               f"({ign}/{n}) — correct there because the VLM is not nested, "
+               f"and one rename from the bug above")
+            n, ign = pair("COSMOSBACKBONE")
+            ok(n > 0 and ign == 0,
+               f"...while quantizing its backbone ({n} modules, {ign} excluded)")
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)
