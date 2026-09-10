@@ -43,6 +43,7 @@ import config
 
 from . import associate as assoc_mod
 from . import canned as canned_mod
+from . import decision as decision_mod
 from . import corpus as corpus_mod
 from . import egomotion
 from . import keyframe as kf_mod
@@ -315,6 +316,28 @@ def _on_reading(model: str, job: dict, reading: dict) -> None:
                 traj["xyz"], img["w"], img["h"])
         except Exception:
             traj["pixels"] = None
+
+    # THE TWO ROWS ONLY ONE COLUMN CAN FILL.
+    #
+    # Alpamayo's is arithmetic on its own trajectory -- what the predicted path
+    # MEANS, in two words, derived here rather than asked of the model so it is
+    # reproducible from the row. Cosmos's is the split of its physics answer
+    # into a per-actor account and a plausibility verdict.
+    #
+    # Both are display-only, like everything else on this side.
+    if rec.get("trajectory"):
+        try:
+            rec["decision"] = decision_mod.describe(rec["trajectory"]) or None
+        except Exception as e:
+            rec["decision"] = {"error": f"{type(e).__name__}: {e}"}
+    if rec.get("reasoning") and not rec.get("trajectory"):
+        try:
+            rec["physics"] = decision_mod.split_physics(
+                rec["reasoning"],
+                getattr(config, "TEACHER_PLAUSIBILITY_MARKER",
+                        "Plausibility:")) or None
+        except Exception as e:
+            rec["physics"] = {"error": f"{type(e).__name__}: {e}"}
 
     kf_for_record = None
     readings_copy = assoc_copy = None

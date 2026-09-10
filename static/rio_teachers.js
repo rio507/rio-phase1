@@ -43,24 +43,52 @@
 (function (root) {
   'use strict';
 
-  var POLL_MS = 1000;          /* the card. A reading changes every ~2 s. */
+  /* THE CARD FOLLOWS THE FRAMES, NOT THE DRIVE.
+   *
+   * This used to start only from startDrive(), so replaying a clip -- which
+   * pushes frames, runs the whole headway pipeline and DOES raise keyframes on
+   * the server -- left the card showing whatever it had painted at page load.
+   * Observed: "fresh 154 s" while a clip was playing and the teachers were
+   * answering every two seconds behind it. The readings were being taken; the
+   * card was not asking for them.
+   *
+   * So: fast while frames are arriving, from any source, and slow when the
+   * page is idle. `noteFrame()` is called from the headway result handler --
+   * one assignment per frame -- so "frames are flowing" is measured rather
+   * than inferred from which button was last pressed.
+   */
+  var POLL_MS = 1000;          /* while frames are arriving */
+  var IDLE_POLL_MS = 10000;    /* when nothing is */
+  /* No frame for this long and the page is idle. Generous next to the 4-15 fps
+     the transport runs at, tight next to a 2 s keyframe floor. */
+  var FRAME_IDLE_MS = 4000;
   var EGO_POST_MS = 1000;      /* one batch a second */
   var EGO_MIN_DT_MS = 45;      /* ~20 Hz; DeviceMotion fires at up to 60 */
   var EGO_MAX_BATCH = 60;      /* a backgrounded tab must not post a minute */
 
-  /* The three fields, in the order a reading is read. Scene first because it
-     is the one both models answer the same way; the trace second because it
-     is the interesting one; attention last because it is the forward-looking
-     one and belongs next to the actor chip. */
+  /* THE SHARED ROWS, trimmed to one sentence each.
+     Two models answering the same question is the comparison; two paragraphs
+     of it is a wall. The full text is one tap away and all of it is in the
+     corpus, so nothing is lost by showing the first sentence here -- and what
+     is gained is that the row BELOW, the one only this model can fill, is on
+     the screen without scrolling. */
   var FIELDS = [
-    { key: 'scene', label: 'Scene' },
-    { key: 'reasoning', label: null },   /* per-model — see TRACE_LABEL */
-    { key: 'attention', label: 'Attention · next 2 s' }
+    { key: 'scene', label: 'Scene', clamp: 1 },
+    { key: 'attention', label: 'Attention · next 2 s', clamp: 1 }
   ];
   var TRACE_LABEL = {
     'alpamayo1.5': 'Chain-of-Causation',
     'cosmos-reason2': 'Physical reasoning'
   };
+
+  /* First sentence, or the whole thing if it is already short. Used for the
+     shared rows; the expander shows the rest. */
+  function firstSentence(text) {
+    var t = String(text || '').trim();
+    if (t.length < 140) return t;
+    var m = t.match(/^[\s\S]*?[.!?](\s|$)/);
+    return m ? m[0].trim() : t;
+  }
   var DISPLAY_NAME = {
     'alpamayo1.5': 'Alpamayo 1.5',
     'cosmos-reason2': 'Cosmos-Reason2'
@@ -136,7 +164,8 @@
     var flags = r.flags || {};
     FIELDS.forEach(function (f) {
       var label = f.label || TRACE_LABEL[model] || 'Reasoning';
-      var text = r[f.key];
+      var full = r[f.key];
+      var text = f.clamp ? firstSentence(full) : full;
       var field = el('div', 'teach-field');
       var head = el('div', 'teach-label', label);
       /* THIS ANSWER LOOKS RECITED. Structural only -- see teachers/canned.py.
@@ -158,20 +187,39 @@
       var body = el('div', 'teach-text', text || 'No reading yet.');
       if (!text) body.classList.add('empty');
       field.appendChild(body);
-      /* The trace is the field that runs long, so it is the one that gets an
-         expander. Clamped to four lines by the stylesheet; the corpus keeps
-         every word regardless of what this shows. */
-      if (text && text.length > 240) {
+      /* Show all reveals whatever was trimmed -- the rest of the sentence
+         for a shared row, the whole trace for a model's own row. The corpus
+         keeps every word regardless of what this shows. */
+      if (full && full !== text) {
         var more = el('button', 'teach-more', 'Show all');
         more.type = 'button';
         more.addEventListener('click', function () {
           var open = field.classList.toggle('open');
+          body.textContent = open ? full : text;
           more.textContent = open ? 'Show less' : 'Show all';
         });
         field.appendChild(more);
+      } else if (text && text.length > 240) {
+        var more2 = el('button', 'teach-more', 'Show all');
+        more2.type = 'button';
+        more2.addEventListener('click', function () {
+          var open = field.classList.toggle('open');
+          more2.textContent = open ? 'Show less' : 'Show all';
+        });
+        field.appendChild(more2);
       }
       col.appendChild(field);
     });
+
+    /* ---- THE ROW ONLY THIS COLUMN CAN FILL -------------------------------
+       Two models answering the same three questions is a comparison, and a
+       comparison of two things that can do the same thing tells you least
+       about what each is FOR. Alpamayo predicts a path and nothing else here
+       does; Cosmos reasons about other road users' motion and nothing else
+       here does. Those get a row apiece, and they are the reason each column
+       is worth its VRAM. */
+    if (model === 'alpamayo1.5') col.appendChild(decisionRow(r));
+    if (model === 'cosmos-reason2') col.appendChild(physicsRow(r));
 
     /* THE REFERENCED ACTOR. Either a track id the overlay is ringing right
        now, or the reason there is not one -- and the reason is the useful
@@ -195,6 +243,107 @@
     actorField.appendChild(chip);
     col.appendChild(actorField);
     return col;
+  }
+
+  /* ALPAMAYO: what its predicted path means, in two words.
+     Derived server-side by arithmetic on the 64 waypoints
+     (teachers/decision.py) -- not asked of the model, so it is the same answer
+     every time and can be re-derived from the corpus row. Display only. */
+  function decisionRow(r) {
+    var field = el('div', 'teach-field');
+    field.appendChild(el('div', 'teach-label', 'Driving decision'));
+    var d = r.decision;
+    if (!d || !d.text) {
+      var none = el('div', 'teach-text empty',
+                    r.trajectory ? 'Path too short to read.'
+                                 : 'No predicted path.');
+      field.appendChild(none);
+      return field;
+    }
+    var line = el('div', 'teach-decision');
+    line.appendChild(el('b', 'dec-long dec-' + d.longitudinal, d.longitudinal));
+    line.appendChild(el('span', 'dec-sep', '·'));
+    line.appendChild(el('b', 'dec-lat', d.lateral));
+    field.appendChild(line);
+    /* The numbers it decided on, so the two words can be argued with rather
+       than trusted. */
+    var nums = el('div', 'teach-meta');
+    function num(label, value) {
+      var sp = el('span');
+      sp.appendChild(el('i', null, label + ' '));
+      sp.appendChild(el('b', null, value));
+      nums.appendChild(sp);
+    }
+    num('v', d.v_start_ms.toFixed(1) + '\u2192' + d.v_end_ms.toFixed(1) + ' m/s');
+    num('a', (d.accel_ms2 >= 0 ? '+' : '') + d.accel_ms2.toFixed(2) + ' m/s\u00b2');
+    num('lat', (d.lateral_end_m >= 0 ? '+' : '') + d.lateral_end_m.toFixed(1) + ' m');
+    num('reach', d.reach_m.toFixed(0) + ' m / ' + (d.horizon_s || 6.4) + ' s');
+    field.appendChild(nums);
+    var hint = el('div', 'teach-hint',
+      'derived from the predicted path — display only, nothing reads it');
+    field.appendChild(hint);
+    /* THE CHAIN-OF-CAUSATION, behind Show all — symmetric with Cosmos's row.
+       It is no longer a shared row (the shared rows are the two questions both
+       models answer), but it is Alpamayo's own reasoning about the path these
+       two words describe, and it belongs next to them rather than nowhere. */
+    if (r.reasoning) {
+      var coc = el('div', 'teach-text');
+      coc.style.display = 'none';
+      coc.textContent = r.reasoning;
+      field.appendChild(coc);
+      var more = el('button', 'teach-more', 'Chain-of-Causation');
+      more.type = 'button';
+      more.addEventListener('click', function () {
+        var open = coc.style.display === 'none';
+        coc.style.display = open ? '' : 'none';
+        more.textContent = open ? 'Hide' : 'Chain-of-Causation';
+      });
+      field.appendChild(more);
+    }
+    return field;
+  }
+
+  /* COSMOS: per-actor motion, and its own plausibility verdict.
+     The full chain of thought is behind Show all -- Cosmos does not emit a
+     separate <think> block under this chat template, so the reasoning IS the
+     answer and "show all" means the whole of it rather than a hidden trace. */
+  function physicsRow(r) {
+    var field = el('div', 'teach-field');
+    var head = el('div', 'teach-label', 'Physics');
+    var ph = r.physics || {};
+    if (ph.implausible === true) {
+      var bad = el('span', 'teach-implausible', ' implausible');
+      bad.title = ph.plausibility || '';
+      head.appendChild(bad);
+    } else if (ph.implausible === false) {
+      var okm = el('span', 'teach-plausible', ' plausible');
+      okm.title = ph.plausibility || '';
+      head.appendChild(okm);
+    }
+    field.appendChild(head);
+    var actors = ph.actors || r.reasoning || '';
+    var body = el('div', 'teach-text', actors || 'No reading yet.');
+    if (!actors) body.classList.add('empty');
+    field.appendChild(body);
+    if (ph.plausibility) {
+      field.appendChild(el('div', 'teach-hint', ph.plausibility));
+    } else if (ph.has_verdict === false) {
+      field.appendChild(el('div', 'teach-hint',
+        'no plausibility verdict in this answer'));
+    }
+    if (r.thinking || (actors && actors.length > 240)) {
+      var more = el('button', 'teach-more', 'Show all');
+      more.type = 'button';
+      more.addEventListener('click', function () {
+        var open = field.classList.toggle('open');
+        body.textContent = open ? (r.thinking
+          ? r.thinking + '\n\n' + (r.reasoning || '') : (r.reasoning || actors))
+          : actors;
+        more.textContent = open ? 'Show less' : 'Show all';
+      });
+      field.appendChild(more);
+    }
+    return field;
   }
 
   function renderTally(state) {
@@ -411,6 +560,9 @@
     var sessionId = cfg.sessionId || function () { return null; };
     var ego = createEgo({ sessionId: sessionId, frameStats: cfg.frameStats });
     var poll = null;
+    var pollMs = 0;
+    var lastFrameAt = 0;
+    var stopped = false;
 
     function url(path) {
       var sid = sessionId();
@@ -424,14 +576,72 @@
         .catch(function () { /* the card keeps its last paint */ });
     }
 
+    /* A CHAINED TIMEOUT, NOT AN INTERVAL, for the two reasons this codebase
+       already uses one for the perception loop:
+
+       A slow fetch must not let calls stack up. setInterval fires on a
+       schedule whatever the last call is doing; a chain arms the next one only
+       when the last has finished, so a card polling a busy server falls behind
+       gracefully instead of queueing.
+
+       And the period changes. An interval whose rate depends on whether
+       frames are flowing has to be torn down and rebuilt on every change; a
+       chain just picks its next delay.
+
+       (It also stopped tools/output_bus_selftest.py counting this as the
+       realtime bus watch, which it identifies by a 1000 ms period. That is a
+       fragile identification and it is not this file's to fix -- but a poll
+       that collides with it is this file's to avoid.) */
+    function pace() {
+      if (stopped) return;
+      var flowing = (Date.now() - lastFrameAt) < FRAME_IDLE_MS;
+      pollMs = flowing ? POLL_MS : IDLE_POLL_MS;
+      if (poll) root.clearTimeout(poll);
+      poll = root.setTimeout(function () { poll = null; tick(); pace(); },
+                             pollMs);
+    }
+
     return {
-      start: function () {
-        if (!poll) poll = root.setInterval(tick, POLL_MS);
+      /* Called by the headway result handler for every frame that comes back,
+         from a camera or a clip. One assignment. */
+      noteFrame: function () {
+        var was = (Date.now() - lastFrameAt) < FRAME_IDLE_MS;
+        lastFrameAt = Date.now();
+        // Frames just started after a quiet spell: paint now and re-pace to
+        // the fast rate rather than waiting out the idle delay.
+        if (!was) { tick(); pace(); }
+      },
+      /* PACING ONLY, AND NO PERMISSION PROMPT. Safe to call at page load,
+         which is the point: the card should be current whenever frames are
+         flowing, and that is not only during a drive.
+
+         It must NOT touch the IMU. On iOS, DeviceMotionEvent.requestPermission
+         called outside a user gesture resolves to 'denied' and can never be
+         asked again for the life of the page -- so arming the card at load
+         would quietly cost every drive after it its yaw rate. */
+      arm: function () {
+        stopped = false;
         tick();
+        pace();
+      },
+      /* The drive: pacing AND the IMU stream. Called from the Start Drive
+         tap, because that tap is the gesture the permission needs. */
+      start: function () {
+        stopped = false;
+        tick();
+        pace();
         return ego.start();
       },
+      /* Ends the drive's IMU stream. The card keeps polling -- a clip can be
+         replayed after a drive ends, and the readings from it are just as
+         real. */
       stop: function () {
-        if (poll) { root.clearInterval(poll); poll = null; }
+        ego.stop();
+      },
+      /* Stops everything. Only the page unloading wants this. */
+      halt: function () {
+        stopped = true;
+        if (poll) { root.clearTimeout(poll); poll = null; pollMs = 0; }
         ego.stop();
       },
       refresh: tick,

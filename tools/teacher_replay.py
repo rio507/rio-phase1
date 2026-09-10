@@ -51,6 +51,46 @@ from teachers import egomotion                                    # noqa: E402
 from teachers import panel                                        # noqa: E402
 
 
+def _looks_annotated(path):
+    """Cheap tell that a clip is a rendered output rather than footage. -> str
+
+    Two things a camera does not produce and a renderer does: long perfectly
+    horizontal or vertical runs of one saturated colour (box edges), and a
+    solid letterboxed bar of near-constant colour at the very top (a HUD
+    strip). Neither is conclusive on its own, which is why this warns rather
+    than refuses.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return ""
+    cap = cv2.VideoCapture(path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 5)
+    ok_, frame = cap.read()
+    cap.release()
+    if not ok_ or frame is None:
+        return ""
+    h, w = frame.shape[:2]
+    hits = []
+    # A HUD strip: the top rows almost uniform and much darker than the scene.
+    top = frame[: max(2, h // 60)]
+    if top.std() < 18 and top.mean() < 60 and frame.mean() > 70:
+        hits.append("a dark uniform bar across the top")
+    # Box edges: rows/columns with a long run of a single very saturated hue.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1] > 150
+    val = hsv[:, :, 2] > 120
+    mask = (sat & val).astype(np.uint8)
+    runs = 0
+    for axis, length in ((1, w), (0, h)):
+        line = mask.sum(axis=axis)
+        runs += int((line > length * 0.12).sum())
+    if runs > (h + w) * 0.02:
+        hits.append("long saturated straight edges, like drawn boxes")
+    return "; ".join(hits)
+
+
 def wrap(text, width=52, limit=None):
     """Hard-wrap for the side-by-side columns. -> list of lines."""
     t = " ".join(str(text or "").split())
@@ -129,6 +169,23 @@ def side_by_side(row, width=52):
                     + f"  [{x['reason']}]")
         return f"unmatched — {x.get('reason')}"
 
+    # THE ROW ONLY ONE COLUMN CAN FILL, side by side like everything else --
+    # Alpamayo's derived verdict on its own path against Cosmos's account of
+    # the other road users. Neither model can produce the other's.
+    dec = a.get("decision") or {}
+    ph = c.get("physics") or {}
+    dec_txt = (f"{dec.get('text')}   "
+               f"[v {dec.get('v_start_ms')}->{dec.get('v_end_ms')} m/s, "
+               f"a {dec.get('accel_ms2')} m/s2, lat {dec.get('lateral_end_m')} m]"
+               if dec.get("text") else "no predicted path")
+    imp = ph.get("implausible")
+    ph_txt = ((ph.get("actors") or "") + "   [Plausibility: "
+              + ("IMPLAUSIBLE" if imp is True else
+                 "plausible" if imp is False else "no verdict")
+              + (f" — {ph.get('plausibility')}" if ph.get("plausibility") else "")
+              + "]") if ph else "—"
+    two("DRIVING DECISION (derived)  |  PHYSICS (per actor)",
+        dec_txt, ph_txt, limit=560)
     two("ASSOCIATED TRACK", actor(aa), actor(ca))
     two("LATENCY / PRECISION / FRESHNESS",
         f"{a['latency_ms']} ms · {a['precision']} · {a['freshness_s']} s",
@@ -192,7 +249,26 @@ def main():
         config.TEACHER_KEYFRAME_MIN_GAP_S = min(
             config.TEACHER_KEYFRAME_MIN_GAP_S, float(args.floor))
 
+    # IS THIS CLIP ALREADY ANNOTATED?
+    #
+    # runs/road_clip.mp4 turned out to be a RENDERED OUTPUT of an earlier
+    # headway run -- bounding boxes and "car 26.4m" labels burned into the
+    # pixels -- and the first ten acceptance readings were taken on it. Both
+    # teachers were shown a picture with the answers written on it, which makes
+    # every reading from that run worthless as a measure of perception: a model
+    # that says "a car 26 m ahead" may simply be reading the caption.
+    #
+    # Nothing downstream can detect that, because the frames are correct and
+    # identical to the detector's by the time they reach the ring -- the
+    # contamination is in the SOURCE. So it is checked here, where the source
+    # is chosen, and it is a loud warning rather than a refusal: replaying an
+    # annotated clip on purpose is a reasonable thing to want to do.
+    warn = _looks_annotated(args.clip)
     print(f"clip     : {args.clip}")
+    if warn:
+        print(f"  !! WARNING: this clip looks ALREADY ANNOTATED ({warn}).")
+        print(f"  !! The teachers will be shown a picture with the answers "
+              f"written on it, and readings from it measure nothing.")
     print(f"floor    : {config.TEACHER_KEYFRAME_FLOOR_S} s"
           + ("  (paced for comparisons — not a drive's cadence)"
              if args.floor is not None else "  (as shipped)"))

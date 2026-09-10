@@ -3231,14 +3231,49 @@ TEACHER_PROMPTS = {
         "seconds, and where is it?"
     ),
 }
-# Cosmos's extra question -- the one Alpamayo answers with its Chain-of-
-# Causation trace instead. Both columns therefore carry a reasoning trace of
-# the model's own kind, which is the thing worth comparing.
+# COSMOS'S OWN ROW, AND THE WORDING IT TOOK TO GET IT.
+#
+# Alpamayo's unique column is derived arithmetic (teachers/decision.py, from
+# its predicted trajectory). Cosmos's has to be asked for, and the obvious
+# phrasings do not get it.
+#
+# "What is moving in this scene, what is about to happen next, and is that
+# physically plausible? Think step by step." -- the shipped wording -- returns
+# FIRST-PERSON DRIVING NARRATION, because that is what the model was
+# post-trained to produce:
+#
+#     "I am driving on the first lane of a 5-lane highway. I maintain a
+#      constant speed and continue to drive straight on the same lane. I keep
+#      an eye on the surroundings for any sudden movements..."
+#
+# True, and useless: it is the ego vehicle's intentions, which RIO already
+# knows, instead of the other road users' motion, which is the one thing
+# Cosmos can say that nothing else here can. It also ran to 28 s, filling its
+# budget -- and once produced 88 consecutive copies of one sentence.
+#
+# Three things fixed it, and all three are load-bearing:
+#   "in the third person" and an explicit "Do not use I or my" -- 0 first-person
+#      references across three runs, against a majority before.
+#   naming the FIELDS wanted per actor (position relative to ego, direction,
+#      rough speed, next two seconds) -- so it enumerates road users instead of
+#      narrating a drive.
+#   a line beginning "Plausibility:" -- which gives the parser something
+#      deterministic to split on rather than hunting for a verdict in prose.
+#
+# Measured on the clean clip: 1.6-6.2 s, no sentence repeated, and the
+# Plausibility line present on every run. See docs/teacher_panel.md.
 TEACHER_COSMOS_PHYSICAL_PROMPT = (
-    "The video shows the view from a car's forward camera. What is moving in "
-    "this scene, what is about to happen next, and is that physically "
-    "plausible? Think step by step."
+    "Describe, in the third person, each road user other than the ego "
+    "vehicle: where it is relative to the ego vehicle, which way it is moving "
+    "and roughly how fast, and what it will most likely do in the next two "
+    "seconds. Do not use \"I\" or \"my\". Finish with a line beginning "
+    "\"Plausibility:\" stating whether anything you have described could not "
+    "physically happen."
 )
+
+# The marker the answer is split on. One string, in one place, because the
+# prompt above asks for it by name and the parser looks for it by name.
+TEACHER_PLAUSIBILITY_MARKER = "Plausibility:"
 
 # Generation. Same numbers NVIDIA's own examples use, so a reading here is
 # comparable with a reading from the model card.

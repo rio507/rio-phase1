@@ -131,6 +131,21 @@ READING_FIELDS = (
                         #          "pixels": [[u,v] ...] | null}
                         #         DISPLAY ONLY. Nothing downstream reads it.
     "gpu",              # dict  — {"vram_mb": float, "device": str}
+    "decision",         # dict|null — ALPAMAYO ONLY, and derived rather than
+                        #         asked for: what its predicted trajectory
+                        #         MEANS, by arithmetic on the 64 waypoints.
+                        #         {"longitudinal": slowing|holding|
+                        #          accelerating|stopping, "lateral": drifting
+                        #          left|right|straight|turning ..., plus every
+                        #          number and threshold the verdict used}.
+                        #         Display only, like the path it comes from.
+                        #         See teachers/decision.py.
+    "physics",          # dict|null — COSMOS ONLY: its per-actor motion account
+                        #         split from its plausibility verdict.
+                        #         {"actors", "plausibility", "implausible",
+                        #          "has_verdict"}. The prompt asks for a line
+                        #         beginning "Plausibility:" so this is a split
+                        #         rather than a hunt for a verdict in prose.
     "flags",            # dict  — what this reading looks like, structurally.
                         #         Empty when clean. {"markers": [...],
                         #         "repeated": n, "why": "..."} when the answer
@@ -182,7 +197,8 @@ def blank_reading(model: str, model_id: str = "", revision: str = "",
         "latency_ms": 0.0, "queue_ms": 0.0, "freshness_s": 0.0,
         "raw": {}, "scene": "", "critical_actor": "", "attention": "",
         "reasoning": "", "thinking": None, "meta_action": None,
-        "trajectory": None, "gpu": {}, "flags": {}, "extra": {},
+        "trajectory": None, "decision": None, "physics": None,
+        "gpu": {}, "flags": {}, "extra": {},
     }
 
 

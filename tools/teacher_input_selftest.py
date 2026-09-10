@@ -37,10 +37,9 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-VENVS = {
-    "alpamayo": "/opt/teachers/venvs/alpamayo/bin/python",
-    "cosmos": "/opt/teachers/venvs/cosmos/bin/python",
-}
+from teachers import paths                                       # noqa: E402
+
+VENVS = paths.VENVS
 
 PASS, FAIL = [], []
 
@@ -284,9 +283,14 @@ def run_uv_script(body):
     """A PEP-723 script through `uv run`, in an environment of its own."""
     import tempfile
 
-    env = dict(os.environ)
-    env["PATH"] = os.path.expanduser("~/.local/bin") + ":" + env.get("PATH", "")
-    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    # UV_CACHE_DIR IS SET HERE, NOT ASSUMED FROM THE SHELL. This exact call is
+    # what filled the container layer twice: `uv run --script` resolves a
+    # ~10 GB torch environment into UV_CACHE_DIR, which defaults to
+    # ~/.cache/uv on the 60 GB container layer that already holds 28 GB of
+    # teacher venvs. boot.sh exports the right value, but a test run from a
+    # plain shell never saw it -- and an environment variable somebody else
+    # has to export is a convention, not a setting. See teachers/paths.py.
+    env = paths.load_secrets(paths.subprocess_env())
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(QUANT_HEADER + body)
         path = f.name
@@ -313,9 +317,8 @@ def run(name, script):
         ok(False, f"{name}: no environment at {py} "
                   f"(bash boot.sh teachers-build)")
         return {}
-    env = dict(os.environ)
-    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
-    env["TRANSFORMERS_VERBOSITY"] = "error"
+    env = paths.load_secrets(paths.subprocess_env(
+        {"TRANSFORMERS_VERBOSITY": "error"}))
     try:
         p = subprocess.run([py, "-c", script], cwd=REPO, env=env,
                            capture_output=True, text=True, timeout=600)

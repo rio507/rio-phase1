@@ -93,7 +93,10 @@ FIXTURE = {
                 "freshness_s": 1.8, "fresh": True, "age_s": 1.4,
                 "raw": {}, "scene": "A two-lane urban road, overcast, with a "
                                     "white panel van in the ego lane and a "
-                                    "cyclist on the near-side shoulder.",
+                                    "cyclist on the near-side shoulder. The "
+                                    "surface is wet and the light is flat, so "
+                                    "braking distances are longer than they "
+                                    "look and the far lane is hard to read.",
                 "critical_actor": "The white panel van directly ahead, because "
                                   "it has just braked and the gap is closing.",
                 "attention": "The van's brake lights, and the cyclist who may "
@@ -105,6 +108,17 @@ FIXTURE = {
                                "frame": "FLU_at_t0",
                                "pixels": [[320 + i, 700 - i * 5]
                                           for i in range(60)]},
+                # The row only this column can fill: derived from the path
+                # above by teachers/decision.py, not asked of the model.
+                "decision": {
+                    "longitudinal": "slowing", "lateral": "drifting right",
+                    "text": "Slowing, drifting right",
+                    "v_start_ms": 13.0, "v_end_ms": 8.4, "accel_ms2": -0.85,
+                    "lateral_end_m": -1.9, "lateral_max_m": 1.9,
+                    "reach_m": 68.0, "horizon_s": 6.4, "points": 64,
+                    "thresholds": {},
+                },
+                "physics": None,
                 "gpu": {"vram_reserved_mb": 24100.0},
             },
             "association": {
@@ -117,7 +131,8 @@ FIXTURE = {
         },
         # A service that is down, AND an unmatched actor. Both of the states a
         # live demo will never show, and both of the ones the card has to be
-        # honest in.
+        # honest in.  (FIXTURE_LIVE below is the same card with Cosmos
+        # answering, so the Physics row is exercised too.)
         "cosmos-reason2": {
             "reading": {
                 "model": "cosmos-reason2",
@@ -128,7 +143,8 @@ FIXTURE = {
                 "fresh": False, "age_s": 9.4, "raw": {},
                 "scene": "", "critical_actor": "", "attention": "",
                 "reasoning": "", "thinking": None, "meta_action": None,
-                "trajectory": None, "gpu": {},
+                "trajectory": None, "decision": None, "physics": None,
+                "gpu": {},
             },
             "association": {
                 "matched": False, "track_id": None, "label": None,
@@ -151,6 +167,51 @@ FIXTURE = {
                            "last_error": "Connection refused"},
     },
 }
+
+# The same card with BOTH teachers answering, so the row only Cosmos can fill
+# is rendered rather than assumed. Built from FIXTURE so the two cannot drift.
+import copy as _copy
+
+
+def live_fixture():
+    f = _copy.deepcopy(FIXTURE)
+    c = f["models"]["cosmos-reason2"]
+    c["reading"].update({
+        "ok": True, "error": None, "latency_ms": 3196.0, "freshness_s": 2.1,
+        "fresh": True, "age_s": 1.7, "precision": "bf16",
+        "scene": "The road is a wide black asphalt highway with three lanes in "
+                 "each direction. Traffic is light. The weather is clear.",
+        "critical_actor": "The white sedan in the adjacent lane is the most "
+                          "relevant, as it is directly beside the ego vehicle.",
+        "attention": "The main hazard is the white car on the right, which is "
+                     "close to the ego vehicle and may cut into the lane.",
+        "reasoning": "To the right of the ego vehicle, in an adjacent lane, "
+                     "there is a white sedan moving forward at a moderate "
+                     "speed. Further ahead on the left, separated by a "
+                     "concrete barrier, there is a silver SUV travelling in "
+                     "the opposite direction. Plausibility: The scenario is "
+                     "physically possible.",
+        "physics": {
+            "actors": "To the right of the ego vehicle, in an adjacent lane, "
+                      "there is a white sedan moving forward at a moderate "
+                      "speed. Further ahead on the left, separated by a "
+                      "concrete barrier, there is a silver SUV travelling in "
+                      "the opposite direction.",
+            "plausibility": "The scenario is physically possible.",
+            "implausible": False, "has_verdict": True,
+        },
+    })
+    c["association"] = {
+        "matched": True, "track_id": 7, "label": "car", "box": [560, 260, 840, 430],
+        "range_m": 25.6, "score": 0.9, "reason": "class+side+range",
+        "phrase": "The white sedan in the adjacent lane",
+        "wanted_class": "car", "wanted_side": "right",
+    }
+    f["services"]["cosmos-reason2"].update(
+        {"loaded": True, "model": "nvidia/Cosmos-Reason2-8B",
+         "precision": "bf16", "failed": 0, "last_error": None})
+    return f
+
 
 RENDER = """
 (state) => {
@@ -192,6 +253,12 @@ READ = """
       actor: (c.querySelector('.teach-actor') || {}).textContent,
       actorMatched: !!c.querySelector('.teach-actor.matched'),
       more: !!c.querySelector('.teach-more'),
+      decision: (c.querySelector('.teach-decision') || {}).textContent || null,
+      decisionColor: c.querySelector('.teach-decision b')
+        ? getComputedStyle(c.querySelector('.teach-decision b')).color : null,
+      hints: Array.from(c.querySelectorAll('.teach-hint')).map(h => h.textContent),
+      implausible: !!c.querySelector('.teach-implausible'),
+      plausible: !!c.querySelector('.teach-plausible'),
       box: box(c),
       textBoxes: Array.from(c.querySelectorAll('.teach-text')).map(box),
     })),
@@ -251,17 +318,30 @@ def run(page, size, label, shot=None):
     c_labels = [s.strip() for s in cols[1]["labels"]]
     ok("Scene" in a_labels and "Scene" in c_labels,
        f"Scene, on both ({a_labels})")
-    ok("Chain-of-Causation" in a_labels,
-       "Alpamayo's trace is called a Chain-of-Causation, because that is what "
-       "it is")
-    ok("Physical reasoning" in c_labels,
-       "and Cosmos's is called physical reasoning — each model is labelled "
-       "with the kind of trace it actually produces")
     ok(any(l.startswith("Attention") for l in a_labels)
        and any(l.startswith("Attention") for l in c_labels),
        "Attention · next 2 s, on both")
     ok("Referenced actor" in a_labels and "Referenced actor" in c_labels,
        "Referenced actor, on both")
+
+    section("the row only one column can fill")
+    ok("Driving decision" in a_labels and "Driving decision" not in c_labels,
+       f"Alpamayo has Driving decision and Cosmos does not ({a_labels} / "
+       f"{c_labels}) — it is derived from a predicted path, and Cosmos "
+       f"predicts none")
+    ok(any(l.startswith("Physics") for l in c_labels)
+       and not any(l.startswith("Physics") for l in a_labels),
+       "Cosmos has Physics and Alpamayo does not — per-actor motion is the "
+       "thing that column can say that nothing else here can")
+    dec = (cols[0]["decision"] or "")
+    ok("slowing" in dec and "drifting right" in dec,
+       f"the decision is the two words, not a paragraph ({dec!r})")
+    hints = " ".join(cols[0]["hints"])
+    ok("derived" in hints and "display only" in hints,
+       f"and it says it was derived and reads nothing ({hints[:90]!r})")
+    meta = cols[0]["box"]["text"]
+    ok("13.0" in meta and "8.4" in meta and "-0.85" in meta,
+       "with the numbers it decided on, so the two words can be argued with")
 
     section("freshness, latency, precision — the three numbers")
     meta = cols[0]["meta"] or ""
@@ -316,11 +396,17 @@ def run(page, size, label, shot=None):
         page.screenshot(path=shot, full_page=False)
         print(f"       wrote {shot}")
 
-    section("a long trace does not eat the card")
-    ok(cols[0]["more"], "a 1200-character trace gets a Show all control")
-    tallest = max((b["height"] for b in cols[0]["textBoxes"]), default=0)
-    ok(tallest < 140,
-       f"and is clamped until it is asked for ({round(tallest)}px tall)")
+    section("the shared rows are one sentence, and the rest is a tap away")
+    scene_shown = cols[0]["textBoxes"][0]
+    ok(scene_shown["height"] < 90,
+       f"the Scene row is a line or two, not a paragraph "
+       f"({round(scene_shown['height'])}px) — two models answering the same "
+       f"question is the comparison; two paragraphs of it is a wall")
+    ok(cols[0]["more"],
+       "and there is a Show all for the rest of it")
+    ok(any("Chain-of-Causation" in (b or "") for b in [cols[0]["box"]["text"]]),
+       "Alpamayo's Chain-of-Causation is still reachable — behind a control on "
+       "its own row rather than nowhere, symmetric with Cosmos's full trace")
     exp = page.evaluate(EXPAND)
     ok(exp and exp["after"] > exp["before"],
        f"Show all expands it ({round(exp['before'])} -> {round(exp['after'])}px)")
@@ -328,6 +414,37 @@ def run(page, size, label, shot=None):
        f"and the control changes to say so ({exp['label']!r})")
 
     return r
+
+
+def run_live_columns(page, shot=None):
+    section("both teachers answering — the Physics row")
+    page.set_viewport_size({"width": DESKTOP[0], "height": DESKTOP[1]})
+    page.evaluate(RENDER, live_fixture())
+    page.wait_for_timeout(120)
+    r = page.evaluate(READ)
+    cols = r["columns"]
+    ok(len(cols) == 2, f"two columns ({len(cols)})")
+    if len(cols) != 2:
+        return
+    c = cols[1]
+    labels = [l.strip() for l in c["labels"]]
+    ok(any(l.startswith("Physics") for l in labels),
+       f"Cosmos's Physics row is rendered ({labels})")
+    ok(c["plausible"] and not c["implausible"],
+       "with its own plausibility verdict beside the label")
+    body = c["box"]["text"]
+    ok("white sedan" in body and "silver SUV" in body,
+       "and the per-actor account is the body — where each road user is and "
+       "which way it is moving")
+    ok("Plausibility" not in (c["box"]["text"] or "").split("physically")[0][-40:],
+       "the verdict is split OFF the actor account rather than left in it")
+    hints = " ".join(c["hints"])
+    ok("physically possible" in hints,
+       f"the verdict is shown in the model's own words ({hints[:70]!r})")
+    ok(cols[0]["decision"], "and Alpamayo still has its Driving decision")
+    if shot:
+        page.screenshot(path=shot.replace(".png", "_live.png"))
+        print(f"       wrote {shot.replace('.png', '_live.png')}")
 
 
 def run_layers(page):
@@ -407,6 +524,7 @@ def main():
         page.wait_for_timeout(700)
 
         run(page, DESKTOP, "desktop", shot=args.shot)
+        run_live_columns(page, args.shot)
         run_layers(page)
         run_mobile(page)
         section("no page errors")

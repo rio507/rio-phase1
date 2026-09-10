@@ -29,6 +29,7 @@ Two of them, in opposite directions, because they fail in different ways:
   because it reads the syntax tree rather than running anything. Run both.
 """
 import argparse
+import base64
 import json
 import os
 import sys
@@ -239,8 +240,6 @@ def run_window():
     job = kf_mod.to_job(kf)
     p = client_mod.TeacherClient._payload(job)
     ok(len(p["frames"]) == 4, "four base64 frames on the wire")
-    import base64
-
     ok([base64.b64decode(b) for b in p["frames"]] == [f.jpeg for f in kf["frames"]],
        "the JPEGs are the client's own bytes, not re-encoded — so the teachers "
        "and RF-DETR are looking at identical pixels")
@@ -248,6 +247,87 @@ def run_window():
     for k in ("kf_id", "t0", "frames", "frame_offsets_s", "ego_history_xyz",
               "ego_history_yaw", "prompts", "physical_prompt", "image"):
         ok(k in p, f"the payload carries {k}")
+
+    section("A3b. the teachers see EXACTLY what the detector saw")
+    # THE INVARIANT, ASSERTED ON THE REAL PIPELINE rather than on the ring.
+    #
+    # A teacher reading a different picture from the one RF-DETR measured is
+    # not a second opinion, it is a second subject -- every association would
+    # be comparing a sentence about one image with boxes from another, and the
+    # disagreements would be an artefact of the plumbing.
+    #
+    # It holds by construction on the server: /headway_frame hands the SAME
+    # bytes object to session.process and to ring.push, and /headway_ws does
+    # the same with frame.jpeg. Construction is not a test, and the thing that
+    # would break it -- someone re-encoding, resizing or annotating on the way
+    # past -- is exactly the sort of change that looks harmless.
+    try:
+        from headway import detect as detect_mod
+        from headway import live as headway_live
+        have_detector = detect_mod.available()
+    except Exception:
+        have_detector = False
+    if not have_detector:
+        ok(False, "RF-DETR is not loaded — cannot check the invariant on the "
+                  "real pipeline (python -m tools.preflight --fix)")
+    else:
+        key3 = "kf-identity"
+        framebuf.drop_ring(key3)
+        headway_live.reset_session(key3)
+        session = headway_live.get_session(key3, use_qwen=True)
+        ring3 = framebuf.get_ring(key3)
+        # Real JPEGs, and a DIFFERENT one per frame so a mix-up cannot pass by
+        # everything happening to be equal.
+        sent = [make_jpeg(seed=i * 7) for i in range(8)]
+        seen_by_detector = []
+        # ONE base instant, taken before the loop. Each session.process is a
+        # real GPU pass of ~20 ms, so re-reading the clock inside the loop
+        # drifts the stamps against each other and two slots end up on one
+        # frame -- which is legitimate behaviour at a low frame rate and is
+        # exactly what must not happen in a test that is about telling four
+        # frames apart.
+        pushed = []
+        for jpeg in sent:
+            result = session.process(jpeg, 13.0, 0.0, None)
+            seen_by_detector.append(jpeg)
+            f = ring3.push(jpeg, result, origin=f"{key3}:clip")
+            if f is not None:
+                pushed.append(f)
+        # STAMPED AFTERWARDS, against a clock read now. Taking the base before
+        # the loop pins every frame to an instant that is already in the past
+        # by however long the pipeline took -- and RF-DETR's first call on a
+        # fresh session compiles for several seconds, which aged the whole
+        # window straight out of the six-second ring. The frames are being
+        # given a synthetic 10 Hz spacing; they must not also be given a
+        # synthetic age.
+        base = time.time()
+        for i, f in enumerate(pushed):
+            f.wall_t = base - (len(pushed) - 1 - i) * 0.1
+        kf3 = kf_mod.build(key3, ring3, RESULT, "manual", seq=0)
+        ok(kf3.get("ok"), f"a keyframe is built off the real pipeline "
+                          f"({kf3.get('reason')})")
+        if kf3.get("ok"):
+            payload3 = client_mod.TeacherClient._payload(kf_mod.to_job(kf3))
+            got = [base64.b64decode(b) for b in payload3["frames"]]
+            by_id = {f.frame_id: f.jpeg for f in ring3.frames()}
+            want = [by_id[w["frame_id"]] for w in kf3["window"]["frames"]]
+            ok(got == want,
+               "every frame in the teacher payload is the ring entry with that "
+               "FRAME ID, byte for byte")
+            ok(all(g in seen_by_detector for g in got),
+               "and every one of those bytes is a buffer RF-DETR was handed — "
+               "not a re-encode, not a resize, not an annotated copy")
+            import hashlib
+
+            digests = [hashlib.sha256(g).hexdigest()[:12] for g in got]
+            det = [hashlib.sha256(b).hexdigest()[:12] for b in seen_by_detector]
+            ok(len(set(digests)) == len(digests),
+               f"the four frames are four DIFFERENT pictures ({digests}) — a "
+               f"check that passed because everything was identical would "
+               f"prove nothing")
+            print(f"       detector saw {det}")
+            print(f"       teachers got {digests}")
+        headway_live.reset_session(key3)
 
     section("A4. the payload is what the services actually read")
     # Parsed out of the service sources rather than imported: those modules run
@@ -447,12 +527,34 @@ def run_service_isolation():
     panel.stop()
 
     section("D3. RIO's interpreter never loads a teacher's stack")
-    heavy = [m for m in ("torch", "transformers", "alpamayo1_5", "accelerate")
-             if m in sys.modules]
-    ok(not heavy,
-       f"importing the whole panel pulls in no model runtime ({heavy or 'none'})"
-       " — the teachers live in their own environments and this one has not "
-       "been made to carry them")
+    # IN A SUBPROCESS, and that is the whole point of the change. Asserting
+    # "torch is not in sys.modules" inside this suite only held while nothing
+    # ELSE had imported it -- and the moment a later section started exercising
+    # the real headway pipeline (which is RIO's own stack, and legitimately
+    # uses torch) the check began failing for a reason that has nothing to do
+    # with the teachers. A test whose result depends on what ran before it is
+    # not measuring what it says.
+    #
+    # So: a fresh interpreter, importing ONLY the panel, reporting what came
+    # with it.
+    import subprocess
+
+    probe = (
+        "import sys; import teachers.panel;"
+        "print(','.join(sorted(m for m in "
+        "('torch','transformers','accelerate','alpamayo1_5','cosmos_reason2') "
+        "if m in sys.modules)))"
+    )
+    out = subprocess.run([sys.executable, "-c", probe],
+                         cwd=os.path.dirname(os.path.dirname(
+                             os.path.abspath(__file__))),
+                         capture_output=True, text=True, timeout=180)
+    heavy = [m for m in out.stdout.strip().split(",") if m]
+    ok(out.returncode == 0 and not heavy,
+       f"a fresh interpreter importing teachers.panel pulls in no model "
+       f"runtime ({heavy or 'none'}) — the teachers live in their own "
+       f"environments and RIO's has not been made to carry them"
+       + (f" [{out.stderr.strip()[-200:]}]" if out.returncode else ""))
 
 
 def run_flow_and_corpus():
@@ -662,6 +764,233 @@ def run_desync():
     panel.stop()
     fast.stop()
     slow.stop()
+    corpus_mod.close(key)
+
+
+def run_paths():
+    section("K. nothing this project runs may fill the container layer")
+    # TWICE IN ONE BUILD the 60 GB container layer filled completely and took
+    # the box with it -- no writable temp space, so nothing that could have
+    # diagnosed it could run either, and it needed a terminal outside the
+    # harness to clear.
+    #
+    # Both times, uv. Its download cache AND the ephemeral environment a
+    # PEP-723 `uv run --script` resolves into live under UV_CACHE_DIR, which
+    # defaults to ~/.cache/uv on the layer that already holds ~28 GB of
+    # teacher venvs. One torch unpack is ~10 GB.
+    #
+    # boot.sh exports the right value. That was not enough: the second time it
+    # filled, it filled from a TEST -- tools/teacher_input_selftest.py shells
+    # out to uv inheriting os.environ, and run from a plain shell the variable
+    # was simply absent. An environment variable somebody else has to export
+    # is a convention, not a setting.
+    import subprocess
+
+    from teachers import paths as paths_mod
+
+    ok(paths_mod.UV_CACHE_DIR.startswith("/workspace"),
+       f"uv's cache is on the volume ({paths_mod.UV_CACHE_DIR}) — the "
+       f"container layer cannot hold it next to two teacher venvs")
+    ok(paths_mod.HF_HOME.startswith("/workspace"),
+       f"and so are the weights ({paths_mod.HF_HOME})")
+
+    # THE POINT OF THE WHOLE FILE: a child process gets the value even when
+    # the parent's shell never heard of it. Asserted with a scrubbed
+    # environment, which is exactly the case that failed.
+    clean = {k: v for k, v in os.environ.items()
+             if k not in ("UV_CACHE_DIR", "UV_LINK_MODE", "HF_HOME",
+                          "UV_PYTHON_INSTALL_DIR")}
+    real, os.environ_backup = dict(os.environ), None
+    try:
+        os.environ.clear()
+        os.environ.update(clean)
+        env = paths_mod.subprocess_env()
+    finally:
+        os.environ.clear()
+        os.environ.update(real)
+    ok(env.get("UV_CACHE_DIR") == paths_mod.UV_CACHE_DIR,
+       "a shell that never sourced env.sh still hands its children the right "
+       "UV_CACHE_DIR")
+    ok(env.get("HF_HOME") == paths_mod.HF_HOME,
+       "...and the right HF_HOME, so a subprocess cannot re-download 21 GB "
+       "into a directory that is about to disappear")
+    ok(env.get("UV_LINK_MODE") == "copy",
+       "with copy linking, because the cache and the venvs are on different "
+       "filesystems and hardlinks do not cross that")
+
+    # And the tools actually use it, rather than building their own env dict.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("teacher_input_selftest.py", "teacher_bench.py"):
+        src = open(os.path.join(here, name)).read()
+        ok("paths.subprocess_env" in src,
+           f"tools/{name} builds its child environment from teachers/paths.py")
+        ok("dict(os.environ)" not in src,
+           f"...and not by hand ({name})")
+    qsrc = open(os.path.join(here, "..", "teachers", "service",
+                             "quantize.py")).read()
+    ok("paths.subprocess_env" in qsrc and "dict(os.environ)" not in qsrc,
+       "and so does the quantizer, which is the one that actually filled it")
+
+    # The token is read from the volume, and is not in the worktree.
+    ok(not os.path.abspath(paths_mod.SECRETS).startswith(
+        os.path.abspath(os.path.join(here, ".."))),
+       f"the HF token lives outside the git worktree ({paths_mod.SECRETS})")
+    probe = subprocess.run(
+        ["git", "check-ignore", "-q", paths_mod.SECRETS],
+        cwd=os.path.join(here, ".."), capture_output=True)
+    ok(probe.returncode != 0,
+       "and git cannot see it at all — it is not merely ignored, it is "
+       "somewhere git is not")
+
+
+def run_unique_rows():
+    section("J. the row only one column can fill")
+    from teachers import decision as dec_mod
+
+    # ALPAMAYO: two words, by arithmetic on its own 64 waypoints. Derived
+    # rather than asked for, so it is the same answer every time and can be
+    # re-derived from a corpus row a year from now.
+    def traj(points):
+        return {"xyz": points, "hz": 10, "horizon_s": 6.4}
+
+    steady = [[i * 1.3, 0.0, 0.0] for i in range(64)]
+    brake, x, v = [], 0.0, 13.0
+    for _ in range(64):
+        brake.append([x, 0.0, 0.0]); x += v * 0.1; v = max(3.0, v - 0.16)
+    accel, x, v = [], 0.0, 8.0
+    for _ in range(64):
+        accel.append([x, 0.0, 0.0]); x += v * 0.1; v += 0.12
+    left = [[i * 1.3, (i / 63.0) ** 2 * 2.5, 0.0] for i in range(64)]
+    right = [[i * 1.3, -(i / 63.0) ** 2 * 2.5, 0.0] for i in range(64)]
+
+    for label, pts, want in (("a steady path", steady, "Holding, straight"),
+                             ("braking", brake, "Slowing, straight"),
+                             ("accelerating", accel, "Accelerating, straight"),
+                             ("curving left", left, "Holding, drifting left"),
+                             ("curving right", right, "Holding, drifting right")):
+        d = dec_mod.describe(traj(pts))
+        ok(d.get("text") == want,
+           f"{label} -> {d.get('text')!r} (want {want!r})")
+    ok(dec_mod.describe(traj(left))["lateral_end_m"] > 0
+       and dec_mod.describe(traj(right))["lateral_end_m"] < 0,
+       "y is metres to the LEFT — getting that sign backwards would put "
+       "'drifting right' on every left-hand curve, and nothing else would "
+       "notice")
+    d = dec_mod.describe(traj(brake))
+    ok(d["thresholds"] and d["v_start_ms"] > d["v_end_ms"],
+       f"the numbers and the thresholds ride with the words "
+       f"({d['v_start_ms']} -> {d['v_end_ms']} m/s, a={d['accel_ms2']})")
+    ok(dec_mod.describe(traj(steady[:4])) == {},
+       "a path too short to difference gets no verdict rather than a guess")
+    ok(dec_mod.describe(None) == {}, "and neither does no path at all")
+
+    section("J2. Cosmos's physics answer splits on its own marker")
+    cases = [
+        ("Actors here. Plausibility: The scenario is physically possible.",
+         False, "the common wording"),
+        ("Actors. Plausibility: the van accelerating through the barrier is "
+         "not physically possible.", True, "an actual denial"),
+        # THE POLARITY TRAP. The prompt asks whether anything "could not
+        # physically happen", so a bare "No." means nothing is implausible --
+        # the opposite of what a keyword match gives. Cosmos answered exactly
+        # this way on two of ten acceptance keyframes.
+        ("Actors. Plausibility: No.", False, "a bare no, read the right way up"),
+        ("Actors. Plausibility: Yes", True, "and a bare yes"),
+        ("Actors. Plausibility: There are no physical inconsistencies.",
+         False, "no inconsistencies"),
+    ]
+    for text, want, why in cases:
+        got = dec_mod.split_physics(text)
+        ok(got.get("implausible") is want,
+           f"{why}: implausible={got.get('implausible')} (want {want})")
+    nov = dec_mod.split_physics("Just an account of the road, no verdict.")
+    ok(nov.get("has_verdict") is False and nov.get("actors"),
+       "an answer with no verdict keeps the whole thing as the actor account "
+       "and says the verdict is missing, rather than inventing one")
+    split = dec_mod.split_physics(
+        "A sedan is to the right. Plausibility: possible.")
+    ok(split["actors"] == "A sedan is to the right.",
+       f"and the verdict is split OFF the account ({split['actors']!r})")
+
+
+def run_cadence_no_drive():
+    section("I. a clip replay keeps the readings coming — with no drive open")
+    # THE BUG. The 2 s floor was described as running "while a drive is
+    # active", and the card only started polling from startDrive(). Replaying a
+    # clip pushes frames, runs the whole headway pipeline and DOES raise
+    # keyframes on the server -- but nothing asked for them, and the card sat
+    # at "fresh 154 s" through an entire clip while the teachers answered
+    # behind it every two seconds.
+    #
+    # The server half is asserted here: frames flowing, NO session, NO drive,
+    # and a keyframe every ~floor seconds. The browser half is the pacing in
+    # static/rio_teachers.js (arm/noteFrame) and is covered by the card suite.
+    panel.reset_all()
+    panel.stop()
+    a = FakeTeacher("alpamayo1.5", 18941, delay=0.02)
+    c = FakeTeacher("cosmos-reason2", 18942, delay=0.02)
+    config.TEACHER_ALPAMAYO_URL = "http://127.0.0.1:18941"
+    config.TEACHER_COSMOS_URL = "http://127.0.0.1:18942"
+    panel.start()
+
+    # "default" is the key a clip replay with no drive uses -- app._visual_key
+    # returns it for a null session_id. Nothing here starts a session, touches
+    # sessions.py, or sets a drive flag.
+    key = "default"
+    framebuf.drop_ring(key)
+    import shutil
+
+    shutil.rmtree(corpus_mod.session_dir(key), ignore_errors=True)
+    panel.drop(key)
+    for i in range(40):
+        egomotion.note_speed(key, 13.0, "manual", at=time.time() - 3.0 + i * 0.1)
+
+    floor = config.TEACHER_KEYFRAME_FLOOR_S
+    raised_at = []
+    t0 = time.time()
+    seen = 0
+    # ~10 fps for three floors' worth of wall clock, exactly as a replay does.
+    while time.time() - t0 < floor * 3 + 0.6:
+        ring, _ = push_window(key, n=5, spacing=0.1)
+        panel.on_frame(key, RESULT, ring)
+        n = panel.status()["sessions"].get(key, {}).get("keyframes", 0)
+        if n > seen:
+            seen = n
+            raised_at.append(round(time.time() - t0, 2))
+        time.sleep(0.1)
+
+    ok(len(raised_at) >= 3,
+       f"frames flowing with no drive raised {len(raised_at)} keyframes in "
+       f"{floor * 3 + 0.6:.1f}s at a {floor}s floor (at {raised_at})")
+    gaps = [round(b - a_, 2) for a_, b in zip(raised_at, raised_at[1:])]
+    ok(gaps and all(floor - 0.35 <= g <= floor + 0.6 for g in gaps),
+       f"and they are ~{floor}s apart, not bunched or starved ({gaps})")
+
+    deadline = time.time() + 20
+    while time.time() < deadline and len(corpus_mod.read_rows(key)) < len(raised_at):
+        time.sleep(0.5)
+    rows = corpus_mod.read_rows(key)
+    ok(len(rows) >= 3,
+       f"and each one became a reading in the record ({len(rows)})")
+    if rows:
+        stamps = [r["t0_wall"] for r in sorted(rows, key=lambda r: r["seq"])]
+        deltas = [round(b - a_, 2) for a_, b in zip(stamps, stamps[1:])]
+        ok(all(d > 0 for d in deltas),
+           f"each reading is of a LATER instant than the one before ({deltas})")
+        ok(all(r["window"]["origin"] == f"{key}:camera" for r in rows),
+           "and they carry the frames' own origin stamp")
+
+    section("I2. ...and stop when the frames do")
+    before = panel.status()["sessions"].get(key, {}).get("keyframes", 0)
+    time.sleep(floor + 0.5)
+    after = panel.status()["sessions"].get(key, {}).get("keyframes", 0)
+    ok(after == before,
+       f"no frames, no keyframes ({before} -> {after}) — the cadence follows "
+       f"the frame push, so a paused clip costs nothing")
+
+    panel.stop()
+    a.stop()
+    c.stop()
     corpus_mod.close(key)
 
 
@@ -886,6 +1215,9 @@ def main():
         run_service_isolation()
         run_flow_and_corpus()
         run_desync()
+        run_paths()
+        run_unique_rows()
+        run_cadence_no_drive()
         run_canned()
         run_association()
         if args.live:

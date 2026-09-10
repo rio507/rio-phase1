@@ -1630,6 +1630,40 @@
   }
   .teach-more:hover { color: var(--t2); }
 
+  /* THE ROW ONLY ONE COLUMN CAN FILL. Alpamayo's two words are a VERDICT --
+     mono, sized up, and the only place on this card where a teacher's word is
+     given weight, because it is the only one that is arithmetic rather than
+     prose. */
+  .teach-decision {
+    font-family: var(--font-mono); font-size: var(--fs-body);
+    letter-spacing: var(--ls-mono); text-transform: uppercase;
+    display: flex; align-items: baseline; gap: var(--gap-2xs);
+    margin-bottom: var(--gap-2xs);
+  }
+  .teach-decision b { font-weight: 500; color: var(--t2); }
+  .teach-decision .dec-sep { color: var(--t5); }
+  /* Slowing/accelerating are the two that mean something is CHANGING, so they
+     are the two that get a colour -- and it is the teacher's violet, never a
+     band colour: this is a shadow model's guess about the next six seconds,
+     not the car's opinion of the road. */
+  .teach-decision .dec-slowing,
+  .teach-decision .dec-stopping     { color: var(--teach-a); }
+  .teach-decision .dec-accelerating { color: var(--teach-a); }
+
+  /* A one-line note under a value: what it was derived from, or a verdict in
+     the model's own words. Quieter than body copy on purpose. */
+  .teach-hint {
+    font-size: var(--fs-nano); color: var(--t5); line-height: 1.4;
+    margin-top: 4px; overflow-wrap: anywhere;
+  }
+
+  /* Cosmos's own verdict on its own account of the scene. */
+  .teach-plausible, .teach-implausible {
+    text-transform: none; letter-spacing: 0; font-style: italic;
+  }
+  .teach-plausible   { color: var(--t4); }
+  .teach-implausible { color: var(--warn-text); }
+
   /* The referenced actor: a chip that either names a track or says why not. */
   .teach-actor {
     display: inline-flex; align-items: center; gap: var(--gap-2xs);
@@ -3457,10 +3491,15 @@ document.addEventListener('DOMContentLoaded', () => {
     schedule();
     startHeadway();
     scheduleHeartbeat();
-    /* The teacher panel starts with the drive, and the DeviceMotion permission
-       is asked for HERE and only here: iOS grants it from a user gesture and
-       from nothing else, and this tap is the gesture. Declining is fine -- the
-       ego history falls back to speed alone and says so. */
+    /* The DeviceMotion permission is asked for HERE and only here: iOS grants
+       it from a user gesture and from nothing else, and this tap is the
+       gesture. Declining is fine -- the ego history falls back to speed alone
+       and says so.
+
+       The card's POLLING is not tied to this. It follows the frame push (see
+       noteFrame), because a clip replay pushes frames and raises keyframes
+       without any drive being started -- and the card used to sit at "fresh
+       154 s" through the whole of one. */
     if (RIO.teacherPanel) RIO.teacherPanel.start();
   }
 
@@ -3488,8 +3527,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (RIO.headway) { RIO.headway.stopWatch(); RIO.headway.resetHud(); }
 
-    // Stopped BEFORE the session id is cleared, so its last IMU batch and its
-    // last poll still carry the drive they belong to.
+    // The IMU stream is stopped BEFORE the session id is cleared, so its last
+    // batch still carries the drive it belongs to. The card keeps polling: a
+    // clip can be replayed after a drive ends and those readings are just as
+    // real.
     if (RIO.teacherPanel) RIO.teacherPanel.stop();
 
     // Clear session first so in-flight captures stop tagging themselves.
@@ -4243,6 +4284,12 @@ document.addEventListener('DOMContentLoaded', () => {
     opts = opts || {};
     framesSeen++;
     paintHud(j);
+    /* FRAMES ARE FLOWING. One assignment, on the one path every headway
+       result comes back through -- camera, clip replay and manual grab alike.
+       The teacher card paces itself off this rather than off which button was
+       last pressed, because the server raises keyframes from the frame push
+       and the card should ask for them whenever that is happening. */
+    if (RIO.teacherPanel) RIO.teacherPanel.noteFrame();
     // WHEN this result describes, handed to the overlay with it. frameT is the
     // clip position the frame came from (replay); capturedAt is the wall clock
     // at the grab (live, where there is no media clock). The overlay needs one
@@ -5769,8 +5816,13 @@ document.addEventListener('DOMContentLoaded', () => {
       ? RIO.headway.streamStats() : null,
   });
 
-  // Paint once on load so the card is not blank before a drive starts.
+  // Paint once on load so the card is not blank before anything starts, and
+  // arm the idle-rate poll. It moves to the fast rate by itself the moment a
+  // frame comes back from anywhere -- see noteFrame.
   RIO.teacherPanel.refresh();
+  // arm(), not start(): pacing without the DeviceMotion permission prompt.
+  // Asking for that outside a user gesture is a permanent 'denied' on iOS.
+  RIO.teacherPanel.arm();
 
   if (RIO.speech && RIO.speech.onEvent) {
     RIO.speech.onEvent(ev => {

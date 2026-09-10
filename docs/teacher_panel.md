@@ -680,6 +680,39 @@ running shows as not answering on the card, `/health` reports it degraded, and
 every corpus row records `models_ran` so a one-teacher drive is
 self-describing rather than silently different.
 
+## 10c. The container layer, and the two times it filled
+
+Twice in this build the 60 GB container layer filled completely and took the
+box with it: no writable temp space, so nothing that could have diagnosed the
+problem could run either, and it needed a terminal outside the harness to
+clear.
+
+Both times, `uv`. Its download cache **and** the ephemeral environment a
+PEP-723 `uv run --script` resolves into live under `UV_CACHE_DIR`, which
+defaults to `~/.cache/uv` — on the layer that already holds ~28 GB of teacher
+venvs. One torch unpack is ~10 GB.
+
+The first fix set `UV_CACHE_DIR` in `boot.sh` and `/workspace/env.sh`. That is
+right and **was not enough**: it only reaches a process whose shell sourced one
+of them, and the second time the layer filled, it filled *from a test* —
+`tools/teacher_input_selftest.py` shells out to `uv` inheriting `os.environ`,
+and run from a plain shell the variable was simply absent.
+
+An environment variable somebody else has to export is a convention, not a
+setting. So `teachers/paths.py` holds the values, and every subprocess in the
+project builds its environment from `paths.subprocess_env()` — asserted in the
+selftest against a *scrubbed* environment, which is exactly the case that
+failed.
+
+| | |
+|---|---|
+| uv cache + script environments | `/workspace/teachers/uv-cache` (volume) |
+| weights | `/workspace/.cache/huggingface` (volume) |
+| FP8 checkpoints | `/workspace/teachers/fp8` (volume) |
+| pinned checkouts | `/workspace/teachers/src` (volume) |
+| the two venvs | `/opt/teachers/venvs` (container layer, rebuilt by boot.sh) |
+| HF token | `/workspace/teachers/secrets.env` (volume, outside the worktree) |
+
 ## 11. What is deliberately not here
 
 * **No training.** The corpus is schema'd so it can be one later.

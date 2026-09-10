@@ -40,11 +40,9 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config                                                     # noqa: E402
+from teachers import paths                                       # noqa: E402
 
-VENVS = {
-    "alpamayo": "/opt/teachers/venvs/alpamayo/bin/python",
-    "cosmos": "/opt/teachers/venvs/cosmos/bin/python",
-}
+VENVS = paths.VENVS
 MODULES = {
     "alpamayo": "teachers.service.alpamayo_service",
     "cosmos": "teachers.service.cosmos_service",
@@ -52,8 +50,8 @@ MODULES = {
 PORTS = {"alpamayo": 8801, "cosmos": 8802}
 # Where the FP8 checkpoints are written by teachers/service/quantize.py.
 FP8_PATHS = {
-    "alpamayo": "/workspace/teachers/fp8/alpamayo_fp8",
-    "cosmos": "/workspace/teachers/fp8/model_fp8",
+    "alpamayo": os.path.join(paths.FP8_DIR, "alpamayo_fp8"),
+    "cosmos": os.path.join(paths.FP8_DIR, "model_fp8"),
 }
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -135,9 +133,11 @@ def start_service(model, precision, port, weights=None, extra=None):
     if weights:
         cmd += ["--model", weights]
     cmd += list(extra or [])
-    env = dict(os.environ)
-    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
-    log = open(f"/opt/teachers/logs/bench_{model}_{precision}.log", "w")
+    # Paths from code, never from the caller's shell — see teachers/paths.py.
+    env = paths.load_secrets(paths.subprocess_env())
+    os.makedirs(paths.LOG_DIR, exist_ok=True)
+    log = open(os.path.join(paths.LOG_DIR,
+                            f"bench_{model}_{precision}.log"), "w")
     print("+ " + " ".join(cmd), flush=True)
     proc = subprocess.Popen(cmd, cwd=REPO, env=env, stdout=log, stderr=log,
                             start_new_session=True)
@@ -290,7 +290,7 @@ def main():
     ap.add_argument("--json", default=None, help="write the raw results here")
     args = ap.parse_args()
 
-    os.makedirs("/opt/teachers/logs", exist_ok=True)
+    os.makedirs(paths.LOG_DIR, exist_ok=True)
     jobs = []
     if args.all:
         # ONE AT A TIME, deliberately: two 20 GB models loading at once on a

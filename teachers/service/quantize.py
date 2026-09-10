@@ -51,7 +51,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_SRC = Path("/workspace/teachers/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from teachers import paths                                       # noqa: E402
+
+REPO_SRC = Path(paths.SRC_DIR)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COSMOS_REPO = REPO_SRC / "cosmos-reason2"
 
@@ -86,8 +89,11 @@ def quantize_cosmos(out_dir: Path, precision: str, num_samples: int) -> int:
            "-o", str(out_dir), "--model", COSMOS_ID,
            "--precision", precision, "--num-samples", str(num_samples)]
     print("+ " + " ".join(cmd), flush=True)
-    env = dict(os.environ)
-    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    # Paths from code, never from the caller's shell. Both branches here are
+    # `uv run --script` and each resolves a large environment of its own;
+    # without UV_CACHE_DIR that lands on the container layer and fills it.
+    # See teachers/paths.py.
+    env = paths.load_secrets(paths.subprocess_env())
     return subprocess.call(cmd, cwd=str(COSMOS_REPO), env=env)
 
 
@@ -107,15 +113,18 @@ def quantize_alpamayo(out_dir: Path) -> int:
         return 2
     cmd = ["uv", "run", "--script", str(script), "-o", str(out_dir)]
     print("+ " + " ".join(cmd), flush=True)
-    env = dict(os.environ)
-    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    # Paths from code, never from the caller's shell. Both branches here are
+    # `uv run --script` and each resolves a large environment of its own;
+    # without UV_CACHE_DIR that lands on the container layer and fills it.
+    # See teachers/paths.py.
+    env = paths.load_secrets(paths.subprocess_env())
     return subprocess.call(cmd, cwd=str(REPO_ROOT), env=env)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=("alpamayo", "cosmos"))
-    ap.add_argument("--out", default="/workspace/teachers/fp8")
+    ap.add_argument("--out", default=paths.FP8_DIR)
     ap.add_argument("--precision", default="fp8",
                     choices=("fp8", "fp8_dynamic", "nvfp4"),
                     help="cosmos only; alpamayo is always FP8_DYNAMIC")

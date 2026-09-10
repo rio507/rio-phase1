@@ -139,7 +139,14 @@ def main():
     ap.add_argument("--name", default="alpamayo_fp8")
     args = ap.parse_args()
 
+    # This script is run directly as often as it is run through quantize.py,
+    # so it sets its own paths rather than trusting the caller's shell. It is
+    # already inside its own uv environment by the time this runs, but HF_HOME
+    # decides where 21 GB of weights are looked for and must not default to a
+    # container-layer cache.
     os.environ.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    os.environ.setdefault("UV_CACHE_DIR", "/workspace/teachers/uv-cache")
+    os.environ.setdefault("UV_LINK_MODE", "copy")
     import torch
     from llmcompressor import oneshot
     from llmcompressor.modifiers.quantization import QuantizationModifier
