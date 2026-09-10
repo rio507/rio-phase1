@@ -222,6 +222,22 @@ rio_wait_healthy() {
 TEACHERS_ROOT=/workspace/teachers
 TEACHERS_VENVS=/opt/teachers/venvs
 TEACHERS_LOGS=/opt/teachers/logs
+# uv's DOWNLOAD AND UNPACK CACHE, ON THE VOLUME. Not a tidiness preference:
+# the container layer is 60 GB and the two teacher environments are ~28 GB of
+# it, so there is no room left on it for uv to also keep an unpacked copy of
+# every wheel AND build the ephemeral environment a `uv run --script` needs.
+#
+# On 2026-09-10 that filled the overlay completely, part-way through resolving
+# the FP8 quantizer's environment, and left the box with no writable temp space
+# at all -- which is a much worse failure than a slow download, because nothing
+# that could have diagnosed it could run either.
+#
+# On the volume it also survives a pod rebuild, so `teachers-build` after a
+# restart is a copy rather than a 28 GB download.
+export UV_CACHE_DIR="$TEACHERS_ROOT/uv-cache"
+# ...and so is the ephemeral environment a PEP-723 script resolves into, which
+# is a separate directory uv places beside the cache.
+export UV_LINK_MODE=copy
 ALPAMAYO_REPO=https://github.com/NVlabs/alpamayo1.5.git
 ALPAMAYO_SHA=36aeb4c5938cbc2eb2aed33b22434773da4ab639
 COSMOS_REPO=https://github.com/nvidia-cosmos/cosmos-reason2.git
@@ -296,9 +312,11 @@ teachers_build() {
     fi
     teachers_clone || return 1
     mkdir -p "$TEACHERS_VENVS" "$TEACHERS_LOGS"
-    # Copy rather than hardlink: the uv cache is on the container layer and the
-    # checkouts are on a network volume, and hardlinks do not cross that.
-    export UV_LINK_MODE=copy UV_PYTHON_INSTALL_DIR=/opt/teachers/pythons
+    # Copy rather than hardlink (set with UV_CACHE_DIR above): the cache and
+    # the venvs are on different filesystems, and hardlinks do not cross that.
+    export UV_PYTHON_INSTALL_DIR=/opt/teachers/pythons
+    mkdir -p "$UV_CACHE_DIR"
+    echo "   uv cache: $UV_CACHE_DIR ($(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1))"
 
     if [ ! -x "$TEACHERS_VENVS/alpamayo/bin/python" ]; then
         echo "   building alpamayo env (python 3.12, torch 2.8)"

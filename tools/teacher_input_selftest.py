@@ -155,6 +155,111 @@ print("NOTHINK", split_thinking("Plain answer.") == ("", "Plain answer."))
 '''
 
 
+# The FP8 recipe, checked against layer names rather than against a checkpoint.
+# "FP8" on a dashboard means the language backbone and NOT the vision tower,
+# the lm_head or the diffusion expert -- which is a claim about regexes, and
+# regexes are exactly the thing that silently stops matching.
+QUANT = '''
+import re, sys
+sys.path.insert(0, "/workspace/teachers/src/alpamayo1.5/src")
+sys.path.insert(0, "%s")
+import torch, transformers, llmcompressor
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
+from teachers.service.quantize_alpamayo import IGNORE
+print("ENV", torch.__version__, transformers.__version__, llmcompressor.__version__)
+m = QuantizationModifier(targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE)
+print("SCHEME", m.scheme)
+def ignored(n):
+    return any(re.search(p[3:] if p.startswith("re:") else p, n) for p in IGNORE)
+print("BACKBONE", not ignored("model.vlm.model.language_model.layers.0.self_attn.q_proj"))
+print("LMHEAD", ignored("model.vlm.lm_head"))
+print("VISION", ignored("model.vlm.model.visual.blocks.0.attn.qkv"))
+print("DIFFUSION", ignored("diffusion_expert.layers.0.mlp.gate_proj"))
+print("ACTION", ignored("action_in_proj.enc.0"))
+print("TRAJ", ignored("traj_tokenizer.proj"))
+''' % REPO
+
+# The vision tower's first layer, rewritten. Checked for EQUALITY first and
+# speed second: a fast layer that quietly computes something else would be
+# invisible in every reading afterwards and would look exactly like the model
+# being worse at driving.
+PATCHEMBED = FRAMES + '''
+import time
+import torch, torch.nn as nn
+from teachers.service.common import flatten_patch_embed
+
+class FakeVisual(nn.Module):
+    def __init__(self, conv):
+        super().__init__()
+        self.patch_embed = nn.Module()
+        self.patch_embed.proj = conv
+
+N, C, T, P, E = 2400, 3, 2, 16, 1152          # one 4-frame window, as shipped
+torch.manual_seed(0)
+conv = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[T,P,P]).cuda().to(torch.bfloat16)
+x = torch.randn(N*C*T*P*P, dtype=torch.bfloat16, device="cuda")
+
+def bench(fn, n=3):
+    fn(); torch.cuda.synchronize(); s0=time.time()
+    for _ in range(n): r = fn()
+    torch.cuda.synchronize()
+    return r, (time.time()-s0)/n*1000
+
+with torch.no_grad():
+    ref, conv_ms = bench(lambda: conv(x.view(-1,C,T,P,P)).view(-1,E))
+    vis = FakeVisual(conv)
+    info = flatten_patch_embed(vis, log=lambda *a: None)
+    got, lin_ms = bench(lambda: vis.patch_embed(x))
+
+print("APPLIED", info.get("applied"), info.get("reason") or "")
+print("SHAPE", tuple(ref.shape) == tuple(got.shape), tuple(got.shape))
+print("MAXDEV", (ref.float()-got.float()).abs().max().item())
+print("ALLCLOSE", torch.allclose(ref.float(), got.float(), atol=5e-2))
+print("CONVMS %.1f" % conv_ms)
+print("LINMS %.3f" % lin_ms)
+
+# An overlapping / padded conv is a DIFFERENT operation and must be refused.
+bad = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[1,8,8]).cuda().to(torch.bfloat16)
+print("REFUSED", not flatten_patch_embed(FakeVisual(bad), log=lambda *a: None)["applied"])
+'''
+
+QUANT_HEADER = """# /// script
+# requires-python = "==3.12.*"
+# dependencies = ["llmcompressor==0.9.0.4","transformers==4.57.1","torch==2.8.0",
+#                 "torchvision>=0.23.0","accelerate>=1.12.0","einops>=0.8.1",
+#                 "hydra-core>=1.3.2","pillow>=12.0.0","numpy<3","scipy>=1.11"]
+# ///
+"""
+
+
+def run_uv_script(body):
+    """A PEP-723 script through `uv run`, in an environment of its own."""
+    import tempfile
+
+    env = dict(os.environ)
+    env["PATH"] = os.path.expanduser("~/.local/bin") + ":" + env.get("PATH", "")
+    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(QUANT_HEADER + body)
+        path = f.name
+    try:
+        p = subprocess.run(["uv", "run", "--script", path], cwd=REPO, env=env,
+                           capture_output=True, text=True, timeout=1200)
+    finally:
+        os.unlink(path)
+    if p.returncode != 0:
+        ok(False, f"the quantization environment failed to resolve or import"
+                  f"\n{p.stderr[-1200:]}")
+        return {}
+    out = {}
+    for line in p.stdout.splitlines():
+        parts = line.split(None, 1)
+        if parts and parts[0].isupper():
+            out[parts[0]] = parts[1] if len(parts) > 1 else ""
+    return out
+
+
 def run(name, script):
     py = VENVS[name]
     if not os.path.exists(py):
@@ -232,6 +337,57 @@ def main():
         ok(c.get("THINK") == "True" and c.get("NOTHINK") == "True",
            "the <think> trace is separated from the answer, and an untagged "
            "generation stays an ANSWER rather than becoming an empty one")
+
+    section("D. the vision tower's first layer — same arithmetic, 13.7 s cheaper")
+    pe = run("cosmos", PATCHEMBED)
+    if pe:
+        ok(pe.get("APPLIED", "").startswith("True"),
+           f"the Conv3d patch embedding is rewritten as a linear layer "
+           f"({pe.get('APPLIED')})")
+        ok(pe.get("ALLCLOSE") == "True" and pe.get("SHAPE", "").startswith("True"),
+           f"and computes the SAME numbers — max deviation "
+           f"{pe.get('MAXDEV')} is bf16 rounding, not a different model")
+        try:
+            conv_ms = float(pe.get("CONVMS", "0"))
+            lin_ms = float(pe.get("LINMS", "0"))
+        except ValueError:
+            conv_ms = lin_ms = 0.0
+        ok(conv_ms > 1000 and lin_ms < 50,
+           f"the shipped Conv3d takes {conv_ms:.0f} ms on one window and the "
+           f"linear form takes {lin_ms:.2f} ms — 99.9% of a vision-tower "
+           f"forward, and four of them per keyframe made Cosmos a 57-second "
+           f"teacher on a 2-second cadence")
+        ok(pe.get("REFUSED") == "True",
+           "an overlapping or padded conv is NOT rewritten — the equivalence "
+           "only holds for non-overlapping patches, and a wrong rewrite here "
+           "would be invisible in every reading afterwards")
+
+    section("C. the FP8 recipe reaches the backbone and nothing else")
+    q = run_uv_script(QUANT)
+    if q:
+        env = q.get("ENV", "").split()
+        ok(len(env) == 3 and env[1] == "4.57.1",
+           f"the quantizer resolves against Alpamayo's OWN transformers pin "
+           f"({q.get('ENV')}) — llmcompressor unpinned drags transformers to "
+           f"5.x and torch to cu130, which is how the serving venv was "
+           f"destroyed once already")
+        ok(q.get("SCHEME") == "FP8_DYNAMIC",
+           "FP8_DYNAMIC — static calibration needs a forward pass the "
+           "composite model's signature does not provide")
+        ok(q.get("BACKBONE") == "True",
+           "the language backbone's Linear layers ARE quantized")
+        for key, what, why in (
+                ("LMHEAD", "the output projection",
+                 "a rounding error of the parameter count, and measurable "
+                 "quality if you round it"),
+                ("VISION", "the vision tower",
+                 "it has to read a 40-metre car out of thirty pixels"),
+                ("DIFFUSION", "the diffusion expert",
+                 "so the predicted path is computed at full precision from a "
+                 "quantized trace"),
+                ("ACTION", "the action projection", "same head, same reason"),
+                ("TRAJ", "the trajectory tokenizer", "same head, same reason")):
+            ok(q.get(key) == "True", f"{what} is NOT — {why}")
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)

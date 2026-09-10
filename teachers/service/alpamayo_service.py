@@ -82,6 +82,7 @@ class AlpamayoService(common.Service):
         self.attn = attn
         self.model = None
         self.processor = None
+        self.patch_embed_info = None
 
     # -- loading ------------------------------------------------------------
     def load(self):
@@ -100,12 +101,24 @@ class AlpamayoService(common.Service):
             kw["dtype"] = torch.bfloat16
         self.model = Alpamayo1_5.from_pretrained(self.model_path, **kw).to("cuda")
         self.model.eval()
+        # The same rewrite Cosmos gets: Alpamayo's backbone IS a Qwen3-VL, so
+        # it has the same Conv3d patch embedding. It is cheaper here -- fewer
+        # patches, because the model's own config caps max_pixels at 196608 --
+        # but it is the same free win, and applying it in one place means the
+        # two teachers cannot end up with differently-shaped vision paths.
+        try:
+            self.patch_embed_info = common.flatten_patch_embed(
+                self.model.vlm.model.visual)
+        except Exception as e:
+            self.patch_embed_info = {"applied": False,
+                                     "reason": f"{type(e).__name__}: {e}"}
         self.processor = helper.get_processor(self.model.tokenizer)
 
     def describe(self):
         return {"model": self.name, "model_id": MODEL_ID, "revision": REVISION,
                 "code_revision": CODE_REVISION, "precision": self.precision,
-                "cameras": 1, "attn": self.attn}
+                "cameras": 1, "attn": self.attn,
+                "patch_embed": getattr(self, "patch_embed_info", None)}
 
     # -- input --------------------------------------------------------------
     def _frames_tensor(self, images):

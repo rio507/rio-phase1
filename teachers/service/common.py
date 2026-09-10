@@ -85,6 +85,102 @@ def decode_frames(payload):
     return out
 
 
+def flatten_patch_embed(visual, verify=True, log=print):
+    """Make Qwen3-VL's vision patch embedding fast, without changing a number.
+
+    THE MEASUREMENT THAT MOTIVATES THIS. On this pod, one forward pass of
+    Cosmos-Reason2's vision tower over a four-frame window took 15.0 s. Broken
+    down: the 27 transformer blocks 16 ms, the positional embedding 2 ms, the
+    rotary table 0.5 ms, the merger 0.1 ms -- and `patch_embed` 13.7 s. One
+    module, 99.9% of the time, and four of them per keyframe made Cosmos a
+    57-second teacher on a 2-second cadence. Every keyframe would have been
+    evicted; the second column of the card would have been empty on the road.
+
+    WHY IT IS SLOW, AND WHY THIS IS NOT A TRICK. The module is an nn.Conv3d
+    whose kernel_size EQUALS its stride and equals the whole spatial extent of
+    each input volume: 2400 separate (3, 2, 16, 16) blocks, each producing
+    exactly one output voxel. cuDNN picks a pathological algorithm for that
+    shape here -- `torch.backends.cudnn.benchmark = True` does not help, it was
+    measured at 13.8 s -- but the operation itself is, exactly and by
+    definition, a matrix multiply: with no overlap and no padding there is one
+    dot product per block between the flattened block and the flattened kernel.
+
+    So the weight is reshaped from (E, C, T, P, P) to (E, C*T*P*P), the input
+    from (N, C, T, P, P) to (N, C*T*P*P), and the conv becomes one GEMM. Same
+    weights, same bias, same arithmetic, same order of the flattened axes.
+    0.0 ms.
+
+    AND IT IS CHECKED, not asserted in a comment. `verify` runs both forms on
+    random input at load and refuses the swap if they disagree beyond bf16
+    rounding -- because a silent numerical change in the first layer of the
+    vision tower would be invisible in every reading afterwards, and would look
+    exactly like the model being worse at driving.
+
+    -> a dict describing what happened, for the service's /health.
+    """
+    import torch
+    from torch import nn
+
+    pe = getattr(visual, "patch_embed", None)
+    proj = getattr(pe, "proj", None)
+    if pe is None or not isinstance(proj, nn.Conv3d):
+        return {"applied": False, "reason": "no Conv3d patch_embed"}
+    k, st, pad, dil = (tuple(proj.kernel_size), tuple(proj.stride),
+                       tuple(proj.padding), tuple(proj.dilation))
+    # The equivalence holds ONLY when the patches do not overlap, are not
+    # padded and are not dilated. Anything else and this is a different
+    # operation, so it is left alone.
+    if k != st or any(pad) or any(d != 1 for d in dil) or proj.groups != 1:
+        return {"applied": False,
+                "reason": f"not a non-overlapping patch conv "
+                          f"(k={k} stride={st} pad={pad} dil={dil})"}
+
+    E = proj.out_channels
+    fan = proj.in_channels * k[0] * k[1] * k[2]
+    W = proj.weight.detach().reshape(E, fan).contiguous()
+    b = None if proj.bias is None else proj.bias.detach().clone()
+
+    if verify:
+        torch.manual_seed(0)
+        x = torch.randn(64 * fan, dtype=W.dtype, device=W.device)
+        with torch.no_grad():
+            ref = proj(x.view(-1, proj.in_channels, *k)).view(-1, E)
+            got = torch.nn.functional.linear(x.view(-1, fan), W, b)
+        # bf16 has ~3 decimal digits; a real difference is orders larger.
+        tol = 5e-2 if W.dtype in (torch.bfloat16, torch.float16) else 1e-4
+        err = (ref.float() - got.float()).abs().max().item()
+        if err > tol:
+            return {"applied": False,
+                    "reason": f"forms disagree by {err:.4g} (> {tol})"}
+    else:
+        err = None
+
+    class LinearPatchEmbed(nn.Module):
+        def __init__(self, weight, bias, in_channels, kernel, embed_dim):
+            super().__init__()
+            self.register_buffer("weight", weight, persistent=False)
+            if bias is None:
+                self.bias = None
+            else:
+                self.register_buffer("bias", bias, persistent=False)
+            self.in_channels = in_channels
+            self.kernel = kernel
+            self.embed_dim = embed_dim
+            self.fan = in_channels * kernel[0] * kernel[1] * kernel[2]
+
+        def forward(self, hidden_states):
+            return torch.nn.functional.linear(
+                hidden_states.view(-1, self.fan).to(self.weight.dtype),
+                self.weight, self.bias)
+
+    visual.patch_embed = LinearPatchEmbed(W, b, proj.in_channels, k, E)
+    log(f"[patch_embed] Conv3d{k} -> linear ({fan} -> {E}); "
+        f"max deviation {err:.3g}" if err is not None
+        else f"[patch_embed] Conv3d{k} -> linear ({fan} -> {E})")
+    return {"applied": True, "kernel": list(k), "fan_in": fan,
+            "embed_dim": E, "max_deviation": err}
+
+
 def vram_mb():
     """Peak allocation this process has reached, in MB. 0 without CUDA."""
     try:

@@ -52,6 +52,7 @@ import sys
 from pathlib import Path
 
 REPO_SRC = Path("/workspace/teachers/src")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 COSMOS_REPO = REPO_SRC / "cosmos-reason2"
 
 ALPAMAYO_ID = "nvidia/Alpamayo-1.5-10B"
@@ -70,10 +71,9 @@ COSMOS_ID = "nvidia/Cosmos-Reason2-8B"
 #                      produces, and it is not worth a byte of what it costs.
 IGNORE_COMMON = ["re:.*lm_head", "re:visual.*", "re:model.visual.*",
                  "re:.*mlp.gate$"]
-IGNORE_ALPAMAYO = IGNORE_COMMON + [
-    "re:.*diffusion.*", "re:.*action_expert.*", "re:.*action_in_proj.*",
-    "re:.*traj.*",
-]
+# Alpamayo's own ignore list lives in quantize_alpamayo.py, next to the
+# recipe that uses it, because that script runs in a different environment and
+# must not import anything from here.
 
 
 def quantize_cosmos(out_dir: Path, precision: str, num_samples: int) -> int:
@@ -92,39 +92,24 @@ def quantize_cosmos(out_dir: Path, precision: str, num_samples: int) -> int:
 
 
 def quantize_alpamayo(out_dir: Path) -> int:
-    """The same recipe, applied to the backbone of a model NVIDIA did not script.
+    """Also its own locked environment — see quantize_alpamayo.py's header.
 
-    Run with the ALPAMAYO venv plus llmcompressor: the model class lives in the
-    `alpamayo1_5` package and cannot be loaded anywhere else.
+    NOT a function call into the serving venv, and this is the one lesson of
+    this file: installing llmcompressor into the Alpamayo environment resolved
+    to a version that wants transformers 5.x, dragged transformers and torch
+    with it, and left the serving venv unable to import PreTrainedModel. A
+    quantizer that breaks the thing it quantizes for is an outage waiting for
+    whoever runs it next.
     """
-    import torch
-    from llmcompressor import oneshot
-    from llmcompressor.modifiers.quantization import QuantizationModifier
-
-    from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
-
-    out = out_dir / "alpamayo_fp8"
-    out.mkdir(parents=True, exist_ok=True)
-
-    print(f"loading {ALPAMAYO_ID} (bf16, cpu)...", flush=True)
-    model = Alpamayo1_5.from_pretrained(
-        ALPAMAYO_ID, dtype=torch.bfloat16, attn_implementation="sdpa")
-
-    recipe = QuantizationModifier(
-        targets="Linear", scheme="FP8_DYNAMIC", ignore=IGNORE_ALPAMAYO)
-    print("oneshot FP8_DYNAMIC (data-free)...", flush=True)
-    oneshot(model=model, recipe=recipe)
-
-    print(f"saving -> {out}", flush=True)
-    model.save_pretrained(str(out), save_compressed=True)
-    # The tokenizer travels with the checkpoint or the service cannot build a
-    # processor from the local path, and a quantized model that can only be
-    # loaded next to the original defeats the point of having it.
-    try:
-        model.tokenizer.save_pretrained(str(out))
-    except Exception as e:
-        print(f"   (tokenizer not saved: {e})")
-    return 0
+    script = Path(__file__).with_name("quantize_alpamayo.py")
+    if not script.exists():
+        print(f"!! {script} is missing")
+        return 2
+    cmd = ["uv", "run", "--script", str(script), "-o", str(out_dir)]
+    print("+ " + " ".join(cmd), flush=True)
+    env = dict(os.environ)
+    env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
+    return subprocess.call(cmd, cwd=str(REPO_ROOT), env=env)
 
 
 def main():
