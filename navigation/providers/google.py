@@ -94,6 +94,60 @@ _MANEUVER_MAP = {
 
 _ONTO = re.compile(r"\b(?:onto|on to)\s+(.+)$", re.IGNORECASE)
 
+# "Take exit 43 toward Sunset Blvd" / "Take exit 12B" / "Exit 7 toward ..."
+# The number and the toward-phrase are the two halves a driver reads off the
+# gantry, and they are the two halves the far call on a freeway is made of.
+_EXIT = re.compile(
+    r"\bexit\s+([0-9]+[A-Za-z]?)\b(?:\s+(?:toward|towards|for|to)\s+(.+))?",
+    re.IGNORECASE)
+
+# THE FAST LADDER STARTS HERE, in metres per second of step average.
+#
+# 22 m/s is 49 mph. A step averaging that has no signals on it, which is the
+# real distinction: a "highway" that a route crawls along at 30 is announced on
+# the surface ladder because that is what its approach actually feels like, and
+# a fast arterial with no lights is announced on the fast one because that is
+# what it drives like. Road class from behaviour rather than from a name is
+# also the only version available at this field mask -- Routes v2 does not
+# return a road classification at all -- and it is the version that stays
+# correct when a freeway is stationary.
+_HIGHWAY_SPEED_MS = 22.0
+# Ramps, merges and lane-keeps are freeway grammar. They get the fast ladder at
+# a lower bar because a 55 mph ramp approach still needs two miles of warning
+# to be across three lanes by the gore point.
+_INTERCHANGE_SPEED_MS = 17.0
+_INTERCHANGE_TYPES = (M.RAMP, M.MERGE, M.KEEP, M.FORK)
+
+
+def _exit_information(instruction: str) -> Optional[dict]:
+    """{"number": "43", "toward": "Sunset Blvd"} -- provider text, unparsed further.
+
+    Both halves are optional and a missing one is simply absent: an exit number
+    RIO invents is an exit a driver takes.
+    """
+    m = _EXIT.search(instruction or "")
+    if not m:
+        return None
+    out = {"number": m.group(1).strip()}
+    toward = (m.group(2) or "").strip().rstrip(".")
+    if toward:
+        # "toward Sunset Blvd and the 405" -- the first name is the one on the
+        # sign in the largest letters and the one worth saying.
+        for cut in (" and ", " then "):
+            i = toward.lower().find(cut)
+            if i > 0:
+                toward = toward[:i]
+        out["toward"] = toward.strip()
+    return out
+
+
+def _road_class(mtype: str, approach_speed_ms: Optional[float]) -> str:
+    """SURFACE or HIGHWAY, from how fast the approach to this maneuver runs."""
+    v = float(approach_speed_ms or 0.0)
+    if mtype in _INTERCHANGE_TYPES:
+        return M.HIGHWAY if v >= _INTERCHANGE_SPEED_MS else M.SURFACE
+    return M.HIGHWAY if v >= _HIGHWAY_SPEED_MS else M.SURFACE
+
 
 # --- autocomplete session tokens --------------------------------------------
 # Google bills autocomplete two ways: per keystroke-request, or once per
@@ -471,14 +525,21 @@ class GoogleProvider(NavigationProvider):
                 continue
             pi = step_start_index[i]
             seq = len(maneuvers)
+            # The APPROACH is the step before this one -- the stretch the
+            # driver is on while the call is made -- so it is that step's
+            # average that decides which announcement ladder is used, not the
+            # speed of the road being turned onto.
+            approach = _step_speed(i - 1)
             maneuvers.append(M.CanonicalManeuver(
                 id=f"m{seq}", sequence=seq, type=mtype, direction=direction,
                 road_name=_road_name(instruction),
                 latitude=points[pi][0], longitude=points[pi][1],
                 route_distance_position=cum[pi], polyline_index=pi,
                 instruction=instruction,
+                road_class=_road_class(mtype, approach),
+                exit_information=_exit_information(instruction),
                 step_distance_m=steps[i].get("distanceMeters"),
-                approach_speed_ms=_step_speed(i - 1),
+                approach_speed_ms=approach,
             ))
 
         # Arrival is a maneuver like any other: it has a place on the geometry,

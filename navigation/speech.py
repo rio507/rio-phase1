@@ -1,199 +1,354 @@
 """What RIO says about a maneuver. Deterministic templates, no model (§23).
 
-THE THREE OPPORTUNITIES
------------------------
-Not three mandatory calls — three chances to be useful, each of which RIO takes
-only if it is still true and still needed:
+THE CADENCE IS GOOGLE MAPS', ON PURPOSE
+---------------------------------------
+This file used to speak its own dialect: "Right turn coming up." at 300 m,
+"Take the next right onto 14th St." at 130 m, "Right here." at 35 m. Every one
+of those sentences is defensible in isolation and the set of them was wrong,
+which the drive of 2026-09-09 (session 738fbb82) shows in one line:
 
-  EARLY      "Right turn coming up."            optional, no camera, no distance
-  PRIMARY    "Turn right by the Shell station." the differentiated one
-             "Take the next right."             ...and its canonical fallback
-  IMMINENT   "Right here."                      only when it is still needed
+    t=76.6   NAV_CONTEXTUAL_CALL   "Take the next right onto 14th St."   31.1 m
+    t=102.3  NAV_EARLY_GUIDANCE    "Coming up on a right onto 14th St."  28.2 m
 
-The primary call REPLACES distance narration. RIO does not say "Turn right in
-200 feet. Turn right by the Shell." — it says "Turn right by the Shell." A
-driver who can see the Shell does not need the number, and a driver who cannot
-gets "Take the next right", which is the same sentence a passenger would use.
+The preparation line arrived AFTER the instruction and three metres closer to
+the junction, because both tiers were timed in seconds-to-turn with a metre
+floor underneath, and at 0.12 m/s in traffic both floors were already crossed
+before the route had finished loading. A driver hearing that has no idea which
+sentence is the one to act on.
+
+Google's cadence is not better because it is Google's. It is better because
+every driver already has it in their bones, and a car that says the words in a
+different order at different distances is asking the driver to learn a second
+system while driving. So:
+
+    ROUTE START   immediately, the whole first move
+                  "Head north on Lincoln Blvd, then turn right onto Ocean Ave."
+    FAR           distance-phrased, on the ladder for the road class
+                  "In half a mile, turn right onto Ocean Ave."
+                  "In two miles, take exit 43 toward Sunset Blvd."
+    NEAR          the instruction, with the road name and no hedging
+                  "Turn right onto Ocean Ave."
+    JUNCTION      two words, and only if NEAR was long enough ago to need them
+                  "Turn right."
+    ARRIVAL       "Your destination is on the right." then "You have arrived."
+
+FIVE TIERS, NOT FIVE ANNOUNCEMENTS. Each is a chance the planner takes only if
+it is still true and still adds something; the >10 s rule on JUNCTION is the
+sharpest example and is enforced in rio_navplan.js, not here.
+
+DISTANCE IS SAID, AND IT IS SAID ROUNDED
+----------------------------------------
+The previous design's stated reason for saying no distance at all was that
+"the primary call REPLACES distance narration -- a driver who can see the Shell
+does not need the number". That is true of the NEAR call, which still carries
+no distance. It is not true of the FAR call, whose entire job is to say how
+much road is left before the driver has to do anything. A far call with no
+number is a car saying "something is coming" and leaving the driver to guess
+whether to start moving over now.
+
+The number is a rounded phrase from distance.py, computed at route load from
+the TIER's nominal distance rather than from the live measurement, so two
+drives down the same road say the same words at the same corner and nothing
+formats language while the car is moving.
 
 WHY THERE IS NO LLM HERE, AND WHY THERE NEVER WILL BE ON THIS PATH
 ------------------------------------------------------------------
 Every sentence RIO can say about a maneuver is enumerable before the drive
-starts: a direction, a road name, and at most one landmark from a list fetched
-at route load. Enumerating them costs a dictionary lookup and removes latency,
-hallucination, a validation layer, a test surface and an entire class of
-failure state.
+starts: a direction, a road name, a rounded distance, and at most one landmark
+from a list fetched at route load. Enumerating them costs a dictionary lookup
+and removes latency, hallucination, a validation layer, a test surface and an
+entire class of failure state.
 
-VARIED, WITHOUT A MODEL AND WITHOUT A DICE ROLL
------------------------------------------------
-A car that says "Left turn coming up." nine times in twenty minutes stops
-sounding like someone in the passenger seat and starts sounding like a GPS,
-which is the one thing RIO is defined against. So the EARLY line and the
-CONTEXTUAL line — the two that are never time-critical — are drawn from a SET
-of phrasings in her register rather than from a single template.
+VARIATION, AND WHERE IT IS NOW ALLOWED TO LIVE
+----------------------------------------------
+It used to live in the FAR and NEAR calls, drawn from a phrasing set indexed by
+position. That was the right instinct aimed at the wrong lines. The whole value
+of a conventional cadence is that the words do not move: "In half a mile, turn
+right onto Ocean Ave." is the sentence a driver has heard ten thousand times
+and can parse without listening to it, and a synonym for it is a sentence they
+have to parse. So the navigation calls are now FIXED, one form each.
 
-The set is fixed, and so is the choice. `_variant` indexes it by the
-maneuver's position in the route plus a per-generation offset, which buys the
-three things a random draw does not:
-
-  a drive never repeats itself     consecutive maneuvers step through the set
-                                   rather than landing on the same line twice
-  a sentence is accountable        the offset is arithmetic on the journey id
-                                   and the generation, both of which are in
-                                   the drive log — so what she said on any
-                                   turn of any drive can be recomputed, which
-                                   a dice roll makes impossible. Two separate
-                                   drives to the same place are two journeys
-                                   and may phrase a turn differently, which is
-                                   the point for anyone who drives it daily.
-  /nav/voice stays a lookup        the text is chosen once, at route build,
-                                   and stored — nothing decides anything about
-                                   language while the car is moving
-
-What varies is the WORDING. What never varies is the CONTENT: every phrasing
-in every set carries the direction and, when the provider gave one, the road
-name — checked in the selftest rather than promised here. The IMMINENT call is
-excluded from all of it and stays one fixed template per maneuver type,
-permanently: at two seconds' notice "Right here." is not a phrasing choice.
+What varies instead is the ANCHOR line -- the one sentence in navigation that
+Google cannot say, because it needs a camera. "Turn right by the Shell station"
+is RIO's own, it is where her voice belongs, and it is still drawn from a set
+indexed by `variant_for` so a drive does not repeat itself. See _CONTEXTUAL.
 
 The text for every call of every maneuver is computed HERE, at route time, and
 stored on the route. Nothing generates language while the car is moving; the
 timing path only ever looks a string up, and /nav/voice re-reads the same
 table, so what is spoken and what is logged cannot drift apart.
 """
-from typing import Optional
+from typing import List, Optional
 
 import config
 
+from . import distance as D
 from . import model as M
 
 # Call types. These are the arbiter's `call_type` and the /nav/voice address.
-EARLY = "early"
-PRIMARY = "primary"
-IMMINENT = "imminent"
+DEPART = "depart"
+FAR = "far"
+FAR_MID = "far_mid"
+NEAR = "near"
+JUNCTION = "junction"
 ARRIVAL = "arrival"
+ARRIVED = "arrived"
 
-CALL_TYPES = (EARLY, PRIMARY, IMMINENT, ARRIVAL)
+CALL_TYPES = (DEPART, FAR, FAR_MID, NEAR, JUNCTION, ARRIVAL, ARRIVED)
+
+# THE OLD NAMES, kept as an address and nothing else.
+#
+# `early/primary/imminent` were the wire format between the server's speech
+# table, the browser's planner, /nav/voice and three test harnesses. Renaming
+# them to what they now are is worth doing -- "primary" no longer describes the
+# call that carries the road name -- but a phone running yesterday's cached
+# page asking for "imminent" should get the junction line rather than silence
+# at a junction. Lookup only: nothing WRITES these keys.
+_LEGACY = {"early": FAR, "primary": NEAR, "imminent": JUNCTION}
 
 _DIR_WORD = {M.LEFT: "left", M.RIGHT: "right"}
 
 
-def _road_phrase(maneuver: "M.CanonicalManeuver") -> str:
-    """" onto Lincoln Boulevard", or "" when the provider gave no road name.
+# ---------------------------------------------------------------------------
+# THE TIER LADDER
+# ---------------------------------------------------------------------------
+# Where each call is made, in metres before the maneuver, by road class. These
+# are Google's distances: half a mile and 150 m on surface streets, two miles
+# and one mile and a quarter mile on a freeway. They travel to the browser in
+# the route payload (`speech.tiers`), so the planner reads a number rather than
+# holding a policy -- and so a drive log records the ladder the drive actually
+# used.
+#
+# The JUNCTION row is a floor, not an announcement distance: it is where the
+# two-word confirmation would go if the NEAR call is far enough behind to make
+# it worth having. 150 m on a freeway rather than 35 is not a longer warning,
+# it is the same ~5 seconds at 30 m/s that 35 m is at 7.
+def _ladder(road_class: str) -> dict:
+    table = getattr(config, "NAV_TIER_DISTANCES_M", None) or {}
+    row = table.get(road_class) or table.get(M.SURFACE) or {}
+    return dict(row)
 
-    Kept as a suffix rather than baked into each template so the no-road-name
-    case — which is common, and is exactly §23's `LEFT + NO_ANCHOR -> "Take the
-    next left."` — is the same sentence minus a phrase, not a separate table.
+
+def tiers_for(maneuver: "M.CanonicalManeuver",
+              leg_m: Optional[float] = None) -> List[dict]:
+    """[{call, at_m}] for this maneuver, outermost first.
+
+    FAR_MID exists only on the highway ladder: a freeway exit gets a two-mile
+    call and a one-mile call, because two miles out is where lane changes start
+    and one mile out is where a driver who missed the first one still has room.
+
+    A TIER FURTHER OUT THAN THE LEG IS LONG IS NOT A TIER, and dropping it here
+    is the difference between a cadence and a set of thresholds. `leg_m` is the
+    road between the previous maneuver (or the start of the route) and this
+    one; a half-mile call on a 414 m leg cannot be made half a mile out, so it
+    fires the moment the maneuver becomes active and says "in half a mile"
+    while the car is 414 m away. That is not a rounding, it is wrong, and it
+    is exactly what the replay of session a2da65cd produced before this
+    existed: two far calls at 414 m and 485 m against an 805 m tier.
+
+    The driver loses nothing. A 400 m leg gets the route-start line or the
+    previous turn's instruction, and then the near call -- which is what Google
+    does on a short block, and is why nobody hears "in half a mile" between two
+    junctions four hundred metres apart.
     """
+    row = _ladder(maneuver.road_class)
+    out = []
+    for call in (FAR, FAR_MID, NEAR, JUNCTION):
+        at = row.get(call)
+        if not at:
+            continue
+        # The near call and the junction call are the instruction and its
+        # confirmation; they are made from wherever the car is when it becomes
+        # due, however short the leg. Only the distance-PHRASED calls, whose
+        # words contain a number, are dropped for want of room.
+        if leg_m is not None and call in (FAR, FAR_MID) and float(at) > leg_m:
+            continue
+        out.append({"call": call, "at_m": round(float(at), 1)})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# THE ACTION PHRASE — the imperative every call is built out of
+# ---------------------------------------------------------------------------
+# Lower case, no full stop, no leading preposition: "turn right onto Ocean Ave".
+# One function, because the FAR call, the NEAR call, the route-start line and
+# the "then" continuation are the SAME instruction in four positions, and a
+# system that formats them separately is a system where they can disagree about
+# what the maneuver is.
+def _road_suffix(maneuver: "M.CanonicalManeuver") -> str:
     name = (maneuver.road_name or "").strip()
     return f" onto {name}" if name else ""
 
 
-# THE PHRASINGS, and the rule they all obey: the direction is in every one of
-# them, and `{road}` — which expands to " onto Lincoln Boulevard" or to nothing
-# at all — is in every one of them too. A set member that could drop either is
-# a set member that makes a call less useful than the template it replaced.
-#
-# Index 0 of each set is the line this file said before there were sets, so a
-# route that draws 0 everywhere is the old behaviour exactly.
-_EARLY_TURN = (
-    "{Dir} turn coming up{road}.",
-    "{Dir} coming up{road}.",
-    "Next one's a {dir}{road}.",
-    "Coming up on a {dir}{road}.",
-)
-_EARLY_UTURN = (
-    "U-turn coming up.",
-    "U-turn's next.",
-    "Coming up on a U-turn.",
-)
-_EARLY_ROUNDABOUT = (
-    "Roundabout coming up.",
-    "Roundabout's next.",
-    "Coming up on a roundabout.",
-)
-_EARLY_RAMP = (
-    "Exit coming up.",
-    "Exit's next.",
-    "Coming up on an exit.",
-)
-# THE ONE PLACE A CALL WAS ADDED RATHER THAN REPHRASED. A long leg with no
-# maneuver on it used to produce nothing at all, which is correct in the sense
-# that there is no turn to call and wrong in the sense that a passenger says
-# "stay on this" and a GPS says nothing. No distance, like every other early
-# line: the planner decides WHEN this is worth saying, and a leg length said
-# out loud here would be a second, worse answer to that question.
-_EARLY_KEEP = (
-    "Stay on {road_this}.",
-    "Stay on {road_this} for now.",
-    "We're on {road_this} for a while.",
-)
+def _exit_phrase(maneuver: "M.CanonicalManeuver") -> Optional[str]:
+    """"take exit 43 toward Sunset Blvd" — provider data only, never invented."""
+    info = maneuver.exit_information or {}
+    number = str(info.get("number") or "").strip()
+    toward = str(info.get("toward") or "").strip()
+    if not number:
+        return None
+    out = f"take exit {number}"
+    if toward:
+        out += f" toward {toward}"
+    return out
 
 
-def _variant(options, index: int) -> str:
-    """One phrasing out of a set, chosen by position rather than by chance.
-
-    `index` is the maneuver's sequence plus the route generation's offset, so
-    consecutive maneuvers walk the set instead of repeating, and the same route
-    built twice says the same words both times.
-    """
-    return options[index % len(options)]
-
-
-def _fill(template: str, maneuver: "M.CanonicalManeuver") -> str:
-    d = _DIR_WORD.get(maneuver.direction) or ""
-    name = (maneuver.road_name or "").strip()
-    return template.format(
-        dir=d, Dir=d.capitalize(),
-        road=_road_phrase(maneuver),
-        # A leg is described by the road it is ON, a turn by the road it goes
-        # ONTO — and a leg whose road the provider did not name is "this",
-        # which is what a passenger says when they mean the one we are on.
-        road_this=name or "this")
-
-
-def early_text(maneuver: "M.CanonicalManeuver", variant: int = 0) -> Optional[str]:
-    """The optional preparation line. No distance, no camera, no urgency."""
+def action_phrase(maneuver: "M.CanonicalManeuver") -> str:
+    """The instruction as a bare imperative clause."""
     d = _DIR_WORD.get(maneuver.direction)
-    if maneuver.type == M.TURN and d:
-        return _fill(_variant(_EARLY_TURN, variant), maneuver)
+
+    if maneuver.type == M.TURN:
+        return f"turn {d}{_road_suffix(maneuver)}" if d else "take the next turn"
     if maneuver.type == M.UTURN:
-        return _variant(_EARLY_UTURN, variant)
-    if maneuver.type == M.ROUNDABOUT:
-        return _variant(_EARLY_ROUNDABOUT, variant)
+        return "make a U-turn"
     if maneuver.type == M.RAMP:
-        return _variant(_EARLY_RAMP, variant)
-    if maneuver.type in (M.KEEP, M.STRAIGHT):
-        return _fill(_variant(_EARLY_KEEP, variant), maneuver)
+        # The exit number is what is on the sign, so it leads when there is
+        # one. Without it, the provider's own line is the honest fallback --
+        # inventing a shorter phrasing for an interchange is how a driver ends
+        # up in the wrong lane.
+        ex = _exit_phrase(maneuver)
+        if ex:
+            return ex
+        return f"take the exit{_road_suffix(maneuver)}"
+    if maneuver.type == M.MERGE:
+        return f"merge {d}{_road_suffix(maneuver)}" if d else f"merge{_road_suffix(maneuver)}"
+    if maneuver.type in (M.FORK, M.KEEP):
+        return f"keep {d}" if d else "keep going"
+    if maneuver.type == M.ROUNDABOUT:
+        # NOT "take the second exit": CanonicalManeuver.exit_information is
+        # populated for ramps and no provider fills it for roundabouts, and a
+        # number said at a roundabout is a number the driver will act on (§28).
+        return f"go {d} at the roundabout" if d else "go around the roundabout"
+    if maneuver.type == M.STRAIGHT:
+        name = (maneuver.road_name or "").strip()
+        return f"continue on {name}" if name else "continue straight"
+    # Anything the vocabulary does not model: the provider's own sentence,
+    # lowered into clause position.
+    text = (maneuver.instruction or "").strip().rstrip(".")
+    if text:
+        return text[0].lower() + text[1:]
+    return "continue"
+
+
+def _sentence(clause: str) -> str:
+    clause = (clause or "").strip()
+    if not clause:
+        return ""
+    out = clause[0].upper() + clause[1:]
+    return out if out.endswith((".", "!", "?")) else out + "."
+
+
+# ---------------------------------------------------------------------------
+# THE FIVE TIER SENTENCES
+# ---------------------------------------------------------------------------
+def far_text(maneuver: "M.CanonicalManeuver", at_m: float,
+             units: str = D.IMPERIAL) -> str:
+    """"In half a mile, turn right onto Ocean Ave."
+
+    The distance comes from the TIER, not from where the car happens to be when
+    the call fires. A call made at 790 m and one made at 815 m are both the
+    half-mile call and both say "half a mile" — which is what makes the phrase
+    a beat in the approach rather than a reading off an instrument.
+    """
+    return f"{D.in_phrase(at_m, units)}, {action_phrase(maneuver)}."
+
+
+def near_text(maneuver: "M.CanonicalManeuver",
+              chained: Optional["M.CanonicalManeuver"] = None) -> str:
+    """"Turn right onto Ocean Ave." — or with the next move chained on.
+
+    No "coming up", no "take the next": at 150 m the turn is the one in front
+    of the driver and naming it is the whole instruction. `chained` is the
+    following maneuver when it is close enough that the two are one move; see
+    chain_window_m.
+    """
+    clause = action_phrase(maneuver)
+    if chained is not None:
+        clause += f", then {action_phrase(chained)}"
+    return _sentence(clause)
+
+
+def depart_text(route: "M.CanonicalRoute") -> Optional[str]:
+    """"Head north on Lincoln Blvd, then turn right onto Ocean Ave."
+
+    Said ONCE, immediately, the moment the route starts — which is the one
+    thing the old cadence had no tier for at all. Session 738fbb82 started a
+    route at t=76.1 and the first thing the driver heard was a turn call half a
+    second later at 31 m; nothing ever told them what road they were on or
+    which way they were pointing.
+
+    Google's DEPART step is exactly "Head north on Lincoln Blvd" and it is
+    provider text, so it is used verbatim. With no depart step the line is just
+    the first move, which is still more than silence.
+    """
+    head = (route.depart_instruction or "").strip().rstrip(".")
+    first = None
+    for m in route.maneuvers:
+        if m.type not in (M.DEPART, M.ARRIVE):
+            first = m
+            break
+    if not head and first is None:
+        return None
+    if first is None:
+        return _sentence(head)
+    if not head:
+        return near_text(first)
+    return _sentence(f"{head}, then {action_phrase(first)}")
+
+
+# THE JUNCTION LINE IS A CLOSED SET, AND THAT IS WHY IT CAN BE A FILE.
+#
+# Every other call names a road or a distance. This one names neither: it is
+# the two words a driver needs while their hands are already moving, and the
+# whole set of sentences it can ever produce is small enough to render once,
+# offline, in her voice, and play off disk at the junction with no network, no
+# queue and no deadline to miss.
+#
+# That matters here more than anywhere else in navigation: this is the one line
+# whose worst case IS the point. Dictating it meant a budget, a budget meant a
+# timeout, and a timeout meant the most time-critical sentence in the system
+# was also the one most likely to come out in the fallback voice — measured at
+# exactly that, one line in eleven, the only one that fell back on a clean
+# drive.
+def junction_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
+    """The two-word confirmation at the junction, or None where there is none.
+
+    EVERY MANEUVER THE PROVIDER CAN EMIT HAS A LINE HERE, OR HAS ONE
+    DELIBERATELY WITHHELD — see IMMINENT_SILENT and _NEEDS_DIRECTION below.
+    Silence and an unwritten sentence look identical from outside this file,
+    and for six of Google's enum values they were the same thing until somebody
+    read it.
+    """
+    d = _DIR_WORD.get(maneuver.direction)
+
+    if maneuver.type == M.TURN:
+        # No direction: the unrecognised-provider-enum case. It cannot say
+        # which way and it can still say WHICH JUNCTION, which is the half of
+        # this call that matters when the near call already said the rest.
+        return f"Turn {d}." if d else "This one."
+    if maneuver.type == M.UTURN:
+        return "Make a U-turn."
+    if maneuver.type == M.RAMP:
+        # Left-hand exits exist and this does not name the side; the near call
+        # carried the exit number and the sign, which is what the driver is
+        # looking for out of the windscreen.
+        return "Take the exit."
+    if maneuver.type in (M.FORK, M.KEEP):
+        return f"Keep {d}." if d else None
+    if maneuver.type == M.MERGE:
+        return f"Merge {d}." if d else "Merge."
+    if maneuver.type == M.ROUNDABOUT:
+        return f"{d.capitalize()} at the roundabout." if d else None
     return None
 
 
-def primary_text(maneuver: "M.CanonicalManeuver") -> str:
-    """The instruction, with no landmark. The canonical fallback (§27).
-
-    This is what RIO says whenever visual context is missing, uncertain,
-    duplicated, stale or simply switched off — which is most of the time, and
-    is not a failure. It is a complete, correct navigation instruction on its
-    own; the landmark version below is the same instruction, said better.
-    """
-    d = _DIR_WORD.get(maneuver.direction)
-    if maneuver.type == M.TURN and d:
-        return f"Take the next {d}{_road_phrase(maneuver)}."
-    if maneuver.type == M.UTURN:
-        return f"Make a U-turn{_road_phrase(maneuver)}."
-    # Merges, ramps, forks, roundabouts and anything a provider hands back that
-    # this vocabulary does not model: the provider's own instruction is the
-    # deterministic, correct thing to say, and inventing a shorter phrasing for
-    # a freeway interchange is how a driver ends up in the wrong lane.
-    text = (maneuver.instruction or "").strip()
-    if text:
-        return text if text.endswith((".", "!", "?")) else text + "."
-    return f"Continue{_road_phrase(maneuver)}."
-
-
-# The contextual sets, one per relation. Same rule as the early sets — every
-# phrasing carries the direction, the road name when there is one, and the
-# landmark, because a contextual line that drops the road is a landmark
-# description rather than an instruction.
+# --- the contextual (landmark) line, which is the one that still varies ------
+#
+# Same rule as before: every phrasing carries the direction, the road name when
+# there is one, and the landmark — a contextual line that drops the road is a
+# landmark description rather than an instruction. This replaces the NEAR call
+# when an anchor has been verified, so it is written in the NEAR call's
+# register: an instruction, not a hedge.
 _CONTEXTUAL = {
     "NEAR": (
         "Turn {dir} by {label}{road}.",
@@ -213,6 +368,16 @@ _CONTEXTUAL = {
 }
 
 
+def _variant(options, index: int) -> str:
+    """One phrasing out of a set, chosen by position rather than by chance.
+
+    `index` is the maneuver's sequence plus the route generation's offset, so
+    consecutive maneuvers walk the set instead of repeating, and the same route
+    built twice says the same words both times.
+    """
+    return options[index % len(options)]
+
+
 def contextual_text(maneuver: "M.CanonicalManeuver", spoken_label: str,
                     relation: str, variant: int = 0) -> Optional[str]:
     """The differentiated line: the same turn, described by what is out there.
@@ -229,160 +394,55 @@ def contextual_text(maneuver: "M.CanonicalManeuver", spoken_label: str,
         return None
     return _variant(options, variant).format(
         dir=d, Dir=d.capitalize(), label=spoken_label,
-        road=_road_phrase(maneuver))
-
-
-def imminent_text(maneuver: "M.CanonicalManeuver") -> Optional[str]:
-    """The backup at the junction. Short, because there is no time for more.
-
-    Stays armed even when a contextual call has already been spoken (§11C): the
-    contextual line explains the turn, this one confirms it is *this* one. Its
-    own timing and validity decide whether it is ever heard.
-
-    EVERY MANEUVER THE PROVIDER CAN EMIT HAS A LINE HERE, OR HAS ONE
-    DELIBERATELY WITHHELD. It used to cover three shapes out of ten, and the
-    silence was not a decision — it was the shapes nobody had written yet:
-
-      A FORK WAS BEING CALLED AN EXIT. FORK_LEFT and FORK_RIGHT both came back
-      as "Take this exit.", which is not what a fork is. A fork is the road
-      splitting under you and the answer is which side to be on; "take this
-      exit" at one is an instruction to leave a road the route stays on. That
-      is the only line here that was WRONG rather than missing, and it is the
-      reason this function was worth re-reading rather than extending.
-
-      KEEP, MERGE AND ROUNDABOUT HAD NOTHING AT ALL. Six of Google's enum
-      values (KEEP_LEFT/RIGHT, MERGE, MERGE_LEFT/RIGHT, ROUNDABOUT_LEFT/RIGHT)
-      produced no junction call whatever, which on a freeway is precisely where
-      one is wanted: the early call is a minute back and the instruction is the
-      provider's own long sentence.
-
-      AND SO DID THE CATCH-ALL. Anything this vocabulary does not recognise
-      becomes TURN/UNKNOWN by design (see providers/google._MANEUVER_MAP), and
-      TURN with no direction fell through to None. So the one maneuver shape
-      guaranteed to exist the day a provider adds an enum was the one shape
-      with no line. "This one." says the only thing that is still true when the
-      direction is not known, which is also exactly what this call is for.
-
-    KEEP AND FORK SAY THE SAME WORDS, and that is not an oversight. Bearing
-    left at a fork and keeping left at a split are one action to a driver, and
-    two near-identical sentences two seconds from a junction is the novelty the
-    docstring above exists to refuse. One meaning, one line.
-
-    WHAT IS STILL DELIBERATELY SILENT: STRAIGHT (there is no junction to
-    confirm), DEPART (nothing has happened yet), and ARRIVE (build() gives
-    arrival its own lines and a backup call at a destination is a confirmation
-    of nothing).
-    """
-    d = _DIR_WORD.get(maneuver.direction)
-
-    if maneuver.type == M.TURN:
-        # No direction: the unrecognised-provider-enum case. It cannot say
-        # which way, and it can still say WHICH JUNCTION, which is the half of
-        # this call that matters when a contextual line has already explained
-        # the turn.
-        return f"{d.capitalize()} here." if d else "This one."
-    if maneuver.type == M.UTURN:
-        return "Turn around here."
-    if maneuver.type == M.RAMP:
-        # Left-hand exits exist and this does not name the side. Kept as it
-        # was: the primary call carries the provider's own wording, and a
-        # two-word line that says "exit" at the exit is not wrong, only terse.
-        return "Take this exit."
-    if maneuver.type in (M.FORK, M.KEEP):
-        return f"Stay {d}." if d else None
-    if maneuver.type == M.MERGE:
-        return f"Merge {d}." if d else "Merge."
-    if maneuver.type == M.ROUNDABOUT:
-        # NOT "Second exit.", and the reason is that nothing here knows which
-        # exit it is: CanonicalManeuver.exit_information exists on the model
-        # and no provider populates it. A number said at a roundabout is a
-        # number the driver will act on, so an invented one is the worst thing
-        # this file could produce -- the same rule ArrivalInfo follows when it
-        # refuses to guess a side (§28). What IS provider data is the
-        # direction, so that is what gets said.
-        return f"{d.capitalize()} at the roundabout." if d else None
-    return None
+        road=_road_suffix(maneuver))
 
 
 # ---------------------------------------------------------------------------
-# THE IMMINENT CALL IS A CLOSED SET, AND THAT IS WHY IT CAN BE A FILE
+# CLIPS
 # ---------------------------------------------------------------------------
-# Every other call names a road. "Take the next left onto Cloverfield
-# Boulevard" cannot be pre-rendered, because there is no set of roads to render
-# — which is the same constraint the tire clips run into, and the reason those
-# say the thing that is true of all four corners.
-#
-# The imminent call names nothing. It is two words, deliberately (see
-# imminent_text), and the whole set of sentences it can ever produce is four:
-#
-#     "Left here."  "Right here."  "Take this exit."  "Turn around here."
-#
-# A closed set of fixed sentences is a set that can be rendered once, offline,
-# in her voice, and played from disk at the junction with no network, no queue
-# and no deadline to miss. Which matters here more than anywhere else in
-# navigation: this is the one line whose worst case IS the point. Dictating it
-# meant a budget, a budget meant a timeout, and a timeout meant that the most
-# time-critical sentence in the system was also the one most likely to come out
-# in the fallback voice — measured at exactly that, one line in eleven, the
-# only one that fell back on a clean drive.
-#
-# So it stops being spoken and starts being played. The dictation path is kept
-# behind it, for a clip that is missing or will not decode.
-#
-# ENUMERATED FROM imminent_text RATHER THAN TYPED OUT. A second list of these
+# ENUMERATED FROM junction_text RATHER THAN TYPED OUT. A second list of these
 # sentences is a second list to forget: add a maneuver type tomorrow and a
 # hand-written table silently stops covering it, which is a turn called in the
 # wrong voice at the worst moment. This asks the function.
-_CLIP_ID_CHARS = str.maketrans({" ": "_", ".": "", "'": ""})
+_CLIP_ID_CHARS = str.maketrans({" ": "_", ".": "", "'": "", "-": "_"})
 
 
-def imminent_clip_id(text: str) -> str:
-    """A stable file name for one imminent sentence. "Left here." -> left_here."""
+def junction_clip_id(text: str) -> str:
+    """A stable file name for one junction sentence. "Turn left." -> turn_left."""
     return (text or "").strip().lower().translate(_CLIP_ID_CHARS).strip("_")
 
 
+# Kept under the old name too: tools/render_alerts.py and the audio manifest
+# address clips by these functions, and one rename is not worth a silent miss.
+imminent_clip_id = junction_clip_id
+
 # THE WHOLE CANONICAL VOCABULARY, not a list of the types that had lines when
 # this was written. That distinction is the entire point of enumerating rather
-# than listing: the first version of this walked four types, which was exactly
-# the four that already had sentences -- so it would have rendered clips for
-# the coverage that existed and stayed silent about the coverage that did not.
-# A set built from the answers can only ever confirm what it already knew.
-#
-# Asked of model.py instead, which is the vocabulary a provider is mapped INTO
-# (providers/google._MANEUVER_MAP) and therefore the real bound on what can
-# arrive. A type added there gets probed here without anyone remembering to.
+# than listing: a set built from the answers can only ever confirm what it
+# already knew. Asked of model.py instead, which is the vocabulary a provider
+# is mapped INTO (providers/google._MANEUVER_MAP) and therefore the real bound
+# on what can arrive.
 _ALL_TYPES = (M.TURN, M.MERGE, M.RAMP, M.FORK, M.ROUNDABOUT, M.KEEP,
               M.STRAIGHT, M.UTURN, M.DEPART, M.ARRIVE)
 _ALL_DIRECTIONS = (M.LEFT, M.RIGHT, M.STRAIGHT_DIR, M.UNKNOWN)
 
 # THE MANEUVERS THAT GET NO JUNCTION CALL, WRITTEN DOWN AS A DECISION.
 #
-# Silence and an unwritten sentence look identical from outside this file, and
-# for six enum values they were the same thing until they were read. So the
-# ones that are meant to be silent are named here, and the test asserts against
-# THIS rather than against whatever imminent_text currently happens to return —
-# which makes a new type with no line a failure instead of a fourth entry
-# nobody notices.
-#
-#   STRAIGHT   there is no junction to confirm. The early call already says
-#              "Stay on Lincoln", which is the whole of what can be said.
-#   DEPART     nothing has happened yet.
-#   ARRIVE     build() gives arrival its own lines, and a backup call at a
-#              destination confirms nothing — the driver is looking at it.
+#   STRAIGHT   there is no junction to confirm. The far call already said
+#              "continue on Lincoln", which is the whole of what can be said.
+#   DEPART     nothing has happened yet — and the route-start line is depart's
+#              only sentence, said once, by depart_text.
+#   ARRIVE     arrival has its own two lines and a backup call at a destination
+#              confirms nothing — the driver is looking at it.
 IMMINENT_SILENT = frozenset({M.STRAIGHT, M.DEPART, M.ARRIVE})
 
 # ...AND THE SECOND REASON A SHAPE IS SILENT, which is not about the type.
 #
-# "Stay left." without a side is not a shorter instruction, it is a different
+# "Keep going." without a side is not a shorter instruction, it is a different
 # one, and there is no honest two-word version of a fork whose direction is
 # unknown — unlike a turn, where "This one." still confirms the junction, or a
 # merge, where "Merge." is complete on its own. These three are the shapes
 # where the direction IS the instruction.
-#
-# No provider emits them: FORK, KEEP and ROUNDABOUT are directional in every
-# entry of _MANEUVER_MAP. They are named anyway, because "unreachable today"
-# and "would be handled correctly" are different claims and the second one is
-# the one worth holding.
 _NEEDS_DIRECTION = frozenset({M.FORK, M.KEEP, M.ROUNDABOUT})
 
 
@@ -390,24 +450,21 @@ def imminent_silent(kind: str, direction: str = M.UNKNOWN) -> bool:
     """Is this shape MEANT to have no junction call?
 
     The whole reason this is a function and not an absence: silence and an
-    unwritten sentence are indistinguishable from outside speech.py, and for
-    six of Google's enum values they were the same thing until somebody read
-    the file. Now a shape that goes quiet without being named here is a test
-    failure rather than a gap nobody notices.
+    unwritten sentence are indistinguishable from outside speech.py. Now a
+    shape that goes quiet without being named here is a test failure rather
+    than a gap nobody notices.
     """
     return kind in IMMINENT_SILENT or (
         kind in _NEEDS_DIRECTION and direction not in (M.LEFT, M.RIGHT))
 
 
-def imminent_shapes() -> dict:
+def junction_shapes() -> dict:
     """{(type, direction): sentence or None} for every shape in the model.
 
-    The None entries are as much of the answer as the sentences are: they are
-    the maneuvers that deliberately have no junction call, and a test that
-    could not see them could not tell "decided against" from "never written".
+    The None entries are as much of the answer as the sentences are.
     """
     return {
-        (kind, direction): imminent_text(M.CanonicalManeuver(
+        (kind, direction): junction_text(M.CanonicalManeuver(
             id="_probe", sequence=0, type=kind, direction=direction,
             road_name="", latitude=0.0, longitude=0.0,
             route_distance_position=0.0, polyline_index=0))
@@ -415,85 +472,155 @@ def imminent_shapes() -> dict:
     }
 
 
-def imminent_clips() -> dict:
-    """{clip_id: sentence} for every imminent line that exists.
-
-    Built by asking imminent_text for one of each shape the model can hold, so
-    the set cannot fall behind the function that produces it — which is what
-    makes "render the junction calls" a command rather than a checklist.
-    """
-    return {imminent_clip_id(t): t
-            for t in imminent_shapes().values() if t}
+imminent_shapes = junction_shapes
 
 
+def junction_clips() -> dict:
+    """{clip_id: sentence} for every junction line that exists."""
+    return {junction_clip_id(t): t
+            for t in junction_shapes().values() if t}
+
+
+imminent_clips = junction_clips
+
+
+# ---------------------------------------------------------------------------
+# ARRIVAL
+# ---------------------------------------------------------------------------
 def arrival_text(destination_name: str, side: str) -> str:
-    """"Your destination is on the right." — and only when the provider said so.
+    """"Your destination is on the right." — the 150 m call.
 
-    UNKNOWN omits the side. There is no camera path to this sentence and no
-    inference: a side is either provider data or it is not said (§28).
+    UNKNOWN omits the side and says "ahead", which is true of every
+    destination and claims nothing. There is no camera path to this sentence
+    and no inference: a side is either provider data or it is not said (§28).
     """
-    name = (destination_name or "").strip()
     if side == M.LEFT:
         return "Your destination is on the left."
     if side == M.RIGHT:
         return "Your destination is on the right."
-    return f"You've arrived at {name}." if name else "You've arrived."
+    return "Your destination is ahead."
 
 
+def arrived_text(destination_name: str = "") -> str:
+    """"You have arrived." — the one at the kerb.
+
+    Google's exact words, and deliberately not "You've arrived at 2411 Lincoln
+    Blvd": by this point the driver is looking at the number on the building,
+    and the address read back is the car narrating rather than navigating.
+    """
+    return "You have arrived."
+
+
+# ---------------------------------------------------------------------------
+# THE PHRASING INDEX
+# ---------------------------------------------------------------------------
 def route_offset(journey_id: str, generation_id: int) -> int:
     """Where in each phrasing set this route generation starts.
 
-    Per GENERATION rather than per journey, so the same turn is not guaranteed
-    the same words after a reroute — the drive has changed, and a line repeated
-    verbatim from the plan that was just abandoned is the one place this would
-    sound like a recording. Arithmetic on the id rather than a random seed:
-    reproducible, and no state to carry.
+    Only the anchor lines vary now, but they vary for the same reasons they
+    always did: reproducible from the drive log, no state to carry, and a turn
+    phrased differently after a reroute because the drive has changed.
     """
     return sum(ord(c) for c in (journey_id or "")) + int(generation_id or 0)
 
 
 def variant_for(route: "M.CanonicalRoute",
                 maneuver: "M.CanonicalManeuver") -> int:
-    """The index this maneuver's phrasings are drawn at. One definition, two
-    callers: the speech table here and the anchor lines in landmarks.py, which
-    must agree or one turn's early call and contextual call come out of
-    different halves of the register."""
+    """The index this maneuver's anchor phrasings are drawn at."""
     return route_offset(getattr(route, "journey_id", ""),
                         getattr(route, "generation_id", 0)) + maneuver.sequence
 
 
+# ---------------------------------------------------------------------------
+# BUILD
+# ---------------------------------------------------------------------------
+def chain_window_m() -> float:
+    """How close the next maneuver has to be to ride on this one's near call."""
+    return float(getattr(config, "NAV_CHAIN_WINDOW_M", 200.0))
+
+
 def build(maneuver: "M.CanonicalManeuver", destination_name: str = "",
-          arrival_side: str = M.UNKNOWN, variant: int = 0) -> dict:
+          arrival_side: str = M.UNKNOWN, variant: int = 0,
+          chained: Optional["M.CanonicalManeuver"] = None,
+          units: Optional[str] = None,
+          leg_m: Optional[float] = None) -> dict:
     """Every line this maneuver can produce, ahead of time.
 
     `anchors` is filled in separately by the landmark stage, which adds one
     prepared sentence per candidate — so even the contextual line is a lookup
     at drive time, never a formatting step.
     """
+    units = units or D.units_from_config()
     if maneuver.type == M.ARRIVE:
+        # TWO LINES, and no far call. "Almost there." used to sit on this
+        # maneuver's early tier and it is a sentence about a feeling rather
+        # than about a distance; the two that are left are the two Google says
+        # and the two a driver acts on -- which side to look at, and that this
+        # is the place.
+        at = float(getattr(config, "NAV_ARRIVAL_CALL_M", 150.0))
+        if leg_m is not None:
+            at = min(at, max(0.0, leg_m))
         return {
-            EARLY: "Almost there.",
-            PRIMARY: arrival_text(destination_name, arrival_side),
             ARRIVAL: arrival_text(destination_name, arrival_side),
+            ARRIVED: arrived_text(destination_name),
+            "tiers": [{"call": ARRIVAL, "at_m": round(at, 1)}],
         }
-    out = {PRIMARY: primary_text(maneuver)}
-    e = early_text(maneuver, variant)
-    if e:
-        out[EARLY] = e
-    # NOT varied, and this is the line that must not be. Two seconds from a
-    # junction the driver is listening for a word, not a sentence, and every
-    # millisecond of novelty is a millisecond of parsing.
-    #
-    # It is also the line that is not spoken at all any more: `clips` names the
-    # pre-rendered file the browser plays instead, off disk, at the junction.
-    # Named by the SERVER for the same reason the sentence is — the browser
-    # holds neither, it is told both — and named next to the sentence so the
-    # two cannot come to disagree about which line the file says.
-    i = imminent_text(maneuver)
-    if i:
-        out[IMMINENT] = i
-        out.setdefault("clips", {})[IMMINENT] = imminent_clip_id(i)
+
+    tiers = tiers_for(maneuver, leg_m)
+    out: dict = {"tiers": tiers}
+    for tier in tiers:
+        call, at_m = tier["call"], tier["at_m"]
+        if call in (FAR, FAR_MID):
+            out[call] = far_text(maneuver, at_m, units)
+        elif call == NEAR:
+            out[NEAR] = near_text(maneuver, chained)
+        elif call == JUNCTION:
+            j = junction_text(maneuver)
+            if j:
+                out[JUNCTION] = j
+                out.setdefault("clips", {})[JUNCTION] = junction_clip_id(j)
+
+    # A near call is the one line every maneuver must have, tier table or not:
+    # it is the instruction. The ladder can drop a far call on a short leg and
+    # a junction call on a shape that has none, never this.
+    out.setdefault(NEAR, near_text(maneuver, chained))
+    if chained is not None:
+        out["chained_to"] = chained.id
     return out
+
+
+def build_route(route: "M.CanonicalRoute", units: Optional[str] = None) -> str:
+    """Fill in every maneuver's speech table and return the route-start line.
+
+    ROUTE-LEVEL, because two of the five tiers are: the depart line needs the
+    route's own heading sentence and the first maneuver, and the "then" chain
+    needs the maneuver AFTER this one. `build()` alone could see neither, which
+    is why a per-maneuver loop in service.py could not produce either sentence.
+    """
+    units = units or D.units_from_config()
+    window = chain_window_m()
+    mans = route.maneuvers or []
+    prev_at = 0.0
+    for i, man in enumerate(mans):
+        # THE ROAD AVAILABLE FOR THIS MANEUVER'S APPROACH: from the maneuver
+        # before it, or from the start of the route for the first one.
+        leg_m = max(0.0, float(man.route_distance_position) - prev_at)
+        prev_at = float(man.route_distance_position)
+        chained = None
+        nxt = mans[i + 1] if i + 1 < len(mans) else None
+        # Chained only when the two are genuinely one move. An ARRIVE riding on
+        # the last turn's near call would say "turn right onto Ocean, then your
+        # destination is ahead", which is a different sentence and gets its own
+        # tier.
+        if (nxt is not None and nxt.type not in (M.ARRIVE, M.DEPART)
+                and man.type not in (M.ARRIVE, M.DEPART)
+                and 0 < (nxt.route_distance_position
+                         - man.route_distance_position) <= window):
+            chained = nxt
+        man.speech = build(man, route.destination.display_name,
+                           route.arrival.side, variant=variant_for(route, man),
+                           chained=chained, units=units, leg_m=leg_m)
+    return depart_text(route) or ""
 
 
 def text_for(route: "M.CanonicalRoute", maneuver_id: str, call_type: str,
@@ -506,17 +633,18 @@ def text_for(route: "M.CanonicalRoute", maneuver_id: str, call_type: str,
     """
     if not route:
         return None
+    call_type = _LEGACY.get(call_type, call_type)
     man = route.maneuver(maneuver_id)
     if not man:
         return None
-    if anchor_id and call_type == PRIMARY:
+    if anchor_id and call_type == NEAR:
         for a in man.anchors:
             if a.get("anchor_id") == anchor_id:
-                return a.get("speech") or man.speech.get(PRIMARY)
+                return a.get("speech") or man.speech.get(NEAR)
         return None      # an anchor that is not on this route is not a sentence
-    # `clips` lives in the same dict and is not a sentence. CALL_TYPES is
-    # closed so no caller can ask for it, but a lookup that would return a
-    # dict to a text endpoint is worth refusing by name rather than by luck.
+    # `clips` and `tiers` live in the same dict and are not sentences.
+    # CALL_TYPES is closed so no caller can ask for them, but a lookup that
+    # would return a dict to a text endpoint is worth refusing by name.
     if call_type not in CALL_TYPES:
         return None
     return man.speech.get(call_type)
@@ -526,13 +654,20 @@ def destination_reply(status: str, name: str = "", candidates=None,
                       query: str = "") -> str:
     """What RIO says when the driver asks to be taken somewhere.
 
-    Deterministic, like everything else on this path, and for a sharper reason
-    than usual: a model composing "Routing to LAX" is a model that can compose
-    "Routing to LAS". The destination in this sentence is the one the provider
-    resolved, spelled the way the provider spelled it, or it is a question.
+    FIRST PERSON, because the turn calls are hers. "Routing to Century City"
+    is a status line from a machine; "I'll take you to Century City" is the
+    person who is about to call every turn saying she has it. Nothing on this
+    path may describe navigation in the third person — see the nav-voice lint
+    in tools/nav_server_selftest.py.
+
+    Deterministic, like everything else here, and for a sharper reason than
+    usual: a model composing "I'll take you to LAX" is a model that can compose
+    "I'll take you to LAS". The destination in this sentence is the one the
+    provider resolved, spelled the way the provider spelled it, or it is a
+    question.
     """
     if status == "resolved":
-        return f"Routing to {name}." if name else "Routing there now."
+        return f"Got it — I'll take you to {name}." if name else "Got it, taking you there."
     if status == "ambiguous":
         names = [c.get("display_name") or c.get("formatted_address", "")
                  for c in (candidates or []) if c]
@@ -551,7 +686,8 @@ def ttl_ms(call_type: str) -> int:
     """How long this call stays true, in milliseconds.
 
     Expire, never catch up: a queued instruction that outlived its window is
-    dropped rather than played late. "Right here" three seconds late is a turn
+    dropped rather than played late. "Turn right" three seconds late is a turn
     already missed being announced into a junction the car is leaving.
     """
+    call_type = _LEGACY.get(call_type, call_type)
     return int(float(config.NAV_SPEECH_TTL_S.get(call_type, 5.0)) * 1000)

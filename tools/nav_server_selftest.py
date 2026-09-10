@@ -110,9 +110,15 @@ def run_provider():
                 "arrival", "destination"):
         ok(key in wire, f"the wire shape carries {key}")
     ok(all(k in wire["timing"] for k in
-           ("early_guidance_s", "context_call_s", "near_turn_s",
+           ("tier_distances_m", "junction_min_gap_s", "chain_window_m",
+            "arrival_call_m", "units",
             "off_route_distance_m", "gps_stale_timeout_s")),
        "every threshold the browser times against ships WITH the route")
+    ok(all("tiers" in m["speech"] for m in wire["maneuvers"]),
+       "...and each maneuver carries its OWN ladder, so the browser reads a "
+       "distance rather than holding a policy")
+    ok(wire.get("depart_speech"),
+       "...and the route-start line rides on the route, not on a maneuver")
 
     # Reroute: same journey, next generation, and the destination object is
     # reused rather than re-resolved.
@@ -159,7 +165,8 @@ def run_provider():
     ok(bare.landmarks_state == "ready" and
        all(not m.anchors for m in bare.maneuvers),
        "a provider with no place data routes normally with no anchors at all")
-    ok(all(m.speech.get("primary") for m in bare.maneuvers),
+    ok(all(m.speech.get("near") or m.speech.get("arrival")
+           for m in bare.maneuvers),
        "and every maneuver still has a complete spoken instruction")
 
 
@@ -356,7 +363,8 @@ def run_candidates():
                                  route.destination)
         ok(provider.landmark_calls == 1 and r3.landmarks_state == "budget_exhausted",
            "the budget cap stops the pass and says so, rather than quietly spending")
-        ok(all(m.speech.get("primary") for m in r3.maneuvers),
+        ok(all(m.speech.get("near") or m.speech.get("arrival")
+               for m in r3.maneuvers),
            "and the maneuvers it did not reach navigate normally")
     finally:
         config.NAV_LANDMARK_MAX_LOOKUPS_PER_ROUTE = old
@@ -498,7 +506,7 @@ def run_verification():
        "carrying the relation the MAP computed, not one the camera guessed")
     ok(set(res["anchor"]) == {"anchor_id", "label", "type", "turn_relation_to_anchor",
                               "identity_confidence", "relation_confidence",
-                              "visibility_confidence", "valid_for_s", "valid_until"},
+                              "visibility_confidence", "valid_for_m"},
        "and nothing else crosses the boundary — no boxes, tracks or depth history")
 
     verify_mod.set_observer(ScriptedObserver({"Shell": dict(seen, instances=2)}))
@@ -554,28 +562,36 @@ def run_speech():
     r = service.build_route(route.geometry[0][0], route.geometry[0][1], route.destination)
 
     m0, m1, arrive = r.maneuvers
-    ok(m0.speech["early"] in [t.format(dir="left", Dir="Left",
-                                       road=" onto Lincoln Boulevard",
-                                       road_this="Lincoln Boulevard")
-                              for t in speech_mod._EARLY_TURN],
-       "the early line is one of the phrasings and nothing else — got "
-       + repr(m0.speech["early"]))
-    ok(not any(ch.isdigit() for ch in m0.speech["early"]),
-       "and still carries no distance, whichever one it drew")
-    ok(m0.speech["primary"] == "Take the next left onto Lincoln Boulevard.",
-       "the canonical instruction is a complete sentence on its own")
-    ok(m0.speech["imminent"] == "Left here.", "the imminent backup is two words")
+    ok(m0.speech["far"] == "In half a mile, turn left onto Lincoln Boulevard.",
+       "the far call is distance-phrased and names the road — got "
+       + repr(m0.speech["far"]))
+    ok(m0.speech["near"] == "Turn left onto Lincoln Boulevard.",
+       "the near call is the instruction, with no hedging — got "
+       + repr(m0.speech["near"]))
+    ok(m0.speech["junction"] == "Turn left.",
+       "the junction call is two words — got " + repr(m0.speech["junction"]))
+    ok("coming up" not in " ".join(str(v) for v in m0.speech.values()).lower(),
+       'nothing anywhere still says "coming up"')
+    ok("take the next" not in " ".join(str(v) for v in m0.speech.values()).lower(),
+       '...nor "take the next", which is not what Google says at 150 m')
+    ok(r.depart_speech ==
+       "Head east on Venice Boulevard, then turn left onto Lincoln Boulevard.",
+       "the route-start line is the whole first move — got "
+       + repr(r.depart_speech))
     ok(arrive.speech["arrival"] == "Your destination is on the right.",
        "arrival says the side the provider gave")
+    ok(arrive.speech["arrived"] == "You have arrived.",
+       "and the line at the kerb is Google's own words")
 
     plain = M.CanonicalManeuver(id="x", sequence=0, type=M.TURN, direction=M.RIGHT,
                                 road_name="", latitude=0, longitude=0,
                                 route_distance_position=0, polyline_index=0,
                                 instruction="Turn right")
-    ok(speech_mod.primary_text(plain) == "Take the next right.",
-       'with no road name it is exactly "Take the next right."')
-    ok(speech_mod.arrival_text("The Getty", M.UNKNOWN) == "You've arrived at The Getty.",
-       "an UNKNOWN arrival side is omitted, never guessed")
+    ok(speech_mod.near_text(plain) == "Turn right.",
+       'with no road name the near call is exactly "Turn right."')
+    ok(speech_mod.arrival_text("The Getty", M.UNKNOWN) ==
+       "Your destination is ahead.",
+       "an UNKNOWN arrival side says ahead, never a guessed side")
 
     ok(m0.anchors[0]["speech"] in [
         t.format(dir="left", Dir="Left", label="the Shell station",
@@ -585,18 +601,24 @@ def run_speech():
        "driving — and is one of the NEAR phrasings")
 
     # Every sentence is addressable, and only by id.
-    ok(speech_mod.text_for(r, "m0", "primary") == m0.speech["primary"],
+    ok(speech_mod.text_for(r, "m0", "near") == m0.speech["near"],
        "/nav/voice resolves (route, maneuver, call) to the stored line")
-    ok(speech_mod.text_for(r, "m0", "primary", m0.anchors[0]["anchor_id"]) ==
+    ok(speech_mod.text_for(r, "m0", "near", m0.anchors[0]["anchor_id"]) ==
        m0.anchors[0]["speech"],
        "...and (route, maneuver, call, anchor) to the contextual one, the "
        "same string that was stored — the choice was made once, at build")
-    ok(speech_mod.text_for(r, "m0", "primary", "not_a_real_anchor") is None,
+    ok(speech_mod.text_for(r, "m0", "near", "not_a_real_anchor") is None,
        "an anchor that is not on this route is not a sentence RIO can say")
-    ok(speech_mod.text_for(r, "m99", "primary") is None,
+    ok(speech_mod.text_for(r, "m99", "near") is None,
        "nor is a maneuver that is not on it")
     ok(speech_mod.text_for(r, "m0", "freestyle") is None,
        "nor is a call type that does not exist")
+    # A PHONE RUNNING YESTERDAY'S CACHED PAGE still asks for "imminent". It
+    # gets the junction line rather than silence at a junction.
+    ok(speech_mod.text_for(r, "m0", "imminent") == m0.speech["junction"],
+       "the old call names still resolve, so a stale client is not mute")
+    ok(speech_mod.text_for(r, "m0", "primary") == m0.speech["near"],
+       "...for all three of them")
 
     ok(all(m.speech for m in r.maneuvers),
        "every maneuver on the route has its lines before the drive starts")
@@ -614,69 +636,314 @@ def run_speech():
 
 
 # ---------------------------------------------------------------------------
-# G2. Varied phrasing, and the preferences a driver can ask for
+# G1b. THE LADDER — Google's distances, by road class
 # ---------------------------------------------------------------------------
-def run_variation():
-    section("G2. phrasing — varied in wording, fixed in content")
-    import persona
+def run_cadence():
+    section("G1b. cadence — the ladder a driver already knows")
+
+    surface = fixtures.city_route()
+    service.set_provider(fixtures.FixtureProvider(surface, []))
+    service.reset()
+    rs = service.build_route(surface.geometry[0][0], surface.geometry[0][1],
+                             surface.destination)
+    m0 = rs.maneuvers[0]
+    tiers = {t["call"]: t["at_m"] for t in m0.speech["tiers"]}
+    ok(m0.road_class == M.SURFACE, "a city street is on the surface ladder")
+    ok(abs(tiers["far"] - 804.7) < 1,
+       f"the far call is half a mile out ({tiers['far']} m)")
+    ok(tiers.get("far_mid") is None,
+       "and there is no one-mile call on a surface street")
+    ok(tiers["near"] == 150.0, f"the near call is at 150 m ({tiers['near']} m)")
+    ok(tiers["junction"] == 35.0, "and the junction floor is 35 m")
+
+    hwy = fixtures.highway_route()
+    service.set_provider(fixtures.FixtureProvider(hwy, []))
+    service.reset()
+    rh = service.build_route(hwy.geometry[0][0], hwy.geometry[0][1],
+                             hwy.destination)
+    h0 = rh.maneuvers[0]
+    ht = {t["call"]: t["at_m"] for t in h0.speech["tiers"]}
+    ok(h0.road_class == M.HIGHWAY, "a 29 m/s ramp approach is on the fast ladder")
+    ok(abs(ht["far"] - 3218.7) < 1, f"the far call is two miles out ({ht['far']} m)")
+    ok(abs(ht["far_mid"] - 1609.3) < 1,
+       f"...with a one-mile call under it ({ht['far_mid']} m)")
+    ok(abs(ht["near"] - 402.3) < 1, f"the near call is a quarter mile ({ht['near']} m)")
+    ok(h0.speech["far"] == "In two miles, take exit 43 toward Sunset Blvd.",
+       "and it names the exit and the sign — got " + repr(h0.speech["far"]))
+    ok(h0.speech["far_mid"] == "In one mile, take exit 43 toward Sunset Blvd.",
+       "the one-mile call says one mile — got " + repr(h0.speech["far_mid"]))
+    ok(h0.speech["near"] == "Take exit 43 toward Sunset Blvd.",
+       "and the near call drops the distance, not the exit number")
+    ok(h0.speech["junction"] == "Take the exit.", "the junction call is two words")
+
+    # THE EXIT NUMBER IS PROVIDER DATA OR IT IS NOT SAID.
+    no_number = M.CanonicalManeuver(
+        id="x", sequence=0, type=M.RAMP, direction=M.RIGHT, road_name="the 10",
+        latitude=0, longitude=0, route_distance_position=0, polyline_index=0,
+        instruction="Take the ramp onto the 10", road_class=M.HIGHWAY)
+    ok("exit " not in speech_mod.near_text(no_number).lower()
+       or "exit number" not in speech_mod.near_text(no_number).lower(),
+       "a ramp with no exit number never invents one — "
+       + repr(speech_mod.near_text(no_number)))
+
+    # CHAINING: two junctions 120 m apart are one sentence.
+    ch = fixtures.chained_route()
+    service.set_provider(fixtures.FixtureProvider(ch, []))
+    service.reset()
+    rc = service.build_route(ch.geometry[0][0], ch.geometry[0][1], ch.destination)
+    c0, c1 = rc.maneuvers[0], rc.maneuvers[1]
+    ok(c0.speech["near"] == "Turn left onto Ocean Ave, then turn right onto 2nd St.",
+       'the near call chains the second turn with "then" — got '
+       + repr(c0.speech["near"]))
+    ok(c0.speech.get("chained_to") == c1.id,
+       "and the maneuver it swallowed is named, so the planner can stay quiet "
+       "about it")
+    ok("far" not in c0.speech,
+       "a 600 m leg gets NO half-mile call — the distance in that sentence is "
+       "written at route load and cannot be said 600 m out")
+    # ...and where there IS a far call, it does not chain: half a mile out the
+    # second turn is not yet a thing the driver can act on.
+    far_man = rs.maneuvers[1]          # 900 m of Lincoln before the Fell turn
+    ok("far" in far_man.speech and "then" not in far_man.speech["far"],
+       "the far call does NOT chain — " + repr(far_man.speech.get("far")))
+    # ...and a turn far enough away is not chained.
+    ok(rs.maneuvers[0].speech.get("chained_to") is None,
+       "two turns 900 m apart stay two announcements")
+    # THE LADDER IS TRIMMED TO THE LEG, which is the rule that stops a
+    # half-mile call on a 400 m block. Session a2da65cd's replay produced two
+    # of exactly those, at 414 m and 485 m against an 805 m tier.
+    short = [m for m in rc.maneuvers if m.type == M.TURN]
+    ok(all("far" not in m.speech for m in short),
+       "no maneuver on a route of short blocks carries a far call at all")
+
+
+def run_distance_phrasing():
+    section("G1c. distance — the closed set of phrases, and the roundings")
+    from navigation import distance as dist_mod
+
+    cases = [
+        (30, "100 feet"), (46, "150 feet"), (76, "250 feet"),
+        (152, "500 feet"), (160, "500 feet"),
+        (300, "a quarter mile"), (402, "a quarter mile"),
+        (700, "half a mile"), (805, "half a mile"),
+        (1207, "three quarters of a mile"),
+        (1609, "one mile"), (3218, "two miles"), (4828, "three miles"),
+    ]
+    for meters, want in cases:
+        got = dist_mod.phrase(meters)
+        ok(got == want, f"{meters} m -> {want!r}" + ("" if got == want else f" (got {got!r})"))
+
+    ok(dist_mod.in_phrase(805) == "In half a mile",
+       "and it composes into a sentence opener")
+
+    # NOTHING BELOW 100 FEET, ever: at 60 ft the driver is in the junction and
+    # a number is worse than the two words that belong there.
+    ok(dist_mod.phrase(10) == "100 feet",
+       "nothing is ever announced closer than a hundred feet")
+
+    # SPOKEN, NOT PRINTED.
+    ok("2 miles" not in dist_mod.phrase(3218),
+       'the mile count is a word, not a digit — "two miles", never "2 miles"')
+
+    # METRIC IS ITS OWN LADDER, not the imperial one converted.
+    metric = [(300, "300 meters"), (805, "800 meters"), (1609, "two kilometers"),
+              (1000, "one kilometer"), (60, "50 meters")]
+    for meters, want in metric:
+        got = dist_mod.phrase(meters, dist_mod.METRIC)
+        ok(got == want, f"metric: {meters} m -> {want!r}"
+           + ("" if got == want else f" (got {got!r})"))
+
+    ok(len(dist_mod.announce_ladder()) <= 12,
+       "the set of phrases is closed and small — "
+       + str(len(dist_mod.announce_ladder())))
+
+    # ...AND THE CONFIG SWITCH REACHES THE ROUTE.
+    route = fixtures.city_route()
+    service.set_provider(fixtures.FixtureProvider(route, []))
+    service.reset()
+    old = config.NAV_UNITS
+    try:
+        config.NAV_UNITS = "metric"
+        rm = service.build_route(route.geometry[0][0], route.geometry[0][1],
+                                 route.destination)
+        ok("meters" in rm.maneuvers[0].speech["far"]
+           or "kilometer" in rm.maneuvers[0].speech["far"],
+           "NAV_UNITS = metric changes what the far call says — "
+           + repr(rm.maneuvers[0].speech["far"]))
+    finally:
+        config.NAV_UNITS = old
+
+
+# ---------------------------------------------------------------------------
+# G1d. SHE IS THE NAVIGATION — no third person anywhere on the spoken path
+# ---------------------------------------------------------------------------
+# On the drive of 2026-09-09 a driver asked for directions and was told the
+# navigation would handle it. There is no "the navigation": the turn calls are
+# RIO, and the fact that a deterministic planner fires them is architecture,
+# not something the driver is told about.
+#
+# The lint runs over everything that can reach the driver's ears or the model's
+# context: every sentence the speech table can produce, and every string a nav
+# tool result can carry. A model that is handed "the system will call it out"
+# will say it back.
+THIRD_PERSON = (
+    "the car will", "the car's", "the vehicle will", "the system",
+    "the navigation system", "navigation will", "the nav system",
+    "the gps will", "it will call", "you'll hear", "will call it out",
+    "will let you know", "will tell you",
+)
+
+
+def nav_voice_lint(text: str):
+    """Which forbidden third-person phrases are in this line, if any."""
+    low = (text or "").lower()
+    return [p for p in THIRD_PERSON if p in low]
+
+
+def run_nav_voice():
+    section("G1e. voice — RIO is the navigation, not a bystander to it")
+    import rio_prompts
+
     route = fixtures.city_route()
     service.set_provider(fixtures.FixtureProvider(route, []))
     service.reset()
     r = service.build_route(route.geometry[0][0], route.geometry[0][1],
                             route.destination)
+
+    lines = [r.depart_speech]
+    for m in r.maneuvers:
+        for k, v in m.speech.items():
+            if isinstance(v, str):
+                lines.append(v)
+    bad = [(ln, nav_voice_lint(ln)) for ln in lines if nav_voice_lint(ln)]
+    ok(not bad, "no spoken navigation line describes navigation in the third "
+                "person" + (f" — {bad}" if bad else f" ({len(lines)} lines)"))
+
+    # The destination reply, which is the exact sentence the drive of
+    # 2026-09-09 got wrong.
+    reply = speech_mod.destination_reply("resolved", "Century City")
+    ok(not nav_voice_lint(reply),
+       "the routing confirmation is in her own voice — " + repr(reply))
+    ok(reply.lower().startswith("got it") and "i'll take you" in reply.lower(),
+       "...and it is first person — " + repr(reply))
+
+    # Every nav tool RESULT, which is what the model actually reads.
+    results = list(_nav_tool_result_samples())
+    offenders = [(name, txt, nav_voice_lint(txt))
+                 for name, txt in results if nav_voice_lint(txt)]
+    ok(not offenders,
+       "no navigation tool result hands the model a third-person sentence to "
+       "parrot" + (f" — {offenders}" if offenders
+                   else f" ({len(results)} results checked)"))
+    firsts = [txt for _n, txt in results
+              if txt.lower().startswith(("i ", "i'", "i’", "got it"))
+              or " i'll " in txt.lower() or " i've " in txt.lower()]
+    ok(len(firsts) >= max(1, len(results) // 2),
+       f"and most of them speak in the first person ({len(firsts)}/{len(results)})")
+
+    # The session instructions the model is given.
+    src = inspect.getsource(rio_prompts)
+    hits = [p for p in THIRD_PERSON if p in src.lower()]
+    ok(not hits, "the session instructions never model that phrasing for her"
+                 + (f" — {hits}" if hits else ""))
+    ok("i call every turn" in src.lower() or "i'll call each turn" in src.lower()
+       or "the turn calls are me" in src.lower(),
+       "...and they say plainly that the turn calls are hers")
+
+
+def _nav_tool_result_samples():
+    """Every navigation tool result shape, with a representative payload.
+
+    Read out of the real handlers rather than typed here, so a new result
+    string is linted the day it is written rather than the day someone
+    remembers this list exists.
+    """
+    import realtime
+    out = []
+    for name in dir(realtime):
+        if not name.startswith("nav_result_"):
+            continue
+        fn = getattr(realtime, name)
+        if not callable(fn):
+            continue
+        try:
+            got = fn()
+        except Exception:
+            continue
+        if isinstance(got, dict):
+            for k, v in got.items():
+                if isinstance(v, str) and " " in v:
+                    out.append((f"{name}.{k}", v))
+        elif isinstance(got, str):
+            out.append((name, got))
+    return out
+
+
+def run_variation():
+    section("G2. phrasing — fixed where a driver relies on it, varied where she owns it")
+    import persona
+    route = fixtures.city_route()
+    turn = route.maneuvers[0].route_distance_position
+    service.set_provider(fixtures.FixtureProvider(
+        route, [shell_near_turn(route, turn - 14, 12, "Shell"),
+                shell_near_turn(route, route.maneuvers[1].route_distance_position - 14,
+                                12, "Chevron")]))
+    service.reset()
+    r = service.build_route(route.geometry[0][0], route.geometry[0][1],
+                            route.destination)
     turns = [m for m in r.maneuvers if m.type == M.TURN]
 
-    # THE CONTENT, which is the half that may not vary. A phrasing that drops
-    # the direction is a phrasing that leaves the driver guessing, and one
-    # that drops the road name is worse than the template it replaced.
+    # THE CONTENT, which is the half that may not vary. A call that drops the
+    # direction leaves the driver guessing, and one that drops the road name is
+    # worse than the template it replaced.
     for m in turns:
         word = "left" if m.direction == M.LEFT else "right"
-        early = m.speech.get("early", "")
-        ok(word in early.lower(),
-           f"{m.id}'s early line says which way to turn ({early!r})")
-        ok(m.road_name in early,
-           f"...and which road it goes onto ({m.road_name!r} in {early!r})")
-        ok(not persona.lint(early),
-           f"...and is in her register: {persona.lint(early) or 'clean'}")
+        for call in ("far", "near"):
+            line = m.speech.get(call, "")
+            ok(word in line.lower(),
+               f"{m.id}'s {call} call says which way to turn ({line!r})")
+            ok(m.road_name in line,
+               f"...and which road it goes onto ({m.road_name!r} in {line!r})")
+            ok(not persona.lint(line),
+               f"...and is in her register: {persona.lint(line) or 'clean'}")
 
-    # THE WORDING, which is the half that must. Two consecutive turns drawing
-    # the same phrasing is the sound this change exists to remove.
-    ok(turns[0].speech["early"] != turns[1].speech["early"],
-       "consecutive turns are not phrased identically ("
-       + " / ".join(repr(m.speech["early"]) for m in turns) + ")")
-
-    # THE IMMINENT CALL, which is neither: one template per maneuver type, the
-    # same bytes every time, whatever the route or the generation.
-    for v in range(len(speech_mod._EARLY_TURN) + 3):
-        ok(speech_mod.imminent_text(turns[0]) == "Left here.",
-           "the imminent call is byte-identical whatever else varies"
-           if v == 0 else None)
-        break
-    imminents = set()
-    for gen in range(1, 6):
+    # THE NAVIGATION CALLS NO LONGER VARY, and that is the change. A driver
+    # parses "In half a mile, turn left onto Lincoln Boulevard." without
+    # listening to it; a synonym for it is a sentence they have to listen to.
+    forms = set()
+    for gen in range(1, 8):
         alt = speech_mod.build(turns[0], "", M.UNKNOWN, variant=gen)
-        imminents.add(alt["imminent"])
-    ok(imminents == {"Left here."},
-       "and stays one string across every variant index — " + repr(imminents))
+        forms.add((alt["far"], alt["near"], alt["junction"]))
+    ok(len(forms) == 1,
+       "every tier is byte-identical across every variant index — "
+       + str(len(forms)) + " form(s)")
+
+    # ...AND THE ANCHOR LINE STILL DOES, because it is the one sentence in
+    # navigation that is hers rather than the map's.
+    anchored = [m for m in turns if m.anchors]
+    ok(len(anchored) >= 2, "the fixture put a landmark at two turns")
+    if len(anchored) >= 2:
+        ok(anchored[0].anchors[0]["speech"] != anchored[1].anchors[0]["speech"]
+           or anchored[0].anchors[0]["label"] != anchored[1].anchors[0]["label"],
+           "consecutive anchored turns are not phrased identically ("
+           + " / ".join(repr(m.anchors[0]["speech"]) for m in anchored) + ")")
 
     # REPRODUCIBLE FROM WHAT IS LOGGED, which is the property a bug report
-    # needs and a weaker one than "always the same words". Two separate drives
-    # to the same place are two journeys and may well phrase a turn
-    # differently — that is the point of it, for anyone who makes the same
-    # commute daily. What must never happen is a line nobody can account for
-    # afterwards: (journey, generation, sequence) is written to the drive log,
-    # and those three reproduce the sentence exactly.
-    for m in turns:
-        ok(speech_mod.build(m, "", M.UNKNOWN,
-                            variant=speech_mod.variant_for(r, m)) == m.speech,
+    # needs: (journey, generation, sequence) is written to the drive log, and
+    # those three redraw the sentence exactly.
+    mans = r.maneuvers
+    for i, m in enumerate(mans):
+        nxt = mans[i + 1] if i + 1 < len(mans) else None
+        chained = nxt if (m.speech.get("chained_to")
+                          and nxt and nxt.id == m.speech["chained_to"]) else None
+        ok(speech_mod.build(m, r.destination.display_name, r.arrival.side,
+                            variant=speech_mod.variant_for(r, m),
+                            chained=chained) == m.speech,
            f"{m.id}'s stored lines are what its journey, generation and "
            "position redraw — nothing decided at drive time")
-    ok(speech_mod.early_text(turns[0], 2) == speech_mod.early_text(turns[0], 2),
-       "and the draw itself is a function of its index, not of the clock")
 
-    # ...and a REROUTE is a new generation, which is allowed to sound
-    # different: the plan changed, and repeating the abandoned one verbatim is
-    # the one place this would sound like a recording.
+    # ...and a REROUTE is a new generation, which the anchor lines are allowed
+    # to sound different for: the plan changed.
     offsets = {speech_mod.route_offset("j-abc", g) for g in (1, 2, 3)}
     ok(len(offsets) == 3,
        "each generation of a journey starts at its own place in the set")
@@ -754,8 +1021,9 @@ def run_spoken():
        "a destination request never reaches the camera")
 
     ok(speech_mod.destination_reply("resolved", name="Griffith Observatory")
-       == "Routing to Griffith Observatory.",
-       "a resolved destination is confirmed with the provider's own name")
+       == "Got it — I'll take you to Griffith Observatory.",
+       "a resolved destination is confirmed with the provider's own name, in "
+       "her own voice")
     two = [{"display_name": "Getty Center"}, {"display_name": "Getty Villa"}]
     ok(speech_mod.destination_reply("ambiguous", candidates=two)
        == "I found two — Getty Center or Getty Villa. Which one?",
@@ -1086,6 +1354,9 @@ def main():
     run_gates()
     run_verification()
     run_speech()
+    run_cadence()
+    run_distance_phrasing()
+    run_nav_voice()
     run_variation()
     run_preferences()
     run_spoken()

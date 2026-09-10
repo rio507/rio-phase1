@@ -166,14 +166,21 @@
      * the clip on the candidate, so a sentence this file has never heard of
      * still gets an element the first time it is called for. */
     var clipEls = {};
+    /* Never throws. A clip that cannot be built is a clip the junction call
+       falls back to dictation for, which is the contingency this design
+       already keeps behind it -- but it used to be built from inside attach(),
+       where a throw took the whole ROUTE down and the drive got no navigation
+       at all rather than one line in a second voice. */
     function clipElement(id) {
       if (!clipEls[id]) {
-        var a = new Audio('/static/audio/' + id + '.mp3');
-        a.preload = 'auto';
-        clipEls[id] = a;
-        if (unlocked) unlockOne(a);
+        try {
+          var a = new Audio('/static/audio/' + id + '.mp3');
+          a.preload = 'auto';
+          clipEls[id] = a;
+          if (unlocked) unlockOne(a);
+        } catch (e) { clipEls[id] = null; }
       }
-      return clipEls[id];
+      return clipEls[id] || null;
     }
 
     var unlocked = false;
@@ -219,7 +226,7 @@
       // The shared output wants the same gesture every element here does.
       try { if (root.RIO && root.RIO.output) root.RIO.output.unlock(); } catch (e) {}
       unlockOne(navAudio);
-      Object.keys(clipEls).forEach(function (id) { unlockOne(clipEls[id]); });
+      Object.keys(clipEls).forEach(function (id) { unlockOneSafe(clipEls[id]); });
     }
 
     /* ...and warmed at the moment a route attaches, rather than at the moment
@@ -229,11 +236,13 @@
     function warmClips(route) {
       var seen = {};
       ((route && route.maneuvers) || []).forEach(function (m) {
-        var id = m.speech && m.speech.clips && m.speech.clips.imminent;
+        var id = m.speech && m.speech.clips && m.speech.clips.junction;
         if (id && !seen[id]) { seen[id] = true; clipElement(id); }
       });
       return Object.keys(seen).length;
     }
+
+    function unlockOneSafe(a) { if (a) { try { unlockOne(a); } catch (e) {} } }
 
     function audioFor(candidate) {
       /* One voice for every line RIO says.
@@ -252,7 +261,7 @@
               + '&call=' + encodeURIComponent(candidate.call_type)
               + (candidate.anchor_id ? '&anchor=' + encodeURIComponent(candidate.anchor_id) : '');
       /* THE FILE, WHERE THERE IS ONE, AND THE MOUTH BEHIND IT.
-         Only the imminent call has a clip, and for it the ordinary ladder is
+         Only the junction call has a clip, and for it the ordinary ladder is
          upside down: dictation is the contingency and the pre-rendered file is
          the path. Everything else keeps the order it had. */
       var clipId = candidate.clip || null;
@@ -262,9 +271,9 @@
         clipUrl: clipId ? '/static/audio/' + clipId + '.mp3' : null,
         clipFirst: !!clipId,
         clipElement: clipId ? clipElement(clipId) : null,
-        // WHICH OF THE FOUR CALLS THIS IS, and it decides how long the line
-        // waits for her voice before being synthesised instead. "Left here."
-        // at the junction cannot be late; the early call, seconds out, can.
+        // WHICH TIER THIS IS, and it decides how long the line waits for her
+        // voice before being synthesised instead. "Turn right." at the
+        // junction cannot be late; the far call, half a mile out, can.
         // Already on the candidate — it is the /nav/voice address above.
         callType: candidate.call_type,
         ttsUrl: url,
@@ -557,6 +566,14 @@
       });
       tracker.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
       planner.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
+      /* THE ROUTE-START LINE, HERE, because here is where a route becomes the
+         live one -- before the first fix, before the first progress event.
+         Waiting for progress is what left session 738fbb82's driver hearing a
+         turn call at 31 m as the first thing anyone said to them. */
+      /* ...and it may never take the route down with it. A sentence that
+         cannot be spoken is a sentence not spoken; a route that fails to
+         attach because of one is a drive with no navigation at all. */
+      try { planner.onRouteStart(); } catch (e) {}
       paintRoute();
       drawRoute();
       RIO.bus.emit('NAV_ROUTE_ATTACHED', {

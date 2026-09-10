@@ -46,6 +46,22 @@ RIGHT = "RIGHT"
 STRAIGHT_DIR = "STRAIGHT"
 UNKNOWN = "UNKNOWN"
 
+# --- road class -------------------------------------------------------------
+# TWO VALUES, AND THEY ONLY EVER CHANGE WHEN A TURN IS CALLED.
+#
+# Every navigation system a driver has used calls a surface-street turn at
+# about half a mile and a freeway exit at two miles, and the reason is not
+# taste: at 30 mph half a mile is a minute and at 70 mph it is thirty seconds
+# with two lane changes still to make. One ladder cannot serve both.
+#
+# It is deliberately NOT a road taxonomy. "Is this the fast ladder or the slow
+# one" is the only question anything downstream asks, so it is the only
+# question this answers -- see providers/google._road_class for how a step's
+# own average speed and maneuver family decide it, and note that a provider
+# that offers a real road classification may simply set this directly.
+SURFACE = "SURFACE"
+HIGHWAY = "HIGHWAY"
+
 # Maneuver families that are worth a landmark. A landmark is a thing the driver
 # picks out of a windscreen and turns at; "continue straight" has nothing to
 # pick out, and a freeway interchange is out of scope for V1.1 (§21).
@@ -97,6 +113,9 @@ class CanonicalManeuver:
     route_distance_position: float      # metres along the route geometry
     polyline_index: int                 # the exact vertex, not a nearest-point guess
     instruction: str = ""               # the provider's own line, for the panel and the log
+    # Which announcement ladder this maneuver is called on. SURFACE unless the
+    # provider says otherwise; see the note by SURFACE/HIGHWAY above.
+    road_class: str = SURFACE
     step_distance_m: Optional[float] = None
     approach_speed_ms: Optional[float] = None
     lane_information: Optional[dict] = None
@@ -123,6 +142,7 @@ class CanonicalManeuver:
             "route_distance_position": round(self.route_distance_position, 1),
             "polyline_index": self.polyline_index,
             "instruction": self.instruction,
+            "road_class": self.road_class,
             "step_distance_m": self.step_distance_m,
             "lane_information": self.lane_information,
             "exit_information": self.exit_information,
@@ -155,6 +175,11 @@ class CanonicalRoute:
     maneuvers: List[CanonicalManeuver]
     arrival: ArrivalInfo = field(default_factory=ArrivalInfo)
     depart_instruction: str = ""
+    # THE ROUTE-START LINE, said once, immediately: "Head north on Lincoln
+    # Blvd, then turn right onto Ocean Ave." Written by speech.build_route
+    # because it is the one sentence that belongs to the ROUTE rather than to
+    # any maneuver -- it needs the depart step and the first maneuver at once.
+    depart_speech: str = ""
     created_at: float = field(default_factory=time.time)
     route_length_m: float = 0.0
     # Set by the landmark generator so the panel and the log can tell "no
@@ -187,6 +212,7 @@ class CanonicalRoute:
             "route_length_m": round(self.route_length_m, 1),
             "arrival": self.arrival.to_dict(),
             "depart_instruction": self.depart_instruction,
+            "depart_speech": self.depart_speech,
             "landmarks_state": self.landmarks_state,
             "landmark_lookups": self.landmark_lookups,
             "maneuvers": [m.to_dict() for m in self.maneuvers],

@@ -2078,31 +2078,45 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
         arrive_radius_m: 25, projection_back_m: 80, projection_fwd_m: 400,
         heading_min_displacement_m: 8, heading_max_sample_age_s: 3,
         heading_min_speed_ms: 1.5, stationary_speed_ms: 0.7,
-        early_guidance_s: 25, anchor_acquisition_s: 11, context_call_s: 6,
-        near_turn_s: 2.5, min_call_distance_m: 20, max_call_distance_m: 400,
-        early_max_distance_m: 900, speed_floor_ms: 3, speed_nominal_ms: 11,
-        duplicate_instruction_cooldown_s: 8, anchor_valid_for_s: 6,
-        speech_ttl_s: { early: 8, primary: 5, imminent: 2.5, arrival: 8 },
+        anchor_acquisition_lead_m: 150, min_call_distance_m: 20,
+        far_max_distance_m: 4000,
+        tier_distances_m: {
+          SURFACE: { far: 804.7, near: 150.0, junction: 35.0 },
+          HIGHWAY: { far: 3218.7, far_mid: 1609.3, near: 402.3, junction: 150.0 },
+        },
+        junction_min_gap_s: 10.0, near_min_lead_s: 4.0,
+        chain_window_m: 200.0, arrival_call_m: 150.0, units: 'imperial',
+        progress_tick_s: 0.5, clip_start_latency_s: 0.05,
+        junction_lead_margin_m: 2.0,
+        speed_floor_ms: 3, speed_nominal_ms: 11,
+        duplicate_instruction_cooldown_s: 8, anchor_valid_for_m: 400,
+        speech_ttl_s: { depart: 12, far: 10, far_mid: 10, near: 6,
+                        junction: 2.5, arrival: 8, arrived: 8 },
         vision_enabled: false,
       },
       avoid_applied: avoid || [],
       avoid_unsupported: [],
+      depart_speech: 'Head east on Venice Boulevard, then turn left onto Lincoln Boulevard.',
       maneuvers: [
         { id: 'm0', sequence: 0, type: 'TURN', direction: 'LEFT',
-          road_name: 'Lincoln Boulevard',
+          road_name: 'Lincoln Boulevard', road_class: 'SURFACE',
           instruction: 'Turn left onto Lincoln Boulevard',
           lat: pts[iTurn][0], lng: pts[iTurn][1],
           route_distance_position: 1200, polyline_index: iTurn, anchors: [],
-          speech: { early: 'Left turn coming up onto Lincoln Boulevard.',
-                    primary: 'Take the next left onto Lincoln Boulevard.',
-                    imminent: 'Left here.' } },
+          speech: { far: 'In half a mile, turn left onto Lincoln Boulevard.',
+                    near: 'Turn left onto Lincoln Boulevard.',
+                    junction: 'Turn left.',
+                    clips: { junction: 'turn_left' },
+                    tiers: [{ call: 'far', at_m: 804.7 },
+                            { call: 'near', at_m: 150.0 },
+                            { call: 'junction', at_m: 35.0 }] } },
         { id: 'm1', sequence: 1, type: 'ARRIVE', direction: 'RIGHT',
           road_name: '', instruction: 'Arrive at Test Destination',
-          lat: pts[iEnd][0], lng: pts[iEnd][1],
+          lat: pts[iEnd][0], lng: pts[iEnd][1], road_class: 'SURFACE',
           route_distance_position: 2100, polyline_index: iEnd, anchors: [],
-          speech: { early: 'Almost there.',
-                    primary: 'Your destination is on the right.',
-                    arrival: 'Your destination is on the right.' } },
+          speech: { arrival: 'Your destination is on the right.',
+                    arrived: 'You have arrived.',
+                    tiers: [{ call: 'arrival', at_m: 150.0 }] } },
       ],
     };
   }
@@ -2191,7 +2205,7 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
 
   const calls = [];
   global.RIO.bus.on('*', (ev) => {
-    if (/NAV_(EARLY_GUIDANCE|CONTEXTUAL_CALL|NEAR_TURN|PRIMARY|ARRIVAL|SPEECH_SPOKEN)/
+    if (/NAV_(ROUTE_START_CALL|FAR_GUIDANCE|CONTEXTUAL_CALL|JUNCTION_CALL|ARRIVAL_CALL|SPEECH_SPOKEN)/
         .test(ev.type)) calls.push(ev);
   });
 
@@ -2241,6 +2255,7 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
     parkAtStart();
     const byVoice = await rt.localTools.start_navigation(
       { destination: 'Test Destination' });
+    if (process.env.RT_DEBUG) console.log('    byVoice:', JSON.stringify(byVoice));
     ok(byVoice.ok === true && byVoice.routing === true,
        'a spoken destination routes (' + byVoice.destination + ')');
     const voiceDrive = await driveToEnd('voice');
@@ -2266,10 +2281,19 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
        'a route started by voice calls its turns in the same sequence as one '
        + 'started on the dashboard\n        voice: ' + voiceSeq.join(' → ')
        + '\n        box:   ' + boxSeq.join(' → '));
-    ok(voiceSeq.some((s) => /:early$/.test(s))
-       && voiceSeq.some((s) => /:primary$/.test(s)),
-       'and the sequence is the real one — an early call and an instruction, '
-       + 'not one lonely event');
+    /* THE ROUTE-START LINE IS NOT IN voiceSeq, and that is the point of it:
+       it goes out when the route ATTACHES, before a metre has been driven, so
+       it lands during start_navigation rather than during the drive. Google
+       says the whole first move before the car leaves the kerb and so does
+       this; a driver who has to move first to be told what road they are on
+       has already had to guess. */
+    ok(calls.some((e) => e.call_type === 'depart' && e.text),
+       'the route-start line went out at attach, before the drive — '
+       + JSON.stringify((calls.filter((e) => e.call_type === 'depart')[0] || {}).text));
+    ok(voiceSeq.some((s) => /:near$/.test(s))
+       && voiceSeq.some((s) => /:far$/.test(s)),
+       'and the drive itself is the real sequence — a far call and an '
+       + 'instruction, not one lonely event');
   })();
 
   // --- STOP: the route ends, and nothing queued survives it ----------------

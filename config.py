@@ -132,10 +132,13 @@ REALTIME_SPEAK_TIMEOUT_MS = 900
 # accidentally urgent.
 REALTIME_SPEAK_TIMEOUT_MS_BY_CHANNEL = {
     "nav": {
-        "imminent": 900,
-        "primary": 1500,
-        "early": 2000,
+        "junction": 900,
+        "near": 1500,
+        "far": 2000,
+        "far_mid": 2000,
+        "depart": 2500,
         "arrival": 2000,
+        "arrived": 2000,
         "_default": 1500,
     },
     "health": {"_default": 2000},
@@ -2745,30 +2748,84 @@ NAV_GPS_WATCHDOG_COARSE_AFTER = 2
 # driver never took is worse than a late call.
 NAV_GPS_COAST_MAX_S = 20.0
 
-NAV_EARLY_GUIDANCE_S = 25.0         # "Right turn coming up."      (optional)
-NAV_ANCHOR_ACQUISITION_S = 11.0     # start looking for the landmark
-NAV_CONTEXT_CALL_S = 6.0            # "Turn right by the Shell station."
-NAV_NEAR_TURN_S = 2.5               # "Right here."                (only if needed)
-# Clamps, so that a crawl does not announce a turn 4 m ahead and a fast road
-# does not announce one from a kilometre out.
-NAV_MIN_CALL_DISTANCE_M = 20.0
-NAV_MAX_CALL_DISTANCE_M = 400.0
-NAV_EARLY_MAX_DISTANCE_M = 900.0
+# ---------------------------------------------------------------------------
+# THE ANNOUNCEMENT LADDER -- Google Maps' distances, because drivers have them
+# ---------------------------------------------------------------------------
+# What was here before was a set of three calls timed in SECONDS to the turn
+# with metre floors underneath, and on the drive of 2026-09-09 (session
+# 738fbb82) it produced this, for one maneuver, in this order:
+#
+#     t=76.6   "Take the next right onto 14th St."   31.1 m   the instruction
+#     t=102.3  "Coming up on a right onto 14th St."  28.2 m   the PREPARATION
+#
+# The preparation line arrived after the instruction and closer to the
+# junction, because at 0.12 m/s both floors were already crossed. That is not a
+# tuning miss; a speed-scaled floor is the wrong shape for this problem. Every
+# navigation system a driver has used announces at FIXED DISTANCES on a ladder
+# chosen by road class, and the value of doing the same is not correctness --
+# it is that the driver already knows what each beat means.
+#
+# So: distances, by road class, from the maneuver. No seconds anywhere.
+#
+#   SURFACE   half a mile, then 150 m, then the junction
+#   HIGHWAY   two miles, then one mile, then a quarter mile, then the gore
+#
+# JUNCTION is a floor rather than an announcement: it is where the two-word
+# confirmation goes IF the near call is far enough behind to make it worth
+# having (NAV_JUNCTION_MIN_GAP_S). 150 m on a freeway rather than 35 is the
+# same five seconds at 30 m/s that 35 m is at 7.
+NAV_TIER_DISTANCES_M = {
+    "SURFACE": {"far": 804.7, "near": 150.0, "junction": 35.0},
+    "HIGHWAY": {"far": 3218.7, "far_mid": 1609.3, "near": 402.3, "junction": 150.0},
+}
 
-# --- distance floors: what makes a slow approach still get warning distance --
+# THE RULE THAT KEEPS THE JUNCTION CALL FROM BEING NOISE.
 #
-# The three calls above are timed in SECONDS TO THE TURN, which is the right
-# unit and is already speed-scaled: 25 s is 750 m at 30 m/s and 250 m at 10.
-# What it is not is what a driver expects in town, where every other navigation
-# system calls a turn at a fixed distance and 6 s at 10 m/s is sixty metres.
+# "Turn right onto Ocean Ave." at 150 m and "Turn right." at 35 m are two
+# instructions about the same turn, and whether the second one is useful or is
+# RIO talking over herself depends entirely on how long ago the first one was.
+# In town at 11 m/s the gap is ten seconds and the confirmation is exactly what
+# a driver wants at the mouth of the junction. On a freeway at 30 m/s the same
+# two distances are four seconds apart and the second one is an interruption.
 #
-# Measured on session 06af3214: the primary call for m0 went out at 47 m and
-# 5.0 s, at 10.4 m/s. That is inside the junction. These floors fire whichever
-# comes first, so at speed the time term still leads and in town the distance
-# term does -- which is exactly how a conventional turn-by-turn behaves.
-NAV_EARLY_DISTANCE_M = 300.0        # "...coming up"       at 300 m if not sooner
-NAV_PRIMARY_DISTANCE_M = 130.0      # the instruction      at 130 m if not sooner
-NAV_IMMINENT_DISTANCE_M = 35.0      # "Left here."         at 35 m if not sooner
+# Ten seconds, which is Google's own behaviour and is long enough that the
+# driver has had time to look for the street sign and not find it.
+NAV_JUNCTION_MIN_GAP_S = 10.0
+
+# A full instruction takes about two seconds to say. Inside this much lead the
+# near call is skipped and the junction gets the two-word line instead -- never
+# a longer sentence begun too late to finish before the driver has to act.
+NAV_NEAR_MIN_LEAD_S = 4.0
+
+# HOW CLOSE THE NEXT MANEUVER HAS TO BE TO RIDE ON THIS ONE'S NEAR CALL.
+# "Turn right onto Ocean, then turn left onto 2nd." Two junctions 120 m apart
+# are one move to a driver, and announcing them as two separate events means
+# the second call lands while the car is still in the first turn.
+NAV_CHAIN_WINDOW_M = 200.0
+
+# Where "Your destination is on the right." goes. The final "You have arrived."
+# is fired by the tracker's own arrival, not by a distance.
+NAV_ARRIVAL_CALL_M = 150.0
+
+# Imperial or metric. The ladder above is in metres either way -- this decides
+# only how the FAR call's distance is SAID. See navigation/distance.py.
+NAV_UNITS = "imperial"
+
+# WHEN THE CAMERA IS ASKED ABOUT THE LANDMARK, and it is a distance now like
+# everything else on this path. It used to be 11 seconds to the turn, which was
+# tuned against a primary call at 6 seconds -- with the near call moved to a
+# fixed 150 m, 11 seconds at a crawl is INSIDE it, and the anchor would arrive
+# after the sentence it was for had already been spoken.
+#
+# So: this far BEFORE the near call. 150 m of lead on a surface street puts the
+# question at 300 m out, which is about where a forecourt sign becomes
+# readable, and on a freeway it scales with the ladder.
+NAV_ANCHOR_ACQUISITION_LEAD_M = 150.0
+# Clamps, so that a crawl does not announce a turn 4 m ahead and a fast road
+# does not announce one from further out than its own ladder allows.
+NAV_MIN_CALL_DISTANCE_M = 20.0
+NAV_MAX_CALL_DISTANCE_M = 500.0
+NAV_FAR_MAX_DISTANCE_M = 4000.0
 
 # ---------------------------------------------------------------------------
 # ...AND THE TICK THE CALL ACTUALLY FIRES ON
@@ -2821,7 +2878,7 @@ NAV_CLIP_START_LATENCY_S = 0.05
 #
 # Two metres, which is under a second even at a crawl and is invisible at
 # speed next to the terms above.
-NAV_IMMINENT_LEAD_MARGIN_M = 2.0
+NAV_JUNCTION_LEAD_MARGIN_M = 2.0
 # Below this, time-to-maneuver stops meaning anything: at 0.2 m/s every
 # maneuver is hours away and nothing is ever said, including the turn being
 # crept towards in traffic. A floor for the arithmetic, not a claimed speed.
@@ -2829,7 +2886,8 @@ NAV_SPEED_FLOOR_MS = 3.0
 NAV_SPEED_NOMINAL_MS = 11.0         # only when there is no speed at all
 NAV_DUPLICATE_INSTRUCTION_COOLDOWN_S = 8.0
 # A speech candidate is true only inside a window. These are the windows.
-NAV_SPEECH_TTL_S = {"early": 8.0, "primary": 5.0, "imminent": 2.5, "arrival": 8.0}
+NAV_SPEECH_TTL_S = {"depart": 12.0, "far": 10.0, "far_mid": 10.0, "near": 6.0,
+                    "junction": 2.5, "arrival": 8.0, "arrived": 8.0}
 
 # --- landmark candidates (V1.1) ---------------------------------------------
 # Fetched ONCE per route generation, one pass over the maneuvers at route load,
@@ -2906,7 +2964,20 @@ NAV_ANCHOR_ORDERED_MIN_RELATION_CONFIDENCE = 0.8   # JUST_BEFORE / JUST_AFTER
 NAV_ANCHOR_MIN_TRACKING_DURATION_S = 1.2
 NAV_ANCHOR_MIN_OBSERVATIONS = 2
 NAV_ANCHOR_MAX_AGE_S = 3.0            # an observation older than this is history
-NAV_ANCHOR_VALID_FOR_S = 6.0          # a VerifiedAnchor's own shelf life
+# A VerifiedAnchor'S OWN SHELF LIFE, IN ROAD RATHER THAN IN SECONDS.
+#
+# Six seconds was the right number when the camera was asked at 11 s to the
+# turn and the instruction went out at 6. With acquisition at 300 m and the
+# near call at 150 m, six seconds is between eight and eighteen metres of
+# travel and the anchor is always stale by the time the sentence it was
+# acquired FOR is due -- so every contextual line silently became the canonical
+# one, which is a fallback that looks exactly like the feature working.
+#
+# What actually goes stale is not the clock, it is the distance: "the Shell is
+# at this junction" stays true while the junction is still ahead. 400 m covers
+# acquisition through the near call with room, and still refuses an anchor
+# carried over from a maneuver ago.
+NAV_ANCHOR_VALID_FOR_M = 400.0
 NAV_ANCHOR_MAX_PER_MANEUVER = 1       # one anchor, ever (§19)
 
 # --- visual verification (V1.1) ---------------------------------------------

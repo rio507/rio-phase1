@@ -8,6 +8,22 @@
       "sha1": "5674a5a1532f",
       "voice": "marin"
     },
+    "keep_left": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 9645,
+      "model": "gpt-realtime-2.1",
+      "sha1": "170a3f410067",
+      "voice": "marin"
+    },
+    "keep_right": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 7965,
+      "model": "gpt-realtime-2.1",
+      "sha1": "c68ed5826ed3",
+      "voice": "marin"
+    },
     "left_at_the_roundabout": {
       "at": 1788732470.5,
       "backend": "openai_realtime",
@@ -22,6 +38,14 @@
       "bytes": 10485,
       "model": "gpt-realtime-2.1",
       "sha1": "631437c4b659",
+      "voice": "marin"
+    },
+    "make_a_u_turn": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 11157,
+      "model": "gpt-realtime-2.1",
+      "sha1": "99453072a49e",
       "voice": "marin"
     },
     "merge": {
@@ -80,6 +104,14 @@
       "sha1": "433d7f287a46",
       "voice": "marin"
     },
+    "take_the_exit": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 13101,
+      "model": "gpt-realtime-2.1",
+      "sha1": "24e1efd8b2da",
+      "voice": "marin"
+    },
     "take_this_exit": {
       "at": 1788730422.9,
       "backend": "openai_realtime",
@@ -126,6 +158,22 @@
       "bytes": 14469,
       "model": "gpt-realtime-2.1",
       "sha1": "adbf08a6e528",
+      "voice": "marin"
+    },
+    "turn_left": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 10629,
+      "model": "gpt-realtime-2.1",
+      "sha1": "b6a4bf658ad5",
+      "voice": "marin"
+    },
+    "turn_right": {
+      "at": 1789005715.7,
+      "backend": "openai_realtime",
+      "bytes": 11733,
+      "model": "gpt-realtime-2.1",
+      "sha1": "510d4473b7a6",
       "voice": "marin"
     },
     "watch_distance": {

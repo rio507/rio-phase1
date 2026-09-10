@@ -250,13 +250,15 @@ def build_route(origin_lat: float, origin_lng: float,
         with _lock:
             _JOURNEYS[route.journey_id] = {"generation": 1, "reroutes": 0}
 
-    # AFTER the generation is decided, never before: the phrasing set is
+    # AFTER the generation is decided, never before: the anchor phrasing set is
     # indexed off journey and generation, so building the speech table first
     # would draw every route's lines at the same place in the set.
-    for man in route.maneuvers:
-        man.speech = speech_mod.build(man, route.destination.display_name,
-                                      route.arrival.side,
-                                      variant=speech_mod.variant_for(route, man))
+    #
+    # ROUTE-LEVEL, because two of the five tiers are. The route-start line
+    # needs the depart step AND the first maneuver, and a "then" chain needs
+    # the maneuver after this one -- neither of which a per-maneuver loop can
+    # see, which is why neither sentence existed before.
+    route.depart_speech = speech_mod.build_route(route)
 
     stats = {"state": "not_requested", "lookups": 0, "candidates": 0}
     if with_landmarks:
@@ -320,27 +322,32 @@ def timing_config() -> dict:
         "heading_max_sample_age_s": config.NAV_HEADING_MAX_SAMPLE_AGE_S,
         "heading_min_speed_ms": config.NAV_HEADING_MIN_SPEED_MS,
         "stationary_speed_ms": config.NAV_STATIONARY_SPEED_MS,
-        "early_guidance_s": config.NAV_EARLY_GUIDANCE_S,
-        "anchor_acquisition_s": config.NAV_ANCHOR_ACQUISITION_S,
-        "context_call_s": config.NAV_CONTEXT_CALL_S,
-        "near_turn_s": config.NAV_NEAR_TURN_S,
+        "anchor_acquisition_lead_m": config.NAV_ANCHOR_ACQUISITION_LEAD_M,
         "min_call_distance_m": config.NAV_MIN_CALL_DISTANCE_M,
         "max_call_distance_m": config.NAV_MAX_CALL_DISTANCE_M,
-        "early_max_distance_m": config.NAV_EARLY_MAX_DISTANCE_M,
-        "early_distance_m": config.NAV_EARLY_DISTANCE_M,
-        "primary_distance_m": config.NAV_PRIMARY_DISTANCE_M,
-        "imminent_distance_m": config.NAV_IMMINENT_DISTANCE_M,
+        "far_max_distance_m": config.NAV_FAR_MAX_DISTANCE_M,
+        # THE LADDER ITSELF, so the browser reads distances rather than holding
+        # a policy -- and so a drive log records the ladder the drive used.
+        # Per-maneuver tier distances ride on `speech.tiers`; this is the table
+        # they were drawn from, for the panel and for a review.
+        "tier_distances_m": {k: dict(v) for k, v
+                             in config.NAV_TIER_DISTANCES_M.items()},
+        "junction_min_gap_s": config.NAV_JUNCTION_MIN_GAP_S,
+        "near_min_lead_s": config.NAV_NEAR_MIN_LEAD_S,
+        "chain_window_m": config.NAV_CHAIN_WINDOW_M,
+        "arrival_call_m": config.NAV_ARRIVAL_CALL_M,
+        "units": config.NAV_UNITS,
         # How far the car travels between the tick that could call the turn
         # and the next one, and how long the clip takes to start. The planner
         # leads the imminent thresholds by both so the junction call lands at
         # or before its floor rather than a tick past it.
         "progress_tick_s": config.NAV_PROGRESS_TICK_S,
         "clip_start_latency_s": config.NAV_CLIP_START_LATENCY_S,
-        "imminent_lead_margin_m": config.NAV_IMMINENT_LEAD_MARGIN_M,
+        "junction_lead_margin_m": config.NAV_JUNCTION_LEAD_MARGIN_M,
         "speed_floor_ms": config.NAV_SPEED_FLOOR_MS,
         "speed_nominal_ms": config.NAV_SPEED_NOMINAL_MS,
         "duplicate_instruction_cooldown_s": config.NAV_DUPLICATE_INSTRUCTION_COOLDOWN_S,
-        "anchor_valid_for_s": config.NAV_ANCHOR_VALID_FOR_S,
+        "anchor_valid_for_m": config.NAV_ANCHOR_VALID_FOR_M,
         "speech_ttl_s": dict(config.NAV_SPEECH_TTL_S),
         "vision_enabled": bool(config.NAV_VISION_ENABLED),
     }
@@ -373,6 +380,7 @@ def summary(route: M.CanonicalRoute) -> dict:
         "duration_s": route.duration_s,
         "eta_epoch": route.eta_epoch,
         "arrival": route.arrival.to_dict(),
+        "depart_speech": route.depart_speech,
         "n_maneuvers": len(route.maneuvers),
         "n_points": len(route.geometry),
         "landmarks_state": route.landmarks_state,

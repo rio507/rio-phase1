@@ -1384,8 +1384,10 @@ def run_routing():
 
     # Nothing about deterministic navigation speech moved.
     import navigation.speech as navspeech
-    ok(navspeech.destination_reply("resolved", name="LAX") == "Routing to LAX.",
-       "the hold-to-talk path still speaks its own fixed line, untouched")
+    ok(navspeech.destination_reply("resolved", name="LAX")
+       == "Got it — I'll take you to LAX.",
+       "the hold-to-talk path still speaks its own fixed line, untouched — "
+       "and it is HER line: first person, because the turn calls are hers")
 
     # The panel is the only implementation. A second one on the server would be
     # a second answer to "where are we going", which is the thing nav_status
@@ -3296,17 +3298,17 @@ def run_backend(live: bool = False):
     # other. Looser buys the voice and lengthens the WORST CASE. So the only
     # line whose worst case is the whole point keeps the tight budget, and the
     # ones issued with room in front of them do not.
-    imminent = config.speak_timeout_ms("nav", "imminent")
-    early = config.speak_timeout_ms("nav", "early")
-    ok(imminent <= config.REALTIME_SPEAK_TIMEOUT_MS,
-       f'"Left here." at the junction keeps the tight budget ({imminent} ms): '
+    junction = config.speak_timeout_ms("nav", "junction")
+    far = config.speak_timeout_ms("nav", "far")
+    ok(junction <= config.REALTIME_SPEAK_TIMEOUT_MS,
+       f'"Turn left." at the junction keeps the tight budget ({junction} ms): '
        "it is the one dictated line whose worst case is the whole point")
-    ok(early > imminent,
-       f"...and a call issued seconds out does not ({early} ms), because "
+    ok(far > junction,
+       f"...and a call issued half a mile out does not ({far} ms), because "
        "nothing about it is late at a second and a half")
-    ok(config.speak_timeout_ms("nav", "primary") >= imminent,
+    ok(config.speak_timeout_ms("nav", "near") >= junction,
        f"the instruction sits between them "
-       f'({config.speak_timeout_ms("nav", "primary")} ms)')
+       f'({config.speak_timeout_ms("nav", "near")} ms)')
 
     # --- ...AND THE JUNCTION CALL DOES NOT USE THAT BUDGET AT ALL -----------
     #
@@ -3321,11 +3323,12 @@ def run_backend(live: bool = False):
     # a road and there is no set of roads to render. This one names nothing.
     from navigation import speech as nav_speech
 
-    clips = nav_speech.imminent_clips()
-    ok(len(clips) >= 12,
-       f"the imminent call is a CLOSED set of sentences ({len(clips)}: "
+    clips = nav_speech.junction_clips()
+    ok(len(clips) >= 10,
+       f"the junction call is a CLOSED set of sentences ({len(clips)}: "
        f"{', '.join(sorted(clips.values()))})")
-    ok(all(" onto " not in t for t in clips.values()),
+    ok(all(" onto " not in t and not any(c.isdigit() for c in t)
+           for t in clips.values()),
        "...and not one of them names a road, which is what makes the set "
        "closed and the set being closed is what makes it renderable")
 
@@ -3340,7 +3343,7 @@ def run_backend(live: bool = False):
     # because nothing was asking the provider what it could send.
     from navigation.providers.google import _MANEUVER_MAP
 
-    shapes = nav_speech.imminent_shapes()
+    shapes = nav_speech.junction_shapes()
     emitted = dict(_MANEUVER_MAP)
     # ...plus the one shape that is in no table: anything the map does not
     # recognise becomes TURN/UNKNOWN, which is the shape guaranteed to exist
@@ -3359,7 +3362,7 @@ def run_backend(live: bool = False):
         if not line:
             missing.append(f"{raw} -> {kind}/{direction}")
             continue
-        cid = nav_speech.imminent_clip_id(line)
+        cid = nav_speech.junction_clip_id(line)
         path = ra.AUDIO_DIR / f"{cid}.mp3"
         got = rendered.get(cid) or {}
         ok(bool(line) and path.exists() and path.stat().st_size > 0
@@ -3387,12 +3390,12 @@ def run_backend(live: bool = False):
     # under the car; "Take this exit." at one is an instruction to leave a road
     # the route stays on.
     fork = shapes[(M.FORK, M.LEFT)]
-    ok(fork == "Stay left.",
+    ok(fork == "Keep left.",
        f"a fork says which side to be on, not that there is an exit ({fork!r})")
     ok(shapes[(M.KEEP, M.LEFT)] == fork,
        "...and a keep says the same words, because bearing left at a fork and "
        "keeping left at a split are one action to a driver")
-    ok(shapes[(M.RAMP, M.LEFT)] == "Take this exit.",
+    ok(shapes[(M.RAMP, M.LEFT)] == "Take the exit.",
        "while a ramp, which IS an exit, still says so")
 
     # ...AND THE ONE THAT MUST NOT BE INVENTED. exit_information is on the
@@ -3414,10 +3417,10 @@ def run_backend(live: bool = False):
         latitude=0.0, longitude=0.0, route_distance_position=0.0,
         polyline_index=0)
     built = nav_speech.build(man)
-    ok(built.get("clips", {}).get("imminent") == "left_here",
+    ok(built.get("clips", {}).get("junction") == "turn_left",
        f"a maneuver carries the clip id beside the sentence "
        f"({built.get('clips')})")
-    ok(built["imminent"] == clips[built["clips"]["imminent"]],
+    ok(built["junction"] == clips[built["clips"]["junction"]],
        "...and the id names the file that says exactly those words")
 
     # ...FOR EVERY FAMILY, not just the one that had clips first. build() is
@@ -3430,15 +3433,16 @@ def run_backend(live: bool = False):
             id="m", sequence=0, type=kind, direction=direction, road_name="",
             latitude=0.0, longitude=0.0, route_distance_position=0.0,
             polyline_index=0, instruction="Merge onto I-10 E"))
-        cid = (b.get("clips") or {}).get("imminent")
+        cid = (b.get("clips") or {}).get("junction")
         ok(cid and (ra.AUDIO_DIR / f"{cid}.mp3").exists()
-           and b["imminent"] == clips[cid],
-           f"{kind}/{direction} -> {b.get('imminent')!r} ({cid}.mp3)")
+           and b["junction"] == clips[cid],
+           f"{kind}/{direction} -> {b.get('junction')!r} ({cid}.mp3)")
 
     # And the planner fires it on the SENTENCE existing, not on the type — so
     # a family that gained a line today does not also need a code change to be
     # heard. This is the condition that makes the whole set reachable.
-    ok("man.speech && man.speech.imminent &&" in plan_js,
+    ok("var jt = man.speech && man.speech[CALL.JUNCTION];" in plan_js
+       and "if (jt) speak(man, CALL.JUNCTION" in plan_js,
        "the planner arms the junction call on the line existing, not on the "
        "maneuver being a turn")
     ok(nav_speech.text_for(None, "m", "clips") is None,

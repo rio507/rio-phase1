@@ -659,9 +659,9 @@ def report_drive(turn, notes, t0):
         # the number on every call. Printing it is the difference between a
         # recording that proves the turns were CALLED and one that proves they
         # were called WHERE THEY SHOULD BE.
-        floor = {"early": config.NAV_EARLY_DISTANCE_M,
-                 "primary": config.NAV_PRIMARY_DISTANCE_M,
-                 "imminent": config.NAV_IMMINENT_DISTANCE_M}.get(c.get("call_type"))
+        ladder = config.NAV_TIER_DISTANCES_M.get(
+            c.get("road_class") or "SURFACE") or {}
+        floor = ladder.get(c.get("call_type"))
         # THE DISTANCE LIVES ON THE PLANNER'S EVENT, NOT THE ARBITER'S.
         # The planner knows where the car was when it decided the call was
         # due and puts to_maneuver_m on EARLY_GUIDANCE/NEAR_TURN/etc;

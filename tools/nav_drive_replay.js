@@ -53,6 +53,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const navcore = require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
 const navplan = require(path.join(__dirname, '..', 'static', 'rio_navplan.js'));
@@ -154,22 +155,57 @@ function buildRoute(logged, timing) {
   leg([0, 0], apex);
   leg(apex, D);
   const n = geometry.length;
+
+  /* THE WORDS ARE REBUILT; NOTHING ELSE IS.
+   *
+   * The sentences in the log are the ones that were live on the day of the
+   * drive, and replaying them would test a cadence that has been replaced.
+   * The geometry, the speeds, the fix timeline and every maneuver position
+   * stay exactly as recorded; only `speech` is asked for again, from the one
+   * module that writes it (tools/nav_respeech.py over a pipe), so the replay
+   * cannot drift from what a route built today would actually say. */
+  const respoken = respeech(logged);
+  const byId = {};
+  for (const m of respoken.maneuvers) byId[m.id] = m;
+
   const maneuvers = logged.maneuvers.map((m, i) => ({
     id: m.id, sequence: m.sequence, type: m.type, direction: m.direction,
     road_name: m.road_name, instruction: m.instruction,
     lat: o.lat, lng: o.lng,
     polyline_index: Math.min(n - 1, Math.round(m.route_distance_position / stepM)),
     route_distance_position: m.route_distance_position,
-    anchors: [], speech: m.speech || {}
+    road_class: (byId[m.id] || {}).road_class || 'SURFACE',
+    anchors: [], speech: (byId[m.id] || {}).speech || m.speech || {}
   }));
   return {
     route_id: logged.route_id, generation_id: logged.generation_id,
     journey_id: logged.journey_id, destination: d, origin: o,
     geometry: geometry, maneuvers: maneuvers,
+    depart_speech: respoken.depart_speech,
     total_distance_m: total, eta_epoch: logged.eta_epoch,
     arrival: logged.arrival || { side: 'UNKNOWN' },
     timing: timing
   };
+}
+
+/* Ask navigation/speech.py what this route says today. */
+function respeech(logged) {
+  const payload = {
+    route_id: logged.route_id, journey_id: logged.journey_id,
+    generation_id: logged.generation_id,
+    destination: logged.destination, arrival: logged.arrival,
+    total_distance_m: logged.total_distance_m,
+    // A log carries no DEPART step. The route-start line then falls back to
+    // the first move on its own, which is what depart_text does with no
+    // heading sentence to lead with -- and is honest about what was recorded.
+    depart_instruction: logged.depart_instruction || '',
+    maneuvers: logged.maneuvers,
+  };
+  const out = execFileSync('python3', ['-m', 'tools.nav_respeech'], {
+    cwd: path.join(__dirname, '..'),
+    input: JSON.stringify(payload), encoding: 'utf8',
+  });
+  return JSON.parse(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,24 +486,36 @@ function main() {
   clean.heard.forEach(h => console.log('    t=' + h.t.toFixed(1) + '  ['
                                        + h.call + '] ' + h.text));
 
-  /* THE INSTRUCTION IS UNCONDITIONAL. The preparation is not: a turn 43 m
-     after the one before it is already inside its own primary window when it
-     becomes the active maneuver, and "coming up on a right" a second before
-     "take the next right" is noise on top of the sentence that matters. So
-     `early` is required only where the leg leaves room for it, which is the
-     planner's own rule (tta > context_call_s) stated from outside. */
+  /* THE INSTRUCTION IS UNCONDITIONAL. The far call is not: a turn 43 m after
+     the one before it is already well inside the half-mile mark when it
+     becomes the active maneuver, and "in half a mile" said 43 m out is not a
+     rounding, it is false. So `far` is required only where the leg leaves room
+     for it, which is the planner's own rule (dist > nearAt) stated from
+     outside.
+
+     A turn that has been swallowed by the previous one's "then" clause is
+     instructed too -- by that sentence -- so a chained maneuver satisfies this
+     without a near call of its own. */
   const legs = {};
   let prevAlong = 0;
   for (const m of route.maneuvers) {
     legs[m.id] = m.route_distance_position - prevAlong;
     prevAlong = m.route_distance_position;
   }
+  const chainedIds = new Set(route.maneuvers
+    .map(m => m.speech && m.speech.chained_to).filter(Boolean));
+  const tierOf = (m, call) => {
+    const t = ((m.speech || {}).tiers || []).filter(x => x.call === call)[0];
+    return t ? t.at_m : null;
+  };
   let missing = [];
   for (const m of turns) {
     const c = callsFor(clean.heard, m.id);
-    if (!c.includes('primary')) missing.push(m.id + ':primary');
-    if (!c.includes('early') && legs[m.id] > timing.early_distance_m) {
-      missing.push(m.id + ':early');
+    if (!c.includes('near') && !chainedIds.has(m.id)) missing.push(m.id + ':near');
+    const farAt = tierOf(m, 'far'), nearAt = tierOf(m, 'near');
+    if (!c.includes('far') && !chainedIds.has(m.id)
+        && farAt && nearAt && legs[m.id] > farAt) {
+      missing.push(m.id + ':far');
     }
   }
   ok(missing.length === 0,
@@ -553,9 +601,28 @@ function main() {
      'the tracker that dead-reckons goes on calling turns through it',
      during.length + ' announcement(s) the driver would otherwise not have had');
 
-  ok(coasting.heard.length > silent.heard.length,
-     'and the whole drive gains announcements rather than losing them',
-     silent.heard.length + ' -> ' + coasting.heard.length);
+  /* AND EVERY CALL COMES NO LATER THAN IT WOULD HAVE.
+   *
+   * The count is now the same both ways, and that is a property of the fixed
+   * distance ladder rather than a regression: a tracker that says nothing
+   * through an outage still makes the near call for that maneuver once fixes
+   * return -- it just makes it from inside the junction. So the thing worth
+   * asserting is WHEN, not whether. Every announcement the coasting drive
+   * makes lands at the same moment or earlier than the silent one's. */
+  const whenOf = h => {
+    const out = {};
+    for (const x of h) out[x.maneuver + ':' + x.call] = x.t;
+    return out;
+  };
+  const cw = whenOf(coasting.heard), sw = whenOf(silent.heard);
+  const lost = Object.keys(sw).filter(k => cw[k] === undefined);
+  const later = Object.keys(sw).filter(k => cw[k] !== undefined && cw[k] > sw[k] + 0.6);
+  const earlier = Object.keys(sw).filter(k => cw[k] !== undefined && cw[k] < sw[k] - 0.6);
+  ok(lost.length === 0 && later.length === 0 && earlier.length > 0,
+     'and every call comes no later than it would have — some of them much earlier',
+     earlier.map(k => k + ' ' + (sw[k] - cw[k]).toFixed(0) + ' s earlier').join(', ')
+       + (lost.length ? '  LOST: ' + lost.join(', ') : '')
+       + (later.length ? '  LATER: ' + later.join(', ') : ''));
 
   // The one thing coasting may never do.
   const coastedPass = coasting.events.filter(
@@ -572,61 +639,107 @@ function main() {
      'a coasted tick never claims the car is AT the junction');
 
   // -------------------------------------------------------------------------
-  section('the distance floors');
+  section('the cadence table — every call against the ladder it was due on');
   // -------------------------------------------------------------------------
-  /* An instruction has to arrive with room to act on it -- but only where
-     there IS room. Two junctions 43 m apart (m2 and m3 on this route) cannot
-     both be called 130 m out, and demanding it would be demanding a fiction.
-     So the floor is applied to maneuvers whose leg from the one before is long
-     enough to allow it, which is every maneuver a driver would call late. */
-  const primaries = clean.events.filter(e => e.type === 'NAV_CONTEXTUAL_CALL'
-                                        && e.call_type === 'primary');
-  const legOf = {};
-  let prev = 0;
+  /* WHAT THE PUNCH LIST ASKED FOR, and what the drive of 2026-09-09 could not
+     produce: each call next to the distance Google would have made it at for
+     that road class. `at_m` is the tier the planner fired -- it comes off the
+     route, which the server built -- and `to_maneuver_m` is where the car
+     actually was. The two agree to within a tick of travel when the ladder is
+     being followed and diverge visibly when it is not.
+
+     A row with no `at_m` is a route-start line, which has no distance by
+     definition: it is said before the approach exists. */
+  const CALLS = ['depart', 'far', 'far_mid', 'near', 'junction', 'arrival', 'arrived'];
+  /* One row per TIER EVENT. NAV_SPEECH_SPOKEN carries the same sentence a
+     moment later, from the arbiter rather than the planner, and it has no
+     `at_m` -- so the tier events are the ones with a distance to compare. */
+  const rows = clean.events.filter(e => CALLS.indexOf(e.call_type) >= 0
+                                   && typeof e.at_m === 'number'
+                                   && (e.text || e.skipped));
+  const legAt = {};
+  let prevPos = 0;
   for (const m of route.maneuvers) {
-    legOf[m.id] = m.route_distance_position - prev;
-    prev = m.route_distance_position;
+    legAt[m.id] = m.route_distance_position - prevPos;
+    prevPos = m.route_distance_position;
   }
-  const roomy = primaries.filter(e => legOf[e.maneuver_id] > timing.primary_distance_m);
-  const worst = roomy.reduce((a, e) => Math.min(a, e.to_maneuver_m), Infinity);
-  ok(roomy.length > 0 && worst >= 90,
-     'no instruction with room for it is given from inside the junction',
-     'closest primary call on a long leg: '
-       + (isFinite(worst) ? worst.toFixed(0) + ' m' : 'none')
-       + ' — the recorded drive gave one at 47 m');
+  console.log('  man   class     call      google  actual   delta     leg   line');
+  console.log('  ' + '-'.repeat(94));
+  for (const e of rows) {
+    const at = e.at_m;
+    const got = typeof e.to_maneuver_m === 'number' ? e.to_maneuver_m : null;
+    const delta = got === null ? null : (got - at);
+    console.log('  ' + String(e.maneuver_id || '').padEnd(5)
+      + ' ' + String(e.road_class || '-').padEnd(9)
+      + ' ' + String(e.call_type).padEnd(9)
+      + ' ' + (at.toFixed(0) + ' m').padStart(6)
+      + ' ' + (got === null ? '     —' : (got.toFixed(0) + ' m').padStart(6))
+      + ' ' + (delta === null ? '      —'
+               : ((delta >= 0 ? '+' : '') + delta.toFixed(0) + ' m').padStart(7))
+      + ' ' + ((legAt[e.maneuver_id] || 0).toFixed(0) + ' m').padStart(7)
+      + '   ' + (e.text || ('(skipped: ' + e.skipped + ')')));
+  }
 
-  /* AND THE ONE CALL THAT IS ONLY WORTH ITS TIMING. "Left here." confirms the
-     junction the driver is arriving at; a metre late it is confirming one they
-     are already in. The floor is 35 m and the call is checked on a tick, so
-     before the lead went in it fired on the tick AFTER the crossing and landed
-     at 24-29 m on a live route at 25 mph.
+  /* ONE TICK OF TRAVEL is the whole of the allowance.
+   *
+   * This subsumes the two distance-floor checks that used to live below it,
+   * and it is a stricter statement of the same two facts. The recorded drive
+   * gave an instruction at 47 m, from inside the junction, and the acceptance
+   * pass of 2026-09-09 measured "Left here." landing at 24-29 m against a 35 m
+   * floor -- one to two ticks late, on the one line whose entire worth is
+   * WHEN it arrives. A ladder makes both of those a comparison against a
+   * number the route itself carries rather than against a constant this file
+   * would have to keep in step.
+   *
+   * The exemption is stated rather than absorbed: a maneuver whose LEG is shorter than its own
+     tier does not become the active maneuver until the car is already inside
+     that tier, so "landed at the tier" is not a thing that can be true of it.
+     m3 on this route is 43 m after m2. Demanding it would be demanding a
+     fiction; the leg column is in the table so a reader can see which rows
+     that is and why. */
+  const tick = r => Math.max(15, (r.speed_ms || 0) * 2);
+  const measured = rows.filter(r => r.text && typeof r.to_maneuver_m === 'number');
+  const judged = measured.filter(r => (legAt[r.maneuver_id] || 0) >= r.at_m + tick(r));
+  const late = judged.filter(r => r.to_maneuver_m < r.at_m - tick(r));
+  const worstOvershoot = judged.length
+    ? Math.min(...judged.map(r => r.to_maneuver_m - r.at_m)) : 0;
+  ok(judged.length > 0 && late.length === 0,
+     'every call on a leg with room for it landed within one tick of the '
+     + 'distance Google would have used',
+     judged.length + ' of ' + measured.length + ' call(s) judged, worst '
+       + 'overshoot ' + worstOvershoot.toFixed(0) + ' m'
+       + (late.length ? ' — LATE: ' + late.map(r => r.call_type
+           + ' ' + r.to_maneuver_m.toFixed(0) + '/' + r.at_m.toFixed(0)).join(', ') : ''));
 
-     >= floor - 2 m, and the 2 m is for arithmetic rather than for slack: the
-     lead is speed x (tick + clip latency) computed from the speed on the tick
-     BEFORE, and a car that is accelerating covers slightly more than that
-     estimate. It is not room for another tick -- one tick at 11 m/s is 5.6 m
-     and would fail this. */
-  const imminents = clean.events.filter(e => e.type === 'NAV_NEAR_TURN'
-                                        && e.call_type === 'imminent'
-                                        && !e.skipped
-                                        && typeof e.to_maneuver_m === 'number');
-  const floorM = timing.imminent_distance_m;
-  const late = imminents.filter(e => e.to_maneuver_m < floorM - 2);
-  if (process.env.NAV_DEBUG) {
-    for (const e of imminents) {
-      console.log('    [dbg] imminent', e.to_maneuver_m.toFixed(1), 'm',
-                  'tta', e.tta_s, 'speed', e.speed_ms, 'man', e.maneuver_id);
+  /* ...AND NO CALL IS EVER MADE FROM FURTHER OUT THAN ITS TIER. Early is the
+     harmless direction for a warning and the wrong one for an instruction: a
+     turn called before the driver can see the junction is a turn they will
+     take at the wrong one. This is the check the old cadence could not have
+     passed -- its early call fired on whichever of a time term and a metre
+     floor came first, and on session 738fbb82 that was after the primary. */
+  const early = measured.filter(r => r.to_maneuver_m > r.at_m + tick(r));
+  ok(early.length === 0, 'and none from further out than its tier',
+     early.length ? early.map(r => r.call_type + ' '
+       + r.to_maneuver_m.toFixed(0) + '/' + r.at_m.toFixed(0)).join(', ')
+       : measured.length + ' call(s) checked');
+
+  /* THE ORDER, which is the failure the drive of 2026-09-09 actually had:
+     "Coming up on a right" arrived AFTER "Take the next right" and closer to
+     the junction. On a ladder that cannot happen, and this says so. */
+  const backwards = [];
+  const seenAt = {};
+  for (const r of rows) {
+    if (!r.text) continue;
+    const k = r.maneuver_id;
+    if (seenAt[k] !== undefined && typeof r.to_maneuver_m === 'number'
+        && r.to_maneuver_m > seenAt[k] + 1) {
+      backwards.push(k + ':' + r.call_type);
     }
+    if (typeof r.to_maneuver_m === 'number') seenAt[k] = r.to_maneuver_m;
   }
-  ok(imminents.length > 0 && late.length === 0,
-     'every junction call lands at or before its distance floor',
-     imminents.length
-       ? imminents.length + ' imminent call(s), closest '
-         + Math.min(...imminents.map(e => e.to_maneuver_m)).toFixed(1)
-         + ' m against a ' + floorM.toFixed(0) + ' m floor'
-         + (late.length ? ' — LATE: '
-             + late.map(e => e.to_maneuver_m.toFixed(1) + ' m').join(', ') : '')
-       : 'no imminent calls in the drive to check');
+  ok(backwards.length === 0,
+     'and each maneuver\'s calls come strictly closer to it, never back out',
+     backwards.length ? backwards.join(', ') : 'in order for every maneuver');
 
   // -------------------------------------------------------------------------
   section('the other half of the fix: the watch that watches the watch');

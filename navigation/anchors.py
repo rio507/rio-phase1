@@ -53,8 +53,13 @@ class VerifiedAnchor:
     identity_confidence: float
     relation_confidence: float
     visibility_confidence: float
-    valid_for_s: float
-    valid_until: float
+    # HOW MUCH ROAD THIS OBSERVATION IS GOOD FOR, not how many seconds.
+    # A camera answer stales because the car has moved past what it described,
+    # and at a crawl six seconds is eight metres -- so the old time-based shelf
+    # life expired every anchor before the sentence it was acquired for was
+    # due. The planner subtracts the distance-to-maneuver at verification from
+    # the current one; see anchorUsable in rio_navplan.js.
+    valid_for_m: float
 
     def to_dict(self) -> dict:
         return {
@@ -65,8 +70,7 @@ class VerifiedAnchor:
             "identity_confidence": round(self.identity_confidence, 3),
             "relation_confidence": round(self.relation_confidence, 3),
             "visibility_confidence": round(self.visibility_confidence, 3),
-            "valid_for_s": round(self.valid_for_s, 2),
-            "valid_until": round(self.valid_until, 3),
+            "valid_for_m": round(self.valid_for_m, 1),
         }
 
 
@@ -213,7 +217,7 @@ def build(candidate: dict, obs: dict, now: float) -> Optional[VerifiedAnchor]:
     if rel is None:
         return None
     relation, relation_conf, _ = rel
-    valid_for = float(config.NAV_ANCHOR_VALID_FOR_S)
+    valid_for = float(config.NAV_ANCHOR_VALID_FOR_M)
     return VerifiedAnchor(
         anchor_id=candidate.get("anchor_id", ""),
         label=candidate.get("label", ""),
@@ -222,6 +226,5 @@ def build(candidate: dict, obs: dict, now: float) -> Optional[VerifiedAnchor]:
         identity_confidence=float(obs.get("identity_confidence") or 0.0),
         relation_confidence=relation_conf,
         visibility_confidence=float(obs.get("visibility_confidence") or 0.0),
-        valid_for_s=valid_for,
-        valid_until=now + valid_for,
+        valid_for_m=valid_for,
     )

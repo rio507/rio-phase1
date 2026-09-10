@@ -54,13 +54,29 @@ const TIMING = {
   projection_back_m: 80, projection_fwd_m: 400,
   heading_min_displacement_m: 8, heading_max_sample_age_s: 3,
   heading_min_speed_ms: 1.5, stationary_speed_ms: 0.7,
-  early_guidance_s: 25, anchor_acquisition_s: 11, context_call_s: 6, near_turn_s: 2.5,
-  min_call_distance_m: 20, max_call_distance_m: 400, early_max_distance_m: 900,
+  anchor_acquisition_lead_m: 150,
+  min_call_distance_m: 20, far_max_distance_m: 4000,
+  // Google's ladder, as config.py sends it. Per-maneuver tiers ride on
+  // `speech.tiers`; this is the table they came from.
+  tier_distances_m: {
+    SURFACE: { far: 804.7, near: 150.0, junction: 35.0 },
+    HIGHWAY: { far: 3218.7, far_mid: 1609.3, near: 402.3, junction: 150.0 },
+  },
+  junction_min_gap_s: 10.0, near_min_lead_s: 4.0,
+  chain_window_m: 200.0, arrival_call_m: 150.0,
+  units: 'imperial',
+  progress_tick_s: 0.5, clip_start_latency_s: 0.05, junction_lead_margin_m: 2.0,
   speed_floor_ms: 3, speed_nominal_ms: 11,
-  duplicate_instruction_cooldown_s: 8, anchor_valid_for_s: 6,
-  speech_ttl_s: { early: 8, primary: 5, imminent: 2.5, arrival: 8 },
+  duplicate_instruction_cooldown_s: 8, anchor_valid_for_m: 400,
+  speech_ttl_s: { depart: 12, far: 10, far_mid: 10, near: 6, junction: 2.5,
+                  arrival: 8, arrived: 8 },
   vision_enabled: true,
 };
+
+// The surface ladder, as the server writes it onto every surface maneuver.
+const SURFACE_TIERS = [{ call: 'far', at_m: 804.7 },
+                       { call: 'near', at_m: 150.0 },
+                       { call: 'junction', at_m: 35.0 }];
 
 function synthRoute(opts) {
   opts = opts || {};
@@ -86,6 +102,7 @@ function synthRoute(opts) {
                    lat: pts[iEnd][0], lng: pts[iEnd][1] },
     total_distance_m: 2600, duration_s: 236, route_length_m: 2600,
     arrival: { side: 'RIGHT' }, landmarks_state: anchors.length ? 'ready' : 'not_requested',
+    depart_speech: 'Head east on Venice Boulevard, then turn left onto Lincoln Boulevard.',
     geometry: pts,
     timing: Object.assign({}, TIMING, opts.timing || {}),
     maneuvers: [
@@ -93,26 +110,30 @@ function synthRoute(opts) {
         road_name: 'Lincoln Boulevard', instruction: 'Turn left onto Lincoln Boulevard',
         lat: pts[iTurn1][0], lng: pts[iTurn1][1],
         route_distance_position: 1200, polyline_index: iTurn1,
-        anchors: anchors,
-        speech: { early: 'Left turn coming up.',
-                  primary: 'Take the next left onto Lincoln Boulevard.',
-                  imminent: 'Left here.' } },
+        anchors: anchors, road_class: 'SURFACE',
+        speech: { far: 'In half a mile, turn left onto Lincoln Boulevard.',
+                  near: 'Turn left onto Lincoln Boulevard.',
+                  junction: 'Turn left.',
+                  clips: { junction: 'turn_left' },
+                  tiers: SURFACE_TIERS } },
       { id: 'm1', sequence: 1, type: 'TURN', direction: 'RIGHT',
         road_name: 'Fell Street', instruction: 'Turn right onto Fell Street',
         lat: pts[iTurn2][0], lng: pts[iTurn2][1],
         route_distance_position: 2100, polyline_index: iTurn2,
-        anchors: [],
-        speech: { early: 'Right turn coming up.',
-                  primary: 'Take the next right onto Fell Street.',
-                  imminent: 'Right here.' } },
+        anchors: [], road_class: 'SURFACE',
+        speech: { far: 'In half a mile, turn right onto Fell Street.',
+                  near: 'Turn right onto Fell Street.',
+                  junction: 'Turn right.',
+                  clips: { junction: 'turn_right' },
+                  tiers: SURFACE_TIERS } },
       { id: 'm2', sequence: 2, type: 'ARRIVE', direction: 'RIGHT',
         road_name: '', instruction: 'Arrive at Test Destination',
         lat: pts[iEnd][0], lng: pts[iEnd][1],
         route_distance_position: 2600, polyline_index: iEnd,
-        anchors: [],
-        speech: { early: 'Almost there.',
-                  primary: 'Your destination is on the right.',
-                  arrival: 'Your destination is on the right.' } },
+        anchors: [], road_class: 'SURFACE',
+        speech: { arrival: 'Your destination is on the right.',
+                  arrived: 'You have arrived.',
+                  tiers: [{ call: 'arrival', at_m: 150.0 }] } },
     ],
   };
 }
@@ -143,6 +164,10 @@ function drive(route, opts) {
   });
   tracker.onEvent(e => { if (e.type !== 'NAV_PROGRESS') events.push(e); });
   planner.onEvent(e => events.push(e));
+  // THE ROUTE-START LINE, before the first fix. rio_nav.js calls this the
+  // moment a route attaches, and a harness that skips it is testing a drive
+  // that begins by announcing a turn.
+  if (opts.routeStart !== false) planner.onRouteStart();
 
   const speedMs = opts.speedMs === undefined ? 15 : opts.speedMs;
   const total = tracker.routeLength();
@@ -161,8 +186,10 @@ function drive(route, opts) {
 }
 
 const spokenFor = (r, id) => r.events.filter(e => e.maneuver_id === id &&
-  (e.type === 'NAV_EARLY_GUIDANCE' || e.type === 'NAV_CONTEXTUAL_CALL' ||
-   e.type === 'NAV_NEAR_TURN'));
+  e.text &&
+  (e.type === 'NAV_FAR_GUIDANCE' || e.type === 'NAV_CONTEXTUAL_CALL' ||
+   e.type === 'NAV_JUNCTION_CALL' || e.type === 'NAV_ROUTE_START_CALL' ||
+   e.type === 'NAV_ARRIVAL_CALL'));
 
 // ---------------------------------------------------------------------------
 section('normal navigation — no vision at all');
@@ -180,35 +207,111 @@ section('normal navigation — no vision at all');
   ok(arrived.length === 1 && r.events[r.events.length - 1].type === 'NAV_ARRIVED',
      'arrival fires exactly once, last');
 
-  // Eight, not seven. "Almost there." is a line the server has always written
-  // on every ARRIVE maneuver and nothing could ever say: rio_navplan's ARRIVE
-  // branch only ever considered the arrival call itself. The first real drive
-  // is what found that whole branch was unreachable — see the note on
-  // onArrived — and enabling the early line for ARRIVE came with the fix.
-  ok(r.spoken.join(' | ') ===
-     'Left turn coming up. | Take the next left onto Lincoln Boulevard. | Left here. | ' +
-     'Right turn coming up. | Take the next right onto Fell Street. | Right here. | ' +
-     'Almost there. | Your destination is on the right.',
-     'the whole drive is eight lines: prepare, instruct, confirm, twice, '
-     + 'then almost-there and arrival');
+  /* GOOGLE'S CADENCE, WORD FOR WORD, and this is the assertion the whole of
+     the timing rewrite exists to make pass. Route start first — the one tier
+     the old design had no slot for at all — then half a mile, then the street
+     name, per turn, then the two arrival lines.
+
+     No junction call here, and that is the >10 s rule working: at 15 m/s the
+     near call lands 10 s from the turn and the junction floor 3 s from it, so
+     "Turn left." would be RIO repeating herself. The slow drive below gets
+     it. */
   if (process.env.NAV_DEBUG) console.log('    SPOKEN:', JSON.stringify(r.spoken, null, 1));
-  ok(!r.spoken.some(t => /\d/.test(t)),
-     'not one of them is a distance countdown — no "in 300 meters" anywhere');
+  ok(r.spoken.join(' | ') ===
+     'Head east on Venice Boulevard, then turn left onto Lincoln Boulevard. | ' +
+     'In half a mile, turn left onto Lincoln Boulevard. | ' +
+     'Turn left onto Lincoln Boulevard. | ' +
+     'In half a mile, turn right onto Fell Street. | ' +
+     'Turn right onto Fell Street. | ' +
+     'Your destination is on the right. | You have arrived.',
+     'the whole drive is Google\'s cadence: the first move, then far and near '
+     + 'per turn, then the two arrival lines');
+  ok(r.spoken.filter(t => /\bmile|\bfeet|\bmeters/.test(t)).length === 2,
+     'exactly the two far calls carry a distance, and they carry a phrase '
+     + 'rather than a countdown');
 
   const dupes = r.spoken.filter((t, i) => r.spoken.indexOf(t) !== i);
   ok(dupes.length === 0, 'nothing is said twice' + (dupes.length ? ': ' + dupes.join(',') : ''));
 
   const calls = spokenFor(r, 'm0').map(e => e.call_type).join(',');
-  ok(calls === 'early,primary,imminent',
-     'the three opportunities fire in order for one maneuver — ' + calls);
+  ok(calls === 'depart,far,near',
+     'the tiers fire outermost first for one maneuver — ' + calls);
 
-  const order = spokenFor(r, 'm0').map(e => Math.round(e.tta_s));
-  ok(order[0] > order[1] && order[1] > order[2],
-     'and each is closer to the turn than the last (' + order.join(' > ') + ' s)');
+  const order = spokenFor(r, 'm0').filter(e => e.to_maneuver_m !== null)
+    .map(e => Math.round(e.to_maneuver_m));
+  ok(order.length >= 2 && order.every((v, i) => i === 0 || v < order[i - 1]),
+     'and each is closer to the turn than the last (' + order.join(' > ') + ' m)');
+
+  /* THE LADDER WAS FOLLOWED, not merely descended. Every call is logged with
+     the tier distance it was supposed to fire at next to where the car
+     actually was; a review of a drive is that pair, and the drive of
+     2026-09-09 could not produce it. */
+  const laddered = r.events.filter(e => e.at_m && e.to_maneuver_m !== null && e.text);
+  const late = laddered.filter(e => e.to_maneuver_m > e.at_m + 30);
+  ok(laddered.length >= 4 && late.length === 0,
+     'every call landed at or inside its tier distance ('
+     + laddered.map(e => e.call_type + ' ' + Math.round(e.to_maneuver_m)
+                    + '/' + Math.round(e.at_m)).join(', ') + ')');
 
   const st = r.tracker.state();
   ok(st.gps_state === 'GPS_OK' && st.route_state === 'ON_ROUTE',
      'a clean drive stays GPS_OK and ON_ROUTE throughout');
+}
+
+// ---------------------------------------------------------------------------
+section('the junction call — only when the near call was long enough ago');
+// ---------------------------------------------------------------------------
+{
+  /* IN TOWN IT FIRES. At 8 m/s the near call lands 19 s from the turn and the
+     junction floor 5 s from it: a driver who has spent fourteen seconds
+     looking for a street sign wants "Turn left." at the mouth of it. */
+  const slow = drive(synthRoute(), { speedMs: 8 });
+  ok(slow.spoken.indexOf('Turn left.') >= 0 && slow.spoken.indexOf('Turn right.') >= 0,
+     'at 8 m/s both junctions get their two-word confirmation');
+  const gaps = slow.events.filter(e => e.type === 'NAV_JUNCTION_CALL' && e.text);
+  ok(gaps.length === 2, 'exactly two of them — ' + gaps.length);
+
+  /* AT SPEED IT DOES NOT, and it says why. Four seconds after "Turn left onto
+     Lincoln Boulevard." the same instruction again is not a confirmation. */
+  const fast = drive(synthRoute(), { speedMs: 20 });
+  ok(fast.spoken.indexOf('Turn left.') < 0,
+     'at 20 m/s it is suppressed rather than stacked on the near call');
+  const skipped = fast.events.filter(e => e.type === 'NAV_JUNCTION_CALL' && !e.text);
+  ok(skipped.length >= 1 && skipped[0].skipped === 'near_call_too_recent',
+     'and the suppression is logged with its reason, not silently dropped — '
+     + (skipped.length ? skipped[0].skipped : 'nothing logged'));
+  ok(skipped.length >= 1 && typeof skipped[0].since_near_s === 'number'
+     && skipped[0].since_near_s < 10,
+     '...with the gap that failed the test (' 
+     + (skipped.length ? skipped[0].since_near_s : '?') + ' s < 10 s)');
+}
+
+// ---------------------------------------------------------------------------
+section('"then" chaining — two junctions inside 200 m are one sentence');
+// ---------------------------------------------------------------------------
+{
+  const route = synthRoute();
+  // m1 moved to 120 m past m0, and the server's chained near call written
+  // onto m0 exactly as navigation/speech.build_route would write it.
+  route.maneuvers[1].route_distance_position = 1320;
+  route.maneuvers[1].polyline_index = 132;
+  route.maneuvers[1].lat = route.geometry[132][0];
+  route.maneuvers[1].lng = route.geometry[132][1];
+  route.maneuvers[0].speech.near =
+    'Turn left onto Lincoln Boulevard, then turn right onto Fell Street.';
+  route.maneuvers[0].speech.chained_to = 'm1';
+
+  const r = drive(route, { speedMs: 8 });
+  ok(r.spoken.indexOf(
+       'Turn left onto Lincoln Boulevard, then turn right onto Fell Street.') >= 0,
+     'the near call carries both moves in one sentence');
+  ok(r.spoken.indexOf('In half a mile, turn right onto Fell Street.') < 0,
+     'and the second turn gets NO far call of its own — it has been announced');
+  ok(r.spoken.indexOf('Turn right onto Fell Street.') < 0,
+     '...nor a second near call forty metres later, which is the car '
+     + 'repeating itself at the worst moment');
+  ok(r.spoken.indexOf('Turn right.') >= 0,
+     'it keeps its junction confirmation, which is the half that is still news');
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +354,7 @@ const VERIFIED_SHELL = {
   anchor: {
     anchor_id: 'm0a0', label: 'Shell', type: 'gas_station',
     turn_relation_to_anchor: 'NEAR', identity_confidence: 0.93,
-    relation_confidence: 0.72, visibility_confidence: 0.81, valid_for_s: 6,
+    relation_confidence: 0.72, visibility_confidence: 0.81, valid_for_m: 400,
   },
   reason: 'verified',
 };
@@ -262,28 +365,34 @@ async function main() {
 section('contextual navigation — the differentiated line');
 // ---------------------------------------------------------------------------
 {
-  const r = drive(synthRoute({ anchors: [SHELL_ANCHOR] }), { verify: () => VERIFIED_SHELL });
+  // Slow enough that the junction call survives the >10 s rule, so this
+  // section can still say what happens to it after a contextual near call.
+  const r = drive(synthRoute({ anchors: [SHELL_ANCHOR] }),
+                  { verify: () => VERIFIED_SHELL, speedMs: 8 });
   ok(r.spoken.indexOf('Turn left by the Shell station.') >= 0,
-     'the primary call names the landmark — "Turn left by the Shell station."');
-  ok(r.spoken.indexOf('Take the next left onto Lincoln Boulevard.') < 0,
+     'the near call names the landmark — "Turn left by the Shell station."');
+  ok(r.spoken.indexOf('Turn left onto Lincoln Boulevard.') < 0,
      'and REPLACES the canonical instruction rather than following it');
-  ok(r.spoken.indexOf('Left here.') >= 0,
-     'the imminent backup stays armed after a contextual call (§11C)');
+  ok(r.spoken.indexOf('Turn left.') >= 0,
+     'the junction confirmation stays armed after a contextual call (§11C)');
   const ctx = r.events.filter(e => e.type === 'NAV_CONTEXT_ACQUISITION_STARTED');
   ok(ctx.length === 1 && ctx[0].maneuver_id === 'm0',
      'acquisition ran once, for the maneuver that had a candidate');
-  ok(ctx.length === 1 && ctx[0].tta_s <= TIMING.anchor_acquisition_s + 1,
-     'and started about ' + TIMING.anchor_acquisition_s + ' s out (' +
-     (ctx.length ? ctx[0].tta_s : '?') + ' s)');
+  ok(ctx.length === 1 && ctx[0].to_maneuver_m <= 150 + TIMING.anchor_acquisition_lead_m + 20,
+     'and started about ' + (150 + TIMING.anchor_acquisition_lead_m) + ' m out (' +
+     (ctx.length ? Math.round(ctx[0].to_maneuver_m) : '?') + ' m) — before the '
+     + 'near call, so the anchor is in hand when the sentence is due');
   const call = r.events.filter(e => e.type === 'NAV_CONTEXTUAL_CALL' && e.maneuver_id === 'm0')[0];
   ok(call && call.anchor_label === 'Shell' && call.relation === 'NEAR',
      'the call is logged with the anchor that produced it');
   ok(r.planner.contextState('m0') === 'CALLED',
      'the context lifecycle ends at CALLED — ' + r.planner.contextState('m0'));
-  ok(r.spoken.filter(t => t.indexOf('Fell') >= 0).length === 1,
+  ok(r.spoken.filter(t => t.indexOf('Fell') >= 0).join(' | ') ===
+     'In half a mile, turn right onto Fell Street. | Turn right onto Fell Street.',
      'the maneuver with no candidate is unaffected and speaks canonically');
-  ok(r.spoken.indexOf('Left turn coming up.') < r.spoken.indexOf('Turn left by the Shell station.'),
-     'the preparation line still comes first, without a landmark in it');
+  ok(r.spoken.indexOf('In half a mile, turn left onto Lincoln Boulevard.')
+     < r.spoken.indexOf('Turn left by the Shell station.'),
+     'the far call still comes first, without a landmark in it');
 }
 
 // ---------------------------------------------------------------------------
@@ -308,14 +417,16 @@ section('contextual navigation — the verifier answering over the network');
     const p = tracker.pointAt(s);
     tracker.position({ lat: p.lat, lng: p.lng, speed: 15, t: t, accuracy: 8 });
     const st = tracker.state();
-    if (st.tta_s !== null && st.tta_s < 9) break;
+    // Stop after the camera has been asked and before the near call goes out:
+    // 300 m out the question is in flight, 150 m out the sentence is due.
+    if (st.to_maneuver_m !== null && st.to_maneuver_m < 200) break;
     s += 15; t += 1;
   }
   ok(planner.contextState('m0') === 'ACQUIRING',
      'while the answer is outstanding the context sits in ACQUIRING — ' +
      planner.contextState('m0'));
-  ok(spoken.indexOf('Left turn coming up.') >= 0,
-     'and the preparation line was already spoken, unblocked by it');
+  ok(spoken.indexOf('In half a mile, turn left onto Lincoln Boulevard.') >= 0,
+     'and the far call was already spoken, unblocked by it');
   resolveVerify(VERIFIED_SHELL);
   await tick();
   ok(planner.contextState('m0') === 'VERIFIED', 'the answer moves it to VERIFIED');
@@ -382,12 +493,12 @@ section('contextual navigation — an anchor that goes stale before it is used')
   // Verified early, then the landmark goes behind a truck: the anchor outlives
   // its shelf life before the call is due, and the canonical line is used.
   const r = drive(synthRoute({ anchors: [SHELL_ANCHOR] }), {
-    verify: () => ({ anchor: Object.assign({}, VERIFIED_SHELL.anchor, { valid_for_s: 1.0 }),
+    verify: () => ({ anchor: Object.assign({}, VERIFIED_SHELL.anchor, { valid_for_m: 20 }),
                      reason: 'verified' }),
   });
   ok(r.spoken.indexOf('Turn left by the Shell station.') < 0,
      'a stale anchor is never spoken');
-  ok(r.spoken.indexOf('Take the next left onto Lincoln Boulevard.') >= 0,
+  ok(r.spoken.indexOf('Turn left onto Lincoln Boulevard.') >= 0,
      'the canonical instruction goes out in its place');
   ok(r.events.some(e => e.type === 'NAV_ANCHOR_REJECTED' && e.reason === 'anchor_expired'),
      'and the expiry is logged as the rejection it is');
@@ -397,7 +508,7 @@ section('contextual navigation — an anchor that goes stale before it is used')
 section('speech validity — checked at dequeue, not at creation');
 // ---------------------------------------------------------------------------
 {
-  // "Left here." is queued behind a safety warning, and the junction goes by
+  // "Turn left." is queued behind a safety warning, and the junction goes by
   // while it waits. When the mouth frees up the line is no longer true.
   let block = null;
   const safety = {
@@ -405,26 +516,30 @@ section('speech validity — checked at dequeue, not at creation');
     play: () => new Promise(res => { block = res; }), stop: () => { if (block) block(); },
   };
   let armed = false;
+  // Slow, so the junction call survives the >10 s rule and there is something
+  // for the warning to hold back in the first place.
   const r = drive(synthRoute(), {
+    speedMs: 8,
     after: (t, tracker, planner, arbiter) => {
       const st = tracker.state();
-      if (!armed && st.maneuver && st.maneuver.maneuver_id === 'm0' && st.tta_s < 5) {
+      if (!armed && st.maneuver && st.maneuver.maneuver_id === 'm0'
+          && st.to_maneuver_m < 60) {
         armed = true;
         arbiter.say(safety);            // takes the mouth and holds it
       }
     },
   });
-  ok(r.spoken.indexOf('Left here.') < 0,
-     '"Left here." never reaches the mouth while the warning holds it');
+  ok(r.spoken.indexOf('Turn left.') < 0,
+     '"Turn left." never reaches the mouth while the warning holds it');
   const queued = r.arbiter.state().queued.map(i => i.id);
-  ok(queued.indexOf('nav:m0:imminent') >= 0,
+  ok(queued.indexOf('nav:m0:junction') >= 0,
      'it is sitting in the queue, created and waiting — ' + queued.join(','));
 
   block();                              // the warning finishes, long after the turn
   await tick();
-  ok(r.spoken.indexOf('Left here.') < 0,
+  ok(r.spoken.indexOf('Turn left.') < 0,
      'and it is dropped rather than played after the turn has been taken');
-  ok(r.events.some(e => e.type === 'NAV_SPEECH_INVALIDATED' && e.call_type === 'imminent'),
+  ok(r.events.some(e => e.type === 'NAV_SPEECH_INVALIDATED' && e.call_type === 'junction'),
      'the drop is recorded as NAV_SPEECH_INVALIDATED, not silently lost');
 }
 
@@ -558,12 +673,14 @@ section('GPS health — stale is not off-route, degraded speaks earlier');
   const degraded = drive(synthRoute(), {
     perturb: (fix) => Object.assign({}, fix, { accuracy: 45 }),   // beyond the limit
   });
-  const cleanCall = spokenFor(clean, 'm0').filter(e => e.call_type === 'primary')[0];
-  const degCall = spokenFor(degraded, 'm0').filter(e => e.call_type === 'primary')[0];
+  const cleanCall = spokenFor(clean, 'm0').filter(e => e.call_type === 'near')[0];
+  const degCall = spokenFor(degraded, 'm0').filter(e => e.call_type === 'near')[0];
   ok(degraded.tracker.state().gps_state === 'GPS_DEGRADED',
      'a fix worse than the accuracy limit -> GPS_DEGRADED');
+  // The widening is metres of road now, not seconds added to seconds: at
+  // 15 m/s a 2 s bias is 30 m of extra room on every tier.
   ok(degCall && cleanCall && degCall.to_maneuver_m >= cleanCall.to_maneuver_m,
-     'the primary call comes no later than it would have: ' +
+     'the near call comes no later than it would have: ' +
      Math.round(degCall.to_maneuver_m) + ' m vs ' + Math.round(cleanCall.to_maneuver_m) + ' m');
   ok(degraded.spoken.join('|') === clean.spoken.join('|'),
      'and what is said does not change — only when');
@@ -618,9 +735,20 @@ section('starting inside the window — no line begun too late to finish');
 {
   const r = drive(synthRoute(), { startM: 1200 - 40 });
   const m0 = spokenFor(r, 'm0').map(e => e.call_type);
-  ok(m0.indexOf('early') < 0, 'a route set 40 m from a turn does not "prepare" for it');
-  ok(r.spoken[0] === 'Left here.',
-     'it says the short line and nothing else — got "' + r.spoken[0] + '"');
+  ok(m0.indexOf('far') < 0,
+     'a route set 40 m from a turn never says "in half a mile" — the distance '
+     + 'in that sentence was written at route load and is now false');
+  ok(r.spoken[0] === 'Head east on Venice Boulevard, then turn left onto Lincoln Boulevard.',
+     'the route-start line still goes out — it is what road we are on and '
+     + 'what the first move is, and neither has stopped being true');
+  ok(r.spoken.indexOf('Turn left.') >= 0,
+     'and the junction gets the two-word line, because there was no room for '
+     + 'a full instruction');
+  ok(r.spoken.indexOf('Turn left onto Lincoln Boulevard.') < 0,
+     '...which is not begun and then still playing through the turn');
+  const skipped = r.events.filter(e => e.type === 'NAV_CONTEXTUAL_CALL'
+                                  && e.skipped === 'no_room_to_finish');
+  ok(skipped.length === 1, 'and the skip is logged with its reason');
 }
 
 // ---------------------------------------------------------------------------

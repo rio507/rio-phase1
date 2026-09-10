@@ -87,6 +87,92 @@ def city_route(lat0: float = 34.0430, lng0: float = -118.2673,
         route_length_m=cum[-1])
 
 
+def highway_route(lat0: float = 34.0430, lng0: float = -118.2673) -> M.CanonicalRoute:
+    """A freeway leg with an exit on it, for the fast announcement ladder.
+
+    The surface fixture cannot exercise the two-mile and one-mile calls at all
+    -- its longest leg is 1200 m -- so a route that runs 6 km at 29 m/s and
+    leaves at a numbered exit is the smallest thing that can. `road_class` and
+    `exit_information` are set the way providers/google._road_class and
+    ._exit_information would set them for these steps.
+    """
+    to_ll, _ = _grid(lat0, lng0)
+    pts: List[List[float]] = []
+    for d in range(0, 6001, 20):
+        pts.append(to_ll(d, 0))
+    for d in range(20, 801, 20):
+        pts.append(to_ll(6000 + d, d * 0.4))
+    cum = geo.cumulative(pts)
+    i_exit = 6000 // 20
+    i_end = len(pts) - 1
+    dest = M.CanonicalDestination(
+        display_name="Sunset Plaza", formatted_address="Sunset Plaza, Los Angeles, CA",
+        latitude=pts[i_end][0], longitude=pts[i_end][1], provider_place_id="fixture_hwy")
+    maneuvers = [
+        M.CanonicalManeuver(id="m0", sequence=0, type=M.RAMP, direction=M.RIGHT,
+                            road_name="", latitude=pts[i_exit][0],
+                            longitude=pts[i_exit][1],
+                            route_distance_position=cum[i_exit], polyline_index=i_exit,
+                            instruction="Take exit 43 toward Sunset Blvd",
+                            road_class=M.HIGHWAY,
+                            exit_information={"number": "43", "toward": "Sunset Blvd"},
+                            step_distance_m=800.0, approach_speed_ms=29.0),
+        M.CanonicalManeuver(id="m1", sequence=1, type=M.ARRIVE, direction=M.LEFT,
+                            road_name="", latitude=pts[i_end][0], longitude=pts[i_end][1],
+                            route_distance_position=cum[i_end], polyline_index=i_end,
+                            instruction="Arrive at Sunset Plaza",
+                            step_distance_m=0.0, approach_speed_ms=12.0),
+    ]
+    return M.CanonicalRoute(
+        route_id=M.new_route_id(), journey_id="", generation_id=0, provider="fixture",
+        origin_lat=pts[0][0], origin_lng=pts[0][1], destination=dest,
+        total_distance_m=cum[-1], duration_s=cum[-1] / 25.0,
+        geometry=pts, maneuvers=maneuvers,
+        arrival=M.ArrivalInfo(side=M.LEFT),
+        depart_instruction="Head north on the 405",
+        route_length_m=cum[-1])
+
+
+def chained_route(lat0: float = 34.0430, lng0: float = -118.2673) -> M.CanonicalRoute:
+    """Two turns 120 m apart -- one move to a driver, and one "then" sentence."""
+    to_ll, _ = _grid(lat0, lng0)
+    pts: List[List[float]] = []
+    for d in range(0, 601, 10):
+        pts.append(to_ll(d, 0))
+    for d in range(10, 121, 10):
+        pts.append(to_ll(600, d))
+    for d in range(10, 401, 10):
+        pts.append(to_ll(600 + d, 120))
+    cum = geo.cumulative(pts)
+    i1, i2, i_end = 60, 72, len(pts) - 1
+    dest = M.CanonicalDestination(
+        display_name="Second Street", formatted_address="2nd St, Los Angeles, CA",
+        latitude=pts[i_end][0], longitude=pts[i_end][1], provider_place_id="fixture_chain")
+    maneuvers = [
+        M.CanonicalManeuver(id="m0", sequence=0, type=M.TURN, direction=M.LEFT,
+                            road_name="Ocean Ave", latitude=pts[i1][0], longitude=pts[i1][1],
+                            route_distance_position=cum[i1], polyline_index=i1,
+                            instruction="Turn left onto Ocean Ave",
+                            step_distance_m=120.0, approach_speed_ms=11.0),
+        M.CanonicalManeuver(id="m1", sequence=1, type=M.TURN, direction=M.RIGHT,
+                            road_name="2nd St", latitude=pts[i2][0], longitude=pts[i2][1],
+                            route_distance_position=cum[i2], polyline_index=i2,
+                            instruction="Turn right onto 2nd St",
+                            step_distance_m=400.0, approach_speed_ms=11.0),
+        M.CanonicalManeuver(id="m2", sequence=2, type=M.ARRIVE, direction=M.UNKNOWN,
+                            road_name="", latitude=pts[i_end][0], longitude=pts[i_end][1],
+                            route_distance_position=cum[i_end], polyline_index=i_end,
+                            instruction="Arrive at Second Street",
+                            step_distance_m=0.0, approach_speed_ms=11.0),
+    ]
+    return M.CanonicalRoute(
+        route_id=M.new_route_id(), journey_id="", generation_id=0, provider="fixture",
+        origin_lat=pts[0][0], origin_lng=pts[0][1], destination=dest,
+        total_distance_m=cum[-1], duration_s=cum[-1] / 11.0,
+        geometry=pts, maneuvers=maneuvers, arrival=M.ArrivalInfo(side=M.UNKNOWN),
+        depart_instruction="Head east on Main St", route_length_m=cum[-1])
+
+
 def place_at(route: M.CanonicalRoute, along_m: float, lateral_m: float,
              name: str, primary_type: str = "gas_station",
              place_id: Optional[str] = None) -> dict:
