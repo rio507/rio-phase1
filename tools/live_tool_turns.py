@@ -141,8 +141,21 @@ NAV_SCRIPT = [
     # DRIVE. Long enough for the first turns to come round at 25 mph, which is
     # what the numbers below are: sim seconds, not wall-clock guesses.
     {"drive_s": 75.0,
-     "want": "the early call, the instruction and the imminent backup — out "
-             "loud, in her voice, on the same id the conversation uses"},
+     "want": "the far call, the instruction and the junction confirmation — "
+             "out loud, in her voice, on the same id the conversation uses"},
+    # WHO IS CALLING THE TURNS, asked out loud, because the answer is the
+    # whole of the second punch-list item and it cannot be checked offline.
+    # On the drive of 2026-09-09 the answer to this was that the car would
+    # call them out. There is no car in this conversation; there is her.
+    {"say": "Who's calling the turns?",
+     "want": "a FIRST PERSON answer — \"I've got it, I'll call each turn as "
+             "we get there\". Never the car, the system or the navigation",
+     "budget_s": 20.0,
+     "lint": "third_person"},
+    {"say": "Do I need to watch the screen for the directions?",
+     "want": "no, and again in the first person — she is the one calling them",
+     "budget_s": 20.0,
+     "lint": "third_person"},
     {"say": "Avoid the freeway.",
      "want": "reroute with avoid=highways, one line, and the car still moving",
      "budget_s": 25.0},
@@ -155,6 +168,42 @@ NAV_SCRIPT = [
     {"drive_s": 20.0,
      "want": "nothing at all — the drive is over and the queue was emptied"},
 ]
+
+
+# The same list the offline lint uses, and deliberately the same words: a
+# phrase added there and not here is a phrase the live rig stops seeing.
+# tools/nav_server_selftest.py THIRD_PERSON is the source.
+_THIRD_PERSON = (
+    "the car will", "the car's", "the vehicle will", "the car announces",
+    "the car does", "the system", "the navigation system", "navigation will",
+    "the nav system", "the gps will", "it will call", "you'll hear",
+    "will call it out", "will let you know", "will tell you",
+    "the turn-by-turn",
+)
+_FIRST_PERSON = ("i'll call", "i'll let you know", "i've got", "i have got",
+                 "i'll take you", "i'll tell you", "that's me", "i am",
+                 "i'm the one", "i call")
+
+
+def _norm(text: str) -> str:
+    """Lower case, and every apostrophe the same apostrophe.
+
+    Not a nicety. The live run of 2026-09-10 answered "You’ll hear the turns
+    as they come up" -- a real violation -- and this lint missed it, because a
+    TTS transcript uses U+2019 and the phrase list uses U+0027. A lint that
+    only fires on straight quotes never fires on anything a model said.
+    """
+    return (text or "").lower().replace("\u2019", "'").replace("\u02bc", "'")
+
+
+def _third_person_in(text: str):
+    low = _norm(text)
+    return [p for p in _THIRD_PERSON if p in low]
+
+
+def _first_person_in(text: str):
+    low = _norm(text)
+    return [p for p in _FIRST_PERSON if p in low]
 
 
 def silence(ms):
@@ -836,6 +885,25 @@ def report(turn, notes, t_ask, t_speech_end):
     if tags:
         print(f"      <-- EXPRESSIVE TAG IN SPOKEN OUTPUT: {tags} — a "
               f"bracketed direction reached the speaker")
+    # WHO SHE SAID IS CALLING THE TURNS, when that is what was asked.
+    #
+    # This is the one check in the second punch-list item that cannot be made
+    # offline: the lints in tools/nav_server_selftest.py prove the model was
+    # never GIVEN a third-person sentence, and only a live turn can show what
+    # it says back. On the drive of 2026-09-09 the answer was that the car
+    # would call them out.
+    if turn.get("lint") == "third_person":
+        hits = _third_person_in(spoken)
+        first = _first_person_in(spoken)
+        if hits:
+            print(f"      <-- THIRD PERSON IN THE ANSWER: {hits} — there is "
+                  f"no car and no navigation in this conversation, there is "
+                  f"her")
+        elif not first:
+            print("      <-- NOT IN THE FIRST PERSON: she neither claimed the "
+                  "turns nor referred them elsewhere")
+        else:
+            print(f"      first person, as it should be: {first}")
     if limits:
         low = min(limits, key=lambda l: l.get("remaining", 0))
         print(f"      tokens left in the minute: {low.get('remaining'):,} of "

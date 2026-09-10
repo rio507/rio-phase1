@@ -1436,8 +1436,11 @@ section('awareness — the three tools a live session needs');
      st.next_maneuver.distance_m + ' m, ' + st.next_maneuver.seconds_away + ' s)');
   ok(st.route_state === 'ON_ROUTE' && st.gps_state === 'GPS_OK',
      'off-route state and GPS health, which are answers in their own right');
-  ok(/do not announce/i.test(st.rules || ''),
-     'and the result itself carries the boundary: answer, do not announce');
+  ok(/do NOT call this maneuver now/i.test(st.rules || ''),
+     'and the result itself carries the boundary: answer, do not call');
+  ok(/you call it yourself/i.test(st.rules || ''),
+     '...in the first person, because the turn calls are hers — a result that '
+     + 'says "the navigation system does it" is a sentence she will repeat');
 
   global.RIO.nav = { state: () => null };
   const none = rt.navStatus();
@@ -1454,7 +1457,7 @@ section('awareness — the three tools a live session needs');
   const fs = require('fs');
   const rtSrc = fs.readFileSync(
     path.join(__dirname, '..', 'static', 'rio_realtime.js'), 'utf8');
-  ok(/do not announce this maneuver/i.test(rtSrc),
+  ok(/do NOT call this maneuver now/i.test(rtSrc),
      'every nav_status result repeats the boundary to the model');
 
   const h2 = harness();
@@ -1647,8 +1650,10 @@ function panelTools() {
   ok(/If they ASK for the directions, call nav_directions/i.test(out.rules || ''),
      'and points her at the tool for when they ask for the turns — reading '
      + 'them is answering');
-  ok(/never do is call a turn as it arrives/i.test(out.rules || ''),
-     'while leaving the CALLS exactly where they were: not hers');
+  ok(/never do is call a turn early/i.test(out.rules || ''),
+     'while leaving the TIMING exactly where it was: not hers');
+  ok(/I'll call each turn as we get there/i.test(out.rules || ''),
+     '...and giving her the sentence for when the driver asks who is');
   ok(out.total_maneuvers === 3 && out.first_steps.length === 3,
      'the confirmation carries the route summary — ' + out.total_maneuvers
      + ' maneuvers, first ' + out.first_steps.length
@@ -2325,8 +2330,8 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
     const out = rt.localTools.stop_navigation();
     ok(out.ok === true && out.was_navigating === true,
        'stop_navigation reports that it stopped something real');
-    ok(/navigation off/i.test(out.rules),
-       'and tells her to confirm it in one line');
+    ok(/I'll stop guiding you/i.test(out.rules),
+       'and tells her to confirm it in one line, in the first person');
     ok(nav.route === null && rt.navStatus().routing === false,
        'the route is gone and nav_status says so — nothing to answer from');
     ok(dropped.some((d) => d[0] === 'queued' && d[1] === 'cleared'),

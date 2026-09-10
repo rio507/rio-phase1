@@ -259,6 +259,38 @@ section('normal navigation — no vision at all');
 }
 
 // ---------------------------------------------------------------------------
+section('the voice — every line of a whole drive is hers');
+// ---------------------------------------------------------------------------
+{
+  /* SHE IS THE NAVIGATION. On the drive of 2026-09-09 a driver asked for
+     directions and was told the car would call them out; the phrasing was in
+     the session instructions and in two nav tool results, and a model handed a
+     third-person description of its own behaviour hands it to the driver.
+     tools/nav_server_selftest.py lints those two sources. This lints the third
+     one: what the planner actually says over a whole drive, which is the only
+     place the sentences and the timing meet. */
+  const THIRD_PERSON = [
+    'the car will', "the car's", 'the vehicle will', 'the car announces',
+    'the system', 'the navigation system', 'navigation will', 'the nav system',
+    'the gps will', 'it will call', "you'll hear", 'will call it out',
+    'will let you know', 'will tell you', 'the turn-by-turn',
+  ];
+  const drives = [drive(synthRoute(), { speedMs: 8 }),
+                  drive(synthRoute(), { speedMs: 20 }),
+                  drive(synthRoute(), { startM: 1200 - 40 })];
+  const said = [].concat(...drives.map(d => d.spoken));
+  const bad = said.filter(t => THIRD_PERSON.some(p => t.toLowerCase().includes(p)));
+  ok(said.length > 10 && bad.length === 0,
+     'no spoken line in ' + drives.length + ' whole drives (' + said.length
+     + ' lines) refers to a car or a navigation in the third person'
+     + (bad.length ? ': ' + JSON.stringify(bad) : ''));
+
+  /* ...AND THE LINT CAN FAIL, which is the only reason to trust it passing. */
+  ok(THIRD_PERSON.some(p => 'The car will call it out.'.toLowerCase().includes(p)),
+     'and the lint catches the sentence that was really said');
+}
+
+// ---------------------------------------------------------------------------
 section('the junction call — only when the near call was long enough ago');
 // ---------------------------------------------------------------------------
 {

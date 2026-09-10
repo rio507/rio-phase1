@@ -422,11 +422,29 @@ def run_text_session():
 # What the account actually has, per minute, for the realtime model. Not from
 # a doc: the live session reports it on every response in rate_limits.updated,
 # and tools/live_tool_turns.py prints the lowest it saw on a real drive.
-TPM = 40_000
+#
+# 40,000 WAS TRUE AND STOPPED BEING TRUE. Every response on the live runs of
+# 2026-09-10 (tools/live_tool_turns.py --script nav, both passes) reported
+# `200,000`, and the lowest the budget got over a whole drive was 190,829 of
+# 200,000. The number below is measured, and the day it changes again a drive
+# will say so in one line.
+TPM = 200_000
 
 # ...and therefore what one response may cost. Four tool turns a minute is
 # eight responses; see run_session_cost for why that is the cadence to size to.
-PER_RESPONSE_CEILING = TPM // 8
+#
+# NOT TPM // 8, and the reason is that TPM // 8 is now 25,000 -- five times
+# today's prompt, which makes this check a guard that can never fire. The
+# purpose of it was never the economics; it was to catch the prompt growing by
+# a paragraph at a time until a drive goes quiet. So the ceiling is a GROWTH
+# ALARM: a little over today's cost, tight enough that the next section added
+# without a corresponding cut trips it, and far under what the minute can
+# actually afford.
+#
+# Both numbers are printed by run_session_cost, so the real headroom is still
+# visible next to the alarm rather than replaced by it.
+PER_RESPONSE_CEILING = 5_200
+AFFORDABLE_PER_RESPONSE = TPM // 8
 
 
 def run_session_cost():
@@ -504,9 +522,12 @@ def run_session_cost():
     #
     # Room to grow: what is left of the 5,000 after today's prompt.
     ok(floor <= PER_RESPONSE_CEILING,
-       f"one response fits the budget: {floor:,} tokens against a ceiling of "
-       f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare), "
-       f"so {TPM // (floor * 2)} tool turns a minute fit in {TPM:,}")
+       f"one response stays under the growth alarm: {floor:,} tokens against "
+       f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare)")
+    ok(floor <= AFFORDABLE_PER_RESPONSE,
+       f"...and well under what the minute can actually afford "
+       f"({AFFORDABLE_PER_RESPONSE:,}): {TPM // (floor * 2)} tool turns a "
+       f"minute fit in {TPM:,}")
     # WHAT A ROUTE COSTS ON TOP, and why it is not paid for the whole drive.
     #
     # stop_navigation and reroute cannot be called until a route exists, so
@@ -1231,9 +1252,17 @@ def run_awareness():
     ok("not yet confirmed" in veh_desc or "not confirmed" in veh_desc,
        "and the car tool names pending codes as part of its job")
     for desc, what in ((nav_desc, "route"), (veh_desc, "car")):
-        ok("not" in desc.lower() and ("announce" in desc.lower()
-                                      or "itself" in desc.lower()),
-           f"the {what} tool's own description says it is for answering, not announcing")
+        low = desc.lower()
+        ok("not" in low and ("announce" in low or "itself" in low
+                             or "not a cue" in low),
+           f"the {what} tool's own description says it is for answering, "
+           f"not calling")
+    # ...AND IT SAYS WHOSE VOICE THE CALL IS IN. A description that says "the
+    # navigation system calls turns itself" is a sentence the model repeats to
+    # the driver; see the nav-voice lint in tools/nav_server_selftest.py.
+    ok("you call every turn" in nav_desc.lower(),
+       "and the route tool's description puts the calls in HER voice, first "
+       f"person — {nav_desc.splitlines()[-1]!r}")
 
     instr = s["instructions"]
     # Line-wrap tolerant copy: these are paragraphs, and a phrase that happens
@@ -1241,8 +1270,11 @@ def run_awareness():
     flat_instr = re.sub(r"\s+", " ", instr)
     ok("YOU ANSWER. YOU DO NOT ANNOUNCE." in instr,
        "the boundary is stated in the instructions, in those words")
-    for phrase in ("never announce a turn", "not a cue", "Unasked, you say nothing"):
-        ok(phrase.lower() in instr.lower(), f"and spelled out: {phrase!r}")
+    # Line-wrap tolerant: "never announce a turn" straddles a newline in the
+    # paragraph it lives in, and a wrap is not a different instruction.
+    for phrase in ("never announce a turn", "never a cue",
+                   "Unasked, you say nothing"):
+        ok(phrase.lower() in flat_instr.lower(), f"and spelled out: {phrase!r}")
     for phrase in ("Say only what the data supports", "Keep the provenance",
                    "detected but NOT CONFIRMED"):
         ok(phrase in instr, f"truthfulness rule carried over: {phrase!r}")
@@ -1559,8 +1591,9 @@ def run_route_control():
                    "Never say you avoided something you did not",
                    "Neither is something you raise yourself"):
         ok(phrase in flat, f"and spell it out: {phrase!r}")
-    ok("are not yours to time or to write" in flat,
-       "and the turns stay the navigation system's, said where a new pair of "
+    ok("What you still never do is call the turns early" in flat,
+       "and the turns stay hers to CALL and not hers to TIME, said where a new "
+       "pair of "
        "route tools is most likely to be read as promotion")
 
     # The panel is still the only implementation of any of it.

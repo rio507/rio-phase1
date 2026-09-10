@@ -94,8 +94,11 @@
       arrived: !!st.arrived,
       // The boundary, restated where it is about to be tempting: a tool result
       // showing a turn four seconds out is context for answering, never a cue.
-      rules: 'Answer the question. Do NOT announce this maneuver — the ' +
-             'navigation system calls it out loud itself.',
+      rules: 'Answer the question. Do NOT call this maneuver now — you ' +
+             'call it yourself when the car gets to it, and that is not this ' +
+             'moment. Speak as the one who is driving them there: "I\'ve got ' +
+             'the route", "I\'ll take you onto Colorado" — never in the ' +
+             'third person about a car or a navigation.',
     };
     if (st.context && st.context.anchor) {
       out.next_maneuver_landmark = st.context.anchor.label;
@@ -212,8 +215,10 @@
              'unless they asked for all of it. A landmark here is what the ' +
              'MAP expects, not something anyone has seen: say "there should ' +
              'be a Shell", never "there\'s a Shell". Do NOT call any of ' +
-             'these turns as instructions now — when each one arrives the ' +
-             'navigation system calls it itself.',
+             'these turns as instructions now — you call each one yourself ' +
+             'when the car gets to it. Say so in the first person if it ' +
+             'comes up: "I\'ll call each turn as we get there." Never that a ' +
+             'car or a navigation does it.',
     };
   }
 
@@ -331,15 +336,17 @@
           eta_epoch: route.eta_epoch || null,
           total_maneuvers: mans.length,
           first_steps: first,
-          rules: 'The route is live and the car is navigating already. ' +
-                 'Confirm it once, briefly, in your own words, using this ' +
-                 'destination name exactly as spelled here. Do NOT tell the ' +
-                 'driver to set it themselves — it is set. Do not read the ' +
-                 'turns out now: confirming is one line. If they ASK for the ' +
-                 'directions, call nav_directions and read them — that is ' +
-                 'answering. What you never do is call a turn as it arrives; ' +
-                 'the navigation system does that itself, at the moment it ' +
-                 'matters.',
+          rules: 'The route is live and you are taking them there now. ' +
+                 'Confirm it once, briefly, in your own words and in the ' +
+                 'FIRST PERSON — "I\'ve got it, about eighteen minutes" — ' +
+                 'using this destination name exactly as spelled here. Do ' +
+                 'NOT tell the driver to set it themselves; it is set. Do ' +
+                 'not read the turns out now: confirming is one line. If ' +
+                 'they ASK for the directions, call nav_directions and read ' +
+                 'them — that is answering. What you never do is call a turn ' +
+                 'early; each one goes out in your voice at the moment it ' +
+                 'matters, and if the driver asks who is calling them the ' +
+                 'answer is you: "I\'ll call each turn as we get there."',
         };
       }
       if (out.status === 'ambiguous') {
@@ -404,10 +411,11 @@
     }
     return {
       ok: true, was_navigating: true, destination: out.destination || null,
-      rules: 'The route is off and the turn-by-turn is silent. Confirm it ' +
-             'once, briefly — "Okay, navigation off." Do not ask whether ' +
-             'they are sure, do not offer to start it again, and do not ' +
-             'read out where they were going.',
+      rules: 'The route is off and you will not be calling any more turns. ' +
+             'Confirm it once, briefly and in the first person — "Okay, I\'ll ' +
+             'stop guiding you." Do not ask whether they are sure, do not ' +
+             'offer to start it again, and do not read out where they were ' +
+             'going.',
     };
   }
 
@@ -446,7 +454,8 @@
       if (out.status === 'no_route') {
         return {
           ok: true, status: 'no_route',
-          rules: 'Nothing is being navigated, so there is no route to ' +
+          rules: 'You are not guiding them anywhere, so there is no route ' +
+                 'to ' +
                  'change. Say that in one line and offer to set one.',
         };
       }
@@ -480,14 +489,15 @@
         generation_id: route.generation_id || null,
         avoid_applied: route.avoid_applied || [],
         avoid_unsupported: unsupported,
-        rules: 'The new route is live and the car is already on it. One ' +
-               'line: what changed and roughly how long it is now — ' +
-               '"Rerouting — about twenty minutes." If avoid_unsupported ' +
-               'has anything in it, say plainly that you cannot do that one ' +
-               'and that you have rerouted anyway; never say you avoided ' +
-               'something that is not in avoid_applied. Do not read the ' +
-               'turns out, and do not call them — the navigation system ' +
-               'still does that itself.',
+        rules: 'The new route is live and you are taking them that way ' +
+               'now. One line, first person: what changed and roughly how ' +
+               'long it is now — "Got you a different way, about twenty ' +
+               'minutes." If avoid_unsupported has anything in it, say ' +
+               'plainly that you cannot do that one and that you have ' +
+               'rerouted anyway; never say you avoided something that is not ' +
+               'in avoid_applied. Do not read the turns out and do not call ' +
+               'them early — you still call each one yourself when the car ' +
+               'gets to it.',
       };
     });
   }

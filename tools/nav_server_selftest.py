@@ -787,22 +787,199 @@ def run_distance_phrasing():
 # tool result can carry. A model that is handed "the system will call it out"
 # will say it back.
 THIRD_PERSON = (
-    "the car will", "the car's", "the vehicle will", "the system",
-    "the navigation system", "navigation will", "the nav system",
-    "the gps will", "it will call", "you'll hear", "will call it out",
-    "will let you know", "will tell you",
+    "the car will", "the car's", "the vehicle will", "the car announces",
+    "the car does", "the system", "the navigation system", "navigation will",
+    "the nav system", "the gps will", "it will call", "you'll hear",
+    "will call it out", "will let you know", "will tell you",
+    "the turn-by-turn",
 )
+
+# A NEGATIVE EXAMPLE IS NOT A VIOLATION, and the instructions are full of them
+# on purpose: never "the car will tell you" is the sentence that stops the
+# model saying it. A substring lint that cannot tell the two apart forces the
+# instructions to stop naming the failure they are preventing, which is the
+# one thing they most need to do.
+#
+# TWO CONDITIONS, BOTH REQUIRED, and one of them alone is not enough:
+#
+#   the phrase is QUOTED     an instruction names a forbidden wording by
+#                            quoting it; a sentence that USES the wording does
+#                            not put it in quotes.
+#   the sentence NEGATES     "never", "not", "n't" somewhere in it.
+#
+# Either on its own lets real failures through. "Don't worry about it, the
+# navigation system will tell you." negates and is exactly the sentence this
+# exists to catch, which is why the quote test is not optional -- it was the
+# first thing this lint got wrong.
+_NEGATORS = ("never", "not ", "n't", "must not", "instead of", "rather than",
+             "stop saying")
+# Straight and curly, and each delimiter matched against ITSELF -- a single
+# character class spanning both kinds ends "you'll hear it" at the apostrophe
+# and loses the quotation it was meant to find.
+_QUOTED = (re.compile(r'"([^"]{3,160})"'),
+           re.compile(r"'([^']{3,160})'"),
+           re.compile("\u201c([^\u201d]{3,160})\u201d"))
+
+
+def _norm(text: str) -> str:
+    """Lower case, and every apostrophe the same apostrophe.
+
+    The live run of 2026-09-10 answered "You\u2019ll hear the turns as they come
+    up" and this lint missed it: a TTS transcript uses U+2019 and the phrase
+    list uses U+0027. A lint that only fires on straight quotes never fires on
+    anything a model actually said.
+    """
+    return (text or "").lower().replace("\u2019", "'").replace("\u02bc", "'")
+
+
+def _sentences(text: str):
+    """Split on sentence ends, EXCEPT inside quotation marks.
+
+    A quoted sentence is one unit. The instructions quote the wording they are
+    forbidding, verbatim and with its own full stop -- and a splitter that cuts
+    inside the quotation hands the lint a fragment with the forbidden phrase in
+    it and the "never" left behind in the sentence before. That is a lint that
+    fails on the instruction telling the model not to do the thing, which is
+    the one sentence that has to be allowed to exist.
+    """
+    # HARD WRAPPING IS NOT PUNCTUATION. The instructions are prose wrapped at
+    # 78 columns, so a single newline falls in the middle of sentences -- and a
+    # splitter that treats it as a sentence end cuts 'which is\nnot a sentence
+    # you say' in half and leaves the forbidden quotation in the half without
+    # the "not". Blank lines still separate; single ones are spaces.
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text or "")
+    out, buf, quote = [], [], None
+    for ch in text:
+        buf.append(ch)
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'\u201c\u2018":
+            # An apostrophe inside a word ("don't") is not an opening quote.
+            prev = buf[-2] if len(buf) > 1 else " "
+            if ch == "'" and prev.isalnum():
+                continue
+            quote = {"\u201c": "\u201d", "\u2018": "\u2019"}.get(ch, ch)
+            continue
+        if ch in ".!?\n":
+            out.append("".join(buf))
+            buf = []
+    if buf:
+        out.append("".join(buf))
+    return out
 
 
 def nav_voice_lint(text: str):
-    """Which forbidden third-person phrases are in this line, if any."""
-    low = (text or "").lower()
-    return [p for p in THIRD_PERSON if p in low]
+    """Which forbidden third-person phrases this text ASSERTS, if any."""
+    hits = []
+    for sentence in _sentences(text):
+        low = _norm(sentence)
+        negates = any(n in low for n in _NEGATORS)
+        quoted = " ".join(_norm(m.group(1))
+                          for rx in _QUOTED for m in rx.finditer(sentence))
+        for p in THIRD_PERSON:
+            if p not in low:
+                continue
+            if negates and p in quoted:
+                continue          # named in order to be forbidden
+            hits.append(p)
+    return sorted(set(hits))
+
+
+# EVERY STRING A NAV TOOL RESULT CAN CARRY, read out of the file that writes
+# them rather than listed here.
+#
+# The results are built in static/rio_realtime.js, in JavaScript, so they
+# cannot be called from this suite -- and a hand-kept list of their sentences
+# is a list that stops covering the result someone adds tomorrow. What CAN be
+# done exactly is to read the source and pull every `rules:` and `note:`
+# string out of the navigation tools, which is what the model actually reads.
+_RESULT_KEYS = ("rules", "note")
+
+
+def _nav_tool_result_strings():
+    """[(where, text)] for every rules/note string in the nav tool handlers."""
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "static", "rio_realtime.js")
+    text = open(src, encoding="utf-8").read()
+    # The navigation tools are the block from navStatus() to the LOCAL_TOOLS
+    # table; everything in it is a navigation answer.
+    start = text.find("function navStatus(")
+    end = text.find("var LOCAL_TOOLS")
+    if start < 0 or end < 0:
+        return []
+    block = text[start:end]
+
+    out = []
+    for key in _RESULT_KEYS:
+        for m in re.finditer(key + r"\s*:\s*", block):
+            i = m.end()
+            if i >= len(block) or block[i] not in "'\"":
+                continue
+            # A concatenated string literal: 'a ' + 'b ' + 'c'. Walk it.
+            parts, j = [], i
+            while j < len(block) and block[j] in "'\"":
+                quote = block[j]
+                j += 1
+                buf = []
+                while j < len(block) and block[j] != quote:
+                    if block[j] == "\\":
+                        j += 1
+                        if j < len(block):
+                            buf.append(block[j])
+                    else:
+                        buf.append(block[j])
+                    j += 1
+                j += 1
+                parts.append("".join(buf))
+                # Skip whitespace and a '+' to reach the next literal.
+                k = j
+                while k < len(block) and block[k] in " \t\r\n":
+                    k += 1
+                if k < len(block) and block[k] == "+":
+                    k += 1
+                    while k < len(block) and block[k] in " \t\r\n":
+                        k += 1
+                    j = k
+                else:
+                    break
+            line = block[:m.start()].count("\n") + 1
+            out.append((f"rio_realtime.js:{line}:{key}", "".join(parts)))
+    return out
+
+
+# THE SENTENCES THAT WERE ACTUALLY THERE, kept as the lint's own proof.
+#
+# A lint that has never failed is a lint nobody can trust, and these are not
+# invented examples: the first two are verbatim from the session instructions
+# and the nav tool results as they stood on the drive of 2026-09-09, and the
+# last two are what a model handed them says to a driver.
+_KNOWN_BAD = (
+    "The car announces things itself — turn instructions, health warnings.",
+    "the navigation system does that itself, at the moment it matters.",
+    "The car will call it out when you get there.",
+    "Don't worry about it, the navigation system will tell you.",
+    # From the live run of 2026-09-10, verbatim, curly apostrophe and all --
+    # the answer to "do I need to watch the screen for the directions?"
+    "No. You\u2019ll hear the turns as they come up.",
+)
 
 
 def run_nav_voice():
-    section("G1e. voice — RIO is the navigation, not a bystander to it")
-    import rio_prompts
+    section("G1d. voice — RIO is the navigation, not a bystander to it")
+
+    # --- THE LINT CATCHES WHAT WAS ACTUALLY SAID ----------------------------
+    missed = [t for t in _KNOWN_BAD if not nav_voice_lint(t)]
+    ok(not missed,
+       "the lint fails on the sentences that were really there"
+       + (f" — MISSED: {missed}" if missed else f" ({len(_KNOWN_BAD)} of them)"))
+    # ...and does NOT fail on the instruction that forbids them, which is the
+    # sentence the instructions most need to be allowed to contain.
+    ok(not nav_voice_lint(
+        'Never "the car will tell you", never "the navigation system will '
+        'call it out", never "you\'ll hear it".'),
+       "and not on the instruction that forbids them, quoted in full")
 
     route = fixtures.city_route()
     service.set_provider(fixtures.FixtureProvider(route, []))
@@ -810,9 +987,10 @@ def run_nav_voice():
     r = service.build_route(route.geometry[0][0], route.geometry[0][1],
                             route.destination)
 
+    # --- EVERY SPOKEN NAVIGATION LINE ---------------------------------------
     lines = [r.depart_speech]
     for m in r.maneuvers:
-        for k, v in m.speech.items():
+        for _k, v in m.speech.items():
             if isinstance(v, str):
                 lines.append(v)
     bad = [(ln, nav_voice_lint(ln)) for ln in lines if nav_voice_lint(ln)]
@@ -824,59 +1002,67 @@ def run_nav_voice():
     reply = speech_mod.destination_reply("resolved", "Century City")
     ok(not nav_voice_lint(reply),
        "the routing confirmation is in her own voice — " + repr(reply))
-    ok(reply.lower().startswith("got it") and "i'll take you" in reply.lower(),
+    ok("i'll take you" in reply.lower(),
        "...and it is first person — " + repr(reply))
 
-    # Every nav tool RESULT, which is what the model actually reads.
-    results = list(_nav_tool_result_samples())
-    offenders = [(name, txt, nav_voice_lint(txt))
-                 for name, txt in results if nav_voice_lint(txt)]
+    # --- EVERY NAV TOOL RESULT ----------------------------------------------
+    results = _nav_tool_result_strings()
+    ok(len(results) >= 8,
+       f"the lint can see the navigation tool results at all ({len(results)} "
+       f"strings)")
+    offenders = [(where, hits) for where, txt in results
+                 for hits in [nav_voice_lint(txt)] if hits]
     ok(not offenders,
        "no navigation tool result hands the model a third-person sentence to "
        "parrot" + (f" — {offenders}" if offenders
                    else f" ({len(results)} results checked)"))
-    firsts = [txt for _n, txt in results
-              if txt.lower().startswith(("i ", "i'", "i’", "got it"))
-              or " i'll " in txt.lower() or " i've " in txt.lower()]
-    ok(len(firsts) >= max(1, len(results) // 2),
-       f"and most of them speak in the first person ({len(firsts)}/{len(results)})")
+    firsts = [w for w, txt in results
+              if re.search(r"\b(i|i'?ve|i'?ll|you call|you are|yourself)\b",
+                           txt.lower())]
+    ok(len(firsts) >= max(1, len(results) // 3),
+       f"and the ones that describe who is speaking put her in it "
+       f"({len(firsts)}/{len(results)})")
 
-    # The session instructions the model is given.
-    src = inspect.getsource(rio_prompts)
-    hits = [p for p in THIRD_PERSON if p in src.lower()]
-    ok(not hits, "the session instructions never model that phrasing for her"
-                 + (f" — {hits}" if hits else ""))
-    ok("i call every turn" in src.lower() or "i'll call each turn" in src.lower()
-       or "the turn calls are me" in src.lower(),
-       "...and they say plainly that the turn calls are hers")
-
-
-def _nav_tool_result_samples():
-    """Every navigation tool result shape, with a representative payload.
-
-    Read out of the real handlers rather than typed here, so a new result
-    string is linted the day it is written rather than the day someone
-    remembers this list exists.
-    """
+    # --- THE SESSION INSTRUCTIONS THE MODEL IS ACTUALLY GIVEN ---------------
+    #
+    # The composed text, not the source file: comments in realtime.py QUOTE the
+    # old sentences on purpose, as the record of what was wrong, and a lint
+    # that reads the source cannot tell a quotation from an instruction.
     import realtime
-    out = []
-    for name in dir(realtime):
-        if not name.startswith("nav_result_"):
-            continue
-        fn = getattr(realtime, name)
-        if not callable(fn):
-            continue
-        try:
-            got = fn()
-        except Exception:
-            continue
-        if isinstance(got, dict):
-            for k, v in got.items():
-                if isinstance(v, str) and " " in v:
-                    out.append((f"{name}.{k}", v))
-        elif isinstance(got, str):
-            out.append((name, got))
-    return out
+    instr = realtime.instructions()
+    hits = nav_voice_lint(instr)
+    ok(not hits, "the session instructions never model that phrasing for her"
+                 + (f" — {hits}" if hits else f" ({len(instr)} chars)"))
+    low = instr.lower()
+    ok("you call the turns" in low,
+       "...and they say plainly that the turn calls are hers")
+    ok("i'll call each turn as we get there" in low,
+       "...with the sentence to use when a driver asks who is calling them")
+    # The internal boundary is architecture and must not have been softened to
+    # make room for the voice change.
+    ok("you answer. you do not announce." in low,
+       "the announce/answer boundary is still there, in those words")
+    ok("never announce a turn" in low,
+       "including the turn rule it has always had")
+
+    # --- AND THE LIVE RIG LOOKS FOR THE SAME WORDS --------------------------
+    #
+    # tools/live_tool_turns.py asks "who's calling the turns?" out loud on a
+    # real session, which is the only place the model's own answer can be
+    # seen. It carries its own copy of this list because it runs against a
+    # live server rather than importing this suite -- so the two are checked
+    # against each other here, or a phrase added to one quietly stops being
+    # looked for by the other.
+    from tools import live_tool_turns as ltt
+    ok(set(ltt._THIRD_PERSON) == set(THIRD_PERSON),
+       "the live rig looks for exactly these phrases too"
+       + ("" if set(ltt._THIRD_PERSON) == set(THIRD_PERSON)
+          else f" — drift: {set(THIRD_PERSON) ^ set(ltt._THIRD_PERSON)}"))
+    ok(any(t.get("lint") == "third_person" for t in ltt.NAV_SCRIPT),
+       "and the live nav script actually asks the question")
+    ok(any("calling the turns" in (t.get("say") or "").lower()
+           for t in ltt.NAV_SCRIPT),
+       '...in those words — "Who\'s calling the turns?"')
 
 
 def run_variation():
