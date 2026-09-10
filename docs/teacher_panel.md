@@ -490,7 +490,7 @@ bash boot.sh status             # includes both services, their weights and thei
 
 python -m tools.teacher_firewall_selftest      # the shadow guarantee
 python -m tools.teacher_selftest               # shapes, refusals, isolation, the record
-python -m tools.teacher_input_selftest         # the two models' input contracts, in their own venvs
+python -m tools.teacher_input_selftest         # input contracts, the patch-embed rewrite and the FP8 recipe, in their own venvs
 python -m tools.teacher_selftest --live        # ...and one real keyframe through both
 python -m tools.teacher_timing_selftest        # the fast loop does not move
 python -m tools.teacher_timing_selftest --gpu-load   # ...with both models on the card

@@ -159,6 +159,56 @@ print("NOTHINK", split_thinking("Plain answer.") == ("", "Plain answer."))
 # "FP8" on a dashboard means the language backbone and NOT the vision tower,
 # the lm_head or the diffusion expert -- which is a claim about regexes, and
 # regexes are exactly the thing that silently stops matching.
+# The vision tower's first layer, rewritten. Checked for EQUALITY first and
+# speed second: a fast layer that quietly computes something else would be
+# invisible in every reading afterwards and would look exactly like the model
+# being worse at driving.
+PATCHEMBED = FRAMES + '''
+import time
+import torch, torch.nn as nn
+from teachers.service.common import flatten_patch_embed
+
+class FakeVisual(nn.Module):
+    def __init__(self, conv):
+        super().__init__()
+        self.patch_embed = nn.Module()
+        self.patch_embed.proj = conv
+
+N, C, T, P, E = 2400, 3, 2, 16, 1152          # one 4-frame window, as shipped
+torch.manual_seed(0)
+conv = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[T,P,P]).cuda().to(torch.bfloat16)
+x = torch.randn(N*C*T*P*P, dtype=torch.bfloat16, device="cuda")
+
+def bench(fn, n=1, warm=True):
+    # ONE timed call by default. The Conv3d takes ~14 s and the linear ~0.06 ms;
+    # what is being asserted is five orders of magnitude, and averaging four
+    # samples of a 14-second constant costs a minute to learn nothing. The
+    # conv is not warmed either -- cuDNN's algorithm search for this shape is
+    # itself part of what makes it slow, and a warm-up would hide it.
+    if warm: fn()
+    torch.cuda.synchronize(); s0=time.time()
+    for _ in range(n): r = fn()
+    torch.cuda.synchronize()
+    return r, (time.time()-s0)/n*1000
+
+with torch.no_grad():
+    ref, conv_ms = bench(lambda: conv(x.view(-1,C,T,P,P)).view(-1,E), warm=False)
+    vis = FakeVisual(conv)
+    info = flatten_patch_embed(vis, log=lambda *a: None)
+    got, lin_ms = bench(lambda: vis.patch_embed(x))
+
+print("APPLIED", info.get("applied"), info.get("reason") or "")
+print("SHAPE", tuple(ref.shape) == tuple(got.shape), tuple(got.shape))
+print("MAXDEV", (ref.float()-got.float()).abs().max().item())
+print("ALLCLOSE", torch.allclose(ref.float(), got.float(), atol=5e-2))
+print("CONVMS %.1f" % conv_ms)
+print("LINMS %.3f" % lin_ms)
+
+# An overlapping / padded conv is a DIFFERENT operation and must be refused.
+bad = nn.Conv3d(C, E, kernel_size=[T,P,P], stride=[1,8,8]).cuda().to(torch.bfloat16)
+print("REFUSED", not flatten_patch_embed(FakeVisual(bad), log=lambda *a: None)["applied"])
+'''
+
 QUANT = '''
 import json, glob, sys
 sys.path.insert(0, "%s")
@@ -266,8 +316,17 @@ def run(name, script):
     env = dict(os.environ)
     env.setdefault("HF_HOME", "/workspace/.cache/huggingface")
     env["TRANSFORMERS_VERBOSITY"] = "error"
-    p = subprocess.run([py, "-c", script], cwd=REPO, env=env,
-                       capture_output=True, text=True, timeout=900)
+    try:
+        p = subprocess.run([py, "-c", script], cwd=REPO, env=env,
+                           capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        # A section that hangs used to take the whole suite with it, silently:
+        # subprocess.TimeoutExpired is not caught by anything above, so the
+        # run ended mid-section with an exit code of 0 and no failure printed.
+        # A suite that can end early without saying so is worse than one that
+        # fails.
+        ok(False, f"{name}: the input script did not finish in 600 s")
+        return {}
     if p.returncode != 0:
         ok(False, f"{name}: the input script failed\n{p.stderr[-1200:]}")
         return {}
