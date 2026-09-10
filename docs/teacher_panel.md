@@ -220,6 +220,60 @@ Conditions are interleaved rather than run in two blocks, because this GPU is
 shared and a run measured entirely before another run is measured against a
 different machine.
 
+## 5b. One `Conv3d`, and 99.9% of a vision-tower forward
+
+The first thing the real weights said was that Cosmos took **56.8 s** per
+keyframe. On a 2 s floor that is not a slow teacher, it is an empty column:
+every keyframe would have been evicted before it was ever run.
+
+Generation length was not the cause — it stops correctly at `<|im_end|>` after
+seventeen tokens. Per-token speed was not the cause either — text-only
+generation runs at 31 tok/s. A single **prefill** through the vision tower took
+15.0 s, and inside that:
+
+| | |
+|---|---|
+| 27 transformer blocks | 16 ms |
+| positional embedding | 2 ms |
+| rotary table | 0.5 ms |
+| merger | 0.1 ms |
+| **`patch_embed`** | **13,700 ms** |
+
+`patch_embed` is an `nn.Conv3d` whose `kernel_size` **equals** its `stride` and
+equals the whole spatial extent of each input volume: 2400 separate
+`(3, 2, 16, 16)` blocks, each producing exactly one output voxel. cuDNN picks a
+pathological algorithm for that shape on this card, and
+`torch.backends.cudnn.benchmark = True` does not help (measured: 13.8 s).
+
+With no overlap, no padding and no dilation, that convolution **is** a matrix
+multiply, by definition — one dot product per block between the flattened block
+and the flattened kernel. Reshaping the weight from `(E, C, T, P, P)` to
+`(E, C*T*P*P)` and the input to match makes it one GEMM: **0.06 ms**.
+
+| on the synthetic bench keyframe | before | after |
+|---|---|---|
+| Cosmos-Reason2 | 56.8 s | **2.6 s** |
+| Alpamayo 1.5 | 6.1 s | **3.6 s** |
+
+Those are bench-frame numbers, and a bench frame is a flat two-tone rectangle
+that neither model has much to say about. On a **real** 1282×684 road clip the
+same fix leaves Alpamayo at ~4–5 s and Cosmos at ~32 s, because a real scene
+produces real answers — see §6b, which is about that 32 s rather than about
+this fix.
+
+Applied to both — Alpamayo's backbone *is* a Qwen3-VL and has the same layer —
+through one shared helper, so the two teachers cannot end up with
+differently-shaped vision paths.
+
+It is **checked, not asserted**. `common.flatten_patch_embed` runs both forms
+against random input at load and refuses the swap if they disagree beyond bf16
+rounding; it refuses outright if the conv overlaps, pads or dilates, because
+then it is a different operation. `/health` reports what it did and by how much
+the forms differed, and the selftest asserts equality *first* and speed second.
+A fast layer that quietly computed something else would be invisible in every
+reading afterwards and would look exactly like the model being worse at
+driving.
+
 ## 6. Outputs
 
 Per keyframe, per model, **every field the model offers, verbatim**. `raw` is
@@ -265,6 +319,42 @@ ribbon through a second camera model would sit visibly beside the corridor
 being wrong. The selftest asserts the constants still match. The metric path is
 kept in the corpus beside the pixels so a later reader can re-project it
 through a better camera model.
+
+## 6b. Cosmos is a thirty-second teacher, and that is the right trade
+
+Measured on a real road clip, after the `patch_embed` fix:
+
+| question | time | output |
+|---|---|---|
+| physical reasoning | 28.4 s | 4275 chars |
+| scene | 2.2 s | 399 |
+| critical actor | 1.0 s | 149 |
+| attention | 0.9 s | 152 |
+
+One question is 88% of the model's time, and it runs to the full 1024-token
+budget. That is **not** waste: those 4275 characters *are* the physical-
+reasoning trace this panel exists to collect, and truncating them to fit a 2 s
+floor would be spending the GPU to produce a worse version of the one output
+nobody else here can give us.
+
+The consequence, stated plainly because it is a design choice rather than a
+bug: **at the shipped 2 s floor Cosmos answers roughly one keyframe in fifteen**
+and the rest are evicted — newest wins, so it is always working on the most
+recent road rather than catching up through a backlog.
+
+That matters less than it looks, because of an asymmetry worth naming: Alpamayo
+is faster and gets the *same* jobs, so **every keyframe Cosmos answers is one
+Alpamayo answered too**. Every Cosmos reading is therefore a comparison; there
+are simply fewer of them. Over a twenty-minute drive that is roughly forty
+side-by-side readings.
+
+`config.TEACHER_COSMOS_MAX_NEW_TOKENS` is where the trade lives: lower it for
+more readings and shorter traces. It is an operator's decision, and the numbers
+above are in the config comment so it can be made knowingly.
+
+**For an acceptance run**, `tools/teacher_replay.py --floor N` paces keyframes
+to the slower teacher so every one of them is a comparison. That is not a
+drive's cadence and the report says which it is looking at.
 
 ## 7. Actor association
 

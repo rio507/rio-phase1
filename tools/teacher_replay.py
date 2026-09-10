@@ -141,9 +141,22 @@ def main():
                     help="session id for the corpus (default: replay-<clip>)")
     ap.add_argument("--stride", type=int, default=1,
                     help="use every Nth frame of the clip")
-    ap.add_argument("--loops", type=int, default=6,
-                    help="passes over the clip, so a short one yields enough "
-                         "keyframes")
+    ap.add_argument("--loops", type=int, default=200,
+                    help="MAXIMUM passes over the clip. The run stops as soon "
+                         "as --keyframes have been raised, so this is only a "
+                         "guard against a clip that never triggers one")
+    ap.add_argument("--max-seconds", type=float, default=900.0,
+                    help="wall-clock cap on the feeding phase")
+    ap.add_argument("--floor", type=float, default=None,
+                    help="override config.TEACHER_KEYFRAME_FLOOR_S for this "
+                         "run. USE IT FOR AN ACCEPTANCE RUN: at the shipped "
+                         "2 s floor the faster teacher runs several keyframes "
+                         "for every one the slower one gets to, so most rows "
+                         "carry a single column. Pacing the floor to the "
+                         "SLOWER teacher's latency makes every keyframe a "
+                         "comparison, which is what a side-by-side reading is "
+                         "for. It is not what a drive does, and the report "
+                         "should say which it is looking at.")
     ap.add_argument("--alpamayo", default=None)
     ap.add_argument("--cosmos", default=None)
     ap.add_argument("--report", default=None)
@@ -160,7 +173,15 @@ def main():
     key = args.session or ("replay-" + os.path.basename(args.clip).split(".")[0])
     from headway import live as headway_live
 
+    if args.floor is not None:
+        config.TEACHER_KEYFRAME_FLOOR_S = float(args.floor)
+        config.TEACHER_KEYFRAME_MIN_GAP_S = min(
+            config.TEACHER_KEYFRAME_MIN_GAP_S, float(args.floor))
+
     print(f"clip     : {args.clip}")
+    print(f"floor    : {config.TEACHER_KEYFRAME_FLOOR_S} s"
+          + ("  (paced for comparisons — not a drive's cadence)"
+             if args.floor is not None else "  (as shipped)"))
     print(f"session  : {key}")
     print(f"teachers : {config.TEACHER_ALPAMAYO_URL}  "
           f"{config.TEACHER_COSMOS_URL}")
@@ -182,10 +203,20 @@ def main():
     ring = framebuf.get_ring(key)
     corpus_mod.close(key)
 
+    # KEYFRAMES ARE RAISED ON A WALL CLOCK, NOT PER FRAME. The floor is one
+    # every ~2 s, and a five-second clip processed at ~20 ms a frame is over in
+    # about two and a half seconds -- so "six passes over the clip" is not a
+    # number of keyframes, it is an accident of how fast the pipeline is. The
+    # clip loops until the TARGET is met, capped by wall clock and by a
+    # generous pass count so a clip that somehow triggers nothing still ends.
     seen = set()
     t_start = time.time()
     stop = False
     for loop in range(args.loops):
+        if time.time() - t_start > args.max_seconds:
+            print(f"  !! stopping after {args.max_seconds:.0f}s with "
+                  f"{len(seen)} keyframes", flush=True)
+            break
         cap = cv2.VideoCapture(args.clip)
         if not cap.isOpened():
             raise SystemExit(f"cannot open {args.clip}")
@@ -211,15 +242,27 @@ def main():
                       flush=True)
             if n >= args.keyframes:
                 stop = True
+            if time.time() - t_start > args.max_seconds:
+                stop = True
         cap.release()
         if stop:
             break
 
     print("\nwaiting for the last readings to come back...", flush=True)
+    # Bounded by PROGRESS, not just by a deadline: once no new row has landed
+    # for a while, the teachers have answered everything they are going to and
+    # sitting out the rest of the timeout tells nobody anything.
     deadline = time.time() + 600
+    last_n, last_change = -1, time.time()
     while time.time() < deadline:
         rows = corpus_mod.read_rows(key)
         if len(rows) >= args.keyframes:
+            break
+        if len(rows) != last_n:
+            last_n, last_change = len(rows), time.time()
+        elif time.time() - last_change > 120:
+            print(f"  !! no new row for 120 s; stopping with {len(rows)}",
+                  flush=True)
             break
         time.sleep(2)
     panel.stop()

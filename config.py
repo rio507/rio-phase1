@@ -3203,5 +3203,28 @@ TEACHER_COSMOS_PHYSICAL_PROMPT = (
 TEACHER_TOP_P = 0.98
 TEACHER_TEMPERATURE = 0.6
 TEACHER_MAX_NEW_TOKENS = 256
-TEACHER_COSMOS_MAX_NEW_TOKENS = 1024   # it thinks in <think>...</think> first
+# COSMOS'S REASONING BUDGET, AND WHAT IT COSTS -- measured, on a real road clip
+# at 1282x684, not guessed:
+#
+#   physical reasoning   28.4 s   4275 characters (the full 1024-token budget)
+#   scene                 2.2 s    399
+#   critical actor        1.0 s    149
+#   attention             0.9 s    152
+#
+# So Cosmos is a ~32 s teacher, and one question is 88% of it. That is not
+# waste -- the 4275 characters ARE the physical-reasoning trace this panel
+# exists to collect, and truncating them to fit a 2 s floor would be spending
+# the GPU to produce a worse version of the one output nobody else can give us.
+#
+# The consequence, stated plainly because it is a design choice and not a bug:
+# at the 2 s floor Cosmos answers roughly one keyframe in fifteen and the rest
+# are evicted (newest wins, so it is always working on the most recent road).
+# Every keyframe it DOES answer is also one Alpamayo answered, because Alpamayo
+# is faster and gets the same jobs -- so every Cosmos reading is a comparison,
+# there are just fewer of them. Over a twenty-minute drive that is ~40
+# side-by-side readings, which is plenty for the purpose.
+#
+# Lower this and you get more readings and shorter traces. That is the trade,
+# and it is an operator's to make rather than one to make silently here.
+TEACHER_COSMOS_MAX_NEW_TOKENS = 1024
 TEACHER_TRAJ_SAMPLES = 1               # display-only; 1 keeps VRAM at ~24 GB
