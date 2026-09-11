@@ -44,6 +44,42 @@ import config
 # under the second.
 _HOLD = {"n": 0, "held_s": 0.0, "holds": 0, "since": 0.0}
 
+# ---------------------------------------------------------------------------
+# A LIVE SESSION IS OPEN. Same shape as the hold and a different question.
+#
+# The hold means "RIO is answering RIGHT NOW". This means "the driver could
+# speak at any moment", which is most of a drive, and it is the state in which
+# starting a 700 ms teacher pass is a bet that the next question arrives after
+# it finishes. Measured: with both teachers inferring, one observer forward
+# pass goes from 368 ms to 704 ms at p50 and 1379 ms at worst.
+#
+# Counted rather than flagged, for the same reason the hold is: two overlapping
+# sessions must not have the first one's close resume the teachers under the
+# second.
+_SESSION = {"n": 0, "until": 0.0}
+
+# ...AND ONLY ONE TEACHER INFERS AT A TIME.
+#
+# Two 8-10B models decoding at once on the same card is the peak of the
+# contention this whole surface exists to bound, and the corpus does not want
+# simultaneity -- it wants both models' reading of the same keyframe, which
+# serialising delivers just as well and later. Module level, shared by both
+# clients, because the card is shared. See config.TEACHER_MAX_CONCURRENT.
+_GATE = threading.Semaphore(max(1, int(
+    getattr(config, "TEACHER_MAX_CONCURRENT", 1) or 1)))
+
+
+def set_max_concurrent(n: int):
+    """Rebuild the gate. For tests, and for nothing on the live path.
+
+    A semaphore's size is fixed at construction, so a test that wants the old
+    both-at-once behaviour -- and there is one, because corpus row accounting
+    under a speed skew between the two models is a different question from how
+    many may decode at once -- cannot get it by assigning to the config.
+    """
+    global _GATE
+    _GATE = threading.Semaphore(max(1, int(n or 1)))
+
 
 def hold_gpu():
     """Context manager: no teacher starts new work while this is open."""
@@ -69,6 +105,55 @@ class _Hold:
 def hold_status():
     return {"held": _HOLD["n"], "holds": _HOLD["holds"],
             "held_s": round(_HOLD["held_s"], 2)}
+
+
+def session_note(open_: bool, ttl_s: float = None):
+    """A live conversation session opened or closed.
+
+    A DEADLINE AS WELL AS A COUNT, and the deadline is the important half.
+    A counter that is incremented on open and decremented on close is correct
+    exactly as long as every close arrives -- and the cases this system already
+    has machinery for (the phone that went flat, the laptop that slept, the tab
+    closed while hidden; see _reap_abandoned_sessions in app.py) are precisely
+    the ones where it does not.
+
+    A leaked increment would pause the teachers for the life of the process:
+    the panel would go quiet, no corpus row would ever be written again, and
+    nothing would look broken. So the pause EXPIRES. Anything that knows a
+    session is still open refreshes it; if nothing does, the teachers resume
+    on their own.
+    """
+    ttl = float(ttl_s if ttl_s is not None
+                else getattr(config, "TEACHER_SESSION_TTL_S", 180.0))
+    if open_:
+        _SESSION["n"] += 1
+        _SESSION["until"] = max(_SESSION["until"], time.time() + ttl)
+    else:
+        _SESSION["n"] = max(0, _SESSION["n"] - 1)
+        if _SESSION["n"] == 0:
+            _SESSION["until"] = 0.0
+
+
+def session_ping(ttl_s: float = None):
+    """This session is still open. Pushes the deadline out, nothing else."""
+    if _SESSION["n"] <= 0:
+        return
+    ttl = float(ttl_s if ttl_s is not None
+                else getattr(config, "TEACHER_SESSION_TTL_S", 180.0))
+    _SESSION["until"] = max(_SESSION["until"], time.time() + ttl)
+
+
+def session_live() -> bool:
+    return _SESSION["n"] > 0 and time.time() < _SESSION["until"]
+
+
+def live_status():
+    return {"sessions": _SESSION["n"],
+            "live": session_live(),
+            "expires_in_s": (round(max(0.0, _SESSION["until"] - time.time()), 1)
+                             if _SESSION["n"] > 0 else None),
+            "max_concurrent": max(1, int(
+                getattr(config, "TEACHER_MAX_CONCURRENT", 1) or 1))}
 
 
 class TeacherClient:
@@ -153,8 +238,20 @@ class TeacherClient:
                   f"{type(e).__name__}: {e}", flush=True)
 
     def paused(self) -> bool:
-        """Is RIO using the GPU for something a driver is waiting on?"""
-        return _HOLD["n"] > 0
+        """Is RIO using the GPU for something a driver is waiting on -- or
+        about to be?
+
+        Two conditions now. The hold is an answer in progress. The session is
+        the state in which one may begin at any moment, and starting a teacher
+        pass in it is a bet on the driver staying quiet for the length of the
+        pass. See config.TEACHER_PAUSE_DURING_SESSION.
+        """
+        if _HOLD["n"] > 0:
+            return True
+        if (getattr(config, "TEACHER_PAUSE_DURING_SESSION", True)
+                and session_live()):
+            return True
+        return False
 
     def _take(self):
         """The next job worth doing, dropping any that have gone stale."""
@@ -222,6 +319,12 @@ class TeacherClient:
         with self._lock:
             self.stats["busy"] = True
             self.stats["sent"] += 1
+        # ONE AT A TIME, ACROSS BOTH CLIENTS. Held around the HTTP call, which
+        # is where the GPU work actually happens -- the service on the far end
+        # is synchronous per request, so a client waiting here is a model not
+        # decoding. Acquired outside the try so a failure to get it cannot be
+        # reported as an inference failure.
+        _GATE.acquire()
         try:
             reading = self._post(job)
             with self._lock:
@@ -240,6 +343,7 @@ class TeacherClient:
                         getattr(config, "TEACHER_FAIL_BACKOFF_S", 15.0))
             reading = {"ok": False, "error": msg[:200]}
         finally:
+            _GATE.release()
             with self._lock:
                 self.stats["busy"] = False
 

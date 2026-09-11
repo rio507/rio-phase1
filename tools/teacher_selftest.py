@@ -49,6 +49,7 @@ from teachers import client as client_mod                         # noqa: E402
 from teachers import corpus as corpus_mod                         # noqa: E402
 from teachers import egomotion                                    # noqa: E402
 from teachers import keyframe as kf_mod                           # noqa: E402
+import teachers.client as tc_client  # noqa: E402
 from teachers import panel                                        # noqa: E402
 from teachers import schema                                       # noqa: E402
 
@@ -685,9 +686,22 @@ def run_desync():
     config.TEACHER_ALPAMAYO_URL = "http://127.0.0.1:18921"
     config.TEACHER_COSMOS_URL = "http://127.0.0.1:18922"
     floor = config.TEACHER_KEYFRAME_FLOOR_S
+    floor_live = config.TEACHER_KEYFRAME_FLOOR_S_LIVE
     gap = config.TEACHER_KEYFRAME_MIN_GAP_S
+    # BOTH FLOORS. While frames are flowing the panel uses the LIVE one (see
+    # teachers.panel._floor_s), and this test pushes frames -- so setting only
+    # the idle constant changes nothing and the test measures the shipped
+    # 8 s cadence instead of the fast one it is trying to exercise.
     config.TEACHER_KEYFRAME_FLOOR_S = 0.12
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = 0.12
     config.TEACHER_KEYFRAME_MIN_GAP_S = 0.05
+    # BOTH AT ONCE, FOR THIS BLOCK ONLY. What is under test here is corpus row
+    # accounting when the two models run at wildly different speeds -- that a
+    # row is still written when they go out of step. The shipped gate of one
+    # (config.TEACHER_MAX_CONCURRENT) makes the fast model wait behind the slow
+    # one, so they cannot go out of step far enough to exercise the rule. The
+    # gate has its own test: tools/teacher_yield_selftest.py.
+    tc_client.set_max_concurrent(2)
     panel.start()
 
     key = "desync"
@@ -760,6 +774,8 @@ def run_desync():
            f"({sorted(extra)[:4]})")
 
     config.TEACHER_KEYFRAME_FLOOR_S = floor
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = floor_live
+    tc_client.set_max_concurrent(config.TEACHER_MAX_CONCURRENT)
     config.TEACHER_KEYFRAME_MIN_GAP_S = gap
     panel.stop()
     fast.stop()
@@ -945,13 +961,27 @@ def run_cadence_no_drive():
     for i in range(40):
         egomotion.note_speed(key, 13.0, "manual", at=time.time() - 3.0 + i * 0.1)
 
-    floor = config.TEACHER_KEYFRAME_FLOOR_S
+    # THE FLOOR THAT ACTUALLY APPLIES HERE. This block pushes frames, and the
+    # cadence while frames flow is the LIVE floor -- which is the whole point
+    # of the change it is now testing: 8 s rather than 2, because a keyframe
+    # every two seconds cost the detector 5.8x (tools/pipeline_probe.py).
+    #
+    # Shortened for the test, because waiting three shipped floors is 25
+    # seconds of suite for a cadence that can be demonstrated in three.
+    floor_live_was = config.TEACHER_KEYFRAME_FLOOR_S_LIVE
+    gap_was = config.TEACHER_KEYFRAME_MIN_GAP_S
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = 0.4
+    # The minimum gap is 1 s in production and would be the thing this measures
+    # if it were left there -- a 0.4 s floor behind a 1 s gap is a 1 s cadence.
+    # The gap has its own coverage; this block is about the floor.
+    config.TEACHER_KEYFRAME_MIN_GAP_S = 0.05
+    floor = config.TEACHER_KEYFRAME_FLOOR_S_LIVE
     raised_at = []
     t0 = time.time()
     seen = 0
     # ~10 fps for three floors' worth of wall clock, exactly as a replay does.
-    while time.time() - t0 < floor * 3 + 0.6:
-        ring, _ = push_window(key, n=5, spacing=0.1)
+    while time.time() - t0 < floor * 5 + 0.8:
+        ring, _ = push_window(key, n=2, spacing=0.1)
         panel.on_frame(key, RESULT, ring)
         n = panel.status()["sessions"].get(key, {}).get("keyframes", 0)
         if n > seen:
@@ -961,10 +991,12 @@ def run_cadence_no_drive():
 
     ok(len(raised_at) >= 3,
        f"frames flowing with no drive raised {len(raised_at)} keyframes in "
-       f"{floor * 3 + 0.6:.1f}s at a {floor}s floor (at {raised_at})")
+       f"{floor * 5 + 0.8:.1f}s at a {floor}s floor (at {raised_at})")
     gaps = [round(b - a_, 2) for a_, b in zip(raised_at, raised_at[1:])]
     ok(gaps and all(floor - 0.35 <= g <= floor + 0.6 for g in gaps),
        f"and they are ~{floor}s apart, not bunched or starved ({gaps})")
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = floor_live_was
+    config.TEACHER_KEYFRAME_MIN_GAP_S = gap_was
 
     deadline = time.time() + 20
     while time.time() < deadline and len(corpus_mod.read_rows(key)) < len(raised_at):
@@ -1084,13 +1116,18 @@ def run_canned():
     for i in range(40):
         egomotion.note_speed(key, 12.0, "obd", at=time.time() - 3.0 + i * 0.1)
     floor, gap = config.TEACHER_KEYFRAME_FLOOR_S, config.TEACHER_KEYFRAME_MIN_GAP_S
+    floor_live = config.TEACHER_KEYFRAME_FLOOR_S_LIVE
     config.TEACHER_KEYFRAME_FLOOR_S = 0.15
+    # ...and the live floor with it: this block pushes frames, and the cadence
+    # while frames flow is the live one. See teachers.panel._floor_s.
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = 0.15
     config.TEACHER_KEYFRAME_MIN_GAP_S = 0.1
     for _ in range(30):
         ring, _ = push_window(key, n=5, spacing=0.1)
         panel.on_frame(key, RESULT, ring)
         time.sleep(0.12)
     config.TEACHER_KEYFRAME_FLOOR_S, config.TEACHER_KEYFRAME_MIN_GAP_S = floor, gap
+    config.TEACHER_KEYFRAME_FLOOR_S_LIVE = floor_live
     deadline = time.time() + 25
     while time.time() < deadline and len(corpus_mod.read_rows(key)) < 4:
         time.sleep(0.5)

@@ -234,8 +234,17 @@
       // drive where the worker never came up, which is worth knowing before
       // the crackle is blamed on something else.
       encoded_off_thread: 0, encoded_on_thread: 0,
-      ages: [], rtts: []
+      ages: [], rtts: [],
+      /* THE STAGES THE SERVER CANNOT SEE.
+         frame_age_ms already covers capture -> detection, and the server
+         breaks its own share down. What nothing measured was the part that
+         happens before the frame leaves the page, which is where a slow clip
+         mode would hide: how often a picture is actually taken, how long the
+         encode costs, and how long the overlay takes to draw the result. */
+      capture_gaps: [], encodes: [], pushes: [], draws: [],
+      server_stage: {}      // stage -> samples, straight from timing_ms
     };
+    var lastCaptureAt = null;
 
     function note(name, detail) { try { onEvent(name, detail || {}); } catch (e) {} }
 
@@ -248,6 +257,12 @@
       feedState = next;
       note('FRAMES_STATE', { state: next, was: prev, why: why || null });
       if (cfg.onState) { try { cfg.onState(next, { was: prev, why: why || null }); } catch (e) {} }
+    }
+
+    /* p50/p90/p99 and n, for one list of samples. */
+    function band(list) {
+      return { p50: pct(list, 0.5), p90: pct(list, 0.9),
+               p99: pct(list, 0.99), n: list.length };
     }
 
     function record(list, v) {
@@ -587,6 +602,7 @@
          drawImage: that is when the pixels left the element. */
       var body = null;
       var capturedAt = null;
+      var encodeT0 = now();
       if (worker && workerReady) {
         var jobId = workerJobSeq + 1;
         var offP = encodeOffThread(el, size.w, size.h);
@@ -629,6 +645,15 @@
         body = new Uint8Array(bytes0);
         stats.encoded_on_thread++;
       }
+
+      /* HOW OFTEN A PICTURE IS ACTUALLY TAKEN, which is not the same as the
+         rate the loop asks for: a tick that skips for want of a slot, a
+         buffer or a frame does not get here. The gap between successive
+         CAPTURES is the effective capture interval, and its p90 is where a
+         mode that is quietly starving shows up. */
+      if (lastCaptureAt !== null) record(stats.capture_gaps, capturedAt - lastCaptureAt);
+      lastCaptureAt = capturedAt;
+      record(stats.encodes, now() - encodeT0);
 
       var s = speed();
       var capServer = (offsetSec === null) ? null : (epochSec(capturedAt) + offsetSec);
@@ -735,7 +760,39 @@
         record(stats.ages, j.frame_age_ms);
         adaptRate(j.frame_age_ms);
       }
+      /* PUSH: send -> result, measured on THIS clock, so it is the whole
+         round trip including everything the server did. frame_age_ms is the
+         other half of the same question (capture -> detection) and the two
+         differ by the encode plus whatever the server queued. */
+      if (lastSentAt) record(stats.pushes, now() - lastSentAt);
+      /* ...AND THE SERVER'S OWN BREAKDOWN, carried up so one report can show
+         the whole pipeline instead of two halves that have to be joined by
+         hand. These are the server's numbers verbatim; nothing is recomputed
+         here. */
+      var tm = j.timing_ms;
+      if (tm && typeof tm === 'object') {
+        for (var k in tm) {
+          if (typeof tm[k] !== 'number') continue;
+          if (!stats.server_stage[k]) stats.server_stage[k] = [];
+          record(stats.server_stage[k], tm[k]);
+        }
+      }
+      for (var f = 0; f < 3; f++) {
+        var name = ['transport_ms', 'queue_ms', 'server_ms'][f];
+        if (typeof j[name] !== 'number') continue;
+        if (!stats.server_stage[name]) stats.server_stage[name] = [];
+        record(stats.server_stage[name], j[name]);
+      }
       try { onResult(j); } catch (e) {}
+    }
+
+    /* THE OVERLAY'S SHARE. Called by whatever draws the boxes, because this
+       module does not own the canvas and should not reach for it. A draw that
+       is slow is a draw that steals from the next capture on the same thread,
+       which is exactly the failure mode a clip mode with a second video
+       element is prone to. */
+    function noteDraw(ms) {
+      if (typeof ms === 'number' && isFinite(ms)) record(stats.draws, ms);
     }
 
     /* ---------------- the supervisor -------------------------------------
@@ -827,7 +884,10 @@
       lastSentAt = now(); lastResultAt = 0; openedAt = 0; pingsOut = 0;
       stallRecoveries = 0; tickOverruns = 0; watchedEl = null;
       setState('reconnecting', 'starting');
-      stats = { sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
+      lastCaptureAt = null;
+      stats = { capture_gaps: [], encodes: [], pushes: [], draws: [],
+                server_stage: {},
+                sent: 0, results: 0, skipped_inflight: 0, skipped_buffer: 0,
                 skipped_capture: 0, bytes: 0, dropped_server: 0,
                 encoded_off_thread: 0, encoded_on_thread: 0, ages: [], rtts: [] };
       workerMisses = 0;
@@ -919,9 +979,27 @@
           since_result_ms: lastResultAt ? Math.round(now() - lastResultAt) : null,
           stall_recoveries: stallRecoveries,
           tick_overruns: tickOverruns,
-          reconnects: reconnects
+          reconnects: reconnects,
+          /* THE WHOLE PIPELINE, one object, p50/p90/p99 each. The point of
+             gathering it here rather than in the probe is that these are the
+             page's own numbers: a bench that re-derives them is measuring the
+             bench. */
+          stages: (function () {
+            var out = {
+              capture_interval_ms: band(stats.capture_gaps),
+              encode_ms: band(stats.encodes),
+              push_ms: band(stats.pushes),
+              overlay_draw_ms: band(stats.draws),
+              frame_age_ms: band(stats.ages)
+            };
+            for (var k in stats.server_stage) {
+              out['srv_' + k] = band(stats.server_stage[k]);
+            }
+            return out;
+          })()
         };
       },
+      noteDraw: noteDraw,
       state: function () { return feedState; },
       /* For the page to call when it knows something this file cannot see --
          a camera re-acquired, a source changed. */

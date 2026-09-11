@@ -637,6 +637,28 @@ async def talk(audio: UploadFile, session_id: str = Query(default=None)):
 # be; the live model is conversation, and conversation is the tier that yields.
 
 
+def _teachers_session(open_: bool):
+    """Tell the teacher panel a live conversation opened or closed.
+
+    THE TEACHERS ARE SHADOW AND THE DRIVER IS NOT. While a session is open the
+    driver may speak at any moment, and every answer goes through look() or the
+    reasoning path on the same card the teachers infer on -- measured at 5.8x
+    on the detector and 3.3x on the whole server frame with both of them
+    running. So no NEW teacher work starts while one is open.
+
+    Wrapped whole and never raised: a shadow feature's bookkeeping may not cost
+    a session. The pause expires on its own if this is never called with False
+    (see teachers.client.session_note).
+    """
+    try:
+        from teachers import client as _tc
+
+        _tc.session_note(bool(open_))
+    except Exception as e:
+        print(f"[teachers] session note failed: {type(e).__name__}: {e}",
+              flush=True)
+
+
 @app.post("/realtime/session")
 def realtime_session_endpoint(session_id: str = Query(default=None)):
     """An ephemeral credential for one live conversation.
@@ -661,6 +683,7 @@ def realtime_session_endpoint(session_id: str = Query(default=None)):
                 "enabled": True, "status": realtime.status()}
     sessions.log_live(session_id, "session_started",
                       {"model": out["model"], "voice": out["voice"]})
+    _teachers_session(True)
     # Start describing the road NOW, not when she is first asked about it.
     # A live conversation is exactly the context where "what do you see" is
     # asked, and the observer needs a second's head start to have an answer
@@ -729,6 +752,7 @@ def live_session_endpoint(body: dict = Body(...),
                       {"model": out["model"], "voice": out["voice"],
                        "backend": "gpt_live",
                        "backend_model": out["backend_model"]})
+    _teachers_session(True)
     # The same head start the realtime path gives the observer, for the same
     # reason: "what do you see" is asked early and the answer takes a second
     # to have ready.
@@ -2477,7 +2501,6 @@ def vehicle_health_endpoint(full: bool = Query(default=True)):
     return vehicle_health.context(full=full)
 
 
-@app.get("/vehicle/health/announcement")
 def _attach_phrasing(issues: list):
     """Write the sentence BEFORE the policy decides to say it.
 
@@ -2540,6 +2563,7 @@ def _attach_phrasing(issues: list):
 _PHRASE_SESSION = "drive"
 
 
+@app.get("/vehicle/health/announcement")
 def vehicle_health_announcement_endpoint():
     """Is there something the driver has to be told right now?
 
@@ -3225,6 +3249,10 @@ def _teardown_session(session_id: str, reason: str = "closed") -> bool:
 
 @app.post("/session/end")
 def session_end_endpoint(session_id: str = Query(...)):
+    # The tidy exit. The untidy ones are covered by the deadline in
+    # teachers.client.session_note, which is why this not arriving is
+    # survivable rather than permanent.
+    _teachers_session(False)
     return {"closed": _teardown_session(session_id)}
 
 
@@ -3240,6 +3268,16 @@ def session_heartbeat_endpoint(session_id: str = Query(...)):
     `ok: false` is an instruction, not an error. The client stops the drive.
     """
     if sessions.touch(session_id):
+        # THE DEADLINE'S REFRESH. The teacher pause expires unless something
+        # keeps saying the session is open, and this is the page's existing
+        # "I am still driving" -- no new poll, no new timer, and the same
+        # signal the reaper already trusts.
+        try:
+            from teachers import client as _tc
+
+            _tc.session_ping()
+        except Exception:
+            pass
         return {"ok": True, "session_id": session_id,
                 "idle_s": round(sessions.idle_for(session_id) or 0.0, 2)}
     return {"ok": False, "unknown_session": True, "session_id": session_id}

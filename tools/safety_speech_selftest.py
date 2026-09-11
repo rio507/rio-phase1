@@ -192,6 +192,37 @@ def t_varies():
        all(ss.check(x, ev)[0] for x in lines))
 
 
+def t_routes():
+    """The endpoints the announcement path needs still resolve to the right
+    functions.
+
+    THIS EXISTS BECAUSE OF A BUG THIS SUITE DID NOT CATCH. `_attach_phrasing`
+    was inserted directly beneath `@app.get("/vehicle/health/announcement")`,
+    so the decorator bound the ROUTE to the helper -- which takes an `issues`
+    argument and therefore answered 422 to every poll -- and left the real
+    endpoint undecorated and unreachable. Health announcements were dead for a
+    whole commit and every policy test still passed, because none of them
+    goes anywhere near the router.
+    """
+    print("\n== the routes still point at the right functions")
+    import app as rio_app
+
+    want = {
+        "/vehicle/health/announcement": "vehicle_health_announcement_endpoint",
+        "/vehicle/health/voice": "vehicle_health_voice_endpoint",
+        "/headway_voice": "headway_voice_endpoint",
+        "/headway_frame": "headway_frame_endpoint",
+    }
+    got = {}
+    for r in rio_app.app.routes:
+        path = getattr(r, "path", None)
+        if path in want:
+            got[path] = getattr(getattr(r, "endpoint", None), "__name__", "?")
+    for path, fn in want.items():
+        ok(f"{path} -> {fn}", got.get(path) == fn,
+           f"resolves to {got.get(path)!r}")
+
+
 def t_suppression():
     print("\n== the suppression rules are untouched")
     root = Path(__file__).resolve().parent.parent
@@ -213,6 +244,7 @@ def main() -> int:
     t_critical()
     t_split()
     t_honesty()
+    t_routes()
     if not a.offline:
         t_fallback()
         t_varies()

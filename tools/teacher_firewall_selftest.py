@@ -125,6 +125,18 @@ APP_TEACHER_FUNCTIONS = {
     # a reading -- asserted below, because a function that returned teacher
     # DATA from here would be a hole in rule B that rule C would not see.
     "_rio_has_the_gpu",
+    # ...AND THE SAME YIELD, SAID THE OTHER WAY. `_rio_has_the_gpu` covers an
+    # answer in progress; these two cover a live conversation being OPEN,
+    # which is the state in which one may begin at any moment. Measured: both
+    # teachers inferring costs the detector 5.8x and the whole server frame
+    # 3.3x (tools/pipeline_probe.py).
+    #
+    # One-way doors like every other entry here. `_teachers_session` passes a
+    # bool and returns None; the heartbeat calls `session_ping()`, which takes
+    # nothing and returns nothing. Neither fetches a reading, and rule E below
+    # is what holds that to be true rather than this comment.
+    "_teachers_session",
+    "session_heartbeat_endpoint",
 }
 
 # D. What none of those may reach out to. Module-level names whose appearance

@@ -4447,15 +4447,47 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  /* THE ENCODE THE REPLAY LOOP USES, and until 2026-09-11 it was the one the
+     socket transport had already been rebuilt to stop doing.
+
+     Measured on a clip (tools/pipeline_probe.py): 94.8 KB a frame at the
+     video's own resolution and q0.8, against 21.5 KB on the socket path over
+     the same road. The socket caps the long side at 640 px and walks quality
+     against a byte budget for a reason that applies identically here -- every
+     consumer works at a few hundred pixels a side: the detector letterboxes to
+     560, depth to 518, lanes to 800x320. The extra pixels are decoded by the
+     server and then thrown away, and they cost the encode, the POST and the
+     server's own JPEG decode on every frame.
+
+     Same numbers as the socket, read from the same place (rio_frames.js's
+     tuning), so there is one answer to "how big is a frame" on this page.
+
+     ONE CANVAS, REUSED. The old version allocated a fresh 1282x684 canvas per
+     frame and dropped it, which at 10 fps is a megabyte of garbage a second
+     for the collector to find during the same frame the detector is waiting on.
+
+     `quality` still overrides, because the manual grab wants a full-quality
+     still of one frame and is not in anybody's timing path. */
+  let _frameCanvas = null;
+  function frameCap() {
+    const t = (RIO.frames && RIO.frames.FALLBACK_TUNING) || {};
+    return { side: t.max_side_px || 640, q: t.quality || 0.62 };
+  }
+
   function frameFrom(el, quality) {
     return new Promise((resolve, reject) => {
       if (!el.videoWidth || !el.videoHeight) return reject(new Error('video not ready'));
-      const cv = document.createElement('canvas');
-      cv.width = el.videoWidth;
-      cv.height = el.videoHeight;
-      cv.getContext('2d').drawImage(el, 0, 0);
+      const cap = frameCap();
+      const w0 = el.videoWidth, h0 = el.videoHeight;
+      const scale = Math.min(1, cap.side / Math.max(w0, h0));
+      const w = Math.max(2, Math.round(w0 * scale));
+      const h = Math.max(2, Math.round(h0 * scale));
+      if (!_frameCanvas) _frameCanvas = document.createElement('canvas');
+      const cv = _frameCanvas;
+      if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+      cv.getContext('2d').drawImage(el, 0, 0, w, h);
       cv.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')),
-                'image/jpeg', quality || 0.8);
+                'image/jpeg', quality || cap.q);
     });
   }
 
@@ -4563,6 +4595,27 @@ document.addEventListener('DOMContentLoaded', () => {
      do it; play events cannot help it, since a seek fires one. */
   let videoStarting = false;
 
+  /* WHAT THE REPLAY LOOP COSTS, per stage.
+     The live feed is instrumented inside rio_frames.js; this loop is a
+     different path -- its own capture, its own encode, its own POST -- and so
+     it needs its own ruler. Same stage names, so one report covers both. */
+  const replayStages = { capture_interval_ms: [], encode_ms: [], push_ms: [],
+                         frame_age_ms: [], bytes: [] };
+  let replayLastCapture = null;
+  function replayNote(name, v) {
+    const a = replayStages[name];
+    if (!a || typeof v !== 'number' || !isFinite(v)) return;
+    a.push(v);
+    if (a.length > 600) a.splice(0, a.length - 600);
+  }
+  function replayBand(a) {
+    if (!a || !a.length) return { p50: null, p90: null, p99: null, n: 0 };
+    const s = a.slice().sort((x, y) => x - y);
+    const q = (f) => Math.round(s[Math.min(s.length - 1,
+                     Math.floor(f * s.length))] * 10) / 10;
+    return { p50: q(0.5), p90: q(0.9), p99: q(0.99), n: s.length };
+  }
+
   async function runVideo() {
     if (videoStarting) return;
     if (videoRunning) { videoRunning = false; return; }
@@ -4634,8 +4687,37 @@ document.addEventListener('DOMContentLoaded', () => {
         await nextVideoFrame(src);
         if (!videoRunning || preview.paused || preview.ended) break;
         const frameT = src.currentTime;
+        const tCap = performance.now();
+        if (replayLastCapture !== null) {
+          replayNote('capture_interval_ms', tCap - replayLastCapture);
+        }
+        replayLastCapture = tCap;
         const blob = await frameFrom(src);
-        await sendFrame(blob, { el: preview, frameT: frameT, capturedAt: t0 });
+        const tEnc = performance.now();
+        replayNote('encode_ms', tEnc - tCap);
+        replayNote('bytes', blob.size);
+        const jr = await sendFrame(blob, { el: preview, frameT: frameT,
+                                           capturedAt: t0 });
+        replayNote('push_ms', performance.now() - tEnc);
+        // THE SERVER'S OWN BREAKDOWN, carried up verbatim so the replay report
+        // shows the same stages the socket report does.
+        const tm = (jr && jr.timing_ms) || null;
+        if (tm) {
+          for (const k in tm) {
+            if (typeof tm[k] !== 'number') continue;
+            if (!replayStages['srv_' + k]) replayStages['srv_' + k] = [];
+            replayNote('srv_' + k, tm[k]);
+          }
+        }
+        if (jr && typeof jr.server_ms === 'number') {
+          if (!replayStages.srv_server_ms) replayStages.srv_server_ms = [];
+          replayNote('srv_server_ms', jr.server_ms);
+        }
+        // AGE AT DETECTION, on the one clock this loop has: the capture
+        // instant to the moment the result was in hand. The socket path gets
+        // this from the server via cap_t; the replay POST sends no cap_t, so
+        // nothing on the server could compute it and nothing ever did.
+        replayNote('frame_age_ms', performance.now() - tCap);
         nFrames++;
       } catch (e) { /* one bad frame must not end the run */ }
       const wait = Math.max(0, REPLAY_CADENCE_MS - (performance.now() - t0));
@@ -4889,6 +4971,10 @@ document.addEventListener('DOMContentLoaded', () => {
     startStream: startStream,
     stopStream: stopStream,
     streamStats: () => (stream ? stream.stats() : null),
+    /* The overlay reports its own cost here rather than reaching into the
+       stream, which it does not own and which may not exist -- a drive can
+       draw a /perceive result with no headway feed running at all. */
+    noteDraw: (ms) => { if (stream && stream.noteDraw) stream.noteDraw(ms); },
     unlock: unlock,
     startWatch: startWatch,
     stopWatch: stopWatch,
@@ -4908,6 +4994,22 @@ document.addEventListener('DOMContentLoaded', () => {
     resetHud: resetHud,
     cadenceMs: CADENCE_MS,
     replayCadenceMs: REPLAY_CADENCE_MS,
+    /* The replay loop's own per-stage numbers, same shape as
+       streamStats().stages so one probe can read either. */
+    replayStats: () => ({
+      capture_interval_ms: replayBand(replayStages.capture_interval_ms),
+      encode_ms: replayBand(replayStages.encode_ms),
+      push_ms: replayBand(replayStages.push_ms),
+      frame_age_ms: replayBand(replayStages.frame_age_ms),
+      bytes: replayBand(replayStages.bytes),
+      ...Object.fromEntries(Object.keys(replayStages)
+        .filter(k => k.startsWith('srv_'))
+        .map(k => [k, replayBand(replayStages[k])])),
+    }),
+    resetReplayStats: () => {
+      Object.keys(replayStages).forEach(k => { replayStages[k].length = 0; });
+      replayLastCapture = null;
+    },
     replayLeadS: REPLAY_LEAD_S,
   };
 });
@@ -5485,6 +5587,24 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function redraw() {
+    const _drawT0 = performance.now();
+    try { return redrawInner(); }
+    finally {
+      /* WHAT THE OVERLAY COSTS, reported to the frame loop that shares this
+         thread with it. A draw is not free and it is not obviously expensive,
+         which is the combination that makes it worth measuring rather than
+         assuming: in clip mode it runs against a queue of pending results and
+         a second video element, and a draw that grows steals from the next
+         capture on the same thread. */
+      try {
+        if (RIO.headway && RIO.headway.noteDraw) {
+          RIO.headway.noteDraw(performance.now() - _drawT0);
+        }
+      } catch (e) {}
+    }
+  }
+
+  function redrawInner() {
     if (!resize()) return;
     wipe();
     if (!enabled) return;

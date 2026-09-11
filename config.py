@@ -3472,7 +3472,11 @@ NAV_VERIFY_DEPTH_MIN_CONF = 0.35
 # behind a loopback HTTP service with a bounded queue, so a teacher that hangs,
 # leaks or dies takes nothing with it. See tools/teacher_firewall_selftest.py,
 # which asserts all of the above from the AST rather than from this comment.
-TEACHERS_ENABLED = True
+# ...AND IT IS A SWITCH, not a constant. A shadow feature that cannot be turned
+# off without an edit is a shadow feature nobody turns off to find out whether
+# it is the problem -- which is exactly the measurement this needed.
+TEACHERS_ENABLED = (os.getenv("RIO_TEACHERS_ENABLED", "1").strip().lower()
+                    not in ("0", "false", "no", "off"))
 
 # Where the two services listen. Loopback only -- these are not on the network,
 # they have no authentication, and they hand out model weights' opinions about
@@ -3489,6 +3493,76 @@ TEACHER_COSMOS_URL = "http://127.0.0.1:8802"
 # The FLOOR is what stops a quiet motorway producing nothing to compare: a
 # keyframe every so often whether or not anything happened.
 TEACHER_KEYFRAME_FLOOR_S = 2.0
+
+# ---------------------------------------------------------------------------
+# THE TEACHERS YIELD TO THE LIVE PIPELINE, not just to an answer
+# ---------------------------------------------------------------------------
+# MEASURED (tools/pipeline_probe.py, three conditions, same clip, same server):
+#
+#   condition                  detector   server total   frame age (camera)
+#   teachers unloaded            4.2 ms      15.7 ms         19.5 ms
+#   loaded but IDLE              4.5 ms      16.7 ms         20.1 ms
+#   loaded and INFERRING        26.2 ms      51.5 ms         55.0 ms
+#
+# Read the first two rows against each other before the third: LOADED COSTS
+# NOTHING. Nineteen gigabytes of resident weights on the same card are free
+# until something runs in them. It is the inference that costs, and it costs
+# 5.8x on the detector and 3.3x on the whole server frame.
+#
+# That matters because it says what the fix is. Unloading the teachers is not
+# it -- they would have to be reloaded, which is 45 seconds, and the corpus is
+# the point of the panel. Running them LESS, one at a time, and not at all
+# while the driver is being listened to, is.
+#
+# The existing hold (hold_gpu, entered from /ask and the realtime tool call)
+# already covers "RIO is answering". These three cover the rest.
+
+# How long between keyframes while frames are actually flowing. The floor
+# above is the idle cadence; this is the one that applies during a drive.
+#
+# 2 s was chosen when the panel was the only thing on the card. At 15 fps it
+# means a teacher pass starting every two seconds and running for hundreds of
+# milliseconds inside a pipeline whose whole frame budget is sixteen -- so the
+# detector spends a third of the drive competing with a shadow feature. Eight
+# seconds is still four keyframes a minute, which is a corpus; it is not a
+# reading every two seconds, which was a tax.
+TEACHER_KEYFRAME_FLOOR_S_LIVE = float(
+    os.getenv("TEACHER_KEYFRAME_FLOOR_S_LIVE", "8.0"))
+
+# How many teachers may be inferring AT ONCE. One.
+#
+# Two 8-10B models decoding simultaneously on the same card is the worst case
+# of the row above, and it is also unnecessary: the corpus wants both readings
+# of the same keyframe, not both at the same instant. Serialising them halves
+# the peak contention and costs only that the second reading lands later --
+# which the readings already carry an `age_s` for.
+TEACHER_MAX_CONCURRENT = int(os.getenv("TEACHER_MAX_CONCURRENT", "1"))
+
+# No new teacher work at all while a live conversation session is open.
+#
+# A session is open exactly when the driver may speak at any moment and expect
+# an answer, and every one of those answers goes through look() or the
+# reasoning path on this same card. The existing hold covers the answer itself;
+# this covers the silence before it, which is where the keyframe would
+# otherwise start a 700 ms pass that the next question then waits behind.
+TEACHER_PAUSE_DURING_SESSION = (
+    os.getenv("TEACHER_PAUSE_DURING_SESSION", "1").strip().lower()
+    not in ("0", "false", "no", "off"))
+
+# ...AND THE PAUSE EXPIRES. A session that is never closed -- a flat phone, a
+# slept laptop, a tab shut while hidden, all of which this system already has a
+# reaper for -- would otherwise pause the teachers for the life of the process
+# and write no corpus row ever again, with nothing looking broken. Anything
+# that knows a session is still open refreshes this; if nothing does, they
+# resume. Three minutes is long next to a gap in a conversation and short next
+# to a drive.
+TEACHER_SESSION_TTL_S = float(os.getenv("TEACHER_SESSION_TTL_S", "180.0"))
+
+# No frame for this long and the live pipeline is not working, so the teachers
+# may go back to the faster cadence. Same number the browser's own card uses
+# for the same judgement (rio_teachers.js FRAME_IDLE_MS), and generous next to
+# the 4-15 fps the transport runs at.
+TEACHER_FRAME_FLOW_S = float(os.getenv("TEACHER_FRAME_FLOW_S", "4.0"))
 # ...and a ceiling on how close together two keyframes may be however many
 # events fire. Without it a burst of band flapping at a junction would queue
 # faster than either model can answer, and every one of them would be dropped

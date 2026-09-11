@@ -52,6 +52,8 @@ from . import schema
 from .client import TeacherClient
 from .client import hold_gpu as _hold_gpu
 from .client import hold_status as _hold_status
+from .client import live_status as _live_status
+from .client import session_note as _session_note
 
 MODEL_NAMES = ("alpamayo1.5", "cosmos-reason2")
 
@@ -166,6 +168,46 @@ def on_frame(session_key: str, result: dict, ring) -> bool:
         return False
 
 
+# WHEN A FRAME LAST ARRIVED. Module level and deliberately crude: the question
+# is "is the live pipeline working right now", and one timestamp answers it.
+_LAST_FRAME_AT = {"t": 0.0}
+
+
+def _floor_s() -> float:
+    """How long between keyframes right now.
+
+    THE LIVE FLOOR APPLIES WHILE FRAMES ARE FLOWING, which is the state the
+    contention happens in. Measured (tools/pipeline_probe.py, same clip, same
+    server, three conditions):
+
+        teachers unloaded      detector  4.2 ms   server total 15.7 ms
+        loaded but IDLE        detector  4.5 ms   server total 16.7 ms
+        loaded and INFERRING   detector 26.2 ms   server total 51.5 ms
+
+    Loaded costs nothing; inferring costs 5.8x on the detector. At the old flat
+    2 s floor a pass started every two seconds for the whole of a drive, inside
+    a pipeline whose entire frame budget is sixteen milliseconds.
+
+    Eight seconds is still four keyframes a minute, and the EVENT triggers --
+    band change, nav maneuver, driver question, IMU jolt -- are not gated by
+    this at all. Those are the instants a corpus reviewer actually wants; the
+    floor is the "nothing happened" sampler, and nothing happening is the class
+    that can afford to be sampled less often.
+    """
+    live = float(getattr(config, "TEACHER_KEYFRAME_FLOOR_S_LIVE", 8.0))
+    idle = float(getattr(config, "TEACHER_KEYFRAME_FLOOR_S", 2.0))
+    flowing_s = float(getattr(config, "TEACHER_FRAME_FLOW_S", 4.0))
+    # RETURNED AS CONFIGURED, not max()'d against the idle floor. The first
+    # version took the larger of the two on the reasoning that the live cadence
+    # should never be faster than the idle one -- which is true of the shipped
+    # values and made the constant a lie for any others: setting the live floor
+    # to 0.4 s got 2.0 s back, silently, and the test that set it spent a while
+    # proving the panel ignored it.
+    if (time.time() - _LAST_FRAME_AT["t"]) <= flowing_s:
+        return live
+    return idle
+
+
 def _on_frame(session_key, result, ring):
     if not (_started and getattr(config, "TEACHERS_ENABLED", False)):
         return False
@@ -173,6 +215,9 @@ def _on_frame(session_key, result, ring):
         return False
     key = str(session_key or "default")
     now = time.time()
+    # THE LIVE PIPELINE IS WORKING. Set before any decision below, because the
+    # cadence that decision uses is a function of it.
+    _LAST_FRAME_AT["t"] = now
 
     with _lock:
         st = _state(key)
@@ -197,7 +242,7 @@ def _on_frame(session_key, result, ring):
         trigger = pending
     elif last_band is not None and band != last_band:
         trigger = "band"
-    elif (now - last_at) >= float(getattr(config, "TEACHER_KEYFRAME_FLOOR_S", 2.0)):
+    elif (now - last_at) >= _floor_s():
         trigger = "floor"
     if trigger is None:
         return False
@@ -625,6 +670,13 @@ def status() -> dict:
             "started": _started,
             "services": _svc(),
             "gpu_hold": _hold_status(),
+            # WHY THE TEACHERS ARE QUIET, when they are. A card that has gone
+            # still during a drive is either broken or yielding, and those look
+            # identical from outside unless one of them says so.
+            "yield": _live_status(),
+            "keyframe_floor_s": _floor_s(),
+            "frames_flowing": (time.time() - _LAST_FRAME_AT["t"]) <= float(
+                getattr(config, "TEACHER_FRAME_FLOW_S", 4.0)),
             "sessions": {k: {"keyframes": st["tally"]["keyframes"],
                              "readings": st["tally"]["readings"],
                              "seq": st["seq"]}
