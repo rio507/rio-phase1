@@ -947,3 +947,24 @@
     module.exports = root.RIO.output;
   }
 })(typeof window !== 'undefined' ? window : globalThis);
+
+/* WHERE THIS DRIVE'S PRE-RENDERED CLIPS LIVE.
+ *
+ * The clips are kept per voice (config.CLIP_DIRS) because they are the one
+ * thing in the system that cannot be re-made at the moment they are needed --
+ * they exist precisely because the tier they serve cannot pay for a round
+ * trip. So the prefix follows VOICE_BACKEND, travels with the session, and is
+ * read from one place here rather than spelled out at each of the three sites
+ * that build a clip URL.
+ *
+ * The default is the shipped path, so a page that has not seen a session yet
+ * (a preload, a test, a fallback before connect) behaves exactly as it did.
+ */
+(function (root) {
+  var base = '/static/audio/';
+  root.RIO = root.RIO || {};
+  root.RIO.clipBase = function () { return base; };
+  root.RIO.setClipBase = function (b) {
+    if (typeof b === 'string' && b) base = b;
+  };
+})(typeof window !== 'undefined' ? window : globalThis);

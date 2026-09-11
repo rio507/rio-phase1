@@ -3800,6 +3800,14 @@
           });
         }
 
+        /* The clip prefix for this voice. The realtime backend's clips are
+           the shipped set in /static/audio/, so this changes nothing today --
+           it is here so that the page reads the prefix from the session under
+           BOTH backends rather than from a literal under one of them. */
+        if (session.clip_base && root.RIO && root.RIO.setClipBase) {
+          root.RIO.setClipBase(session.clip_base);
+        }
+
         return step('voice', voiceReady, progress)
           .then(function () {
             return step('offer', pc.createOffer().then(function (offer) {

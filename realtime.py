@@ -1215,6 +1215,11 @@ def mint_client_secret() -> dict:
         # copy of the verbatim instruction that could drift from this one. What
         # RIO is told to read a warning as is decided here, once.
         "verbatim_instruction": VERBATIM_INSTRUCTION,
+        # WHERE THIS VOICE'S CLIPS ARE. See config.CLIP_DIRS: the clips are
+        # kept per voice now, and the served prefix follows VOICE_BACKEND so a
+        # backend change cannot leave the previous voice in the three lines
+        # that cannot be re-rendered at the moment they fire.
+        "clip_base": config.clip_base(),
         # WHOSE VOICE, and everything the page needs to build the mouth for it.
         # Sent with the session for the same reason the dictation and resume
         # policies are: the browser holds no second copy of a decision made in
@@ -2162,9 +2167,21 @@ def status() -> dict:
     """What the panel and /health need to know, without calling anything."""
     return {
         "enabled": bool(config.REALTIME_ENABLED),
-        "model": config.OPENAI_REALTIME_MODEL,
-        "voice": config.OPENAI_REALTIME_VOICE,
-        "reasoning_model": config.OPENAI_REASONING_MODEL,
+        # WHICH CONTROLLER THE PAGE SHOULD OPEN. The two backends speak
+        # different event dialects and connect through different endpoints, so
+        # the browser has to know before it starts rather than discover it from
+        # a failure. Decided in config.py, read here, chosen once per drive.
+        "voice_backend": config.VOICE_BACKEND,
+        "model": (config.GPT_LIVE_MODEL
+                  if config.VOICE_BACKEND == "gpt_live"
+                  else config.OPENAI_REALTIME_MODEL),
+        "realtime_model": config.OPENAI_REALTIME_MODEL,
+        "voice": (config.GPT_LIVE_VOICE if config.VOICE_BACKEND == "gpt_live"
+                  else config.OPENAI_REALTIME_VOICE),
+        "reasoning_model": (config.GPT_LIVE_BACKEND_MODEL
+                            if config.VOICE_BACKEND == "gpt_live"
+                            else config.OPENAI_REASONING_MODEL),
+        "guards": config.guards(),
         "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME,
                   NAV_DIRECTIONS_TOOL_NAME, PLACES_TOOL_NAME,
                   VEHICLE_TOOL_NAME, NAVIGATE_TOOL_NAME,

@@ -21,6 +21,14 @@
 (function () {
   'use strict';
 
+  /* The clip prefix for the voice this drive is actually using. One accessor
+     rather than a literal at each site: see RIO.clipBase in rio_output.js. */
+  function clipBase() {
+    var r = (typeof window !== 'undefined' ? window : globalThis).RIO;
+    return (r && r.clipBase) ? r.clipBase() : '/static/audio/';
+  }
+
+
   window.RIO = window.RIO || {};
 
   /* ---------------------------------------------------------------------
@@ -174,7 +182,7 @@
     function clipElement(id) {
       if (!clipEls[id]) {
         try {
-          var a = new Audio('/static/audio/' + id + '.mp3');
+          var a = new Audio(clipBase() + id + '.mp3');
           a.preload = 'auto';
           clipEls[id] = a;
           if (unlocked) unlockOne(a);
@@ -268,7 +276,7 @@
       return RIO.speak.provider({
         text: candidate.text || '',
         channel: 'nav',
-        clipUrl: clipId ? '/static/audio/' + clipId + '.mp3' : null,
+        clipUrl: clipId ? clipBase() + clipId + '.mp3' : null,
         clipFirst: !!clipId,
         clipElement: clipId ? clipElement(clipId) : null,
         // WHICH TIER THIS IS, and it decides how long the line waits for her

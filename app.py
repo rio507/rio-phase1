@@ -677,6 +677,71 @@ def realtime_session_endpoint(session_id: str = Query(default=None)):
     return out
 
 
+@app.post("/live/session")
+def live_session_endpoint(body: dict = Body(...),
+                          session_id: str = Query(default=None)):
+    """One gpt-live-1 session, negotiated on the browser's behalf.
+
+    WHY THE SERVER IS IN THE MIDDLE HERE AND IS NOT FOR gpt-realtime. The
+    realtime path mints an ephemeral secret and lets the browser negotiate
+    directly. The live endpoint takes the session configuration and the SDP
+    offer in ONE request, so the only way to keep the account key out of the
+    browser is to make that request from here.
+
+    What it costs is a single extra hop on connect, once per drive. It is not
+    on the audio path: the media still flows browser-to-OpenAI over the
+    connection this call sets up.
+
+    The browser POSTs {sdp} and gets back {sdp, ...the same policy the realtime
+    session carries}. Everything in that second half is read from config.py so
+    the page holds no second copy of a decision -- including which of the four
+    guards it should be running, which is a per-backend measurement and not a
+    thing a browser should be inferring for itself.
+    """
+    if not config.REALTIME_ENABLED:
+        return {"error": "live conversation is switched off", "enabled": False}
+    offer = (body or {}).get("sdp")
+    if not offer:
+        return {"error": "no SDP offer", "enabled": True}
+    try:
+        import live
+
+        got = live.negotiate(offer)
+    except Exception as e:
+        print(f"[live] session negotiate failed: {type(e).__name__}: {e}",
+              flush=True)
+        sessions.log_live(session_id, "session_failed",
+                          {"error": f"{type(e).__name__}", "backend": "gpt_live"})
+        return {"error": f"could not start a live session: {type(e).__name__}",
+                "enabled": True}
+    if not got.get("ok"):
+        print(f"[live] session refused: {got.get('status')} "
+              f"{got.get('error')}", flush=True)
+        sessions.log_live(session_id, "session_failed",
+                          {"error": got.get("error"), "backend": "gpt_live"})
+        return {"error": got.get("error"), "enabled": True}
+    out = dict(live.client_config())
+    out["sdp"] = got["sdp"]
+    out["session_id"] = got.get("session_id")
+    out["expires_at"] = got.get("expires_at")
+    out["enabled"] = True
+    sessions.log_live(session_id, "session_started",
+                      {"model": out["model"], "voice": out["voice"],
+                       "backend": "gpt_live",
+                       "backend_model": out["backend_model"]})
+    # The same head start the realtime path gives the observer, for the same
+    # reason: "what do you see" is asked early and the answer takes a second
+    # to have ready.
+    try:
+        import observer
+
+        observer.start(_visual_key(session_id))
+    except Exception as e:
+        print(f"[live] observer not started: {type(e).__name__}: {e}",
+              flush=True)
+    return out
+
+
 @app.get("/realtime/status")
 def realtime_status_endpoint():
     """What the live path is doing, read-only.

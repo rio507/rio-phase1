@@ -929,12 +929,350 @@ OPENAI_REASONING_EFFORT = "none"
 # slightly different voice is a much smaller thing than a warning that does
 # not arrive, so "nothing on the active path" means exactly that and not
 # "nothing anywhere".
+#   "gpt_live"         RIO's voice is a gpt-live-1 session, and her THINKING
+#                      is not. gpt-live-1 is a front end: it listens, speaks,
+#                      and hands every question that needs a tool or a thought
+#                      to a backend text model over Responses delegation. So
+#                      this backend is the only one of the three where "the
+#                      model" is two models, and the split is the point --
+#                      turn-taking and prosody belong to the voice layer, tool
+#                      discipline and brevity to the backend. See live.py.
 VOICE_BACKEND = os.getenv("VOICE_BACKEND", "openai_realtime")
 # "realtime" was what this setting called the live voice before ElevenLabs came
 # back. Old .env files and old shell exports still say it, and a car that comes
 # up mute because a value was renamed is a bad trade for a tidier vocabulary.
 if VOICE_BACKEND == "realtime":
     VOICE_BACKEND = "openai_realtime"
+# ...and the same courtesy for the new one, which people will type both ways.
+if VOICE_BACKEND in ("gpt-live", "gptlive", "live"):
+    VOICE_BACKEND = "gpt_live"
+
+# A BACKEND NAME THAT IS NOT ONE OF THE THREE IS A MUTE CAR, and it fails here
+# rather than at the first warning. The old code accepted anything and let the
+# page discover it had no mouth; a typo in an .env is worth a line on stderr at
+# boot and the shipped default, not a silent drive.
+VOICE_BACKENDS = ("openai_realtime", "gpt_live", "elevenlabs")
+if VOICE_BACKEND not in VOICE_BACKENDS:
+    print(f"[config] VOICE_BACKEND={VOICE_BACKEND!r} is not one of "
+          f"{VOICE_BACKENDS}; falling back to openai_realtime", flush=True)
+    VOICE_BACKEND = "openai_realtime"
+
+# ---------------------------------------------------------------------------
+# gpt-live-1: THE VOICE THAT DOES NOT THINK
+# ---------------------------------------------------------------------------
+# The other two backends put one model in front of the driver. This one puts
+# two, and the whole reason to want it is the seam between them.
+#
+# gpt-live-1 is FULL DUPLEX: it listens while it speaks, which is what a
+# person does and what neither of the other backends can do. It has no tools,
+# no memory of the car, and no opinion about tire pressure. When a question
+# needs any of that it raises a DELEGATION, and a backend text model answers
+# it -- over Responses delegation, where OpenAI runs the loop and this server
+# executes the functions.
+#
+# WHAT THAT COSTS US ARCHITECTURALLY, stated up front because it is the real
+# trade and not a detail: the deterministic path stops being a dictation and
+# becomes a REQUEST. gpt-realtime takes a response.create with the exact words
+# and says them; gpt-live-1 has no such event. The nearest thing is
+# session.commentary.append, which the model is trained to PARAPHRASE, and
+# which the docs say may be ignored entirely. Measured on the real API it is
+# very nearly verbatim -- see GPT_LIVE_VERBATIM_* below for the number and for
+# what is done about the cases where it is not.
+GPT_LIVE_MODEL = os.getenv("GPT_LIVE_MODEL", "gpt-live-1")
+
+# HER VOICE, under this backend. Gleam: North American English, and the one
+# chosen because it is the one the clips can also be rendered in -- see
+# tools/live_render.py. A voice that the live session can speak but nothing
+# else can produce would make "one voice everywhere" false the first time a
+# clip played, which is the failure this constant exists to avoid.
+#
+# NOT changeable mid-session. The API refuses it and so does the argument:
+# a drive that changes speaker halfway through is the thing the whole
+# one-voice design is built to prevent.
+GPT_LIVE_VOICE = os.getenv("GPT_LIVE_VOICE", "gleam")
+
+# WHO DOES THE THINKING, and it was chosen by measurement rather than by the
+# documentation's recommendation. tools/live_backend_bench.py, RIO's own nine
+# tool schemas and eleven scripted utterances, nine trials each:
+#
+#   model            routed      first-token p50   p95      $/M in   $/M out
+#   gpt-5.6-terra    31/33              832 ms    1663 ms     2.00     12.00
+#   gpt-5.6-luna     33/33              816 ms    1923 ms     0.20      1.20
+#   gpt-5.6-sol      33/33             1143 ms    2520 ms     5.00     30.00
+#
+# Luna: it routed every utterance correctly, it was the fastest to first
+# token, and it is a TENTH of Terra's price. The documentation calls Terra the
+# primary recommendation and Luna "the cost-sensitive alternative", and on
+# RIO's actual tool surface that ranking does not survive being measured --
+# Terra's two misses were both "how far is it to the Getty", answered with
+# find_places, which is the near-neighbour confusion this bench exists to
+# catch.
+#
+# WHAT TERRA IS BETTER AT, because it is not nothing: the tail. 1663 ms
+# against 1923. This file cares about p95 more than most (see the turn-end
+# measurements above) and a 260 ms worse tail is a real cost. It is not worth
+# ten times the price and two routing misses, and the switch is one env var if
+# a drive disagrees with the bench.
+GPT_LIVE_BACKEND_MODEL = os.getenv("GPT_LIVE_BACKEND_MODEL", "gpt-5.6-luna")
+
+# How the thinking is reached. "responses" lets OpenAI run the backend loop and
+# hand us the function calls; "client" would make this server own the whole
+# path. Responses, because RIO's tools are already HTTP handlers and the loop
+# is the part worth not writing twice.
+GPT_LIVE_DELEGATION = os.getenv("GPT_LIVE_DELEGATION", "responses")
+
+# ---------------------------------------------------------------------------
+# VERBATIM, WHICH IS NOW A MEASUREMENT AND NOT A GUARANTEE
+# ---------------------------------------------------------------------------
+# Under openai_realtime a dictated line is exact by construction: response.create
+# carries the words and the model reads them. gpt-live-1 has no such event, and
+# the API documents no verbatim mechanism at all. So exactness here is a
+# property that had to be FOUND, and the first place it was looked for did not
+# have it.
+#
+# THE WRONG EVENT, AND WHY IT LOOKED RIGHT. session.commentary.append is the
+# one whose whole job is "here is something to say", and the documentation's
+# description of it is exact: information for the model to vocalize, WHICH IT
+# MAY PARAPHRASE. Measured on RIO's own lines (tools/live_verbatim_bench.py),
+# three trials each, it paraphrased 12 of 21:
+#
+#   "In half a mile, turn right onto Ocean Avenue."
+#     -> "Half a mile up, take a right on Ocean Avenue."
+#   "In 300 feet, turn right onto Ocean Avenue."
+#     -> "About 300 feet, take a right onto Ocean Avenue."
+#   "I've lost the sensor on the rear right tire - that corner's dark to me
+#    while we're moving."
+#     -> "Hey- I'm blind on the rear right tire sensor right now, so if you..."
+#
+# Read the second one carefully, because it is the one that decides this: ABOUT
+# 300 FEET IS A HEDGE ADDED TO A DISTANCE THE POLICY STATED EXACTLY. The third
+# drops "while we're moving", which is the qualifier that makes the sentence
+# true rather than alarming. Neither is a paraphrase of the kind a passenger
+# makes; both change what was claimed.
+#
+# THE RIGHT EVENT. session.instructions.append is a DIRECTIVE rather than
+# material, and the live-conversations guide gives it with exactly this use --
+# "Immediately say the following disclosure exactly...". Re-measured on the
+# same lines, the same three trials each: 21 of 21, including the two long
+# health announcements that commentary got wrong every single time.
+#
+# So deterministic speech goes through instructions.append and conversation
+# goes through commentary.append. See live.verbatim_event.
+#
+# IT IS STILL NOT A CONTRACT, and the fallback chain still matters. A directive
+# that is obeyed is not the same thing as an API that guarantees. The lines
+# where being wrong is dangerous -- the red headway tier, the two tire
+# fast-path lines, the imminent turn call -- do not go through the model at all
+# under ANY backend: they play a pre-rendered clip from static/audio/, with no
+# network in the path, and under this backend those clips are rendered in Gleam
+# (tools/render_alerts.py --backend gpt_live) so the voice still matches.
+GPT_LIVE_VERBATIM_INSTRUCTION = (
+    "When you are told to say something exactly, reproduce it word for word. "
+    "Do not rephrase it, do not add to it, do not introduce it.")
+
+# ---------------------------------------------------------------------------
+# WHAT VERBATIM COSTS IN MILLISECONDS, AND WHO PAYS IT
+# ---------------------------------------------------------------------------
+# The directive that buys exactness is not free. Measured on the same bench,
+# the same lines, three trials each:
+#
+#   mechanism                        verbatim    append -> first audio
+#   session.commentary.append          9/21      p50  758 ms   p95  883 ms
+#   session.instructions.append       21/21      p50 1324 ms   p95 2317 ms
+#
+# So the right words arrive about 570 ms later at the median and 1.4 s later
+# at the tail. That is a real cost and it lands on a real deadline: the
+# per-channel budgets below were cut against gpt-realtime's 390-585 ms, and a
+# budget of 900 ms in front of a p50 of 1324 does not mean "say it the other
+# way if something goes wrong", it means "say it the other way every time".
+#
+# A FLOOR, AND NOT A UNIFORM ONE, because the channels do not agree about what
+# being late costs them:
+#
+#   nav      2400 ms. The calls that reach dictation are the ones issued with
+#            room in front of the maneuver; the imminent call at the junction
+#            does not reach it at all, because that one plays its clip FIRST
+#            and keeps dictation underneath as the contingency (rio_speak.js,
+#            clipFirst). So nav can afford to wait for her own voice.
+#   health   2400 ms. An announcement about the car, not an alert. The two
+#            genuinely urgent tire lines are clips and no number here touches
+#            them.
+#   headway  1200 ms, UNCHANGED, and this is the one that must not be raised.
+#            Its arbiter item carries a 2500 ms TTL -- a gap measured three
+#            seconds ago is not a gap -- and the budget plus the fallback has
+#            to fit inside that. A calm coaching line arriving in a slightly
+#            different voice is a small thing; the same line arriving after the
+#            gap it describes has closed is a wrong thing.
+#
+# THE TRADE THIS ENCODES, stated plainly: nav and health buy one voice with up
+# to 2.4 seconds of patience, and headway buys timeliness with the risk of a
+# second voice. Both of those are the argument the per-channel table has always
+# made, applied to a slower mouth.
+GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS = int(
+    os.getenv("GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS", "2400"))
+
+GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS_BY_CHANNEL = {
+    "nav": GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS,
+    "health": GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS,
+    # Bounded by the TTL on its own arbiter item, not by this mechanism.
+    "headway": 1200,
+}
+
+
+def speak_timeout_floor_ms(channel: str = None) -> int:
+    """The minimum a deterministic line gets, whatever its channel asked for.
+
+    Zero on the backends whose dictation is fast enough that the per-channel
+    table means what it says.
+    """
+    if VOICE_BACKEND != "gpt_live":
+        return 0
+    return int(GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS_BY_CHANNEL.get(
+        channel, GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS))
+
+
+def speak_timeout_floors() -> dict:
+    """The whole table, as the page receives it with the session."""
+    if VOICE_BACKEND != "gpt_live":
+        return {}
+    return dict(GPT_LIVE_SPEAK_TIMEOUT_FLOOR_MS_BY_CHANNEL)
+
+
+# ---------------------------------------------------------------------------
+# THE FOUR GUARDS, AND WHICH OF THEM THIS MODEL MAKES UNNECESSARY
+# ---------------------------------------------------------------------------
+# The echo gate, the sustained-speech barge-in rule, fragment coalescing and
+# the phantom-supersede rule were all built against gpt-realtime, and the
+# claim on gpt-live-1 is that it handles noise, silence and interruption
+# natively -- +30pp on Full Duplex Bench. If that is true here, some of this
+# is now dead weight in the path.
+#
+# IT WAS MEASURED RATHER THAN BELIEVED, and the answer is not the one the
+# benchmark implies. Each guard below carries its own evidence.
+#
+# NOTHING IS DELETED. Every guard keeps its code, its tests and its constants;
+# this decides only whether it RUNS. A bench is not a cabin, and the first
+# drive that disagrees with one of these numbers needs a flag, not a revert.
+def _guard(name: str, default_on: bool) -> bool:
+    """One guard's switch: env wins, else the per-backend measurement."""
+    raw = os.getenv(f"RIO_GUARD_{name.upper()}")
+    if raw is not None:
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return default_on
+
+
+_LIVE = VOICE_BACKEND == "gpt_live"
+
+# ECHO GATE -- STAYS ON. THIS IS THE ONE THE BENCHMARK IS WRONG ABOUT.
+#
+# MEASURED (tools/live_echo_probe.py): RIO's own voice, played back into the
+# session's microphone the way a phone speaker plays it back into a phone
+# microphone, was transcribed as the driver and ANSWERED. Eight trials from
+# 0 dB down to -20 dB of attenuation, on both her live voice and a
+# pre-rendered clip. She heard "Back off now", decided the driver had said it,
+# and replied "Okay, I'll give you space."
+#
+# WHY THE MODEL IS NOT AT FAULT AND THE GATE IS STILL NEEDED: full duplex
+# means it listens while it speaks ON PURPOSE, so it cannot treat everything
+# that arrives during its own turn as noise. Its own WebRTC audio is cancelled
+# by the browser's echo canceller, which has a reference for it. The lines
+# that come back into the microphone here are the ones the canceller has NO
+# reference for -- a pre-rendered clip and the TTS fallback are ordinary media
+# playback -- and that is exactly what config's barge-in note says broke the
+# phone in the first place. A new conversation model does not change what a
+# loudspeaker does to a microphone eight inches away.
+GUARD_ECHO_GATE = _guard("echo_gate", True)
+
+# SUSTAINED-SPEECH BARGE-IN -- OFF FOR THE CONVERSATION, ON FOR THE REST.
+#
+# Not because the model is better at it, but because under this backend the
+# rule has nothing to act on. The gate is built on
+# `input_audio_buffer.speech_started` and it acts by sending `response.cancel`;
+# gpt-live-1 emits neither event and accepts neither command. The model
+# decides when to stop talking, which is the whole point of full duplex, and
+# there is no client-side veto to hold open.
+#
+# WHAT IT STILL GUARDS, and why this is a switch rather than a deletion: the
+# deterministic path is still ours. A clip and a TTS line are played by the
+# page, through the page's own audio element, and the page still decides
+# whether a noise during one of them should stop it. That half stays on under
+# every backend -- see GUARD_ECHO_GATE, which is what actually protects it.
+GUARD_BARGE_SUSTAIN = _guard("barge_sustain", not _LIVE)
+
+# FRAGMENT COALESCING -- OFF. STRUCTURALLY, NOT BY PREFERENCE.
+#
+# Coalescing joins two COMMITTED utterances that the transcript shows are one
+# sentence. gpt-live-1 has no commits: audio streams continuously, the
+# migration guide's first instruction is to remove the manual commit, and
+# transcripts arrive as revisable overlapping deltas rather than as finished
+# turns. There is no second fragment to join to a first, because the thing
+# that produced two fragments -- a turn detector ending a turn on a pause --
+# is not in the path any more.
+#
+# This is the guard the Full Duplex Bench claim is actually about, and it is
+# also the one that needed the least deciding: the code has no events to run on.
+GUARD_FRAGMENT_COALESCE = _guard("fragment_coalesce", not _LIVE)
+
+# PHANTOM SUPERSEDE -- OFF FOR THE CONVERSATION, SAME REASONING.
+#
+# The rule is "a transcript may only supersede the answer in progress if the
+# barge gate confirmed it", and it exists because RIO's own greeting came back
+# through an iPhone speaker and cancelled her mid-sentence, thirty-six times
+# in two sessions. Superseding means cancelling a response, and there is no
+# response to cancel: gpt-live-1 owns its own turn.
+#
+# THE ARBITER'S PRIORITIES ARE NOT THIS AND ARE UNCHANGED. What gets announced
+# and in what order is static/rio_speech.js, it is deterministic, and no
+# backend has ever had a vote in it.
+GUARD_PHANTOM_SUPERSEDE = _guard("phantom_supersede", not _LIVE)
+
+
+# ---------------------------------------------------------------------------
+# WHERE THE PRE-RENDERED CLIPS FOR *THIS* VOICE LIVE
+# ---------------------------------------------------------------------------
+# THE PROBLEM A SINGLE DIRECTORY HAS, now that there are three backends: the
+# clips are the one thing in the system that cannot be re-made at the moment
+# they are needed. They are rendered offline precisely because the tier they
+# serve cannot pay for a round trip -- so the day VOICE_BACKEND changes, the
+# files on disk are still in the previous voice, and the most important lines
+# RIO says come out of a different mouth from everything around them.
+#
+# The old answer was a manifest and a preflight warning, which is honest and
+# does not fix anything: it tells you the drive you are about to take has two
+# voices in it.
+#
+# So the clips are kept PER VOICE, and the served path follows the config.
+# static/audio/ stays exactly where it was -- that is the marin set, shipped,
+# and nothing about the default backend changes -- and a new voice renders
+# alongside it rather than over it. Switching backends is then a config change
+# and a restart, with no render in the path and no window where the files and
+# the session disagree.
+CLIP_DIRS = {
+    # The shipped set, in the live session's own voice. Unmoved on purpose:
+    # every preloaded <audio> element and every test that names a clip path
+    # keeps working.
+    "openai_realtime": "/static/audio/",
+    "gpt_live": "/static/audio/gleam/",
+    # ElevenLabs renders its own; it has always shared the default directory
+    # and nothing here changes that.
+    "elevenlabs": "/static/audio/",
+}
+
+
+def clip_base() -> str:
+    """The URL prefix the page should build clip URLs from."""
+    return CLIP_DIRS.get(VOICE_BACKEND, "/static/audio/")
+
+
+def guards() -> dict:
+    """The four switches, as the page receives them with the session."""
+    return {
+        "echo_gate": bool(GUARD_ECHO_GATE),
+        "barge_sustain": bool(GUARD_BARGE_SUSTAIN),
+        "fragment_coalesce": bool(GUARD_FRAGMENT_COALESCE),
+        "phantom_supersede": bool(GUARD_PHANTOM_SUPERSEDE),
+    }
+
 
 # The one thing that does not vary WHEN ELEVENLABS IS THE VOICE. Every
 # ElevenLabs path below — the dialogue socket, the deterministic lines, the

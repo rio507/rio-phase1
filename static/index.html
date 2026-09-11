@@ -3126,6 +3126,38 @@ async function toggleLive() {
    * connects is not a thing this page can survive -- both would hold a
    * microphone, and handle.stop() ends with `element.srcObject = null` on the
    * one shared player, so tearing the first down would silence the second. */
+  /* WHICH CONTROLLER OPENS THIS DRIVE.
+   *
+   * Two backends, two event dialects, two endpoints -- and the page must know
+   * which before it starts rather than discover it from a failure. The server
+   * says, once, from config.VOICE_BACKEND; the answer is cached for the life
+   * of the page because it cannot change without a restart (config.py says why
+   * the choice is config-plus-restart and not a runtime toggle).
+   *
+   * A status call that fails does NOT fail the connect: it falls back to the
+   * realtime controller, which is the shipped path and the one that was there
+   * before any of this. A drive that starts on the previous backend is a much
+   * smaller thing than a drive that does not start.
+   */
+  let voiceBackendPromise = null;
+  function voiceBackend() {
+    if (!voiceBackendPromise) {
+      voiceBackendPromise = fetch(RIO.url('/realtime/status'))
+        .then((r) => r.json())
+        .then((s) => s.voice_backend || 'openai_realtime')
+        .catch(() => 'openai_realtime');
+    }
+    return voiceBackendPromise;
+  }
+
+  async function voiceConnect(opts) {
+    const backend = await voiceBackend();
+    if (backend === 'gpt_live' && RIO.live && RIO.live.connect) {
+      return RIO.live.connect(opts);
+    }
+    return RIO.realtime.connect(opts);
+  }
+
   if (liveBusy) {
     liveGen++;
     setMicState('idle');
@@ -3138,7 +3170,7 @@ async function toggleLive() {
   const gen = ++liveGen;
   let connectStep = 'starting';
   try {
-    live = await RIO.realtime.connect({
+    live = await voiceConnect({
       arbiter: RIO.speech,
       url: RIO.url,
       element: player,
@@ -5710,6 +5742,12 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_speech.js"></script>
 <script src="/static/rio_voice_eleven.js"></script>
 <script src="/static/rio_realtime.js"></script>
+<!-- The gpt-live-1 controller. Loaded alongside rather than instead of the
+     realtime one: VOICE_BACKEND decides which connects (see voiceConnect
+     below), and the losing branch costs a parse and nothing else. Keeping both
+     in the page is what makes gpt-realtime-2.1 a FALLBACK TIER rather than a
+     revert -- switching back is a config change and a restart, not a build. -->
+<script src="/static/rio_live.js"></script>
 <script src="/static/rio_speak.js"></script>
 <script src="/static/rio_frames.js"></script>
 <!-- THE ENCODER WORKER'S URL, STAMPED LIKE EVERY OTHER ASSET.

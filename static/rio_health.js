@@ -28,6 +28,14 @@
 (function (root) {
   'use strict';
 
+  /* The clip prefix for the voice this drive is actually using. One accessor
+     rather than a literal at each site: see RIO.clipBase in rio_output.js. */
+  function clipBase() {
+    var r = (typeof window !== 'undefined' ? window : globalThis).RIO;
+    return (r && r.clipBase) ? r.clipBase() : '/static/audio/';
+  }
+
+
   /* Only used when the fetch itself failed — the real cadence always comes from
      the payload's poll_ms (config.HEALTH_POLL_MS), which we do not have when the
      request never landed. Same shape as rio_vehicle.js's RETRY_MS. */
@@ -96,7 +104,7 @@
        start in time. The arbiter item around it is unchanged: still P2, still
        group "health", still pre-empted by a gap warning. */
     var clip = (ann.audio && ann.audio !== 'tts')
-      ? '/static/audio/' + ann.audio + '.mp3' : null;
+      ? clipBase() + ann.audio + '.mp3' : null;
     var source = RIO.speak.provider({
       text: ann.text || '',
       channel: 'health',

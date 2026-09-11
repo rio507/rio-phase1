@@ -29,3 +29,7 @@ static/recordings/
 # once and cached so every run measures against the same recording; it is a
 # derived artifact, not a fixture, and re-makes itself on a fresh checkout.
 tools/_driver_*.pcm
+
+# Cached driver audio for the live benches. Synthesised on demand and
+# deterministic per question; there is no reason to carry it in the repo.
+tools/_live_cache/

@@ -229,8 +229,17 @@
     var element = opts.element;
     var current = null;
     var stopped = false;
-    var live = (root.RIO && root.RIO.realtime && root.RIO.realtime.active) ?
-               root.RIO.realtime.active() : null;
+    /* WHICHEVER BACKEND IS ACTUALLY OPEN. There is one live session per
+       drive and only one, but which module holds it depends on VOICE_BACKEND:
+       rio_realtime.js under gpt-realtime, rio_live.js under gpt-live-1. Asked
+       for by capability rather than by name so a warning fires from a code
+       path that has never heard of either. */
+    var live = (function () {
+      var r = root.RIO || {};
+      var h = (r.realtime && r.realtime.active) ? r.realtime.active() : null;
+      if (h) return h;
+      return (r.live && r.live.active) ? r.live.active() : null;
+    })();
     var dictate = !!(text() && live && live.speak &&
                      (!live.speechEnabled || live.speechEnabled(opts.channel)));
     /* Did her voice actually open its mouth for this line? Set from the

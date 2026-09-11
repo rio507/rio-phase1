@@ -1,0 +1,145 @@
+{
+  "clips": {
+    "back_off": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 17493,
+      "model": "gpt-live-1",
+      "sha1": "44f0841ff688",
+      "voice": "gleam"
+    },
+    "keep_left": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 11661,
+      "model": "gpt-live-1",
+      "sha1": "74071647ee2e",
+      "voice": "gleam"
+    },
+    "keep_right": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 11805,
+      "model": "gpt-live-1",
+      "sha1": "cd95ebbcd6ba",
+      "voice": "gleam"
+    },
+    "left_at_the_roundabout": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 22029,
+      "model": "gpt-live-1",
+      "sha1": "b6ee1c254c78",
+      "voice": "gleam"
+    },
+    "make_a_u_turn": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 15885,
+      "model": "gpt-live-1",
+      "sha1": "1953dd1d13c7",
+      "voice": "gleam"
+    },
+    "merge": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 11517,
+      "model": "gpt-live-1",
+      "sha1": "c6262d84d59b",
+      "voice": "gleam"
+    },
+    "merge_left": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 11541,
+      "model": "gpt-live-1",
+      "sha1": "1a89b938dae2",
+      "voice": "gleam"
+    },
+    "merge_right": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 9405,
+      "model": "gpt-live-1",
+      "sha1": "909d578b37f9",
+      "voice": "gleam"
+    },
+    "right_at_the_roundabout": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 19533,
+      "model": "gpt-live-1",
+      "sha1": "aea1c97f9101",
+      "voice": "gleam"
+    },
+    "take_the_exit": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 12525,
+      "model": "gpt-live-1",
+      "sha1": "8af2c3c8df72",
+      "voice": "gleam"
+    },
+    "this_one": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 10941,
+      "model": "gpt-live-1",
+      "sha1": "75bed6a74079",
+      "voice": "gleam"
+    },
+    "tire_critical": {
+      "at": 1789148982.8,
+      "backend": "gpt_live",
+      "bytes": 64557,
+      "model": "gpt-live-1",
+      "sha1": "342a720ec538",
+      "voice": "gleam"
+    },
+    "tire_sensor_lost": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 82605,
+      "model": "gpt-live-1",
+      "sha1": "aec22a8f6414",
+      "voice": "gleam"
+    },
+    "too_close": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 14517,
+      "model": "gpt-live-1",
+      "sha1": "15cc17abf6f1",
+      "voice": "gleam"
+    },
+    "turn_left": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 14277,
+      "model": "gpt-live-1",
+      "sha1": "c4a0e318f25e",
+      "voice": "gleam"
+    },
+    "turn_right": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 8901,
+      "model": "gpt-live-1",
+      "sha1": "79e3160a4e07",
+      "voice": "gleam"
+    },
+    "watch_distance": {
+      "at": 1789150282.1,
+      "backend": "gpt_live",
+      "bytes": 17373,
+      "model": "gpt-live-1",
+      "sha1": "2b8fb404905a",
+      "voice": "gleam"
+    }
+  },
+  "voice": {
+    "backend": "gpt_live",
+    "model": "gpt-live-1",
+    "voice": "gleam"
+  }
+}

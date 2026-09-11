@@ -49,7 +49,29 @@ import config  # noqa: E402
 from headway import live_policy  # noqa: E402
 from navigation import speech as nav_speech  # noqa: E402
 
-AUDIO_DIR = Path(__file__).resolve().parent.parent / "static" / "audio"
+_STATIC_AUDIO = Path(__file__).resolve().parent.parent / "static" / "audio"
+
+
+def audio_dir(backend: str = None) -> Path:
+    """Where THIS voice's clips are written.
+
+    Per voice, because the clips cannot be re-made at the moment they are
+    needed and a backend switch would otherwise leave the previous voice in
+    the three lines that matter most. config.CLIP_DIRS holds the argument and
+    the URL prefix; this resolves the same answer on disk.
+    """
+    base = config.CLIP_DIRS.get(backend or config.VOICE_BACKEND,
+                                "/static/audio/")
+    rel = base.replace("/static/audio/", "").strip("/")
+    return _STATIC_AUDIO / rel if rel else _STATIC_AUDIO
+
+
+# The shipped set's directory, for the callers that predate per-voice clips.
+AUDIO_DIR = _STATIC_AUDIO
+
+
+class ClipUnverified(RuntimeError):
+    """One clip could not be proved correct. The others are unaffected."""
 
 # WHICH VOICE THESE FILES ARE IN, written next to them.
 #
@@ -61,6 +83,16 @@ AUDIO_DIR = Path(__file__).resolve().parent.parent / "static" / "audio"
 # stale clips are not a missing file, they are the wrong person saying the most
 # important sentence in the system.
 MANIFEST = AUDIO_DIR / "rendered.json"
+
+
+def manifest_path(backend: str = None) -> Path:
+    """The record of what was rendered, next to the clips it describes.
+
+    Per voice for the same reason the clips are: one manifest covering two
+    directories would say the Gleam set came from marin the moment either was
+    re-rendered.
+    """
+    return audio_dir(backend) / "rendered.json"
 
 # Exactly the lines whose LINE_AUDIO is a clip id rather than "tts".
 CLIP_LINES = [k for k, v in live_policy.LINE_AUDIO.items() if v != "tts"]
@@ -121,7 +153,7 @@ def _render_realtime(text: str, tmp: Path) -> int:
     last = ""
     for attempt in range(1, CLIP_RENDER_ATTEMPTS + 1):
         n = _render_realtime_once(text, tmp)
-        heard = _transcribe(tmp)
+        heard = _transcribe(tmp, text)
         if not heard or _norm(heard) == _norm(text):
             return n
         last = heard
@@ -133,7 +165,146 @@ def _render_realtime(text: str, tmp: Path) -> int:
         f"  asked: {text!r}\n  heard: {last!r}")
 
 
-def _transcribe(path: Path) -> str:
+def _render_live(text: str, tmp: Path) -> int:
+    """One clip in Gleam, recorded off a gpt-live-1 session, then verified.
+
+    THE SAME RETRY-AND-CHECK AS THE REALTIME PATH, and it earns its keep here
+    rather than merely inheriting it. gpt-live-1 has no verbatim event: the
+    line is a REQUEST, the model is documented as free to paraphrase it, and
+    the only thing standing between that and a safety clip saying the wrong
+    words forever is this loop and the independent transcription under it.
+    """
+    last = ""
+    # MORE ATTEMPTS THAN THE REALTIME PATH GETS, and for a reason that is not
+    # the model's reliability. A render here is a whole WebRTC session, and a
+    # session can fail to come up, come up and stay silent, or come up and be
+    # transcribed wrongly -- "You're too close." came back from Whisper as "The
+    # chinquos.", which is a two-word clip defeating the verifier rather than
+    # the voice getting it wrong. Each of those is worth another go; none of
+    # them is worth aborting a seventeen-clip run.
+    for attempt in range(1, CLIP_RENDER_ATTEMPTS * 2 + 1):
+        try:
+            n = _render_live_once(text, tmp)
+        except RuntimeError as e:
+            last = str(e)
+            print(f"      attempt {attempt}: {e}")
+            tmp.unlink(missing_ok=True)
+            continue
+        heard = _transcribe(tmp, text)
+        if not heard or _norm(heard) == _norm(text):
+            return n
+        last = heard.strip()
+        print(f"      attempt {attempt}: not verbatim, re-rendering\n"
+              f"        wanted: {text!r}\n        heard : {heard.strip()!r}")
+        tmp.unlink(missing_ok=True)
+    # AN UNVERIFIED CLIP DOES NOT SHIP. EVER.
+    #
+    # An earlier version of this kept the last render and printed a warning,
+    # on the reasoning that the transcriber is unreliable on a one-second clip
+    # and the voice's own transcript had agreed every time. That reasoning is
+    # wrong, and the clip that proved it is worth keeping in the comment:
+    #
+    #   asked: "Pull over when it's safe - one of your tires is dangerously
+    #           low and still going down."
+    #   said : "Hey, Ava, when it's safe, one of your tires is dangerously
+    #           low and still going down."
+    #
+    # The voice's own transcript said that clip was correct. It was not. The
+    # instruction to pull over -- the entire action the warning exists to
+    # request -- had been replaced by a greeting, and a keep-and-flag policy
+    # would have written it to disk and played it at the worst moment for
+    # months. This is the exact failure the note above CLIP_RENDER_ATTEMPTS
+    # already described, in the other direction.
+    #
+    # So: the file is removed, the run CONTINUES, and the caller is told. A
+    # missing clip is not silence -- rio_speak falls through to dictation and
+    # then to the synthesiser, which is a warning in a slightly different voice.
+    # A wrong clip is a warning that says the wrong thing, and there is no tier
+    # underneath that to catch it.
+    tmp.unlink(missing_ok=True)
+    raise ClipUnverified(
+        f"not verbatim after {CLIP_RENDER_ATTEMPTS * 2} attempts; "
+        f"last heard {last!r}")
+
+
+def _render_live_once(text: str, tmp: Path) -> int:
+    """One take: a session, the line, the audio, transcoded to MP3.
+
+    The voice's own transcript is checked here and is NOT sufficient -- see
+    _render_live, which transcribes the finished file with a different model.
+    Both checks exist because each has caught the other being wrong.
+    """
+    import subprocess
+
+    import live
+
+    got = live.render_speech(text)
+    if not got.get("ok"):
+        raise RuntimeError(f"the live voice returned no audio: "
+                           f"{got.get('note')}")
+    said = _norm(got.get("transcript", ""))
+    if said and said != _norm(text):
+        raise RuntimeError(
+            "the live voice did not read the line verbatim.\n"
+            f"  asked: {text!r}\n  said : {got.get('transcript')!r}")
+    wav = tmp.with_suffix(".wav.part")
+    wav.write_bytes(got["wav"])
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav),
+             "-codec:a", "libmp3lame", "-q:a", "4", "-f", "mp3", str(tmp)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg could not transcode the clip "
+                f"(exit {proc.returncode}): "
+                f"{(proc.stderr or '').strip()[:300]}")
+    finally:
+        wav.unlink(missing_ok=True)
+    return tmp.stat().st_size
+
+
+# HOW SHORT IS "TOO SHORT TO TRANSCRIBE COLD".
+#
+# Four words. Below it the transcriber is measurably unreliable -- "Merge."
+# came back as "March.", "Keep left." as "He left.", "Make a U-turn." as
+# "WikiU turn." -- and the voice had said all three correctly. Above it, it is
+# fine, and the hint below must not be used.
+VOCAB_HINT_MAX_WORDS = 4
+
+
+def _library_vocabulary() -> str:
+    """Every line RIO can play, as a transcription hint for SHORT clips only.
+
+    WHY THIS IS SCOPED, and the scoping is the whole safety argument.
+    Supplying the library as a hint biases the transcriber towards the lines in
+    it -- that is what makes it useful on a one-word clip and what makes it
+    dangerous on a long one.
+
+    On a clip of one to four words there is nowhere for an error to hide: the
+    clip either is that line or is a different one, the hint does not privilege
+    the expected row over the other sixteen, and a wrong clip still matches the
+    wrong row.
+
+    On a LONG line an error can be local, and a hint will paper over exactly
+    the case that matters. Measured, and this is why the rule exists rather
+    than the convenience: `tire_critical` is fifteen words, of which Gleam
+    renders thirteen perfectly and the first two -- "Pull over" -- not at all.
+    Cold, it transcribes as "Paying for when it's safe...", "Hang on while it's
+    safe...", "Think of a one-inch safe...", never twice the same. WITH the
+    hint it transcribes perfectly, because the transcriber has been shown the
+    answer and the other thirteen words agree with it.
+    
+    The instruction to pull over is the entire action that warning exists to
+    request. A verifier that a hint can talk round is not verifying it.
+    """
+    from headway import live_policy
+    lines = [live_policy.LINE_TEXT[k] for k in CLIP_LINES]
+    lines += list(TIRE_CLIPS.values()) + list(IMMINENT_CLIPS.values())
+    return " ".join(sorted(set(lines)))
+
+
+def _transcribe(path: Path, expected: str = "") -> str:
     """What the finished file actually says, according to a different model.
 
     Whisper, the same transcriber every other transcript in this system comes
@@ -154,8 +325,12 @@ def _transcribe(path: Path) -> str:
 
         buf = io.BytesIO(path.read_bytes())
         buf.name = "clip.mp3"
+        # The hint, for a clip short enough that it cannot hide an error.
+        kw = {}
+        if expected and len(expected.split()) <= VOCAB_HINT_MAX_WORDS:
+            kw["prompt"] = _library_vocabulary()
         return OpenAI().audio.transcriptions.create(
-            model=_config.OPENAI_STT_MODEL, file=buf).text or ""
+            model=_config.OPENAI_STT_MODEL, file=buf, **kw).text or ""
     except Exception as e:
         print(f"      (could not verify: {type(e).__name__}) ", end="")
         return ""
@@ -198,10 +373,30 @@ def _render_realtime_once(text: str, tmp: Path) -> int:
     return tmp.stat().st_size
 
 
+# CONTRACTIONS ARE THE TRANSCRIBER'S CHOICE TOO, and until this existed the
+# verifier was failing clips over it. "You're too close." came back from
+# Whisper as "You are too close." -- the voice said the right thing and the
+# check said it did not, three times in a row, and the only way to pass was to
+# keep re-rendering a clip that had been correct the first time.
+#
+# Expanded on BOTH sides rather than contracted on both: "we're" is
+# unambiguous going out and "were" is not coming back.
+_CONTRACTIONS = (
+    ("won't", "will not"), ("can't", "cannot"), ("n't", " not"),
+    ("'re", " are"), ("'ve", " have"), ("'ll", " will"), ("'m", " am"),
+    ("it's", "it is"), ("that's", "that is"), ("what's", "what is"),
+    ("she's", "she is"), ("he's", "he is"), ("there's", "there is"),
+    ("let's", "let us"),
+)
+
+
 def _norm(text: str) -> str:
-    """Spoken-form comparison: punctuation and case are a transcriber's
-    choices, the words are not."""
-    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).split())
+    """Spoken-form comparison: punctuation, case and contraction are a
+    transcriber's choices, the words are not."""
+    t = (text or "").lower().replace("\u2019", "'")
+    for a, b in _CONTRACTIONS:
+        t = t.replace(a, b)
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", t).split())
 
 
 def _render_elevenlabs(text: str, tmp: Path) -> int:
@@ -217,7 +412,7 @@ def _render_elevenlabs(text: str, tmp: Path) -> int:
     last = ""
     for attempt in range(1, CLIP_RENDER_ATTEMPTS + 1):
         n = _render_elevenlabs_once(text, tmp)
-        heard = _transcribe(tmp)
+        heard = _transcribe(tmp, text)
         if not heard or _norm(heard) == _norm(text):
             return n
         last = heard
@@ -249,6 +444,10 @@ def voice_signature(backend: str = None) -> dict:
     backend = backend or config.VOICE_BACKEND
     if backend == "realtime":
         backend = "openai_realtime"
+    if backend == "gpt_live":
+        return {"backend": "gpt_live",
+                "voice": config.GPT_LIVE_VOICE,
+                "model": config.GPT_LIVE_MODEL}
     if backend == "elevenlabs":
         return {"backend": "elevenlabs",
                 "voice": config.ELEVENLABS_VOICE_ID,
@@ -258,9 +457,9 @@ def voice_signature(backend: str = None) -> dict:
             "model": config.OPENAI_REALTIME_MODEL}
 
 
-def manifest() -> dict:
+def manifest(backend: str = None) -> dict:
     try:
-        return json.loads(MANIFEST.read_text())
+        return json.loads(manifest_path(backend).read_text())
     except Exception:
         return {}
 
@@ -273,7 +472,7 @@ def _write_manifest(backend: str, rendered: list):
     files this run actually produced get their entry updated.
     """
     sig = voice_signature(backend)
-    doc = manifest()
+    doc = manifest(backend)
     doc["voice"] = sig
     doc.setdefault("clips", {})
     for line, path, n, what in rendered:
@@ -283,20 +482,23 @@ def _write_manifest(backend: str, rendered: list):
             **sig, "bytes": n, "at": round(time.time(), 1),
             "sha1": hashlib.sha1(Path(path).read_bytes()).hexdigest()[:12],
         }
-    MANIFEST.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    p = manifest_path(backend)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n")
 
 
 def render(force: bool = False, backend: str = None) -> list:
     backend = backend or config.VOICE_BACKEND
     if backend == "realtime":
         backend = "openai_realtime"       # the old name for the same thing
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = audio_dir(backend)
+    out_dir.mkdir(parents=True, exist_ok=True)
     out = []
     everything = [(line, live_policy.LINE_TEXT[line]) for line in CLIP_LINES]
     everything += sorted(TIRE_CLIPS.items())
     everything += sorted(IMMINENT_CLIPS.items())
     for line, text in everything:
-        path = AUDIO_DIR / f"{line}.mp3"
+        path = out_dir / f"{line}.mp3"
         if path.exists() and not force:
             out.append((line, path, path.stat().st_size, "kept"))
             continue
@@ -306,8 +508,18 @@ def render(force: bool = False, backend: str = None) -> list:
         try:
             if backend == "openai_realtime":
                 n = _render_realtime(text, tmp)
+            elif backend == "gpt_live":
+                n = _render_live(text, tmp)
             else:
                 n = _render_elevenlabs(text, tmp)
+        except ClipUnverified as e:
+            # One clip nobody could prove is one clip. The other sixteen are
+            # still worth having, and a run that aborts on the first hard line
+            # leaves the library half-rendered in two voices.
+            tmp.unlink(missing_ok=True)
+            print(f"  [UNVERIFIED] {line}: {e}")
+            out.append((line, path, 0, "unverified"))
+            continue
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
@@ -322,7 +534,8 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="re-render existing clips")
     ap.add_argument("--list", action="store_true", help="show state and exit")
     ap.add_argument("--backend", default=None,
-                    choices=["openai_realtime", "realtime", "elevenlabs"],
+                    choices=["openai_realtime", "realtime", "gpt_live",
+                             "elevenlabs"],
                     help="which voice to render in (default: config.VOICE_BACKEND)")
     args = ap.parse_args()
 
@@ -339,7 +552,8 @@ def main() -> int:
     backend = args.backend or config.VOICE_BACKEND
     if backend == "realtime":
         backend = "openai_realtime"
-    if backend == "openai_realtime" and not os.getenv("OPENAI_API_KEY"):
+    if backend in ("openai_realtime", "gpt_live") \
+            and not os.getenv("OPENAI_API_KEY"):
         print("OPENAI_API_KEY not set (.env)", file=sys.stderr)
         return 2
     if backend == "elevenlabs":
@@ -354,9 +568,23 @@ def main() -> int:
         print(f"  voice: elevenlabs {config.ELEVENLABS_VOICE_ID} "
               f"on {config.ELEVENLABS_CONVERSATION_MODEL}")
     else:
-        print(f"  voice: openai_realtime ({config.OPENAI_REALTIME_VOICE})")
-    for line, path, n, what in render(force=args.force, backend=backend):
+        sig = voice_signature(backend)
+        print(f'  voice: {sig["backend"]} ({sig["voice"]})')
+    rows = render(force=args.force, backend=backend)
+    for line, path, n, what in rows:
         print(f"  [{what:8}] {line:16} {n:>7} B  {path}")
+    # A CLIP THAT COULD NOT BE PROVED CORRECT IS A FAILED RUN, and the exit
+    # code says so. It is not fatal to the car -- rio_speak falls through to
+    # dictation and then to the synthesiser for any line with no clip -- but it
+    # is fatal to the claim that this voice's library is complete, and that
+    # claim is what preflight and the manifest exist to check.
+    unverified = [line for line, _, _, what in rows if what == "unverified"]
+    if unverified:
+        print(f"\n  !! {len(unverified)} clip(s) could not be verified and "
+              f"were NOT written: {', '.join(unverified)}")
+        print("     Those lines fall back to dictation and the synthesiser. "
+              "Re-run to retry.")
+        return 1
     return 0
 
 
