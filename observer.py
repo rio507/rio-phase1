@@ -382,6 +382,87 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
     return out
 
 
+def recent(session_key: str, max_age_s: float = None) -> dict:
+    """The latest observation if it is recent ENOUGH TO ANSWER WITH. -> {} if not.
+
+    A SECOND, WIDER WINDOW, and the two are for different jobs.
+
+    `fresh()` is the one the fast path was built on: OBSERVER_FRESH_S, two
+    seconds, the window inside which a description is about the road the car is
+    on. That is the right bar for serving a sentence as though it were current.
+
+    This one is the bar for serving it AT ALL, with its age attached. At 13 m/s
+    a three-second-old description is about forty metres back -- still the road
+    being driven, and the caller says how old it is, which is what makes the
+    difference between a stale answer and a timestamped one.
+
+    It exists because the alternative to a slightly old sentence was a
+    synchronous Qwen pass measured at 1.0-5.8 s inside the turn. A driver would
+    rather hear about three seconds ago than wait five for now.
+    """
+    s_max = float(max_age_s if max_age_s is not None
+                  else getattr(config, "OBSERVER_ANSWER_MAX_AGE_S", 5.0))
+    rec = cached(session_key)
+    if not rec:
+        return {}
+    if not serve_to(rec, session_key):
+        return {}
+    frame_t = rec.get("frame_wall_t") or rec.get("at")
+    age = time.time() - float(frame_t or 0)
+    if age > s_max:
+        return {}
+    out = dict(rec)
+    out["age_s"] = round(age, 2)
+    out["stale_ok"] = True
+    return out
+
+
+def observe_soon(session_key: str, deadline_ms: float = None) -> dict:
+    """observe_now, but it gives up on the CALLER's behalf. -> record or {}
+
+    WHY THIS EXISTS. observe_now runs a Qwen forward pass synchronously inside
+    look(), which is inside the turn a driver is waiting through. On an idle
+    card that is ~0.4 s, which is the number its docstring quotes and the
+    number it was written against. Measured on a working drive -- the detector
+    at 15 fps, this loop at 1 Hz, and the shadow panel's models resident
+    -- the same call ran 1.0 to 5.8 seconds. A scene question is supposed to
+    take under a second in total.
+
+    The pass cannot be interrupted: it is a local GPU call and Python has no
+    way to stop a thread. So this does not try to cancel it. It runs it OFF the
+    answer path, waits `deadline_ms`, and if it has not finished by then the
+    answer goes on without it -- and the pass keeps running and FILES ITS
+    RESULT, so the question after this one finds it in the cache.
+
+    That is the same trade the tool endpoint already makes for an abandoned
+    call: the work finishes into nothing rather than being waited on. Here it
+    finishes into the cache, which is better than nothing.
+    """
+    ms = float(deadline_ms if deadline_ms is not None
+               else getattr(config, "OBSERVER_ON_DEMAND_DEADLINE_MS", 600.0))
+    key = str(session_key or "default")
+    box = {}
+    done = threading.Event()
+
+    def work():
+        try:
+            box["rec"] = observe_now(key)
+        except Exception:
+            box["rec"] = {}
+        finally:
+            done.set()
+
+    threading.Thread(target=work, daemon=True,
+                     name=f"observe_soon:{key[:8]}").start()
+    if done.wait(timeout=max(0.0, ms / 1000.0)):
+        return box.get("rec") or {}
+    with _lock:
+        st = _sessions.get(key)
+        if st is not None:
+            st["on_demand_late"] = st.get("on_demand_late", 0) + 1
+    return {}
+
+
 def status() -> dict:
     """What is running, for /health and the selftests."""
     with _lock:

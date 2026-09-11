@@ -1027,13 +1027,25 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
     # band, no line RIO says on her own initiative.
     # tools/teacher_firewall_selftest.py asserts that this call is the
     # only caller of context_for anywhere in the repo.
+    # ...AND IT MAY NEVER COST THE ANSWER A MILLISECOND IT DOES NOT HAVE.
+    #
+    # context_for reads a cached reading and returns; it does not start an
+    # inference and never has. What it DOES take is the panel's lock, which is
+    # shared with the frame path, and a lock is a wait like any other. So the
+    # fetch is bounded: whatever is cached, within TEACHER_CONTEXT_TIMEOUT_MS,
+    # or nothing at all.
+    #
+    # Nothing here is allowed to be the reason a driver waits. A shadow
+    # feature's opinion is worth exactly as much as it costs to have already.
     tctx = None
+    _t_tctx = time.time()
     if teacher_panel is not None:
         try:
-            tctx = teacher_panel.context_for(_visual_key(session_id))
+            tctx = teacher_panel.context_now(_visual_key(session_id))
         except Exception as e:
             print(f"[teachers] context unavailable: "
                   f"{type(e).__name__}: {e}", flush=True)
+    _tctx_ms = round((time.time() - _t_tctx) * 1000.0, 1)
 
     # THE TEACHERS YIELD FOR THE LENGTH OF THE TOOL CALL. This is the path a
     # driver is actually waiting through -- look() and the reasoning turn --
@@ -1043,9 +1055,14 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
 
     async def _run_tool():
         try:
-            return await run_in_threadpool(
+            out = await run_in_threadpool(
                 realtime.run_tool, name, args, _visual_key(session_id), where,
                 body.get("spoken"), tctx)
+            if isinstance(out, dict):
+                stages = dict(out.get("stages") or {})
+                stages["teacher_ctx_ms"] = _tctx_ms
+                out["stages"] = stages
+            return out
         finally:
             # Released when the WORK ends, not when the request does: an
             # abandoned call still finishes into nothing on the GPU, and the

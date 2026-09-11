@@ -253,6 +253,32 @@ def _describe(obj) -> str:
     return f"{' '.join(bits)} — {where}{dist}"
 
 
+def _resolve_with_deadline(adapter, frame, phrase, cands):
+    """adapter.resolve, bounded. -> (candidate_id | None, info)."""
+    import threading
+
+    ms = float(getattr(config, "RESOLVE_VLM_DEADLINE_MS", 900.0))
+    if ms <= 0:
+        try:
+            return adapter.resolve(frame.jpeg, phrase, cands)
+        except Exception as e:
+            return None, {"error": f"{type(e).__name__}: {e}"}
+    box, done = {}, threading.Event()
+
+    def work():
+        try:
+            box["r"] = adapter.resolve(frame.jpeg, phrase, cands)
+        except Exception as e:
+            box["r"] = (None, {"error": f"{type(e).__name__}: {e}"})
+        finally:
+            done.set()
+
+    threading.Thread(target=work, daemon=True, name="resolve-vlm").start()
+    if done.wait(timeout=ms / 1000.0):
+        return box.get("r") or (None, {})
+    return None, {"timed_out_ms": ms}
+
+
 def resolve(question: str, phrase: Optional[str], graph, frame,
             cache: enrich_mod.EnrichmentCache, adapter=None,
             allow_model: bool = True) -> Resolution:
@@ -334,10 +360,46 @@ def resolve(question: str, phrase: Optional[str], graph, frame,
     if allow_model and discriminating and frame is not None and len(plausible) > 1:
         adapter = adapter or enrich_mod.get_adapter()
         cands = [(o.candidate_id, o.box, _describe(o)) for _, o in plausible]
-        try:
-            cid, info = adapter.resolve(frame.jpeg, question or phrase or "", cands)
-        except Exception as e:
-            cid, info = None, {"error": f"{type(e).__name__}: {e}"}
+        # WITH A DEADLINE. The tie-break is a Qwen pass, measured at 5-6 s on
+        # this box, inside a turn whose whole budget is three. Geometry has
+        # already produced a ranking; the model is here to settle a close call,
+        # and a tie-break that arrives after the driver has stopped waiting has
+        # not settled anything.
+        #
+        # Past the deadline the answer falls through to the `ambiguous` return
+        # below -- which is the honest outcome and the one that makes RIO ASK
+        # rather than guess. The pass is not cancelled (it cannot be); it
+        # finishes into nothing.
+        cid, info = _resolve_with_deadline(
+            adapter, frame, question or phrase or "", cands)
+        if cid is None and info.get("timed_out_ms"):
+            # THE TIE-BREAK RAN OUT OF TIME, WHICH IS NOT THE SAME AS THE
+            # QUESTION BEING AMBIGUOUS.
+            #
+            # The "ask rather than guess" rule above was written for ambiguity
+            # in the LANGUAGE -- a bare "what is that?" with nothing in it to
+            # discriminate on, where no amount of looking helps. That is not
+            # this. Here the words DID discriminate (that is what
+            # `discriminating` checked), geometry produced a ranking, and the
+            # only thing missing is a model's opinion we could not afford to
+            # wait for.
+            #
+            # Asking the driver "which one?" because our own card was busy
+            # dresses up a latency failure as a question. Geometry's top
+            # candidate is taken instead, with the confidence marked down and
+            # the method saying exactly what happened.
+            if top_score > 0:
+                return Resolution(
+                    track_id=top.track_id, candidate_id=top.candidate_id,
+                    method="geometry_after_timeout",
+                    confidence=min(0.5, _confidence(top_score, margin)),
+                    ambiguous=False,
+                    alternatives=[o.track_id for (_, o) in scored[1:4]],
+                    cues=_cues_log(cues), scores=log_scores,
+                    info={"vlm": info, "margin": (None if margin is None
+                                                  else round(margin, 3)),
+                          "enriched": list(enriched.keys())},
+                    latency_ms=(time.perf_counter() - t0) * 1000)
         if cid is not None:
             picked = next((o for _, o in plausible if o.candidate_id == cid), None)
             if picked is not None:

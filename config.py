@@ -2144,6 +2144,62 @@ ENRICH_MAX_OBJECTS = 3
 ENRICH_TTL_S = 20.0
 ENRICH_MAX_NEW_TOKENS = 48
 
+# ---------------------------------------------------------------------------
+# HOW BIG A PICTURE QWEN IS ACTUALLY GIVEN, on the object path
+# ---------------------------------------------------------------------------
+# MEASURED, and it is the whole of why an object question took thirteen
+# seconds. vision.observe has always downscaled to OBSERVER_MAX_SIDE_PX (512)
+# before the model, and enrich.QwenAdapter downscaled nothing at all -- it sent
+# the crop at CROP_MIN_PX..CROP_MAX_PX (768-1024) and, for resolve, the whole
+# annotated frame.
+#
+#   call                     image      tokens out   measured
+#   /perceive (observe)      512 px         60        2777 ms
+#   enrich (attributes)     1024 px         14        6383 ms
+#   resolve (which one)     full frame      32        5106 ms
+#
+# Fourteen output tokens taking six and a half seconds is not a decode cost; it
+# is the vision tower reading a picture four times larger than it needs. And
+# /perceive is FLAT at 2.77 s whether it is handed 384 px or 1024, because it
+# downscales first -- which is the same experiment run by accident, and the
+# answer to "does size matter here".
+#
+# The crops were upscaled to 768 px on the way in (CROP_MIN_PX), so capping at
+# 512 mostly undoes an upscale rather than throwing anything away: what reaches
+# the model is the detail the crop actually had.
+ENRICH_MAX_SIDE_PX = int(os.getenv("ENRICH_MAX_SIDE_PX", "512"))
+
+# How long the ANSWER may wait for an attribute read before going without it.
+#
+# A Qwen pass on this box is 2.8-6.4 s and an object question is supposed to
+# take three. Colour and body style are worth having and are not worth that:
+# the composing model is handed the crop as well, so it can see the colour for
+# itself, and the pass that missed the deadline still files its result -- so a
+# follow-up about the same car has it for free.
+ENRICH_ANSWER_DEADLINE_MS = float(
+    os.getenv("ENRICH_ANSWER_DEADLINE_MS", "700"))
+
+# ...and the same for the reference tie-break, which is the other local Qwen
+# pass on the object path and was measured at 5-6 s. Past this the turn takes
+# geometry's own answer as ambiguous, which makes RIO ASK which one rather than
+# guess -- the honest outcome, and a much better one than a correct answer that
+# arrives after the car has passed the thing.
+RESOLVE_VLM_DEADLINE_MS = float(
+    os.getenv("RESOLVE_VLM_DEADLINE_MS", "900"))
+
+# ...and the clarification's own reads, which are one PER CANDIDATE and were
+# measured at 11.7 s for a question RIO asks INSTEAD of answering. Late reads
+# cost colour, and the fallback description -- label and lane -- is what the
+# question sounded like before enrichment existed.
+CLARIFY_ENRICH_DEADLINE_MS = float(
+    os.getenv("CLARIFY_ENRICH_DEADLINE_MS", "700"))
+
+# The resolve frame carries NUMBERED BOXES the model has to read, so it keeps
+# more pixels than a colour-and-shape crop needs. 768 rather than 512 for that
+# reason and no other; if resolve starts picking the wrong number, this is the
+# first thing to put back.
+RESOLVE_MAX_SIDE_PX = int(os.getenv("RESOLVE_MAX_SIDE_PX", "768"))
+
 # --- the running observation (observer.py) ----------------------------------
 # "What do you see?" was slow, and the measurement said why: the multimodal
 # answer is a remote call to a reasoning model — ~1.1 s to the first word, ~2.0
@@ -2167,6 +2223,31 @@ OBSERVER_PERIOD_S = 1.0
 # this the fast path declines and the full path looks at the road NOW — the
 # refusal is the honesty, not a fallback that got unlucky.
 OBSERVER_FRESH_S = 2.0
+
+# ...AND THE WIDER WINDOW THE ANSWER PATH MAY USE.
+#
+# OBSERVER_FRESH_S is "current enough to serve as though it were now". This is
+# "recent enough to serve WITH ITS AGE ATTACHED", and the gap between them is
+# what stops a one-second question costing five.
+#
+# Measured: a miss on the 2 s window used to run a Qwen pass synchronously
+# inside look(), at 1.0-5.8 s on a working drive (the detector at 15 fps, the
+# background observer at 1 Hz, two teachers on the same card). The background
+# loop was going to produce one within the second anyway; waiting five for a
+# fresher sentence than the one already in hand is a bad trade for a driver.
+#
+# At 13 m/s five seconds is about sixty metres. Every result carries
+# `seen_s_ago` and the rules tell RIO how old it is, so this is a timestamped
+# answer rather than a stale one.
+OBSERVER_ANSWER_MAX_AGE_S = float(
+    os.getenv("OBSERVER_ANSWER_MAX_AGE_S", "5.0"))
+
+# How long the answer path waits for an on-demand observation before going on
+# without it. The pass cannot be cancelled -- it is a local GPU call -- so it
+# keeps running and files its result for the NEXT question. See
+# observer.observe_soon.
+OBSERVER_ON_DEMAND_DEADLINE_MS = float(
+    os.getenv("OBSERVER_ON_DEMAND_DEADLINE_MS", "600.0"))
 # ...and how old the newest frame in the ring may be before the observer stops
 # spending a forward pass on it at all. Same number, and it is a separate name
 # because they answer different questions: FRESH_S is "may this sentence be
@@ -3563,6 +3644,22 @@ TEACHER_SESSION_TTL_S = float(os.getenv("TEACHER_SESSION_TTL_S", "180.0"))
 # for the same judgement (rio_teachers.js FRAME_IDLE_MS), and generous next to
 # the 4-15 fps the transport runs at.
 TEACHER_FRAME_FLOW_S = float(os.getenv("TEACHER_FRAME_FLOW_S", "4.0"))
+
+# How long a driver's question may spend collecting the teachers' opinion
+# before it goes without one.
+#
+# The teachers have never inferred on demand and do not now -- context_for
+# reads a cached reading and returns. What it takes is the panel's LOCK, which
+# is shared with the frame path, and a lock is a wait like any other. "None of
+# those critical sections is long" is an argument; this is a bound.
+#
+# 50 ms is generous next to the few microseconds the read actually needs and
+# invisible next to the one-second target for a scene answer. Past it the
+# answer goes out with no teacher block, which is the same state as the
+# teachers having nothing fresh -- already a thing the block expresses and RIO
+# already knows how to work with.
+TEACHER_CONTEXT_TIMEOUT_MS = float(
+    os.getenv("TEACHER_CONTEXT_TIMEOUT_MS", "50.0"))
 # ...and a ceiling on how close together two keyframes may be however many
 # events fire. Without it a burst of band flapping at a junction would queue
 # faster than either model can answer, and every one of them would be dropped

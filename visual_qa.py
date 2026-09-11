@@ -605,8 +605,17 @@ class VisualAnswer:
         # The candidates have to be told apart by how they LOOK, so this is
         # where enrichment earns its latency: colour is usually the only thing
         # that separates two saloons in adjacent lanes.
-        enrich_mod.enrich_objects(self._frame, offered, self.session.enrichment,
-                                  max_objects=len(offered))
+        # BOUNDED, like every other local Qwen pass on this path. One read is
+        # 2.8-6.4 s on this box and this asks for one PER CANDIDATE -- measured
+        # at 11.7 s for a clarification, which is three times the whole budget
+        # for the answer it is an alternative to.
+        #
+        # What it buys is colour, which is usually what tells two cars apart.
+        # What it costs when it is late is nothing: resolve_mod.describe falls
+        # back to label and position ("the one in the left lane"), which is a
+        # perfectly good question to ask a driver and is what RIO asked before
+        # enrichment existed.
+        self._enrich_many_within_budget(offered)
         self._graph = self._graph_for(self._frame, ring)
 
         descriptions = {}
@@ -924,18 +933,104 @@ class VisualAnswer:
         self.meta["crop"] = {k: v for k, v in self._crop_info.items()
                              if k != "from_memory"}
 
+    def _enrich_many_within_budget(self, track_ids: list) -> dict:
+        """enrich_objects for several candidates, bounded. -> what arrived.
+
+        The clarification path asks for one attribute read PER CANDIDATE, and a
+        read is seconds. Whatever is not back by the deadline is simply not in
+        the descriptions: resolve_mod.describe falls back to label and lane,
+        which is what the question sounded like before enrichment existed.
+        """
+        ms = float(getattr(config, "CLARIFY_ENRICH_DEADLINE_MS", 700.0))
+        if not track_ids:
+            return {}
+        if ms <= 0:
+            return enrich_mod.enrich_objects(
+                self._frame, track_ids, self.session.enrichment,
+                max_objects=len(track_ids))
+        box, done = {}, threading.Event()
+        frame, cache = self._frame, self.session.enrichment
+        ids = list(track_ids)
+
+        def work():
+            try:
+                box["got"] = enrich_mod.enrich_objects(
+                    frame, ids, cache, max_objects=len(ids))
+            except Exception:
+                box["got"] = {}
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True, name="enrich-clarify").start()
+        if done.wait(timeout=ms / 1000.0):
+            return box.get("got") or {}
+        self.timing["clarify_enrich_late"] = 1
+        return {}
+
+    def _enrich_within_budget(self) -> dict:
+        """enrich_objects, bounded. -> whatever arrived in time (maybe {})."""
+        ms = float(getattr(config, "ENRICH_ANSWER_DEADLINE_MS", 700.0))
+        if ms <= 0:
+            return enrich_mod.enrich_objects(
+                self._frame, [self._referent.track_id],
+                self.session.enrichment)
+        box, done = {}, threading.Event()
+        frame, track, cache = (self._frame, self._referent.track_id,
+                               self.session.enrichment)
+
+        def work():
+            try:
+                box["got"] = enrich_mod.enrich_objects(frame, [track], cache)
+            except Exception:
+                box["got"] = {}
+            finally:
+                done.set()
+
+        threading.Thread(target=work, daemon=True,
+                         name=f"enrich:{track}").start()
+        if done.wait(timeout=ms / 1000.0):
+            return box.get("got") or {}
+        self.timing["enrich_late"] = 1
+        return {}
+
     def _enrich(self, ring) -> None:
         """Colour and body style for the referent, so the answer can name it."""
         if self._referent is None or self._frame is None:
             return
-        got = enrich_mod.enrich_objects(
-            self._frame, [self._referent.track_id], self.session.enrichment)
+        try:
+            import enrich as _en0
+            self._gen_before = _en0.GENERATE_COUNT["n"]
+        except Exception:
+            self._gen_before = 0
+        # WITH A DEADLINE, AND OFF THIS THREAD.
+        #
+        # Measured on this box: one Qwen attribute read is 6.4 s -- fourteen
+        # output tokens, and flat whatever size the picture is downscaled to.
+        # That is more than twice the whole budget for an object question, for
+        # a colour and a body style that the composing model ALSO gets, because
+        # _build_messages hands it the crop.
+        #
+        # So this is best-effort. If it lands inside the budget the grounding
+        # packet carries it; if it does not, the answer goes without it and the
+        # pass still finishes and files itself in the enrichment cache -- so the
+        # NEXT question about the same track has it for free, which is the case
+        # a follow-up ("what colour is it?") actually hits.
+        got = self._enrich_within_budget()
         e = got.get(self._referent.track_id)
         if e:
             self._referent.attributes.update(
                 {k: v for k, v in (e.get("attributes") or {}).items() if v})
             self._referent.fine_label = (self._referent.fine_label
                                          or e.get("fine_label"))
+        try:
+            import enrich as _en
+            if _en.LAST_GENERATE:
+                self.timing["enrich_generate"] = dict(_en.LAST_GENERATE)
+                # How many passes this ONE enrich actually ran.
+                self.timing["enrich_generate"]["passes_in_call"] = (
+                    _en.GENERATE_COUNT["n"] - int(self._gen_before or 0))
+        except Exception:
+            pass
         self.meta["enrichment"] = {
             "track_id": self._referent.track_id,
             "attributes": dict(self._referent.attributes),

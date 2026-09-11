@@ -134,6 +134,33 @@ class VisionAdapter:
         return []
 
 
+# The last generate's own breakdown. One dict, overwritten per call: this is a
+# diagnostic read straight after a call by whoever made it, not a time series.
+LAST_GENERATE = {}
+# How many generates this process has run, ever. The per-call dict above is
+# overwritten; this is what says whether ONE enrich cost one pass or three.
+GENERATE_COUNT = {"n": 0}
+
+
+def _downscale(pil, max_side: int):
+    """The same thing vision._downscale does, and for the same reason.
+
+    It lives in both files rather than being imported because enrich.py must
+    not depend on vision.py's module state -- it borrows the handles through
+    one function on purpose. Six lines of arithmetic is the cheaper coupling.
+    """
+    if not max_side:
+        return pil
+    w, h = pil.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return pil
+    scale = max_side / float(longest)
+    from PIL import Image as _Im
+    return pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                      _Im.BILINEAR)
+
+
 class QwenAdapter(VisionAdapter):
     """Qwen3-VL-8B, borrowed from the copy vision.py already has resident."""
 
@@ -150,24 +177,44 @@ class QwenAdapter(VisionAdapter):
         # The same lock every other Qwen caller takes. It serialises against
         # /perceive and against headway's anchor path, which is what stops two
         # generates stacking on the GPU while the 4 fps loop is running.
+        # WHERE THE SECONDS GO, split three ways: waiting for the lock,
+        # preparing the inputs, and the decode itself. An attribute read was
+        # measured at 6.5 s and nothing said which of the three it was -- and
+        # they have completely different fixes.
+        _t0 = time.perf_counter()
         with lock:
+            _t_lock = time.perf_counter()
             inputs = processor.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt",
             ).to(model.device)
+            _t_prep = time.perf_counter()
             with torch.inference_mode():
                 out = model.generate(**inputs, max_new_tokens=max_new_tokens,
                                      do_sample=False)
-            return processor.batch_decode(
+            _t_gen = time.perf_counter()
+            text = processor.batch_decode(
                 out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
             )[0].strip()
+        GENERATE_COUNT["n"] += 1
+        LAST_GENERATE.update({
+            "seq": GENERATE_COUNT["n"],
+            "lock_ms": round((_t_lock - _t0) * 1000, 1),
+            "prep_ms": round((_t_prep - _t_lock) * 1000, 1),
+            "gen_ms": round((_t_gen - _t_prep) * 1000, 1),
+            "in_tokens": int(inputs["input_ids"].shape[1]),
+            "out_tokens": int(out.shape[1] - inputs["input_ids"].shape[1]),
+            "max_new": int(max_new_tokens),
+        })
+        return text
 
     def enrich(self, crop_jpeg: bytes) -> dict:
         import io
 
         from PIL import Image
 
-        pil = Image.open(io.BytesIO(crop_jpeg)).convert("RGB")
+        pil = _downscale(Image.open(io.BytesIO(crop_jpeg)).convert("RGB"),
+                         config.ENRICH_MAX_SIDE_PX)
         raw = self._generate([pil], ENRICH_PROMPT, config.ENRICH_MAX_NEW_TOKENS)
         return _parse_enrichment(raw)
 
@@ -178,7 +225,11 @@ class QwenAdapter(VisionAdapter):
         from PIL import Image
 
         annotated, legend = _annotate(frame_jpeg, candidates)
-        pil = Image.open(io.BytesIO(annotated)).convert("RGB")
+        # Downscaled AFTER annotating, so the boxes and numbers are drawn at
+        # the frame's own resolution and then shrunk with it -- annotating a
+        # small image would draw a number too coarse to read.
+        pil = _downscale(Image.open(io.BytesIO(annotated)).convert("RGB"),
+                         config.RESOLVE_MAX_SIDE_PX)
         prompt = RESOLVE_PROMPT.format(phrase=phrase, legend=legend)
         raw = self._generate([pil], prompt, 32)
         n, sure = _parse_choice(raw)

@@ -553,6 +553,53 @@ def state(session_key: str) -> dict:
 CONTEXT_FRESH_S = float(getattr(config, "TEACHER_CONTEXT_FRESH_S", 2.0))
 
 
+def context_now(session_key: str, timeout_ms: float = None) -> dict:
+    """context_for, but it gives up rather than wait. -> {} if it cannot.
+
+    THE RULE THIS ENFORCES: the teachers never delay an answer. Not by
+    inferring on demand -- they never did -- and not by holding a lock either,
+    which is the way a "never blocks" claim quietly stops being true.
+
+    context_for takes the panel's lock, and that lock is shared with the frame
+    path: on_frame takes it several times per keyframe, and a reading being
+    filed takes it too. None of those is long, but "none of them is long" is an
+    argument, and what a driver waiting on "what do you see" needs is a bound.
+
+    So: try to take the lock for TEACHER_CONTEXT_TIMEOUT_MS. If it is not free
+    by then, return nothing and let the answer go without a second opinion --
+    which is exactly what happens when the teachers have nothing fresh anyway,
+    and is a state the block is already designed to express.
+
+    Never triggers an inference. Never waits for one. There is no code path
+    from here to a model.
+    """
+    ms = float(timeout_ms if timeout_ms is not None
+               else getattr(config, "TEACHER_CONTEXT_TIMEOUT_MS", 50.0))
+    got = _lock.acquire(timeout=max(0.0, ms / 1000.0))
+    if not got:
+        _CTX_TALLY["timed_out"] += 1
+        return {}
+    try:
+        _CTX_TALLY["served"] += 1
+        # THE LOCK IS REENTRANT (RLock), so context_for's own two acquisitions
+        # are free on this thread. Holding it across the whole call is what
+        # makes the bound a real one: without that, the timeout would cover
+        # the first acquire and the second could still wait.
+        return context_for(session_key)
+    finally:
+        _lock.release()
+
+
+# How often the bound above actually fired. A timeout that never happens and a
+# timeout that happens on every call are both worth knowing about, and neither
+# is visible from the answer.
+_CTX_TALLY = {"served": 0, "timed_out": 0}
+
+
+def context_tally() -> dict:
+    return dict(_CTX_TALLY)
+
+
 def context_for(session_key: str, max_age_s: float = None) -> dict:
     """The teachers' latest reading, IF it is still about this road. -> {} if not.
 
@@ -674,6 +721,10 @@ def status() -> dict:
             # still during a drive is either broken or yielding, and those look
             # identical from outside unless one of them says so.
             "yield": _live_status(),
+            # HOW OFTEN THE 50 ms BOUND ACTUALLY FIRED. A timeout that never
+            # happens and one that happens on every call are both worth
+            # knowing, and neither is visible from the answer.
+            "context_tally": context_tally(),
             "keyframe_floor_s": _floor_s(),
             "frames_flowing": (time.time() - _LAST_FRAME_AT["t"]) <= float(
                 getattr(config, "TEACHER_FRAME_FLOW_S", 4.0)),

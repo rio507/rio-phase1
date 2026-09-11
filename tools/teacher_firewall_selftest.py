@@ -547,13 +547,34 @@ def rule_f():
     path = REPO / "app.py"
     tree = parse(path)
     owner = enclosing_functions(tree)
+    # THE DOOR IS NOW context_now, WHICH IS context_for WITH A DEADLINE ON IT.
+    #
+    # The narrowness is unchanged and the reason for the extra step is latency,
+    # not access: context_for reads a cached reading and returns, but it takes
+    # the panel's lock, and a lock is a wait. context_now bounds that wait so a
+    # shadow feature cannot delay an answer even by contending. It lives INSIDE
+    # teachers/panel.py, so the rule this asserts is the same rule: exactly one
+    # function in app.py hands teacher readings out for use, and it is the tool
+    # endpoint a driver's question arrives through.
     callers = sorted({owner.get(n, "<module>")
                       for n in ast.walk(tree)
                       if isinstance(n, ast.Call)
                       and isinstance(n.func, ast.Attribute)
-                      and n.func.attr == "context_for"})
+                      and n.func.attr in ("context_for", "context_now")})
     ok(callers == ["realtime_tool_endpoint"],
-       f"context_for has exactly one caller, the tool endpoint ({callers})")
+       f"the context door has exactly one caller in app.py ({callers})")
+
+    # ...and context_for itself is reached only from inside the panel, so the
+    # bound cannot be stepped around by calling the unbounded one.
+    ptree = parse(REPO / "teachers" / "panel.py")
+    powner = enclosing_functions(ptree)
+    inner = sorted({powner.get(n, "<module>")
+                    for n in ast.walk(ptree)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "context_for"})
+    ok(inner in ([], ["context_now"]),
+       f"context_for is only called by context_now ({inner})")
 
     # And nowhere else in the repo calls it either.
     others = []

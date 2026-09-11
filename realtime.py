@@ -1642,6 +1642,21 @@ _NEEDS_SPECIFICS = re.compile(
     r"\b(left|right(?!\s+now)|behind|beside|next\s+to|that|those|this|these|sign|says?|"
     r"reads?|colou?r|make|model|plate|licen[cs]e|building|shop|store|logo|"
     r"kind\s+of|type\s+of|sort\s+of|"
+    # NAMING A VEHICLE IS NAMING A PARTICULAR THING, and it was missing.
+    #
+    # "What car is in front of us?" matched nothing here, is seven words, and
+    # was therefore served from the running caption -- so the driver asked what
+    # the car ahead was and got a general description of the road. Measured on
+    # the shipped build: the object question took the observer_direct path in
+    # 6 runs out of 6, at 1.2 ms, which looked like a triumph and was a wrong
+    # answer arriving quickly.
+    #
+    # These sit with `building` and `shop`, which were already here for exactly
+    # this reason. A bare "what's ahead" still has no noun in it and is still a
+    # scene question -- the list disqualifies naming a THING, not looking in a
+    # direction.
+    r"car|truck|lorry|van|bus|bike|motorbike|motorcycle|vehicle|suv|"
+    r"trailer|taxi|cab|"
     r"how\s+far|how\s+many|which)\b",
     re.IGNORECASE)
 
@@ -1806,12 +1821,22 @@ def look(question: str, session_key: str = "default",
     if not q:
         return {"ok": False, "note": "no question"}
     t0 = time.time()
+    # PER STAGE, because "look is slow" was answerable only by re-measuring it
+    # by hand. Every branch records where its milliseconds went, and the result
+    # carries them, so a drive log says which stage was slow on the turn the
+    # driver actually complained about.
+    stages = {}
+
+    def _mark(name, since):
+        stages[name] = round((time.time() - since) * 1000.0, 1)
     try:
         import observer
         import router as request_router
         import visual_qa
 
+        _t = time.time()
         session = visual_qa.get_session(session_key)
+        _mark("session_ms", _t)
 
         # THE FAST PATH, and it comes FIRST -- before the router, because the
         # router is itself a possible remote call and this is the branch that
@@ -1826,21 +1851,57 @@ def look(question: str, session_key: str = "default",
         # in particular, not whether a car was discussed earlier, which was the
         # first version of this condition and made every scene question slow
         # for the rest of a conversation once one object had been mentioned.
+        _t = time.time()
         observer.start(session_key)
         observer.touch(session_key)
+        _mark("observer_start_ms", _t)
         # This turn is a look. deep_dive refuses a visual question asked within
         # DEPTH_COLD_S of one -- see depth_allowed().
         note_look(session_key, q)
         if (is_generic_scene_question(q, spoken)
                 and session.pending_clarification() is None):
+            _t = time.time()
             hit = observer.fresh(session_key)
+            _mark("observer_cache_ms", _t)
+            stages["observer_cache_hit"] = bool(hit)
             if not hit:
-                # The background loop is one tick behind frames that ARE
-                # current: describe the frame in front of the car now, locally,
-                # instead of paying the full remote turn for a question one
-                # forward pass would answer. Returns {} when there is no recent
-                # frame either, and then the full path says so properly.
-                hit = observer.observe_now(session_key)
+                # A MISS IS A TIMING GAP, NOT AN EMPTY CACHE.
+                #
+                # The background loop describes a frame about once a second and
+                # fresh() refuses one older than OBSERVER_FRESH_S, so a question
+                # arriving in the gap finds a description slightly too old
+                # rather than none at all. A slightly older sentence is not a
+                # worse answer, it is an answer about a moment further back --
+                # and every result from this path carries `seen_s_ago` and
+                # tells RIO how old it is.
+                _t = time.time()
+                hit = observer.recent(session_key)
+                _mark("observer_recent_ms", _t)
+                stages["observer_recent_hit"] = bool(hit)
+            if not hit:
+                # Nothing usable at any age. NOW describe the frame in front of
+                # the car -- but with a deadline, off this thread. Measured on a
+                # working drive this pass ran 1.0 to 5.8 s inside the turn, on a
+                # question whose whole target is one second. It cannot be
+                # cancelled, so it is not waited on: it keeps running and files
+                # its result for the next question. See observer.observe_soon.
+                _t = time.time()
+                hit = observer.observe_soon(session_key)
+                _mark("observe_now_ms", _t)
+                if not hit:
+                    # THE RACE THE DEADLINE OPENS, closed. While the on-demand
+                    # pass was running, the BACKGROUND loop may have filed one
+                    # -- it runs at 1 Hz and the deadline is 600 ms, so this is
+                    # a coin flip rather than a long shot.
+                    #
+                    # It matters more than one answer: the fall-through is the
+                    # full visual turn, which holds the observer for its own
+                    # length and therefore makes the NEXT question miss too.
+                    # One cold miss used to turn into a whole conversation of
+                    # slow answers, which is the failure look()'s own comment
+                    # about observer.hold describes.
+                    hit = observer.recent(session_key)
+                    stages["observer_recheck_hit"] = bool(hit)
             if hit:
                 took = round((time.time() - t0) * 1000, 1)
                 base = {
@@ -1878,7 +1939,10 @@ def look(question: str, session_key: str = "default",
                 # left to form. Handing her second opinions about a line the
                 # driver has already heard would invite her to revise it, which
                 # is the one thing that branch exists to prevent.
+                _t = time.time()
                 tctx = teacher_context(teachers, q)
+                _mark("teacher_block_ms", _t)
+                base["stages"] = stages
                 if hit.get("speakable"):
                     base["speak_directly"] = True
                     base["speech"] = hit["text"]
@@ -1906,10 +1970,12 @@ def look(question: str, session_key: str = "default",
                 )
                 return base
 
+        _t = time.time()
         route = request_router.classify(
             q,
             has_referent=session.active_referent() is not None,
             pending_clarification=session.pending_clarification() is not None)
+        _mark("route_ms", _t)
         if not request_router.is_visual(route["request_type"]):
             # The model has already decided this question is about what is out
             # there -- that is what calling `look` MEANS -- so a classifier
@@ -1926,9 +1992,26 @@ def look(question: str, session_key: str = "default",
         # holding through it starved the observer so thoroughly that the fast
         # path stopped hitting at all, each slow answer making the next question
         # slow too.
+        _t = time.time()
         with observer.hold(session_key):
             va = visual_qa.answer(session_key, q, route)
+        _mark("prepare_ms", _t)
+        # PREPARE'S OWN BREAKDOWN, surfaced rather than re-derived. visual_qa
+        # has timed its own steps since it was written (select_frame, resolve,
+        # crop, enrich) and nothing outside it ever looked.
+        for _k, _v in (getattr(va, "timing", None) or {}).items():
+            if isinstance(_v, (int, float)):
+                stages[f"prep_{_k}"] = round(float(_v), 1)
+            elif isinstance(_v, dict):
+                # The Qwen pass's own split (lock / input prep / decode), which
+                # is the only place that says whether a six-second attribute
+                # read was waiting, preparing or generating.
+                stages[f"prep_{_k}"] = {
+                    k2: v2 for k2, v2 in _v.items()
+                    if isinstance(v2, (int, float))}
+        _t = time.time()
         text = (va.text() or "").strip()
+        _mark("compose_ms", _t)
     except Exception as e:
         took = round((time.time() - t0) * 1000, 1)
         print(f"[realtime] look failed after {took} ms: "
@@ -1943,9 +2026,12 @@ def look(question: str, session_key: str = "default",
         return {"ok": False, "note": "nothing to see", "took_ms": took}
     meta = getattr(va, "meta", None) or {}
     seen_s_ago = meta.get("frame_age_s")
+    _t = time.time()
     tctx = teacher_context(teachers, q)
+    _mark("teacher_block_ms", _t)
     return {
         "ok": True, "answer": text, "took_ms": took,
+        "stages": stages,
         # THE SECOND OPINIONS, on the path that actually looks at the object.
         # Omitted entirely when nothing fresh -- see teachers.panel.context_for.
         **({"teachers": tctx} if tctx else {}),
