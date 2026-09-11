@@ -210,11 +210,36 @@ LINE_BACK_OFF = "back_off"
 
 # The words are fixed here, in the deterministic layer. The bible governs how
 # they are *delivered*; it never gets to choose whether or what to warn.
+# THE RED TIER'S WORDS, REVISITED 2026-09-11. The clips were not stale because
+# they were clips; they were stale because nobody had read them out loud since
+# they were written.
+#
+#   "You're too close."      a flat assessment with nothing to do about it.
+#                            Now "Too close - ease back.": the fact AND the
+#                            action, which is what a passenger actually says.
+#   "Watch your distance."   the worst of them. That is a driving instructor,
+#                            and the bible rules the register out by name
+#                            ("NOT a driving instructor"). Now "That's tight -
+#                            drop back."
+#   "Back off - now."        UNCHANGED, reviewed and kept. Short, action
+#                            first, urgency in the words rather than in the
+#                            delivery. Changing it to show change would have
+#                            made it worse.
+#
+# A AND B MUST STAY EQUAL IN FORCE. _next_unsafe_line alternates them for the
+# same event, so a difference in severity between them would make the warning
+# a driver got depend on how many times they had been warned before. Both are
+# fact-then-action fragments of the same length for exactly that reason.
+#
+# The CALM tier's two lines are no longer fixed text at all -- they are phrased
+# fresh from the event by safety_speech.py. These remain as the deterministic
+# fallback for when phrasing is slow or switched off, which is why they are
+# still here and still have to read well.
 LINE_TEXT = {
     LINE_CALM: "Beep beep — you're getting a little close there.",
     LINE_ESCALATE: "Still closing — ease off a touch.",
-    LINE_TOO_CLOSE: "You're too close.",
-    LINE_WATCH_DISTANCE: "Watch your distance.",
+    LINE_TOO_CLOSE: "Too close — ease back.",
+    LINE_WATCH_DISTANCE: "That's tight — drop back.",
     LINE_BACK_OFF: "Back off — now.",
 }
 

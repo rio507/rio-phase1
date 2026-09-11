@@ -129,11 +129,11 @@
       "voice": "marin"
     },
     "tire_critical": {
-      "at": 1788724589.9,
+      "at": 1789153068.6,
       "backend": "openai_realtime",
-      "bytes": 43773,
+      "bytes": 27621,
       "model": "gpt-realtime-2.1",
-      "sha1": "2f5f521eb23c",
+      "sha1": "40bc021c9b1a",
       "voice": "marin"
     },
     "tire_sensor_lost": {
@@ -145,11 +145,11 @@
       "voice": "marin"
     },
     "too_close": {
-      "at": 1788724589.9,
+      "at": 1789153068.6,
       "backend": "openai_realtime",
-      "bytes": 14061,
+      "bytes": 18645,
       "model": "gpt-realtime-2.1",
-      "sha1": "f4191bb88283",
+      "sha1": "23fa9d3d9e9a",
       "voice": "marin"
     },
     "turn_around_here": {
@@ -177,11 +177,11 @@
       "voice": "marin"
     },
     "watch_distance": {
-      "at": 1788724589.9,
+      "at": 1789153068.6,
       "backend": "openai_realtime",
-      "bytes": 13269,
+      "bytes": 18381,
       "model": "gpt-realtime-2.1",
-      "sha1": "52c607109523",
+      "sha1": "6e452d806251",
       "voice": "marin"
     }
   },

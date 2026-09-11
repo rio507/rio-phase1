@@ -518,8 +518,10 @@ def run_clips():
 
     from tools import render_alerts as ra
 
-    expected = {"back_off", "too_close", "watch_distance",
-                "tire_critical", "tire_sensor_lost"}
+    # ASKED, NOT LISTED. A second copy of the clip set is a second thing to
+    # forget: when tire_sensor_lost left the clip tier for live phrasing, this
+    # line was the one still insisting it had to be on disk.
+    expected = set(ra.CLIP_LINES) | set(ra.TIRE_CLIPS)
     present = {p.stem for p in (REPO / "static/audio").glob("*.mp3")}
     ok(expected <= present,
        f"all {len(expected)} pre-rendered clips are on disk "

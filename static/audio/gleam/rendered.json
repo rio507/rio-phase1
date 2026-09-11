@@ -9,11 +9,11 @@
       "voice": "gleam"
     },
     "keep_left": {
-      "at": 1789150282.1,
+      "at": 1789153227.5,
       "backend": "gpt_live",
-      "bytes": 11661,
+      "bytes": 9117,
       "model": "gpt-live-1",
-      "sha1": "74071647ee2e",
+      "sha1": "ee38ed30b350",
       "voice": "gleam"
     },
     "keep_right": {
@@ -89,11 +89,11 @@
       "voice": "gleam"
     },
     "tire_critical": {
-      "at": 1789148982.8,
+      "at": 1789153173.1,
       "backend": "gpt_live",
-      "bytes": 64557,
+      "bytes": 44349,
       "model": "gpt-live-1",
-      "sha1": "342a720ec538",
+      "sha1": "ca25986e930f",
       "voice": "gleam"
     },
     "tire_sensor_lost": {
@@ -105,11 +105,11 @@
       "voice": "gleam"
     },
     "too_close": {
-      "at": 1789150282.1,
+      "at": 1789153173.1,
       "backend": "gpt_live",
-      "bytes": 14517,
+      "bytes": 9717,
       "model": "gpt-live-1",
-      "sha1": "15cc17abf6f1",
+      "sha1": "b4649df7661c",
       "voice": "gleam"
     },
     "turn_left": {
@@ -129,11 +129,11 @@
       "voice": "gleam"
     },
     "watch_distance": {
-      "at": 1789150282.1,
+      "at": 1789153173.1,
       "backend": "gpt_live",
-      "bytes": 17373,
+      "bytes": 27069,
       "model": "gpt-live-1",
-      "sha1": "2b8fb404905a",
+      "sha1": "d4ff2be80238",
       "voice": "gleam"
     }
   },

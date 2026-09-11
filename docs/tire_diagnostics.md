@@ -224,7 +224,10 @@ has already been passed, and those gates are what a single malformed packet, a
 wake-up frame, a receiver-wide loss or an unknown sensor cannot get through.
 
 They play **pre-rendered clips** (`static/audio/tire_critical.mp3`,
-`tire_sensor_lost.mp3`) at the existing `VEHICLE_HEALTH` arbiter priority — the
+`tire_sensor_lost.mp3`, **retired 2026-09-11** — see docs/safety_speech.md:
+sensor loss is now phrased fresh in her voice, which lets it name the corner
+and the last reading a clip never could) at the existing `VEHICLE_HEALTH`
+arbiter priority — the
 same mechanism and the same argument as the headway red tier. A pre-rendered
 line cannot name a corner or a pressure, so it says what is true of all of them
 and the dashboard carries the detail.

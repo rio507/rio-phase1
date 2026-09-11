@@ -107,13 +107,22 @@ CLIP_LINES = [k for k, v in live_policy.LINE_AUDIO.items() if v != "tts"]
 # pressure, so it says the thing that is true of all of them and the dashboard
 # carries the detail. That is a real constraint of the mechanism, not a
 # shortcut: a clip per corner per pressure is not a set anyone can render.
+# ONE ENTRY, NOT TWO, SINCE 2026-09-11, and the one that left is the point of
+# the split. `tire_sensor_lost` said "check it by hand when you stop" -- an
+# action that is not NOW -- so it has no business paying the price of a fixed
+# clip. It is phrased fresh from the event instead (safety_speech.py), which
+# also lets it say the corner and the last reading, which a clip never could.
+#
+# The one that stays was rewritten. "Pull over when it's safe - one of your
+# tires is dangerously low and still going down." is fifteen words in the tier
+# defined by not having time for them, and it was also the line the Gleam voice
+# could not render intelligibly -- see docs/live_gpt_live.md. The replacement
+# leads with why and puts the action second, and "when you can" keeps the
+# judgement where it belongs: pulling over is the driver's call, and RIO does
+# not grab the wheel.
 TIRE_CLIPS = {
     "tire_critical":
-        "Pull over when it's safe — one of your tires is dangerously low and "
-        "still going down.",
-    "tire_sensor_lost":
-        "I've lost the sensor on a tire that was already losing air. Check it "
-        "by hand when you stop.",
+        "Tire's going down fast — pull over when you can.",
 }
 
 # THE IMMINENT TURN CALL, for the same reason and by the same argument.

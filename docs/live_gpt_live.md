@@ -224,8 +224,9 @@ transcription counts as **unchecked**, not wrong — the transcriber declines on
 very short audio often enough that treating silence as a mismatch condemned six
 good clips the render-time check had just passed.
 
-**Final state of the Gleam library: 16 rendered and verified, 0 wrong, 1
-refused.**
+**Final state of the Gleam library: 16 rendered, 0 wrong.** (The set changed
+shape on 2026-09-11 — `tire_sensor_lost` left for live phrasing and
+`tire_critical` was rewritten and now renders.)
 
 It earned its keep twice.
 
@@ -251,7 +252,16 @@ clip is now **refused**: the file is removed, the run continues, the exit code
 is non-zero. A missing clip is not silence — `rio_speak` falls through to
 dictation and then the synthesiser. A *wrong* clip has no tier underneath it.
 
-### The one clip Gleam could not render
+### The one clip Gleam could not render — since fixed
+
+> **Resolved 2026-09-11.** The line was rewritten as part of the safety-speech
+> split (docs/safety_speech.md): *"Tire's going down fast — pull over when you
+> can."* Nine words instead of fifteen, and "pull over" sits mid-sentence
+> rather than at the start, where Gleam renders it correctly. `tire_critical`
+> is now in the Gleam library and verified. The account below is kept because
+> the failure mode is real and the next long line may hit it.
+
+
 
 `tire_critical` — *"Pull over when it's safe — one of your tires is dangerously
 low and still going down."* — **does not verify in Gleam**, across ten renders

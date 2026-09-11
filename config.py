@@ -1228,6 +1228,58 @@ GUARD_PHANTOM_SUPERSEDE = _guard("phantom_supersede", not _LIVE)
 
 
 # ---------------------------------------------------------------------------
+# SAYING A SAFETY FINDING IN HER OWN WORDS
+# ---------------------------------------------------------------------------
+# THE COMPLAINT THIS EXISTS FOR: the spoken safety layer sounded like a
+# recording, because most of it was one. "The front left tire is down to 24
+# PSI. That's low enough that I wouldn't keep driving on it." is a template
+# with two slots, and a driver hears the same sentence, in the same order, with
+# the same emphasis, every time the car finds the same thing. That is an ADAS
+# beep with a vocabulary.
+#
+# So the library is split by URGENCY rather than by subject, and the question
+# asked of each line is only "can this wait for a model and a mouth?":
+#
+#   critical    the headway red tier and "pull over now". Clips, unchanged,
+#               local, instant. See safety_speech.CRITICAL_CLIPS -- that set
+#               is the whole of the answer and this comment is not it.
+#   everything  phrased fresh from the structured event, in the conversation
+#   else        voice, with the existing fallback chain underneath.
+#
+# NOTHING HERE CHANGES WHEN SHE SPEAKS. The bands, the cooldowns, the
+# minimum gap, the reminder window, the healing gate, the confidence and
+# warm-up suppressions -- all of them decide WHETHER there is a line, and this
+# decides only what the line says. A change that made her talk more would be a
+# different change and is not this one.
+#
+# WHICH MODEL WRITES IT, chosen by measurement (tools/safety_phrase_bench.py).
+# The job is small -- one sentence from a handful of structured fields -- and
+# what matters is the whole line arriving, not the first token: nothing can be
+# spoken until the sentence is finished.
+SAFETY_PHRASE_MODEL = os.getenv("SAFETY_PHRASE_MODEL", "gpt-5.6-luna")
+
+# How long phrasing may take before the deterministic sentence is used instead.
+#
+# It has to fit INSIDE the channel's existing speak budget, not beside it: the
+# health channel allows 2000 ms from decision to first audio, and that budget
+# has to cover this call AND the mouth starting. A generator that spent the
+# whole budget would leave the fallback chain no time to be a fallback.
+SAFETY_PHRASE_TIMEOUT_S = float(os.getenv("SAFETY_PHRASE_TIMEOUT_S", "1.2"))
+
+# One or two sentences. A ceiling at the API rather than in the prompt, for the
+# same reason max_response_tokens is one: the instructions ask for brevity and
+# mostly get it, and this makes a paragraph impossible rather than unlikely.
+SAFETY_PHRASE_MAX_TOKENS = int(os.getenv("SAFETY_PHRASE_MAX_TOKENS", "120"))
+
+# Phrasing is a live path and lives with the other switches that turn one off.
+# Off, every non-critical line is the deterministic sentence it was before --
+# which is to say, this whole feature is one env var from not existing.
+SAFETY_PHRASE_ENABLED = (
+    os.getenv("SAFETY_PHRASE_ENABLED", "1").strip().lower()
+    not in ("0", "false", "no", "off"))
+
+
+# ---------------------------------------------------------------------------
 # WHERE THE PRE-RENDERED CLIPS FOR *THIS* VOICE LIVE
 # ---------------------------------------------------------------------------
 # THE PROBLEM A SINGLE DIRECTORY HAS, now that there are three backends: the

@@ -1795,6 +1795,37 @@ def headway_sessions_endpoint():
     return headway_live.active_sessions()
 
 
+def _headway_text(line: str) -> str:
+    """The coaching line, in her words if one is ready.
+
+    STILL A LOOKUP, NOT A TEXT-TO-SPEECH ENDPOINT, and that property is the
+    reason this function exists rather than a `text` parameter. The browser
+    sends a KEY -- "calm" or "escalate" -- and what it gets back is bounded by
+    the two events in safety_speech.HEADWAY_EVENTS and by the validator every
+    generated line passes. Nothing the page can send makes RIO say a sentence
+    nobody wrote a rule for.
+
+    The floor is live_policy.LINE_TEXT, which is what shipped before phrasing
+    existed and is what comes back when phrasing is off, slow, or refused.
+    """
+    floor = live_policy.LINE_TEXT[line]
+    if not getattr(config, "SAFETY_PHRASE_ENABLED", False):
+        return floor
+    try:
+        import safety_speech
+
+        ev = dict(safety_speech.HEADWAY_EVENTS.get(line) or {})
+        if not ev:
+            return floor
+        ev["fallback"] = floor
+        got = safety_speech.next_line(ev, _PHRASE_SESSION, ev["key"])
+        return (got.get("text") or "").strip() or floor
+    except Exception as e:
+        print(f"[headway] phrasing skipped for {line}: "
+              f"{type(e).__name__}: {e}", flush=True)
+        return floor
+
+
 @app.get("/headway_voice")
 def headway_voice_endpoint(line: str = Query(...)):
     """Live TTS for the amber-tier lines.
@@ -1807,9 +1838,19 @@ def headway_voice_endpoint(line: str = Query(...)):
     """
     if live_policy.LINE_AUDIO.get(line) != "tts":
         return {"error": "unknown or non-TTS line", "line": line}
-    text = live_policy.LINE_TEXT[line]
-    return StreamingResponse(voice.synthesize_stream(text), media_type="audio/mpeg",
-                             headers={"Cache-Control": "no-store"})
+    text = _headway_text(line)
+    return StreamingResponse(
+        voice.synthesize_stream(text), media_type="audio/mpeg",
+        headers={
+            # PERCENT-ENCODED, exactly as X-Health-Text is, and for a reason
+            # this change discovered the hard way: a phrased line contains an
+            # em dash, HTTP headers are latin-1, and a raw one returns 500 --
+            # which on this endpoint means a gap warning that never arrives.
+            # The old fixed lines happened to be ASCII; generated ones are not.
+            "X-Headway-Text": quote(text, safe=""),
+            "Access-Control-Expose-Headers": "X-Headway-Text",
+            "Cache-Control": "no-store",
+        })
 
 
 # --- Navigation (docs/navigation_v1.md) ---
@@ -2437,6 +2478,68 @@ def vehicle_health_endpoint(full: bool = Query(default=True)):
 
 
 @app.get("/vehicle/health/announcement")
+def _attach_phrasing(issues: list):
+    """Write the sentence BEFORE the policy decides to say it.
+
+    THE TIMING IS THE WHOLE POINT. Phrasing costs 1.2-1.7 s and the health
+    channel allows 2000 ms from decision to first audio, so a line written when
+    the policy says "speak" does not fit -- measured, and measured again with
+    the mouth included: 1925 ms at the median on the shipped backend, which is
+    the budget, which means falling through to the synthesiser about half the
+    time.
+
+    It does not have to be written then. A confirmed fault sits behind a
+    cooldown, a minimum gap, a confidence gate and a healing gate before it is
+    ever announced, and the sentence can be written during that wait. By the
+    time the policy says yes the words are already here: 670 ms to first audio
+    instead of 1925.
+
+    Same move observer.py makes for the camera -- start describing the road
+    now, not when she is first asked about it.
+
+    THIS DOES NOT MAKE HER TALK MORE. Preparing a line is not deciding to say
+    one. Every gate that decides whether there is an announcement at all is
+    downstream of this and none of them can see it.
+    """
+    if not getattr(config, "SAFETY_PHRASE_ENABLED", False):
+        return
+    try:
+        import safety_speech
+    except Exception:
+        return
+    for issue in issues or []:
+        # A critical line is a clip and is not phrased: the whole reason it is
+        # a clip is that it cannot wait for any of this.
+        if safety_speech.is_critical(str(issue.get("audio") or "")):
+            continue
+        if not issue.get("announce_allowed"):
+            continue
+        key = str(issue.get("key") or "")
+        if not key:
+            continue
+        try:
+            rev = safety_speech.revision_of(issue)
+            got = safety_speech.take(_PHRASE_SESSION, key, rev)
+            if got:
+                issue["spoken_override"] = got["text"]
+            else:
+                safety_speech.prepare(safety_speech.event_from_issue(issue),
+                                      _PHRASE_SESSION, key, revision=rev)
+        except Exception as e:
+            # A line that cannot be phrased is a line that gets said the old
+            # way. Never a reason for the announcement not to happen.
+            print(f"[health] phrasing skipped for {key}: "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+
+# One phrasing session per process, which is one per drive in practice. It is
+# what "not twice in the same drive" is scoped to -- and it is shared by the
+# health announcements and the headway coaching deliberately: a driver who
+# hears the same sentence from two different subsystems has still heard the
+# same sentence twice.
+_PHRASE_SESSION = "drive"
+
+
 def vehicle_health_announcement_endpoint():
     """Is there something the driver has to be told right now?
 
@@ -2460,6 +2563,7 @@ def vehicle_health_announcement_endpoint():
 
     now = time.time()
     issues = vehicle_health.issues()
+    _attach_phrasing(issues)
     out = _health_policy.tick(issues, now)
 
     # The communication ledger is the ENGINE's, not the policy's, because it has

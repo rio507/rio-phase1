@@ -276,8 +276,10 @@ def check_weights():
         expected = (set(_ra.CLIP_LINES) | set(_ra.TIRE_CLIPS)
                     | set(_ra.IMMINENT_CLIPS))
     except Exception:
+        # The last-resort list, for when render_alerts will not import at all.
+        # Safety clips only -- the nav set is long and this is a fallback.
         expected = {"back_off", "too_close", "watch_distance",
-                    "tire_critical", "tire_sensor_lost"}
+                    "tire_critical"}
     missing = sorted(expected - set(clips))
     check(not missing,
           f"pre-rendered clips ({len(expected) - len(missing)}/{len(expected)})",

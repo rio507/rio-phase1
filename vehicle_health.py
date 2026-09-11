@@ -531,7 +531,14 @@ def _issue_from_diagnostic(i: dict) -> dict:
 # exists to avoid. Rendered by tools/render_alerts.py.
 _FAST_PATH_CLIP = {
     "tire.critical_low_pressure": "tire_critical",
-    "tire.sensor_loss_during_decline": "tire_sensor_lost",
+    # tire.sensor_loss_during_decline USED TO BE HERE and is not any more. It
+    # is still fast-path eligible -- it may still interrupt -- but its audio is
+    # now "tts", which means it is phrased fresh and spoken in her voice.
+    #
+    # The split is by URGENCY and this finding is not urgent in the sense the
+    # clip tier means: "check it by hand when you stop" is an action for the
+    # next stop, not for now. What it buys by leaving is the thing a fixed clip
+    # can never do -- name the corner and the last reading it had.
 }
 
 

@@ -428,8 +428,9 @@ def parse_tool_call(event: dict):
 
 _RENDER_INSTRUCTIONS = (
     "You are a speech renderer, not an assistant. Speak exactly the text you "
-    "are given, word for word, once. Never add a greeting, a comment, an "
-    "acknowledgement or a question. Never rephrase.")
+    "are given, word for word, ONCE, and then stop and stay silent. Never "
+    "repeat it. Never add a greeting, a comment, an acknowledgement or a "
+    "question. Never rephrase.")
 
 
 def render_speech(text: str, timeout_s: float = 45.0) -> dict:
@@ -617,12 +618,55 @@ def _run_render(line: str, timeout_s: float) -> dict:
         pcm = bytes(state["pcm"])
         if not pcm:
             return {"ok": False, "note": "no audio"}
-        # Trim the trailing quiet the stop test just waited through, so the
-        # clip is the sentence and not the sentence plus a second of room.
+        # SHE SOMETIMES SAYS IT, PAUSES, AND THEN SAYS SOMETHING ELSE.
+        #
+        # Measured on "Too close - ease back.": 1.6 s of the line, 0.7 s of
+        # silence, and then 1.4 s more audio. The whole 4.4 s went into the
+        # clip and the transcriber -- reasonably -- made nonsense of it
+        # ("Two calls, ease back"). A four-word warning that is four seconds
+        # long is also simply wrong for the tier it serves.
+        #
+        # So the clip is the FIRST RUN OF SPEECH, where a run continues across
+        # the short pauses inside a sentence and ends at a long one.
+        #
+        # 0.9 s, AND THE THRESHOLD IS DELIBERATELY TOO LOOSE TO CATCH EVERY
+        # CASE. The two things being separated overlap: an em dash reads at
+        # 0.45 to 0.7 s depending on the line, and the unasked-for second
+        # utterance arrived after 0.7. No threshold splits them cleanly, so
+        # this one is set where it cannot TRUNCATE -- tried at 0.55 s, it cut
+        # "That's tight - drop back." down to "That's tight." -- and the
+        # occasional clip that keeps a trailing extra is left to the
+        # independent transcription in tools/render_alerts.py, which refuses
+        # it and renders again.
+        #
+        # Truncating is the worse error and it is silent: a clip that says
+        # half a warning still plays, still sounds fluent, and says the wrong
+        # thing. A clip with something extra on the end fails the verifier.
+        #
+        # The independent transcription in tools/render_alerts.py is what makes
+        # this safe to do at all -- a trim that cut a real word produces a clip
+        # that does not match its line, and that clip is re-rendered rather
+        # than shipped.
         arr = np.frombuffer(pcm, "<i2")
-        loud = np.where(np.abs(arr) > 150)[0]
-        if len(loud):
-            arr = arr[:min(len(arr), loud[-1] + int(rate * 0.18))]
+        loud = np.abs(arr) > 150
+        gap = int(rate * 0.9)
+        win = max(1, int(rate * 0.01))
+        end = len(arr)
+        quiet_run = 0
+        started = False
+        for i in range(0, len(arr), win):
+            if loud[i:i + win].any():
+                started = True
+                quiet_run = 0
+            elif started:
+                quiet_run += win
+                if quiet_run >= gap:
+                    end = i - quiet_run + win
+                    break
+        arr = arr[:max(end, 1)]
+        tail = np.where(np.abs(arr) > 150)[0]
+        if len(tail):
+            arr = arr[:min(len(arr), tail[-1] + int(rate * 0.18))]
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)

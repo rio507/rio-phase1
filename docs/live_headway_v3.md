@@ -56,7 +56,7 @@ enter UNSAFE         at τ < 2.0   exit back    at τ > 2.2
 |---|---|---|
 | "Beep beep — you're getting a little close there." | confirmed entry into GETTING_UNSAFE **from a better band** | live TTS (`/headway_voice?line=calm`) |
 | "Still closing — ease off a touch." | 5 s in GETTING_UNSAFE with the gap still closing | live TTS |
-| "You're too close." / "Watch your distance." | confirmed entry into UNSAFE | **pre-rendered clip** |
+| "Too close — ease back." / "That's tight — drop back." | confirmed entry into UNSAFE | **pre-rendered clip** |
 | "Back off — now." | entry into UNSAFE while RAPIDLY closing, or the gap starting to collapse while already in UNSAFE | **pre-rendered clip** |
 
 The red tier is pre-rendered because an ElevenLabs round-trip measures **267 ms**
@@ -77,7 +77,7 @@ The two red phrasings alternate, so a repeat is not word-for-word.
 - **Hysteresis** — 0.2 s τ on exit, so boundary flicker cannot re-trigger entry.
 - **Cooldowns** — 30 s calm tier, 15 s unsafe tier, applied **per tier, not per
   line**. The spec says "same line not repeated within 30 s / 15 s"; per-line
-  would let "You're too close." and "Watch your distance." fire back to back and
+  would let "Too close — ease back." and "That's tight — drop back." fire back to back and
   satisfy that on a technicality. Per tier is strictly stronger and implies it.
 - **Genuine clear re-arms** — continuous NORMAL for > 10 s clears every cooldown.
   Danger that resolves and returns deserves a fresh warning.
@@ -102,7 +102,7 @@ The two red phrasings alternate, so a repeat is not word-for-word.
   silent**: the reset lands ~0.5 s before the confirmation completes, so at
   2 fps the entry always fell inside the window. Neutralising the trend keeps
   the real protection — no line may be *chosen* from an unconverged ḋ, so a
-  warm-up entry gets "You're too close." rather than "Back off — now.", and
+  warm-up entry gets "Too close — ease back." rather than "Back off — now.", and
   neither the escalation nor the in-band collapse branch can fire.
 - **A transient gate defers an entry, it does not delete one** — a band entry is
   a one-shot event, so a confidence dip (or a NEW_LEAD frame) landing on exactly

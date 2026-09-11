@@ -327,6 +327,21 @@ def compose(issue: dict) -> str:
     the selftest assert on RIO's actual words instead of on a shape.
     """
     issue = issue or {}
+    # A LINE THE CALLER ALREADY WROTE, if there is one.
+    #
+    # This is how live phrasing reaches the announcement without a model call
+    # inside a policy that is documented pure, clockless and replayable -- and
+    # it has to stay all three, because tools/vehicle_health_selftest.py
+    # replays whole sessions through it and asserts on RIO's exact words.
+    #
+    # So the I/O happens in app.py, which ticks this, and the result arrives as
+    # an ordinary field on the issue. Same input still gives same output; the
+    # input just got richer. An issue with no override composes exactly as it
+    # did before this existed, which is also what happens when phrasing is
+    # slow, refused or switched off.
+    override = (issue.get("spoken_override") or "").strip()
+    if override:
+        return override
     template = LINE.get(issue.get("type"))
     fallback = (issue.get("spoken_fallback") or "").strip()
     if not template:
