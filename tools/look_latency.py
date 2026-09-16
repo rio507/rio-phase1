@@ -178,7 +178,7 @@ def band(xs):
 
 
 def run(base: str, session: str, question: str, n: int) -> dict:
-    totals, stages, paths = [], {}, []
+    totals, stages, paths, calls = [], {}, [], []
     for _ in range(n):
         t0 = time.time()
         try:
@@ -188,8 +188,14 @@ def run(base: str, session: str, question: str, n: int) -> dict:
         except Exception as e:
             print(f"   {type(e).__name__}: {e}")
             continue
-        totals.append((time.time() - t0) * 1000.0)
+        ms = (time.time() - t0) * 1000.0
+        totals.append(ms)
         paths.append(r.get("path") or ("REFUSED:" + str(r.get("note"))))
+        # PER CALL, not just percentiles. p95 of a total and p95 of each stage
+        # are computed over different calls and do not add up -- the only way
+        # to say what the slow calls were made of is to keep them whole.
+        calls.append({"ms": round(ms, 1), "path": paths[-1],
+                      "stages": dict(r.get("stages") or {})})
         for k, v in (r.get("stages") or {}).items():
             if isinstance(v, (int, float)):
                 stages.setdefault(k, []).append(float(v))
@@ -199,7 +205,8 @@ def run(base: str, session: str, question: str, n: int) -> dict:
                     if isinstance(v2, (int, float)):
                         stages.setdefault(f"{k}.{k2}", []).append(float(v2))
         time.sleep(0.4)
-    return {"total": band(totals), "stages": stages, "paths": paths}
+    return {"total": band(totals), "stages": stages, "paths": paths,
+            "calls": calls}
 
 
 def report(label: str, res: dict):
@@ -228,6 +235,20 @@ def report(label: str, res: dict):
     print(f'    {"-" * 46}')
     print(f'    {"TOOL ROUND TRIP":<28}{t["p50"]:>9.1f}{t["p95"]:>9.1f}'
           f'   n={t["n"]}')
+    calls = res.get("calls") or []
+    if calls:
+        worst = sorted(calls, key=lambda c: -c["ms"])[:4]
+        print("\n    slowest calls, whole:")
+        for c in worst:
+            bits = []
+            for k in ("prep_resolve", "prep_clarify", "prep_enrich",
+                      "observe_now_ms", "compose_ms", "prep_prepare_total"):
+                v = c["stages"].get(k)
+                if isinstance(v, (int, float)) and v >= 1:
+                    bits.append(f"{k.replace('prep_', '').replace('_ms', '')}"
+                                f"={v:.0f}")
+            print(f'      {c["ms"]:8.0f} ms  {c["path"]:<14} '
+                  f'{"  ".join(bits)}')
 
 
 def main() -> int:
