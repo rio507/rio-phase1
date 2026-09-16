@@ -2811,9 +2811,15 @@ RIO.ui = (function () {
         let msg = '', blocking = false;
         if (!snap.secure) {
           blocking = true;
-          msg = 'This page is not on HTTPS, so the browser will not offer the '
-              + 'camera, microphone or location at all. Open it over https:// '
-              + '(or on localhost) — nothing here can be granted until then.';
+          /* Name the address to go to, rather than the rule that was
+             broken. "Not a secure context" is the accurate sentence and it is
+             useless on a phone at the kerb; the URL is what the driver can
+             act on. The port is the one boot.sh starts the TLS proxy on. */
+          msg = 'Not on HTTPS, so the browser will not offer the camera, '
+              + 'microphone or location at all — it refuses before it asks. '
+              + 'Open https://' + location.hostname + ':8443/ on this device '
+              + 'instead. It will warn once about the certificate; tapping '
+              + 'through is enough.';
         } else if (snap.geo === 'denied') {
           blocking = true;
           msg = 'Location is denied, so anything about where you are — places '

@@ -163,6 +163,81 @@ default.
 
 ---
 
+## 6. HTTPS, which is what actually unblocks the phone
+
+`localhost` is a secure context by special dispensation. **A phone is never on
+localhost.** Over `http://192.168.1.42:8888` a browser refuses the camera, the
+microphone and geolocation *before drawing any prompt* — not as a permission the
+driver denied, but as a capability never offered. That is the most likely root
+cause of the live failure, and no amount of work on the permission flow fixes
+it, because the flow never gets to run.
+
+```
+  bash boot.sh cert --add 192.168.1.42     # the address the phone will type
+  bash boot.sh restart                     # starts TLS if a cert exists
+  # phone: https://192.168.1.42:8443/      # warns once; tap through
+```
+
+### Why a terminator rather than `uvicorn --ssl-keyfile`
+
+uvicorn serves one protocol per process and this process loads Qwen3-VL.
+Turning the existing listener into an HTTPS one means either a second 16 GB
+model server or no plain-HTTP dashboard — and roughly fifteen selftests, every
+`curl` and every playwright run in this repository speak plain HTTP to
+`127.0.0.1:8888`. They would all have to learn about certificates to go on
+testing things that have nothing to do with TLS.
+
+So `tools/tls_proxy.py` terminates TLS on **8443** and forwards plaintext to
+**8888**. The edge speaks TLS, the application does not, which is how this is
+done in production anyway. Both ports stay up: the phone uses one, every local
+tool keeps using the other, unchanged.
+
+It forwards **raw bytes** rather than parsing HTTP, because the dashboard's most
+important connection is a WebSocket — the frame transport — and an upgrade, its
+binary frames and its close handshake are all just bytes. There is no parser
+here to get any of them subtly wrong. `tools/https_selftest.py` §D proves the
+upgrade survives, because a terminator that quietly dropped it would take the
+camera feed with it while leaving the page looking fine.
+
+### What makes the certificate one iOS will accept
+
+`openssl req -x509` alone produces a certificate iOS refuses *after* the driver
+has already tapped through the warning, which is the most confusing possible
+moment. Apple's requirements, all set by `tools/make_cert.py` and all asserted
+in the selftest:
+
+| requirement | why it bites |
+|---|---|
+| **Subject Alternative Names** | Apple ignores the Common Name entirely. A CN-only cert is a cert for nothing |
+| **825 days or less** | for anything issued after 2019-07-01 |
+| **EKU with serverAuth** | without it the certificate is rejected outright |
+| **SHA-256+, EC P-256 or RSA 2048+** | weaker is refused |
+
+The address problem is real and cannot be solved here: the server sees a
+container address (`172.x`), the phone dials the host machine's LAN address, and
+this script cannot know the second. Detected addresses go in, `--add` is for the
+one you actually type, and a mismatch shows up as a second warning rather than a
+silent failure.
+
+### What this does not do
+
+It does not make the certificate **trusted**. Self-signed means a warning on
+first visit; tapping through is enough for a secure context, which is all the
+permission prompts need. For a phone used daily, installing `cert/rio-cert.pem`
+as a trusted profile removes the warning.
+
+It does not close port 8888. Plain HTTP is still there for the loopback and
+every local tool — on a machine reachable from anywhere untrusted, that is the
+port to firewall.
+
+The private key is generated per machine in seconds, so `cert/` is gitignored
+entirely: there is nothing to preserve and everything to lose. Note that `chmod
+600` is ineffective on this workspace's filesystem — `tools/tls_proxy.py
+--check` says so rather than pretending otherwise, and the gitignore is the
+protection that actually holds.
+
+---
+
 ## 5. Files
 
 | file | what |
@@ -175,3 +250,6 @@ default.
 | `static/index.html` | the checklist, the fix line, the blocking gate |
 | `tools/session_isolation_selftest.py` | two sessions, two sources, no leaking |
 | `tools/permissions_selftest.js` | gesture ordering, four states, no fallback |
+| `tools/make_cert.py` | an iOS-shaped self-signed certificate |
+| `tools/tls_proxy.py` | TLS on 8443 in front of plaintext 8888 |
+| `tools/https_selftest.py` | the cert, the terminator, and `isSecureContext` |

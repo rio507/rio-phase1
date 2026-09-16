@@ -7,6 +7,7 @@ app.py.bak
 app.py.embedfix.bak
 *.bak
 uvicorn.log*
+tls.log*
 training_data/
 runs/
 weights/
@@ -33,3 +34,10 @@ tools/_driver_*.pcm
 # Cached driver audio for the live benches. Synthesised on demand and
 # deterministic per question; there is no reason to carry it in the repo.
 tools/_live_cache/
+
+# TLS for the dashboard (tools/make_cert.py). The PRIVATE KEY lives here and
+# must never be committed — it is generated per machine in seconds, so there is
+# nothing to preserve and everything to lose. The whole directory is ignored
+# rather than the key alone: a certificate naming a machine's LAN addresses is
+# not secret, but it is not useful anywhere else either.
+cert/

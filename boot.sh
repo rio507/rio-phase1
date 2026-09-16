@@ -115,6 +115,75 @@ rio_pids() {
 # The pids on one line, trimmed, or empty. Used for reporting only.
 rio_pidline() { rio_pids | tr '\n' ' ' | sed 's/ *$//'; }
 
+# ---------------------------------------------------------------------------
+# TLS, so a phone can be asked for the camera, the microphone and a position
+# ---------------------------------------------------------------------------
+# Over plain http on a LAN address a browser refuses all three BEFORE drawing a
+# prompt — not as a permission the driver denied, but as a capability never
+# offered. `localhost` is exempt; a phone is never on localhost. That is what
+# the 2026-09-16 drive hit, and it looked like a bad search rather than a
+# missing prompt.
+#
+# TLS terminates in a small proxy (tools/tls_proxy.py) rather than in uvicorn
+# because this process loads Qwen3-VL: turning the listener into an HTTPS one
+# would mean a second 16 GB server, or no plain-HTTP dashboard for the fifteen
+# selftests and every curl in this repository that speak it. So the edge
+# speaks TLS and the loopback stays plaintext, which is how it is done in
+# production anyway.
+#
+# It is started ONLY when a certificate exists. No certificate is not a fault:
+# the dashboard works perfectly on http://localhost for desk work, and a
+# machine that never serves a phone never needs one.
+HTTPS_PORT=${RIO_HTTPS_PORT:-8443}
+CERT_FILE="$REPO/cert/rio-cert.pem"
+
+tls_pids() { pgrep -f 'tools.tls_proxy' 2>/dev/null || true; }
+
+tls_stop() {
+    local pids
+    pids=$(tls_pids)
+    [ -z "$pids" ] && return 0
+    echo "   stopping tls proxy: $(echo "$pids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 0.5
+}
+
+tls_start() {
+    if [ ! -f "$CERT_FILE" ]; then
+        echo "   no certificate — https not started (http://localhost:$PORT still works)"
+        echo "   for a phone: python -m tools.make_cert --add <the address you will type>"
+        return 0
+    fi
+    tls_stop
+    setsid nohup python3 -m tools.tls_proxy --listen "$HTTPS_PORT" --to "$PORT" \
+        > "$REPO/tls.log" 2>&1 < /dev/null &
+    sleep 1
+    if [ -z "$(tls_pids)" ]; then
+        echo "   !! tls proxy did not come up — tail of tls.log:"
+        tail -n 8 "$REPO/tls.log" 2>/dev/null | sed 's/^/      /'
+        return 1
+    fi
+    echo "   https on :$HTTPS_PORT -> :$PORT  (pid $(tls_pids | tr '\n' ' '))"
+    echo "   phone: https://<this machine's LAN address>:$HTTPS_PORT/"
+    return 0
+}
+
+tls_status() {
+    local pids
+    pids=$(tls_pids)
+    if [ -z "$pids" ]; then
+        echo "   tls proxy: not running"
+    else
+        echo "   tls proxy: $(echo "$pids" | tr '\n' ' ')  (:$HTTPS_PORT)"
+    fi
+    if [ -f "$CERT_FILE" ]; then
+        python3 -m tools.tls_proxy --check 2>&1 | sed 's/^/   /'
+    else
+        echo "   certificate: none (python -m tools.make_cert)"
+    fi
+}
+
 rio_stop() {
     local pids i
     pids=$(rio_pidline)
@@ -495,17 +564,23 @@ rio_status() {
 # is half-built.
 case "${1-}" in
     restart) log "restarting uvicorn on :$PORT"; rio_stop; rio_start
-             log "health check"; rio_wait_healthy; exit $? ;;
-    stop)    log "stopping uvicorn"; rio_stop; exit 0 ;;
+             log "health check"; rio_wait_healthy; rc=$?
+             log "https"; tls_start; exit $rc ;;
+    stop)    log "stopping uvicorn"; rio_stop; tls_stop; exit 0 ;;
     start)   log "starting uvicorn on :$PORT"; rio_stop; rio_start
-             log "health check"; rio_wait_healthy; exit $? ;;
+             log "health check"; rio_wait_healthy; rc=$?
+             log "https"; tls_start; exit $rc ;;
     status)  log "RIO on :$PORT"; rio_status
+             log "https"; tls_status
              log "teachers"; teachers_status; exit 0 ;;
+    https)   log "starting tls proxy on :$HTTPS_PORT"; tls_start; exit $? ;;
+    https-stop) log "stopping tls proxy"; tls_stop; exit 0 ;;
+    cert)    shift; python3 -m tools.make_cert "$@"; exit $? ;;
     teachers)       teachers_start; exit $? ;;
     teachers-stop)  log "stopping teacher services"; teachers_stop; exit 0 ;;
     teachers-build) teachers_build; exit $? ;;
     "")      ;;
-    *)       echo "usage: bash boot.sh [restart|stop|start|status|teachers|teachers-stop|teachers-build]" >&2; exit 2 ;;
+    *)       echo "usage: bash boot.sh [restart|stop|start|status|cert|https|https-stop|teachers|teachers-stop|teachers-build]" >&2; exit 2 ;;
 esac
 
 # `set -e` makes this script abort on the first failure, which is right -- but a
