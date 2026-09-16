@@ -2894,6 +2894,25 @@
                                            response_id: speaking
                                              ? speaking.responseId : null });
           }
+          /* CITATIONS, on their own event and before the answer is asked for.
+             OpenAI's web search terms require that when web results, or
+             information drawn from them, are shown to a person, inline
+             citations are clearly visible and clickable. RIO's answer is
+             SPOKEN, so the dashboard is the only surface that can carry them,
+             and it has to have them before she starts talking rather than
+             after she stops.
+
+             A separate event rather than more fields on LIVE_TOOL_RESULT:
+             that event is consumed by the drive log and by the counters, and
+             a licensing obligation should not ride inside something whose
+             shape is tuned for telemetry. See LICENSING.md section 4. */
+          if (result && result.citations && result.citations.length) {
+            emit('LIVE_SOURCES', {
+              tool: name, call_id: callId,
+              question: (args && args.question) || null,
+              citations: result.citations,
+            });
+          }
           var ask = { type: 'response.create' };
           if (name === 'look' && lookAnswerMaxTokens) {
             ask.response = { max_output_tokens: lookAnswerMaxTokens };

@@ -101,6 +101,15 @@ as a landmark beside a turn.
   and whether an audible answer changes it. The tool result carries an
   `attribution` field so that whatever the answer is can be implemented in one
   place.
+
+  **This is one of three instances of the same question** — see §4's
+  "This is the same question §2 asks about Places". Google Weather (§3) and
+  OpenAI web search (§4) attach display obligations to content RIO *speaks*,
+  exactly as Places does. §4 now ships a Sources card that satisfies the
+  strictest of the three wordings **on the dashboard surface** and does nothing
+  for a driver with the screen off, which is the shared unresolved half. Take
+  all three to counsel as one question about spoken products rather than three
+  integration details.
 - **Ratings and review counts read aloud.** Whether a rating and its review
   count may be spoken, and whether they must be attributed to Google when they
   are. RIO currently says "four point four" without naming the source.
@@ -215,7 +224,10 @@ hidden, obscured or modified. The string is carried out of `weather.py` on
 every successful context as `attribution`, so whatever is decided can be
 implemented in one place.
 
-**The unsolved part is the same one `places.py` has and it is worse here.**
+**The unsolved part is the same one `places.py` has, and it is the same one
+§4 reaches with the Sources card: a display obligation against an audible
+answer.** See §4's "This is the same question §2 asks about Places" for the
+three wordings side by side and the argument for answering them once.
 RIO's weather answer is *audible*, in a car, and the dashboard may not be in
 front of the driver — or may not be showing anything at all. A requirement to
 display something "clearly visible" has no obvious meaning for a sentence
@@ -274,7 +286,7 @@ provider is one more implementation of `get_weather_context`, and the
 
 ---
 
-## 4. Web search for news and local knowledge — ONE FINDING BLOCKS PRODUCTION
+## 4. Web search for news and local knowledge — HALF ANSWERED, HALF OPEN
 
 `localnews.py` answers "any news round here", "why is traffic bad", "what's the
 story of this place". It reaches the web through the **OpenAI Responses API's
@@ -286,7 +298,7 @@ nonetheless a separate call.
 Because the vendor is one RIO already depends on, most of this section is
 short. One line of it is not.
 
-### The blocking finding: citations must be clickable, and RIO speaks
+### The citation requirement: what is built, and what is still open
 
 OpenAI's web search documentation requires, verbatim:
 
@@ -294,35 +306,98 @@ OpenAI's web search documentation requires, verbatim:
 > users, inline citations must be made clearly visible and clickable in your
 > user interface."
 
-**RIO's answer is a sentence said out loud in a moving car.** It has no user
-interface, it cannot be clicked, and the driver is — correctly — not looking at
-a screen. `localnews.py` additionally instructs her *never to read a URL aloud*,
-because reading one out is both useless and unsafe.
+**RIO's answer is a sentence said out loud in a moving car.** `localnews.py`
+additionally instructs her *never to read a URL aloud*, because reading one out
+is both useless and unsafe. So the requirement had to be met somewhere other
+than in the answer itself.
 
-So the requirement as written is not satisfied by the current product, and this
-is not a detail to settle later — it is the condition on which the whole feature
-ships. What must be decided before production:
+#### Built: the Sources card on the dashboard
 
-- Whether the dashboard rendering the cited sources — headline, source, link —
-  while RIO speaks satisfies "clearly visible and clickable", given the driver
-  is not looking at it.
-- Whether it satisfies it when the panel is backgrounded, the phone is locked,
-  or the car is driven with the screen off.
-- Whether an audible attribution ("the Daily Press reported") is accepted in
-  place of a clickable one, or is simply a different thing that does not
-  discharge the obligation.
-- Whether a passenger-facing display is required, and whether that changes the
-  product's hardware assumptions.
+The dashboard now renders a citation card for every answer that drew on web
+results (`RIO.ui.sources()`, in the dialogue column). Per source it shows:
 
-**What is already done so that the answer is implementable rather than a
-rewrite:** every result kept by `localnews.audit()` retains its `url`, `source`,
-`headline` and `published`, and they travel all the way out to the tool result.
-The data a citation UI needs is present and plumbed. **The UI that renders it
-does not exist yet, and building it is a prerequisite to shipping this feature,
-not an enhancement.** This is the same shape as the Places and Weather
-attribution questions in §2 and §3 — audible answers against display-worded
-terms — but it is the strictest of the three, because "clickable" cannot be
-read aloud at all.
+- the **source's name** and what kind of source it is;
+- the **headline**;
+- the **publication time**, absolute and as an age ("Sep 16, 4:00 PM (3h ago)");
+- the **geography that made it relevant**, where the question was geographic;
+- the **URL as a real anchor** — underlined at rest rather than on hover,
+  opening in a new tab, `rel="noopener noreferrer"`.
+
+It is **scrollback, not a live readout**: each answer appends a block headed by
+the question it answers, and earlier blocks stay. An answer given four
+questions ago is still one a driver may want to check, and a card that only
+ever showed the latest would erase every citation at the moment it mattered.
+
+Two rules the implementation enforces rather than assumes, both because the
+obligation attaches to what is *displayed*:
+
+- **A citation with nothing to click is not rendered at all.** A headline and a
+  source name with no working link is precisely the "not clickable" case the
+  requirement names. `localnews.py` drops URL-less results and the renderer
+  drops them again; a browser test caught the renderer producing a dead row
+  when only the server-side filter existed.
+- **The card renders even for a superseded turn.** If a search ran and its
+  results informed something shown to the driver, the obligation attached —
+  it does not depend on which conversational turn ultimately won.
+
+`tools/sources_card_selftest.py` drives a real browser and asserts every one of
+the above, including that the anchor has a working `href`, that the link is
+visibly a link without hover, and that it is a large enough target to press.
+This cannot be proved from the markup: the failures that matter are a container
+never un-hidden, an anchor rendered without an `href`, and a renderer that
+throws halfway down a list.
+
+#### NOT solved, and this is the open question for counsel
+
+**The card satisfies the letter of the requirement on the dashboard surface,
+for a person looking at the dashboard. It does nothing whatsoever for the case
+the product is actually built around.**
+
+A driver hears the answer with the phone face-down in a cradle, in a pocket, on
+a locked screen, or on a head unit showing a map. There is **no visible UI at
+all** in those situations, and no amount of work on this card changes that. The
+citations exist, they are correct, and nobody can see them.
+
+So the question that remains, and that only counsel can close:
+
+- Does a citation surface that exists but is not being looked at satisfy
+  "clearly visible and clickable", or does the requirement presuppose a reader?
+- If it presupposes a reader, is a spoken product compatible with the web
+  search tool's terms **at all**, on any implementation?
+- Does an audible attribution ("the Daily Press reported", which RIO already
+  says for contested or consequential claims) discharge any part of the
+  obligation, or is it simply a different thing?
+- Does the answer change with the surface — dashboard in view, phone pocketed,
+  head unit, passenger screen?
+
+Until that is answered, **this feature is not cleared for production**, and the
+card should be read as narrowing the exposure rather than removing it.
+
+#### This is the same question §2 asks about Places, and it should be answered once
+
+The Places review in §2 contains an identical problem in a different costume:
+Google attaches **display** obligations to Places content — attribution,
+and rules about showing ratings and reviews — and RIO reads business names and
+ratings **aloud**, with the dashboard possibly not showing a map or not being
+looked at. §3 has the third instance: Weather requires "Source: Includes
+weather data from Google" displayed and clearly visible, against a spoken
+forecast.
+
+Three vendors, three sets of words, **one question**: *what discharges a
+display obligation when the product's primary output is audible and the screen
+is, by design, not being watched?*
+
+It should be taken to counsel **once, as a single question about spoken
+products**, rather than three times as three integration details. A per-vendor
+answer would leave the next integration — events, alerts, any future content
+source — reopening it from scratch. The three sections each record their own
+vendor's exact wording so that one review can cover all of them:
+
+| § | vendor | the words | RIO's surface |
+|---|---|---|---|
+| 2 | Google Places | attribution + display rules for ratings/reviews | spoken business names and ratings |
+| 3 | Google Weather | "Source: Includes weather data from Google", clearly visible | spoken forecast |
+| 4 | OpenAI web search | inline citations "clearly visible and clickable" | spoken answer + this card |
 
 ### The rest, which is comparatively settled
 
@@ -336,8 +411,9 @@ read aloud at all.
 
 ### Still open, and to settle before production
 
-- **The citation requirement above.** Everything else in this section is
-  routine; that one is not.
+- **The spoken-surface half of the citation requirement above**, which the
+  Sources card does not reach. Everything else in this section is routine; that
+  one is not, and it is the same question §2 and §3 ask.
 - **Content provenance and republication.** RIO speaks a summary of a
   publisher's reporting. Whether summarising a news article aloud in a
   commercial product raises anything with the PUBLISHERS — independently of

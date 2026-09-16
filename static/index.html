@@ -954,6 +954,39 @@
     letter-spacing: var(--ls-mono); color: var(--t5);
   }
 
+  /* ---- sources card -------------------------------------------------------
+     Reuses .history/.hist-item so a citation block reads as the same kind of
+     object as a transcript entry rather than as an advert. The only thing that
+     is deliberately louder than its surroundings is the link, because a
+     citation nobody can see is the failure this card exists to fix. */
+  .src-history { max-height: 260px; }
+  .src-q {
+    display: block; margin: 2px 0 7px;
+    color: var(--t3); font-style: italic;
+  }
+  .src-row {
+    padding: 6px 0;
+    border-top: 1px solid var(--line, rgba(255,255,255,0.06));
+  }
+  .src-row:first-of-type { border-top: 0; }
+  .src-head { color: var(--t2); }
+  .src-meta {
+    margin-top: 3px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t5);
+  }
+  .src-meta .src-name { color: var(--t3); }
+  /* The clickable part. Underlined at rest, not only on hover: "clearly
+     visible" is the wording of the requirement, and a link that only looks
+     like one when a mouse is already on it fails that in a car. */
+  .src-link {
+    color: var(--accent); text-decoration: underline;
+    text-underline-offset: 2px; word-break: break-all;
+  }
+  .src-link:hover, .src-link:focus { color: var(--accent-hover); }
+  /* A comfortable target for a passenger's thumb on the move. */
+  .src-link { display: inline-block; padding: 2px 0; min-height: 20px; }
+
   /* ---------- dialogue ---------- */
 
   .turn { padding: 12px 14px; margin-bottom: var(--gap-xs); border-radius: var(--r-inset); }
@@ -2151,6 +2184,20 @@ acted on, never consulted by the arbiter.">Shadow</div>
 
       <div class="col-sublabel">Session transcript</div>
       <div class="history" id="dialoghistory"></div>
+
+      <!-- SOURCES. Not a feature: a licensing obligation with a UI.
+           OpenAI's web search terms require that where web results, or
+           information drawn from them, are shown to a person, inline
+           citations are clearly visible and CLICKABLE. RIO's answer is spoken,
+           so this card is the only surface in the product that can carry them.
+           It is scrollback rather than a live readout for the same reason —
+           an answer given four questions ago still has to be checkable.
+           See LICENSING.md section 4, which also records what this does NOT
+           solve. -->
+      <div class="col-sublabel" id="sourceslabel" hidden>
+        Sources &middot; what she read
+      </div>
+      <div class="history src-history" id="sourceshistory" hidden></div>
     </section>
 
     <!-- ============ VOICE LAYER ============ -->
@@ -2523,6 +2570,122 @@ RIO.ui = (function () {
       const sp = $('spokenline');
       if (sp && text) { sp.textContent = '“' + text + '”'; sp.classList.add('has-line'); }
     },
+    /* ----- sources: the citation card -------------------------------------
+       WHAT THIS IS FOR, because it looks like a nicety and is not: OpenAI's
+       web search terms require that wherever web results, or information drawn
+       from them, are shown to a person, inline citations are clearly visible
+       and clickable. RIO speaks her answer, so without this card there is no
+       surface in the product carrying them at all.
+
+       WHAT IT DOES NOT SOLVE, stated here so nobody reads the card as closing
+       the question: a driver listening with the phone face-down, pocketed, or
+       the screen off has no visible UI, and this changes nothing for them.
+       That gap is recorded in LICENSING.md section 4 as the open question for
+       counsel, alongside the identical problem Places' attribution has.
+
+       Appended per ANSWER and kept, rather than replaced: an answer given four
+       questions ago is still one the driver may want to check, and a card that
+       only ever shows the latest would make every earlier citation vanish the
+       moment it mattered. */
+    sources(payload) {
+      /* A citation with nothing to click is not a citation — it is a headline
+         and a source name with no way to check either, which is the exact
+         shape the requirement forbids. localnews.py already drops these, and
+         this drops them AGAIN on purpose: the obligation attaches to what is
+         DISPLAYED, so the thing doing the displaying is the right place for
+         the last word. A browser test caught this rendering a dead row. */
+      const list = ((payload && payload.citations) || [])
+        .filter((c) => c && typeof c.url === 'string' && c.url.trim());
+      if (!list.length) return;
+      const hist = $('sourceshistory'), label = $('sourceslabel');
+      if (!hist) return;
+      if (label) label.hidden = false;
+      hist.hidden = false;
+
+      const item = document.createElement('div');
+      item.className = 'hist-item';
+
+      const t = document.createElement('span');
+      t.className = 'hist-time';
+      t.textContent = stamp() + ' · ' + list.length
+        + (list.length === 1 ? ' source' : ' sources');
+      item.appendChild(t);
+
+      if (payload.question) {
+        const q = document.createElement('span');
+        q.className = 'src-q';
+        q.textContent = '“' + payload.question + '”';
+        item.appendChild(q);
+      }
+
+      list.forEach((c) => {
+        const row = document.createElement('div');
+        row.className = 'src-row';
+
+        const head = document.createElement('div');
+        head.className = 'src-head';
+        head.textContent = c.headline || '(untitled)';
+        row.appendChild(head);
+
+        /* Source, when it was published, and what made it relevant to HERE.
+           Each is only shown when it is actually known: an empty slot says
+           "not stated", and a dash invented to fill the column would be a
+           claim about the source rather than a gap in it. */
+        const meta = document.createElement('div');
+        meta.className = 'src-meta';
+        const name = document.createElement('span');
+        name.className = 'src-name';
+        name.textContent = c.source || 'unknown source';
+        meta.appendChild(name);
+        const bits = [];
+        if (c.published) bits.push(RIO.ui.whenText(c.published, c.age_h));
+        if (c.where) bits.push(c.where);
+        if (bits.length) meta.appendChild(
+          document.createTextNode(' · ' + bits.join(' · ')));
+        row.appendChild(meta);
+
+        /* The clickable part, which is the whole obligation. `noopener` keeps
+           the dashboard's window object out of a third-party page's reach,
+           and the full URL is shown rather than a "read more" label so the
+           driver can see where it goes before deciding to go there. */
+        {
+          const a = document.createElement('a');
+          a.className = 'src-link';
+          a.href = c.url;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = c.url;
+          row.appendChild(a);
+        }
+        item.appendChild(row);
+      });
+
+      hist.insertBefore(item, hist.firstChild);
+      trim(hist, 12);
+    },
+
+    /* A publication time as a person reads it. The ISO string is what the
+       source published and is never rewritten; this is only how it is shown,
+       and it falls back to the raw value rather than printing nothing when the
+       date cannot be parsed -- an unreadable timestamp is still evidence. */
+    whenText(published, ageH) {
+      let when = '';
+      try {
+        const d = new Date(published);
+        if (!isNaN(d.getTime())) {
+          when = d.toLocaleString([], { month: 'short', day: 'numeric',
+                                        hour: 'numeric', minute: '2-digit' });
+        }
+      } catch (e) { /* fall through to the raw string */ }
+      if (!when) when = String(published);
+      if (typeof ageH === 'number' && isFinite(ageH)) {
+        when += ageH < 1 ? ' (under an hour ago)'
+          : ageH < 48 ? ' (' + Math.round(ageH) + 'h ago)'
+            : ' (' + Math.round(ageH / 24) + 'd ago)';
+      }
+      return when;
+    },
+
     turnToHistory(driverText, rioText) {
       const hist = $('dialoghistory');
       if (!hist) return;
@@ -3198,6 +3361,11 @@ async function toggleLive() {
         else if (mine && ev.type === 'LIVE_RESPONSE_START') { RIO.ui.voice('speaking'); setMicState('speaking'); }
         else if (mine && ev.type === 'LIVE_RESPONSE_END') { RIO.ui.voice('listening'); setMicState('listening'); }
         else if (mine && ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
+        // The citation card. Rendered whatever the screen is otherwise doing
+        // and NOT gated on `mine`: a superseded turn whose search already ran
+        // still showed the driver information drawn from those pages, and the
+        // obligation attaches to what was shown rather than to which turn won.
+        else if (ev.type === 'LIVE_SOURCES') RIO.ui.sources(ev);
         else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
         else if (mine && ev.type === 'LIVE_RESUME') {
           // Say so on screen. An answer that finishes itself after a warning is

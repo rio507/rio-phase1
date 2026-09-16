@@ -1145,6 +1145,8 @@ def _news(loc, cls, place_name, session_key, route_ahead=None) -> dict:
                       if i < len(ranked) and j < len(ranked)],
         "dropped": checked["dropped"],
         "dropped_n": len(checked["dropped"]),
+        # What the dashboard must display. See LICENSING.md §4.
+        "citations": citations_of_results(ranked),
         "offer_other": cls.get("offer_other"),
         "searches": got.get("searches"),
         "est_cost_usd": got.get("est_cost_usd"),
@@ -1211,11 +1213,83 @@ def _background(loc, cls, place_name, session_key) -> dict:
     return {
         "ok": True, "classified": cls, "mode": MODE_BACKGROUND,
         "subject": subject, "background": text,
+        "citations": citations_of_response(r),
         "searches": searches, "est_cost_usd": cost,
         "offer_other": cls.get("offer_other"),
         "retrieve_ms": round((time.time() - t0) * 1000, 1),
         "rules": RULES_BACKGROUND,
     }
+
+
+def citations_of_results(results: list) -> list:
+    """The audited results, shaped for a citation UI and nothing else.
+
+    OpenAI's web search terms require inline citations to be "clearly visible
+    and clickable" wherever web results, or information drawn from them, are
+    shown to a person. RIO's answer is spoken, so the dashboard is the only
+    surface that can carry them — and this is the payload it renders.
+
+    Deliberately a SEPARATE field from `results` rather than the panel reading
+    the scoring internals. What a citation must contain is a licensing
+    question, not a ranking one, and it should not silently change the next
+    time a weight is renamed.
+    """
+    out = []
+    for r in results:
+        url = (r.get("url") or "").strip()
+        if not url:
+            # A citation with nothing to click is not a citation. It is left
+            # out rather than rendered dead, and the result is still spoken --
+            # the obligation attaches to what is DISPLAYED.
+            continue
+        out.append({
+            "source": (r.get("source") or "").strip() or "unknown source",
+            "headline": (r.get("headline") or "").strip(),
+            "url": url,
+            "published": r.get("published"),
+            "age_h": r.get("age_h"),
+            # What made it relevant to HERE. Null for topic and world, where
+            # geography is not part of the question and a distance would be an
+            # invented one.
+            "where": r.get("city") or None,
+            "geo_level": r.get("geo_level"),
+            "source_type": r.get("source_type"),
+        })
+    return out
+
+
+def citations_of_response(resp) -> list:
+    """The url_citation annotations off a prose response.
+
+    The background path answers in prose and has no result list, but when it
+    searches, its answer IS "information contained in web results" and carries
+    the same obligation. The annotations are where the API puts the sources, so
+    this is the same citation payload arriving by a different door.
+    """
+    out, seen = [], set()
+    for item in (getattr(resp, "output", None) or []):
+        if getattr(item, "type", "") != "message":
+            continue
+        for c in (getattr(item, "content", None) or []):
+            for a in (getattr(c, "annotations", None) or []):
+                if getattr(a, "type", "") != "url_citation":
+                    continue
+                url = (getattr(a, "url", "") or "").strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                title = (getattr(a, "title", "") or "").strip()
+                out.append({
+                    "source": _host_of(url), "headline": title, "url": url,
+                    "published": None, "age_h": None, "where": None,
+                    "geo_level": None, "source_type": "unknown",
+                })
+    return out
+
+
+def _host_of(url: str) -> str:
+    m = re.match(r"https?://(?:www\.)?([^/]+)", url or "")
+    return m.group(1) if m else (url or "")[:40]
 
 
 def _on_route(result: dict, route_ahead: list) -> bool:

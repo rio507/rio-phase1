@@ -191,9 +191,47 @@ question and it gets the cheaper, better-suited call.
 | `realtime.py` | `search_local_news` tool + schema + session instructions |
 | `tools/news_selftest.py` | amendments A, B, F and C, offline; plus a live pass |
 | `tools/news_shapes.py` | every question shape, live, end to end |
-| `LICENSING.md` §4 | **the clickable-citation finding, which blocks production** |
+| `static/index.html` | the Sources card: `RIO.ui.sources()`, markup and CSS |
+| `static/rio_realtime.js` | emits `LIVE_SOURCES` when a tool result carries citations |
+| `tools/sources_card_selftest.py` | the card, in a real browser |
+| `LICENSING.md` §4 | **what the card solves, and the half it does not** |
 
-## 8. Not built, on purpose
+## 8. Citations: the Sources card
+
+OpenAI's web search terms require inline citations be "clearly visible and
+clickable" wherever web results, or information drawn from them, are shown to a
+person. RIO's answer is spoken, so the dashboard is the only surface that can
+carry them.
+
+Every result that survives `audit()` keeps its `url`, `source`, `headline` and
+`published`; `citations_of_results()` shapes those into a payload built for the
+UI rather than for ranking, and the background path gets the same payload from
+the response's `url_citation` annotations. `rio_realtime.js` emits
+`LIVE_SOURCES` before asking for the spoken answer — the card has to be there
+before she starts talking, not after she stops — and `RIO.ui.sources()` renders
+a block per answer, headed by the question, kept in scrollback.
+
+Two rules that are enforced rather than assumed, because the obligation
+attaches to what is *displayed*:
+
+- **A citation with nothing to click is not rendered.** Dropped server-side and
+  again in the renderer. A browser test caught the renderer producing a dead
+  row — headline and source, no link — when only the server filter existed,
+  which is exactly the "not clickable" case the requirement names.
+- **The card renders even for a superseded turn.** If a search ran and informed
+  something shown to the driver, the obligation attached; it does not depend on
+  which turn won.
+
+**What it does not solve**, and this belongs here as much as in LICENSING: a
+driver listening with the phone face-down, pocketed, or the screen off has no
+visible UI at all. The citations exist, they are correct, and nobody can see
+them. That is the open question for counsel in LICENSING.md §4, and it is the
+same question Places (§2) and Weather (§3) ask about *their* display
+obligations — worth answering once, as one question about spoken products.
+
+---
+
+## 9. Not built, on purpose
 
 **No proactive news** (amendment E). V1 answers when asked. When proactive
 does come it enters through the arbiter as an advisory finding under the
