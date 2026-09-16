@@ -166,7 +166,7 @@ the open licensing questions are in **LICENSING.md §3**.
 
 ---
 
-## 6. Cost, and why route-aware weather is phase 2
+## 6. Cost, and the blocker phase 2 must clear first
 
 Phase 1 counted against `weather.py`'s own `_needs_refresh`, stepped per minute;
 phase 2 modelled on top with the assumptions named below it.
@@ -193,12 +193,73 @@ month. Two other things are the real content of this table:
    20-minute urban one. That is the feature working — weather must follow the
    vehicle — but it means the cost driver is *distance*, not duration, and
    phase 2 multiplies exactly the dimension that is already dominant.
-2. **Fan-out is a correctness surface before it is a billing one.** Every
-   sampled point needs its own `fetched_for`, its own age, and its own
-   staleness refusal, or phase 1's central guarantee quietly stops holding —
-   and it stops holding in the direction that is hardest to see: a confident
-   forecast for a point on the route the car will reach in forty minutes, spoken
-   as though it were about here.
+2. **Fan-out is a correctness surface before it is a billing one**, and that —
+   not the cost — is what keeps phase 2 unbuilt. See below.
+
+### The blocker: phase 1's honesty model does not survive contact with a route
+
+**This has to be solved before any sampling code is written.** Not alongside
+it, and not after a prototype — because a prototype that samples the route will
+*work*, will sound excellent, and will be wrong in the one direction nobody can
+hear.
+
+Phase 1's guarantee is a single sentence: `usable(ctx, lat, lng)` answers *may
+this be spoken for a car that is HERE, NOW*. It is enforceable because a context
+describes one place at one time, and both are the place and time the car is in.
+`fetched_for` is compared against the car's own position; `age_s` against the
+car's own clock. One context, one provenance, one refusal.
+
+Route weather breaks **both halves on purpose**. A sampled point is fetched for
+somewhere the car explicitly is *not*, and describes a time the car has not
+reached. So `WEATHER_MAX_DISTANCE_M` is not merely wrong for a route sample —
+it is inverted: the check that makes phase 1 honest would reject every sample
+phase 2 exists to take. And the obvious workaround, exempting route samples
+from the distance test, does not adapt the guarantee. It deletes it, and leaves
+the code looking exactly as principled as it does today.
+
+Four things need answering, in this order:
+
+1. **Validity becomes a property of the claim, not of the car.** A route
+   sample needs a two-axis test: how old the fetch is, *and* how far the
+   forecast hour it quotes sits from the ETA at that point. Neither axis alone
+   is sufficient and phase 1 has only ever had the first. Until this test
+   exists and can refuse, there is nothing to hang a sampling loop off.
+
+2. **ETA drift is the dangerous case, and it is invisible to everything built
+   so far.** The forecast was fetched for arrival at 4:15; traffic pushes
+   arrival to 5:05; the claim is now about the wrong hour. `age_s` is small,
+   `fetched_for` is exactly right, and every check in `weather.py` passes. This
+   is the failure mode that the existing staleness rule cannot even represent,
+   because phase 1 never holds a claim about the future of a place. A
+   destination forecast must be invalidated by **ETA movement**, not only by
+   time and distance.
+
+3. **Provenance under aggregation is unsolved.** "There's heavier rain ahead
+   along your route" is synthesized from several contexts, each with its own
+   age and its own coordinates. Phase 1's contract is one context, one
+   provenance, one refusal — and there is currently no answer to what age a
+   six-context sentence carries, or which sample's staleness is allowed to
+   refuse the whole sentence. Guessing here produces a sentence that is
+   individually sourced and collectively unattributable.
+
+4. **A reroute invalidates every sample at once.** Samples are held against
+   correct coordinates for a route the car is no longer on. Nothing in the
+   current cache keys on route generation, so the samples survive the thing
+   that made them meaningful. `navigation/` already versions route generations;
+   phase 2's cache has to key on that, and the wiring does not exist.
+
+**What phase 2 has to demonstrate before it ships**, in the shape
+`tools/weather_selftest.py` already uses: a route sample past its ETA window is
+refused; a destination forecast is dropped when the ETA moves by more than the
+tolerance; a multi-point claim carries the *worst* age among its sources and is
+refused when any required source is absent; a reroute drops every sample from
+the previous generation. Four assertions, none of which can be written today,
+because the model they would assert against does not exist yet.
+
+The honest summary: phase 1 answers *is this forecast still about here and
+now*. Phase 2 needs to answer *is this forecast still about the place the car
+will be, at the time it will be there* — and that is a different question with
+a different data model, not a wider radius on the existing one.
 
 ---
 

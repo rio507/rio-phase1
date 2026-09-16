@@ -52,7 +52,12 @@ exactly as many requests as it makes: current + hourly, plus daily when
 config.WEATHER_INCLUDE_DAILY is on. They are the calls whose absence a driver
 would notice — now, next few hours, and sunset — and nothing fans out beyond
 them. Phase 2's route sampling would multiply this by the number of points
-sampled along the polyline, which is precisely why it is phase 2.
+sampled along the polyline — but cost is NOT why it is still phase 2. The
+blocker is that `usable()` below answers "is this still about here and now",
+and a route sample is deliberately about neither. Read docs/weather_context.md
+§6 before writing a line of sampling code: the staleness model has to be
+re-derived first, and a prototype that skips that step will work, sound
+excellent, and be wrong where nobody can hear it.
 
 THE HONESTY RULE, which is the whole of amendment C
 ---------------------------------------------------
