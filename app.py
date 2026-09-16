@@ -43,6 +43,7 @@ import telemetry
 import insights
 import vehicle_health
 import vehicle_health_policy
+import weather
 from tire_diag import engine as tire_diag
 from tire_diag import codes as tire_codes
 from tire_diag import monitors as tire_monitors
@@ -377,6 +378,13 @@ def health():
             # reading a log that has scrolled. `active: false` with a `reason`
             # is the compiled model having been offered and refused; see
             # headway/detect.adopt_accel.
+            # The weather service, which is here rather than in `models`
+            # because the interesting numbers are operational: is it on, what
+            # units is it asking Google for, how old a reading it will still
+            # speak, and how many billed requests a refresh costs. The last is
+            # the one to watch when phase 2 is costed -- route sampling
+            # multiplies it by the number of points on the polyline.
+            "weather": weather.status(),
             "detector_accel": headway_detect.accel_status()}
 
 

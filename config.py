@@ -1548,6 +1548,83 @@ PLACES_TIMEOUT_S = 8.0
 PLACES_CACHE_TTL_S = 180.0
 
 
+# ---------------------------------------------------------------------------
+# Weather (weather.py) — what the sky is doing, and what it does next
+# ---------------------------------------------------------------------------
+# RIO can see the sky and cannot see three o'clock. Everything here exists to
+# keep those two facts apart: the camera answers what is visible, Google's
+# Weather API answers the numbers and the forecast, and a vision model is never
+# allowed to supply the second from the first. See weather.py's header.
+WEATHER_ENABLED = True
+
+# IMPERIAL or METRIC. A request parameter, not a response property — Google
+# defaults to METRIC and gives back whatever is asked for, so this is the one
+# place the car's units are decided. The unit NAMES ride out with every number
+# in the context, so nothing downstream ever has to infer whether 26 was
+# Celsius.
+WEATHER_UNITS = "IMPERIAL"
+
+# How far ahead the hourly forecast reaches. The API allows 240 hours and bills
+# the same for any of them, so this is a size-of-context decision rather than a
+# cost one: six hours covers "is it going to rain", "when does it start" and
+# "what's it like when we get there" for any drive that is not a road trip, and
+# a model handed 240 hours reasons worse, not better.
+WEATHER_FORECAST_HOURS = 6
+
+# Whether the daily call rides along with the refresh. It is the third billed
+# request and it buys sunrise/sunset and the day's high and low — sunset being
+# the one a driver actually acts on, for headlights and for the glare on a west
+# heading. Turn it off and a refresh is two requests instead of three.
+WEATHER_INCLUDE_DAILY = True
+
+# --- the refresh clock -----------------------------------------------------
+# "Do not call the API per sentence." Refresh is decided by age, by movement
+# and by whether the numbers are the sort that move.
+#
+# 600 s is the quiet default: a settled sky at 26 degrees does not need
+# checking twice a minute, and a drive that never leaves the weather it started
+# in should cost six requests an hour, not sixty.
+WEATHER_REFRESH_S = 600.0
+
+# The clock when something is actually happening — rain in the window, an
+# active precipitation probability worth saying, a rough condition type. A
+# chance of rain is a number that moves; a clear sky is not.
+WEATHER_REFRESH_VOLATILE_S = 300.0
+
+# Movement invalidates a reading faster than time does. 5 km is roughly the
+# scale a forecast is drawn at, and at motorway speed it is three minutes —
+# which is the real reason a vehicle needs this and a phone on a desk does not.
+WEATHER_REFRESH_DISTANCE_M = 5000.0
+
+# --- the honesty limits (amendment C) --------------------------------------
+# Deliberately LOOSER than the refresh clock above, and the gap between them is
+# the point: the refresh happens on the softer number so that the hard one is
+# almost never reached, and when it is reached the answer is silence rather
+# than an old forecast.
+#
+# Past either of these the context is treated as ABSENT — not caveated, not
+# hedged, not spoken with a warning attached. A confident forecast for where
+# the car was fifteen minutes ago is worse than no forecast, because it is
+# indistinguishable from a good one until the driver is already in it.
+WEATHER_MAX_AGE_S = 900.0
+WEATHER_MAX_DISTANCE_M = 15000.0
+
+# The chance of precipitation at which an hour counts as "rain expected". Used
+# to find the first hour worth naming ("around 3") and to decide whether a
+# forecast is volatile enough to refresh sooner. It is NOT the threshold for
+# speaking unprompted — that one is in weather_policy.py, is higher, and is
+# deliberately somewhere a conversation cannot reach.
+WEATHER_PRECIP_PROB_THRESHOLD = 30.0
+
+WEATHER_TIMEOUT_S = 6.0
+
+# A GPS fix older than this is not where the car is, and weather fetched for it
+# is a forecast for somewhere else wearing this drive's name. Matched to the
+# honesty limits above rather than to PLACES_FIX_MAX_AGE_S: a restaurant 600 s
+# behind you is still a restaurant, and a rain band is not.
+WEATHER_MAX_FIX_AGE_S = 180.0
+
+
 # --- replay presentation buffer ---------------------------------------------
 # Seconds the ANALYSIS stream runs ahead of the picture during an uploaded-clip
 # headway run. It is the fix for a rendering fault, not a detection one: a box

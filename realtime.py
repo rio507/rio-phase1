@@ -56,6 +56,7 @@ import voice_tags
 # Place search lives in its own module for the same reason visual_qa does: it is
 # a pipeline with a bill and a licence attached, not a branch of this file.
 import places
+import weather
 
 _client: Optional[OpenAI] = None
 _client_lock = threading.Lock()
@@ -97,6 +98,15 @@ NAV_DIRECTIONS_TOOL_NAME = "nav_directions"
 # well rather than to know it. Server-side, because the key stays here.
 PLACES_TOOL_NAME = "find_places"
 
+# What the sky is doing and what it does next. The camera can see cloud and it
+# cannot see three o'clock: asked whether it will rain, a vision model answers
+# from the look of the sky, fluently and with a number, and the driver plans
+# around it. So every temperature, probability, wind figure and "what happens
+# later" comes from Google's Weather API for the car's own coordinates, and the
+# model's job is the same one it has with places -- to say it well rather than
+# to know it. Server-side, because the key stays here.
+WEATHER_TOOL_NAME = "get_weather"
+
 VEHICLE_TOOL_NAME = "vehicle_status"
 
 # ...and the one thing on this list she DOES rather than reports. A driver who
@@ -124,7 +134,7 @@ REROUTE_TOOL_NAME = "reroute"
 # by session.update when its condition holds, and removed when it stops.
 def _base_tools():
     return [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
-            PLACES_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA]
+            PLACES_SCHEMA, WEATHER_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA]
 
 
 TOOL_SCHEMA = {
@@ -135,7 +145,8 @@ TOOL_SCHEMA = {
         "factual research, or multi-step reasoning you cannot do well in a "
         "couple of seconds. Takes a few seconds.\n"
         "NOT for: chat; the car's own sensors (vehicle_status); the route "
-        "(nav_status, nav_directions); a place near the car (find_places); or "
+        "(nav_status, nav_directions); a place near the car (find_places); "
+        "the weather or the forecast (get_weather); or "
         "anything you can SEE — the road, a car, a sign, a building — which is "
         "the look tool and the camera. This one has no picture to answer from."
     ),
@@ -285,6 +296,43 @@ PLACES_SCHEMA = {
         "required": ["query"],
         "additionalProperties": False,
     },
+}
+
+# TRIGGER LOGIC, written where the model reads it. The spec asks for a
+# `weather_relevant` flag computed before the response is generated; in a
+# realtime voice session there is no such "before" to hook -- the model decides
+# and speaks in one pass. So the flag lives here, as the list of moments that
+# oblige a call, and the rule that makes it enforceable is the one in the
+# second paragraph: any weather CLAIM must come from a result. That turns
+# "detect relevance" from a thing the system must predict into a thing the
+# model cannot avoid, which is the stronger arrangement.
+WEATHER_SCHEMA = {
+    "type": "function",
+    "name": WEATHER_TOOL_NAME,
+    "description": (
+        "Live weather and the next several hours, for wherever the car is "
+        "right now. Temperature and feels-like, conditions, chance of rain and "
+        "when it starts, wind, visibility, humidity, today's high and low, "
+        "sunrise and sunset.\n"
+        "CALL IT BEFORE YOU SAY ANYTHING ABOUT THE WEATHER. Any of these: the "
+        "driver asks about the weather, rain, fog, snow, wind, temperature, "
+        "visibility or a storm; they ask what you can see and the sky or the "
+        "road surface is part of the answer; weather could matter to this "
+        "drive or where they are going; or you are about to mention weather "
+        "while answering something else. If a sentence you are about to say "
+        "contains a fact about the weather, this runs first.\n"
+        "You do NOT know the weather. You can see out of the window, which "
+        "tells you about cloud, wet road, spray and low sun — and tells you "
+        "nothing whatever about temperature, probability, or anything later "
+        "than this second. Never read a forecast off the sky, never give a "
+        "number you did not get from here, and if this fails say you can't "
+        "pull the forecast rather than guessing from what it looks like.\n"
+        "Do not call it for an ordinary 'what do you see' where the weather is "
+        "unremarkable, and do not volunteer the weather just because you have "
+        "it — a clear sky is not news. Fast, and cached between calls, so "
+        "calling it when weather is genuinely in play costs nothing."
+    ),
+    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
 VEHICLE_SCHEMA = {
@@ -660,6 +708,44 @@ WHEN THEY PICK ONE
 "Take me to the second one." "Let's go to the Blue Bottle." That is
 start_navigation, with the place_id the result you already have carries for
 every place you read out — the same place, already resolved.
+
+WHEN THE WEATHER COMES UP
+
+"What's the weather?" "Is it going to rain?" "How cold is it out?" — and also
+the quieter ones: they ask what you see and the sky is doing something, they
+ask whether they need a jacket at the other end, or you are halfway through a
+sentence about something else and about to mention the weather. All of it goes
+to get_weather first. Not sometimes. If a fact about the weather is going to
+leave your mouth, that tool ran.
+
+You have two sources and they do different jobs. The camera is the authority on
+what is VISIBLE — dark cloud building, wet road, spray off the truck ahead, sun
+low enough to hurt. get_weather is the authority on every NUMBER and everything
+LATER — temperature, how likely rain is, when it starts, wind, how far you can
+see. Look out of the window for the first and never for the second.
+
+Say them together, the way somebody with a phone and a windscreen would: "Those
+clouds ahead are getting dark. About a seventy percent chance of rain here in
+the next hour — showers around three twenty." The observation gives it a reason
+to be said; the data gives it the part worth knowing.
+
+WHEN THEY DISAGREE, SAY BOTH. Wet road and no rain reported is "the roads are
+wet, though the weather data isn't showing active rain here" — never "it's
+raining", and never a theory about which one is right. Two readings, both
+reported, and the driver is perfectly capable of putting them together.
+
+Round like a person. "About seventy percent", "around three", "low seventies",
+"about a mile". Never a decimal. The times you get are the tops of hours, so
+they are "around three", not "three o'clock exactly".
+
+If it fails, you can still say what you SEE. What you cannot do is turn that
+into a forecast: "looks like rain ahead, but I can't pull the local forecast
+right now" is the whole of it. Not a probability, not a time, not "should blow
+over". The sky does not tell you when it will rain and neither does anything
+you were trained on.
+
+A clear sky is not news. Do not announce the weather because you happen to have
+it, and do not work it into an answer it has nothing to do with.
 
 WHEN A QUESTION NEEDS MORE THAN A QUICK ANSWER
 
@@ -2193,7 +2279,8 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # and atomic replacement of objects that only exist in the page — the
         # tracker, the planner, and the queue of sentences waiting to be said.
         return {"ok": False, "note": f"{name} is answered by the panel"}
-    if name not in (TOOL_NAME, LOOK_TOOL_NAME, PLACES_TOOL_NAME):
+    if name not in (TOOL_NAME, LOOK_TOOL_NAME, PLACES_TOOL_NAME,
+                    WEATHER_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
         try:
@@ -2209,6 +2296,13 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # actually said wherever they are available. See look().
         return look(str(arguments.get("question") or ""), session_key,
                     spoken=str(spoken or "") or None, teachers=teachers)
+    if name == WEATHER_TOOL_NAME:
+        # No arguments: the question is always "here, now". The coordinates
+        # come from `where` -- the panel's own fix, already attached to every
+        # tool call -- so the weather follows the VEHICLE rather than a city
+        # the model picked, which is the whole requirement. A stale or missing
+        # fix is refused inside context_for_fix rather than guessed around.
+        return weather.context_for_fix(where, session_key=session_key)
     if name == PLACES_TOOL_NAME:
         return places.find_places(
             query=str(arguments.get("query") or ""),

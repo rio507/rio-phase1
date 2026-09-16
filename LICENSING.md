@@ -147,7 +147,134 @@ mode — see §27 of the design).
 
 ---
 
-## 3. Other services
+## 3. Weather provider data — VERIFIED where it could be, OPEN where it could not
+
+A third door to the same vendor, deliberately separate from routing
+(`navigation/providers/google.py`) and from conversational place search
+(`places.py`) for the same reason those two are separate from each other: it is
+a different product, with different terms, doing a different job. All of it is
+reached through `weather.py` and nothing downstream of that file knows Google
+exists.
+
+### What was actually checked, rather than assumed
+
+Amendment A asked for verification before belief. This was run against the
+live endpoint on the project's existing `GOOGLE_MAPS_API_KEY`
+(`python -m tools.weather_probe`, kept in the tree so it can be re-run when
+any of this is doubted):
+
+| Question | Answer, measured |
+|---|---|
+| Enabled on the existing key? | **Yes** — `currentConditions:lookup` returns HTTP 200 with no key or project change |
+| Endpoints used | `currentConditions:lookup`, `forecast/hours:lookup`, `forecast/days:lookup` |
+| Forecast horizon | hourly **240 h max** (24 per page, `nextPageToken` beyond); daily **10 days max** |
+| Units | a **request** parameter (`unitsSystem`), not a property of the response. METRIC is the default; RIO asks for IMPERIAL and carries the unit NAMES out with every number |
+| Field mask | `fields` is supported and works, but unlike Places (New) it does **not** select a SKU — it is a payload reduction only |
+| Latency | ~250–500 ms per endpoint; ~790 ms for a full three-call refresh |
+| Cost | **one SKU, "Weather Usage" (9DB8-727A-ACFE)**, billed per request regardless of endpoint: first **10,000 requests/month free**, then **$0.15 / 1,000** (0.15¢ each) to 100k, tiering down to $0.038 / 1,000 above 5M |
+| Rate limits | not published on the usage-and-billing page; **OPEN** (see below) |
+| **Severe weather alerts** | **THERE IS NO ALERTS ENDPOINT.** Four candidate paths all 404 |
+| **Geographic coverage** | **not global.** Japan, South Korea and mainland China return HTTP 404 *"Information is not supported for this location"* on every endpoint; Australia, Germany, Brazil, Nigeria, India and the US answer normally |
+
+### The alerts finding, because it changes what the code may claim
+
+The spec asks for "severe weather when available" and the context carries an
+`alerts` field. Google's Weather API has no alerts endpoint, so **that list is
+always empty**. It is kept only so the shape does not change if a source is
+ever added, and `weather.py` documents — and `tools/weather_selftest.py`
+asserts — that an empty `alerts` means **NOT KNOWN** and never "no severe
+weather". Those are different claims and only one of them is true. If severe
+weather warnings are ever a product requirement, they need a different
+provider (NWS/CAP in the US, MeteoAlarm in the EU) and their own row in this
+file, because government alert feeds carry redistribution terms of their own.
+
+### The coverage finding, which is a product question before it is a legal one
+
+Google's Weather API does not cover everywhere. Probing found Japan, South
+Korea and mainland China refusing every endpoint with a 404 while comparable
+markets answered normally. `weather.py` raises `NoCoverage` for that case and
+returns `note: "no_coverage"` — the same honest refusal a network failure gets,
+because the driver's experience should be identical, but named differently so
+that a drive through an uncovered region does not fill the log with what look
+like network faults.
+
+RIO therefore degrades correctly rather than silently in those markets: she
+says she cannot pull the forecast and forecasts nothing from the sky. **What
+she does not do is work there.** If any of those markets is a launch market,
+this is a second-provider decision and not a licensing one, and it should be
+made before the feature is promised rather than after.
+
+### Attribution — answered, and it lands in the same unsolved place as Places
+
+Google's Weather API policies require, verbatim:
+
+> "Source: Includes weather data from Google"
+
+displayed **on or next to the data used**, "clearly visible", never removed,
+hidden, obscured or modified. The string is carried out of `weather.py` on
+every successful context as `attribution`, so whatever is decided can be
+implemented in one place.
+
+**The unsolved part is the same one `places.py` has and it is worse here.**
+RIO's weather answer is *audible*, in a car, and the dashboard may not be in
+front of the driver — or may not be showing anything at all. A requirement to
+display something "clearly visible" has no obvious meaning for a sentence
+spoken by a synthesised voice to someone watching the road. This must be
+settled before a production release:
+
+- Whether the dashboard's existing attribution satisfies it for data that is
+  *heard*, or whether audible attribution is required.
+- Whether a spoken weather figure ("about seventy percent") is "data used"
+  for the purposes of that clause.
+- Whether the answer differs when the panel is backgrounded, the phone is
+  locked, or the car is being driven with the screen off.
+
+Note what is NOT a problem here, having been checked: the policies place **no
+restriction on displaying weather data away from a Google map**, which was the
+open question that made the Places case hard. Weather data does not have to
+sit on a map.
+
+### Still open, and to settle before production
+
+- **Caching and retention.** The Weather API is **not named** in the Maps
+  Platform Service Specific Terms' caching clauses, which enumerate Geocoding,
+  Directions, Solar and others at 30 consecutive calendar days, and exempt
+  place IDs entirely. Weather's absence from that list is not permission.
+  RIO holds one context per session in memory for minutes
+  (`WEATHER_REFRESH_S` 600 s, hard limit `WEATHER_MAX_AGE_S` 900 s) and writes
+  nothing to disk, which is inside any plausible reading — but "inside any
+  plausible reading" is what this file exists to replace with an answer.
+- **Synthesized speech.** Same question as the spoken route instructions and
+  the spoken business names, for a third content class: may Weather API
+  content be read aloud by a TTS voice in a commercial product. Unanswered for
+  all three; answering it once probably answers it three times.
+- **In-vehicle use.** Automotive and head-unit terms are frequently distinct
+  from web and mobile terms. Confirm the Weather API's position specifically —
+  do not infer it from the Routes review.
+- **Rate limits / QPM.** Not documented on the usage-and-billing page. Get the
+  real number before phase 2, whose route sampling is precisely the thing that
+  would find it.
+- **Derived claims.** `weather.py` computes `next_precipitation` — the first
+  forecast hour crossing a probability threshold — from Google's hourly data,
+  and RIO speaks it ("rain around three"). That is a *derivation* from provider
+  content rather than a field of it. It is the same class of question as
+  `places.py`'s drive-time estimate and should be read alongside it.
+- **Logging.** Decide what may appear in a session log. Currently a weather
+  context is not written to the session log at all; if that changes, the
+  question is whether logging a temperature and a probability is caching.
+
+### What is already true, and makes substitution cheap
+
+The same property the navigation stack has. `weather.py` is the only file that
+knows Google's response shape; everything else — the tool bridge in
+`realtime.py`, the proactive gate in `weather_policy.py`, the honesty limits,
+the selftests — operates on the normalized context. A different weather
+provider is one more implementation of `get_weather_context`, and the
+`alerts` question above is the most likely reason to need one.
+
+---
+
+## 4. Other services
 
 | Service | Used for | To review |
 |---|---|---|
@@ -156,7 +283,7 @@ mode — see §27 of the design).
 
 ---
 
-## 4. Privacy posture, stated so it can be checked
+## 5. Privacy posture, stated so it can be checked
 
 Not a licence question, but adjacent and easy to lose track of:
 
