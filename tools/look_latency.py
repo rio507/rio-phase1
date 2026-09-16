@@ -209,7 +209,49 @@ def run(base: str, session: str, question: str, n: int) -> dict:
             "calls": calls}
 
 
-def report(label: str, res: dict):
+# The stages the SUMMARY names, in the order a call actually spends them. The
+# dump deliberately does not use this list: a curated view is what the
+# percentile table already is, and a dump that hides fields is not a dump.
+SUMMARY_STAGES = ("prep_resolve", "prep_clarify", "prep_enrich",
+                  "observe_now_ms", "compose_ms", "prep_prepare_total")
+
+
+def _stage_bits(stages: dict, keys=None) -> str:
+    """One call's stage timings as `name=ms`, nested ones flattened a level.
+
+    `keys` picks a curated subset and its order; without it, every stage the
+    call carried, sorted. Two things this has to get right and the first
+    version did not:
+
+      booleans are not timings. `observer_cache_hit` is a bool, and a bool IS
+      an int in Python -- so an unguarded isinstance check prints a cache hit
+      as `cache_hit=1` next to real milliseconds, which reads as a suspiciously
+      fast stage rather than as the flag it is.
+
+      the Qwen split is a dict, not a number. prep_qwen arrives as
+      {lock, input, decode} and is the only thing that says whether a six
+      second attribute read was waiting, preparing or generating -- so it is
+      flattened rather than skipped.
+    """
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    items = ([(k, stages.get(k)) for k in keys] if keys
+             else sorted(stages.items()))
+    out = []
+    for k, v in items:
+        short = k.replace("prep_", "").replace("_ms", "")
+        if num(v):
+            if v >= 1:
+                out.append(f"{short}={v:.0f}")
+        elif isinstance(v, dict):
+            for k2, v2 in sorted(v.items()):
+                if num(v2) and v2 >= 1:
+                    out.append(f"{short}.{k2}={v2:.0f}")
+    return "  ".join(out)
+
+
+def report(label: str, res: dict, dump: bool = False):
     t = res["total"]
     print(f"\n  {label}")
     print(f'    paths: { ", ".join(sorted(set(res["paths"]))) }')
@@ -236,19 +278,30 @@ def report(label: str, res: dict):
     print(f'    {"TOOL ROUND TRIP":<28}{t["p50"]:>9.1f}{t["p95"]:>9.1f}'
           f'   n={t["n"]}')
     calls = res.get("calls") or []
-    if calls:
-        worst = sorted(calls, key=lambda c: -c["ms"])[:4]
+    if not calls:
+        return
+    if not dump:
         print("\n    slowest calls, whole:")
-        for c in worst:
-            bits = []
-            for k in ("prep_resolve", "prep_clarify", "prep_enrich",
-                      "observe_now_ms", "compose_ms", "prep_prepare_total"):
-                v = c["stages"].get(k)
-                if isinstance(v, (int, float)) and v >= 1:
-                    bits.append(f"{k.replace('prep_', '').replace('_ms', '')}"
-                                f"={v:.0f}")
+        for c in sorted(calls, key=lambda c: -c["ms"])[:4]:
             print(f'      {c["ms"]:8.0f} ms  {c["path"]:<14} '
-                  f'{"  ".join(bits)}')
+                  f'{_stage_bits(c["stages"], SUMMARY_STAGES)}')
+        return
+    # --dump: EVERY call, in the order they were made, with every stage.
+    #
+    # Order is the whole reason this is not just a longer version of the block
+    # above. Ranking by duration destroys the one pattern a latency run most
+    # often contains -- the first call after a cold cache is the slow one and
+    # the rest are fine -- and a table sorted worst-first shows that as a wide
+    # p50/p95 spread with no explanation. Numbered and in sequence, it reads
+    # off the page.
+    #
+    # The slowest is still marked, so the dump loses nothing the summary had.
+    slowest = max(c["ms"] for c in calls)
+    print(f"\n    every call, in order (n={len(calls)}, * = slowest):")
+    for i, c in enumerate(calls, 1):
+        mark = "*" if c["ms"] == slowest else " "
+        print(f'    {mark} {i:>3}. {c["ms"]:8.0f} ms  {c["path"]:<14} '
+              f'{_stage_bits(c["stages"])}')
 
 
 def main() -> int:
@@ -256,6 +309,9 @@ def main() -> int:
     ap.add_argument("--base", default="http://127.0.0.1:8888")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--session", default="lookprobe")
+    ap.add_argument("--dump", action="store_true",
+                    help="print every call in order with every stage, "
+                         "instead of the slowest four")
     ap.add_argument("--feed", default="on")
     ap.add_argument("--warm", default="on",
                     help="off = skip the session mint, i.e. measure a cold "
@@ -294,9 +350,9 @@ def main() -> int:
         pass
 
     print(f"\n== scene question: {SCENE_Q!r}", flush=True)
-    report("scene", run(a.base, a.session, SCENE_Q, a.n))
+    report("scene", run(a.base, a.session, SCENE_Q, a.n), a.dump)
     print(f"\n== object question: {OBJECT_Q!r}", flush=True)
-    report("object", run(a.base, a.session, OBJECT_Q, a.n))
+    report("object", run(a.base, a.session, OBJECT_Q, a.n), a.dump)
     if feed:
         feed.stop()
         print(f"\n  ({feed.sent} frames pushed during the run)")
