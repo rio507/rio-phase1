@@ -6,10 +6,22 @@
 THE POINT OF THIS SUITE IS ONE BOOLEAN. `window.isSecureContext` decides
 whether a browser will even OFFER the camera, the microphone and geolocation —
 and over plain http on a LAN address it is false, so all three are refused
-before any prompt is drawn. On 2026-09-16 that was the whole failure: no
-geolocation prompt on the phone, place search answering about somewhere else,
-and nothing on screen saying why. Everything else here exists to make that one
-boolean true on a device that is not localhost.
+before any prompt is drawn. Everything else here exists to make that boolean
+true on a device that is not localhost.
+
+WHICH DEPLOYMENT THIS IS FOR, because getting it wrong wasted an afternoon.
+It is for **the in-car one**: a Jetson or a laptop on a local network with no
+proxy in front of it. A RunPod pod is published through an HTTPS proxy and is
+ALREADY a secure origin — it needs none of this.
+
+It was built on the belief that a non-secure origin caused the 2026-09-16
+drive to fail. The logs disprove that (docs/session_scope.md §2a): the client
+addresses were RunPod's proxy range, and the phone logged geolocation TIMEOUT
+rather than the PERMISSION_DENIED an insecure origin raises. The real cause was
+a 4-second watchdog tearing down the watch while the permission sheet was still
+on screen. This suite is still worth having — for the deployment it was
+actually right about — and section F pins the one thing that misled: the page
+must name the RIGHT url for where it is running.
 
 What is checked, and why each one is a way it silently fails anyway:
 
@@ -202,6 +214,30 @@ def t_browser(https_url, http_url):
         rows = p2.eval_on_selector_all(".perm-row", "els => els.map(e => e.className)")
         ok("all three rows show the insecure state",
            all("insecure" in c for c in rows), rows)
+
+        section("F. the hint names the RIGHT url for the deployment")
+        # Two deployments, two different right answers. Naming the wrong one is
+        # what sent the first diagnosis of this bug off to build a certificate
+        # for a pod that was already behind an HTTPS proxy.
+        pod = p2.evaluate(
+            "([h,o]) => RIO.ui.secureOriginHint(h,o)",
+            ["abc123-8888.proxy.runpod.net",
+             "http://abc123-8888.proxy.runpod.net"])
+        ok("a RunPod host is told to use the proxy URL",
+           "proxy.runpod.net/" in pod and "https://abc123-8888" in pod, pod[:110])
+        ok("...and explicitly that no certificate is needed",
+           "no certificate is needed" in pod, pod[:110])
+        ok("...and is NOT sent to make one",
+           "make_cert" not in pod, pod[:140])
+
+        lan = p2.evaluate("([h,o]) => RIO.ui.secureOriginHint(h,o)",
+                          ["192.168.1.42", "http://192.168.1.42:8888"])
+        ok("a LAN address is sent to the TLS terminator",
+           ":8443/" in lan, lan[:110])
+        ok("...and told how to make the certificate",
+           "make_cert" in lan, lan[:140])
+        ok("...and is NOT told to use a proxy it does not have",
+           "runpod" not in lan.lower(), lan[:140])
         b.close()
 
 

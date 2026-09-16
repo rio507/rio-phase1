@@ -72,11 +72,9 @@ identical from the passenger seat.
 
 Three faults were hiding behind one silence:
 
-1. **Not a secure context.** Over plain `http` on a LAN address, `getUserMedia`
-   and geolocation are refused before any prompt is drawn. The page knew this
-   for media (`RIO.mediaError`) and had no equivalent for position. **This is
-   the most likely root cause of the live failure**: a phone opening
-   `http://<ip>:8888` gets no camera and no location, silently.
+1. ~~**Not a secure context.**~~ **This was my first diagnosis and the logs
+   disprove it — see §2a.** It is a real failure mode and the page now detects
+   it, but it is not what happened on 2026-09-16.
 2. **The gesture was spent.** iOS grants a prompt only from a trusted gesture,
    and a gesture does not survive an `await`. All three requests are now
    *started* synchronously in the Start Drive handler and awaited afterwards —
@@ -86,6 +84,66 @@ Three faults were hiding behind one silence:
    before any fix had arrived, so a drive that never received a position
    reported a **fresh** position age for its whole length. It is `null` until a
    fix actually arrives, and every reader treats that as "no fix".
+
+## 2a. What the logs actually say, after the first diagnosis was wrong
+
+I first concluded the phone was on a plain-http origin and built a TLS
+terminator for it. **That was wrong, and the evidence was available before I
+started.**
+
+### The origin was not in the logs at all — which is the first finding
+
+`uvicorn`'s default access log records the client address, the method, the path
+and the status. **No `Host`, no `Origin`, no `X-Forwarded-*`** — zero matches
+across every surviving generation. The question "was the page on a secure
+origin?" was not answerable from the server, so it got inferred, and the
+inference was wrong. That gap is now closed: `/session/start` records `origin`,
+`host`, `forwarded_proto` and the browser's own `window.isSecureContext`
+alongside the user agent it already kept.
+
+### What the evidence does say
+
+| evidence | reading |
+|---|---|
+| client addresses are all `100.64.x.x` | RFC 6598 carrier-grade NAT — the **RunPod proxy**, not a LAN. The phone reached the pod through `https://<pod>-8888.proxy.runpod.net`, which **is** a secure origin |
+| six iPhone drives log `gps_error code=3 TIMEOUT` | an insecure origin raises **code 1 PERMISSION_DENIED immediately**, never a timeout |
+| the only `code=1` in the whole corpus is on a **Mac** | one genuine denial, on a different machine, unrelated |
+| `gps_watch_rearm` escalating 1 → 2 → 3 → 4 into coarse mode | the watch was armed and re-armed repeatedly, receiving nothing |
+
+Two independent facts therefore rule out the secure-context theory: the origin
+was a proxy https URL, and the error code was a timeout rather than a denial.
+
+### The actual bug, which was ours
+
+```
+watchPosition(..., { timeout: 10000 })   // the browser gets 10 s
+watchCfg.watchdog_s = 4.0                // we tore it down after 4
+```
+
+The watchdog exists for a good reason — a stalled GPS radio does not recover by
+being asked twice, so the watch is rebuilt. But **"it was delivering and went
+quiet" and "it has never delivered" were the same four-second clock**, and
+before the first fix that clock is not measuring a stalled radio. It is
+measuring *a human reading an iOS permission sheet and deciding to tap Allow*.
+
+Re-arming cancels the pending request. The prompt never survives long enough to
+be answered, `watchPosition` returns TIMEOUT, and the loop repeats — which is
+exactly the escalation the logs show, on every one of the six drives.
+
+**And my own "honest fix age" change made it worse before it made it better.**
+Setting `lastFixAt = null` (correct in itself — a drive with no fix must not
+report a fresh one) made `quiet` evaluate to `Infinity`, so the watchdog fired
+on its *first* tick: a one-second prompt instead of a four-second one.
+
+The fix separates the two clocks. `watchdog_s` (4 s) still governs a watch that
+was delivering and stopped. A new `first_fix_grace_s` (45 s) governs a watch
+that has never delivered, measured from when it was armed — long enough for a
+person to notice a sheet, read it and tap, and it costs nothing because a watch
+that is delivering never reaches that timer. `gps_watch_rearm` now carries
+`first_fix`, so "never delivered" and "stopped delivering" stop looking
+identical in the log.
+
+---
 
 ### What the driver sees now
 
@@ -163,16 +221,30 @@ default.
 
 ---
 
-## 6. HTTPS, which is what actually unblocks the phone
+## 6. HTTPS — for the in-car deployment, NOT for the pod
 
-`localhost` is a secure context by special dispensation. **A phone is never on
-localhost.** Over `http://192.168.1.42:8888` a browser refuses the camera, the
-microphone and geolocation *before drawing any prompt* — not as a permission the
-driver denied, but as a capability never offered. That is the most likely root
-cause of the live failure, and no amount of work on the permission flow fixes
-it, because the flow never gets to run.
+> **This did not fix the 2026-09-16 drive and was not needed for it.** That pod
+> is published through RunPod's HTTPS proxy, which is already a secure origin —
+> see §2a. The TLS terminator is kept because it is the right answer for a
+> deployment this project is heading towards and does not have yet: **a Jetson
+> or a laptop in the car, on a local network, with no proxy in front of it.**
+> There, `http://192.168.1.42:8888` really is a non-secure origin and really
+> does make the camera, microphone and geolocation unavailable before any
+> prompt is drawn.
+
+**Which deployment you are in decides the answer, and they are not the same:**
+
+| where | the URL | what is needed |
+|---|---|---|
+| RunPod pod (today) | `https://<pod>-8888.proxy.runpod.net` | **nothing** — already a secure origin |
+| in-car / Jetson / LAN (later) | `https://<address>:8443` | the certificate and terminator below |
+
+Getting this wrong sends somebody to make a certificate they do not need, which
+is what happened the first time this was diagnosed. The checklist's hint reads
+the hostname and names the right one of the two:
 
 ```
+  # in the car, on a local network:
   bash boot.sh cert --add 192.168.1.42     # the address the phone will type
   bash boot.sh restart                     # starts TLS if a cert exists
   # phone: https://192.168.1.42:8443/      # warns once; tap through

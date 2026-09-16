@@ -2756,6 +2756,44 @@ RIO.ui = (function () {
       trim(hist, 12);
     },
 
+    /* WHERE TO GO INSTEAD, for a page that is not on a secure origin.
+       Two deployments, two different right answers, and naming the wrong one
+       wastes an afternoon. A RunPod pod is reached through a proxy hostname
+       that is already https; a car or a bench on a local network is not, and
+       that is what the TLS terminator on 8443 is for. */
+    secureOriginHint(hostArg, originArg) {
+      // The host is a PARAMETER so the branches can be tested. `location` is
+      // not stubbable in a browser, and a hint that names the wrong URL is
+      // exactly the mistake this function exists to stop repeating.
+      const host = (hostArg !== undefined ? hostArg : location.hostname) || '';
+      const origin = (originArg !== undefined ? originArg : location.origin);
+      const head = 'Not a secure origin (' + origin + '), so the '
+        + 'browser refuses the camera, microphone and location BEFORE asking — '
+        + 'no prompt will ever appear. ';
+      // A RunPod pod is published as <pod>-<port>.proxy.runpod.net over https.
+      // The plain-http case here is someone reaching the pod some other way.
+      const pod = (host.match(/^([a-z0-9]+)-\d+\.proxy\.runpod\.net$/i) || [])[1];
+      if (pod) {
+        return head + 'This pod is published through RunPod: open '
+          + 'https://' + pod + '-8888.proxy.runpod.net/ instead. That URL is '
+          + 'already a secure origin — no certificate is needed.';
+      }
+      if (/\.proxy\.runpod\.net$/i.test(host)) {
+        return head + 'Open the same address over https:// — the RunPod proxy '
+          + 'already serves it, and no certificate is needed.';
+      }
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.endsWith('.local')
+          || host === '' ) {
+        return head + 'On a local network (a car, a bench, a Jetson) use the '
+          + 'TLS terminator: https://' + host + ':8443/. It warns once about '
+          + 'the self-signed certificate; tapping through is enough. '
+          + 'Make one with: python -m tools.make_cert --add ' + host;
+      }
+      return head + 'Open this page over https://. On a pod, use the '
+        + 'provider\'s https proxy URL; on a local network, run '
+        + 'python -m tools.make_cert and use https://' + host + ':8443/.';
+    },
+
     /* A publication time as a person reads it. The ISO string is what the
        source published and is never rewritten; this is only how it is shown,
        and it falls back to the raw value rather than printing nothing when the
@@ -2812,14 +2850,20 @@ RIO.ui = (function () {
         if (!snap.secure) {
           blocking = true;
           /* Name the address to go to, rather than the rule that was
-             broken. "Not a secure context" is the accurate sentence and it is
-             useless on a phone at the kerb; the URL is what the driver can
-             act on. The port is the one boot.sh starts the TLS proxy on. */
-          msg = 'Not on HTTPS, so the browser will not offer the camera, '
-              + 'microphone or location at all — it refuses before it asks. '
-              + 'Open https://' + location.hostname + ':8443/ on this device '
-              + 'instead. It will warn once about the certificate; tapping '
-              + 'through is enough.';
+             broken. "Not a secure context" is accurate and useless on a phone
+             at the kerb; a URL is something the driver can act on.
+             WHICH url depends on where this is running, and the two
+             deployments are genuinely different places:
+               a RunPod pod  reached through RunPod's HTTPS proxy, which is
+                             already a secure origin — so the answer is "use
+                             the proxy URL", not a certificate;
+               in-car / LAN  a Jetson or a laptop on a local network, where
+                             there is no proxy and the TLS terminator on 8443
+                             is the answer.
+             Getting this wrong sends somebody to make a certificate they do
+             not need, which is exactly what happened when this bug was first
+             diagnosed. */
+          msg = RIO.ui.secureOriginHint();
         } else if (snap.geo === 'denied') {
           blocking = true;
           msg = 'Location is denied, so anything about where you are — places '
@@ -3962,7 +4006,15 @@ document.addEventListener('DOMContentLoaded', () => {
       const r = await fetch('/session/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ metadata: { source: 'dashboard', ua: navigator.userAgent } })
+        /* `secure_context` is the browser's OWN answer, sent rather than
+           reconstructed. A secure context is what decides whether the camera,
+           microphone and geolocation are offered at all, and after 2026-09-16
+           it should never again have to be inferred from a client address. */
+        body: JSON.stringify({ metadata: {
+          source: 'dashboard', ua: navigator.userAgent,
+          secure_context: window.isSecureContext === true,
+          page_origin: location.origin,
+        } })
       });
       sid = (await r.json()).session_id;
       if (!sid) throw new Error('no session_id in response');
@@ -4534,11 +4586,36 @@ document.addEventListener('DOMContentLoaded', () => {
   let watchdogTimer = null;
   let rearms = 0;
   let lastFixAt = 0;
+  // When the CURRENT watch was armed. The first-fix grace is measured from
+  // here rather than from the last fix, because before the first fix there is
+  // no last fix -- which is precisely the case that was getting four seconds.
+  let watchArmedAt = 0;
   let gpsErrors = 0;
 
   // Fallbacks only. The real values arrive with the route in `timing`, exactly
   // as the tracker's do; RIO.nav hands them over when a route attaches.
-  let watchCfg = { watchdog_s: 4.0, max_rearms: 8, coarse_after: 2 };
+  let watchCfg = { watchdog_s: 4.0, max_rearms: 8, coarse_after: 2,
+                   /* THE FIRST FIX IS A DIFFERENT EVENT FROM A LOST ONE, and
+                      conflating them is what broke geolocation on the phone.
+
+                      `watchdog_s` answers "it was delivering and went quiet",
+                      where four seconds is right: the radio stalled and
+                      rebuilding the watch is the fix. Before the FIRST fix,
+                      the same four seconds is measuring something else
+                      entirely — a human reading an iOS permission sheet and
+                      deciding to tap Allow. Tearing the watch down under them
+                      cancels the pending request, which returns TIMEOUT, and
+                      the loop repeats.
+
+                      That is not a theory. Six iPhone drives logged
+                      `gps_error code=3 Timeout expired` and `gps_watch_rearm`
+                      escalating 1 -> 2 -> 3 -> 4 into coarse mode, with not a
+                      single PERMISSION_DENIED among them: the prompt never
+                      survived long enough to be answered. 45 s is a person
+                      noticing a sheet, reading it and tapping, with room to
+                      spare -- and it costs nothing, because a watch that IS
+                      delivering never reaches this timer. */
+                   first_fix_grace_s: 45.0 };
 
   function noteGps(tag, detail) {
     try {
@@ -4551,6 +4628,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function armWatch(coarse) {
+    watchArmedAt = performance.now();
     try {
       watchId = navigator.geolocation.watchPosition(
         pos => {
@@ -4584,12 +4662,17 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function rearmWatch() {
-    const quiet = lastFixAt === null ? Infinity
+    const first = lastFixAt === null;
+    const quiet = first ? (performance.now() - watchArmedAt) / 1000
       : (performance.now() - lastFixAt) / 1000;
     rearms++;
     const coarse = rearms > watchCfg.coarse_after;
+    // `first_fix` in the log separates "never delivered" from "stopped
+    // delivering". They were the same line before, which is why six drives of
+    // this looked like a flaky radio rather than a cancelled prompt.
     noteGps('gps_watch_rearm', { quiet_s: Math.round(quiet * 10) / 10,
-                                 attempt: rearms, coarse: coarse });
+                                 attempt: rearms, coarse: coarse,
+                                 first_fix: first });
     // Torn down and rebuilt, not merely re-requested: a stalled watch does not
     // start delivering again because it was asked twice.
     try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
@@ -4601,8 +4684,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watchdogTimer !== null) return;
     watchdogTimer = setInterval(() => {
       if (watchId === null) return;
-      const quiet = lastFixAt === null ? Infinity
-      : (performance.now() - lastFixAt) / 1000;
+      /* Nothing has ever arrived: this is the first-fix case, and the clock
+         that applies is the long one. Re-arming here is what cancelled the
+         permission prompt on six drives. */
+      if (lastFixAt === null) {
+        const waiting = (performance.now() - watchArmedAt) / 1000;
+        if (waiting < watchCfg.first_fix_grace_s) return;
+        rearmWatch();
+        return;
+      }
+      const quiet = (performance.now() - lastFixAt) / 1000;
       if (quiet < watchCfg.watchdog_s) return;
       if (rearms >= watchCfg.max_rearms) {
         // The radio is not coming back. Churning it further costs battery and

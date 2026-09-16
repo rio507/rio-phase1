@@ -3256,8 +3256,47 @@ def vehicle_signals_endpoint(vehicle_id: str):
 # --- Phase 2.5 session endpoints ---
 
 @app.post("/session/start")
-def session_start_endpoint(metadata: dict = Body(default=None, embed=True)):
-    sid = sessions.start_session(metadata=metadata)
+def session_start_endpoint(request: Request,
+                           metadata: dict = Body(default=None, embed=True)):
+    """Start a drive, and record WHERE THE PAGE CAME FROM.
+
+    The origin is recorded because on 2026-09-16 it could not be answered. A
+    phone failed to get a position and the question "was the page on a secure
+    origin?" had no answer anywhere: uvicorn's access log carries the client
+    address, the method and the path, and no headers at all. The client address
+    was 100.64.x — carrier-grade NAT, which is the RunPod proxy — so the answer
+    had to be INFERRED rather than read, and the first inference was wrong.
+
+    Three fields, once per drive, next to the user agent that was already here:
+
+      origin       the scheme and host the page was served from. This is the
+                   one that settles secure-context arguments, because a secure
+                   context is a property of the origin and nothing else.
+      host         what the browser addressed, which through a proxy is the
+                   proxy's hostname and not this machine's.
+      secure       what the PAGE says about itself (window.isSecureContext),
+                   sent in the metadata. The browser's own answer beats any
+                   reconstruction of it from headers.
+
+    Headers, not a guess. `Origin` is absent on a plain navigation, so `Referer`
+    is the fallback and its path is cut — a drive log should not carry a URL
+    with a query string in it.
+    """
+    meta = dict(metadata or {})
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        ref = (request.headers.get("referer") or "").strip()
+        if "://" in ref:
+            scheme, _, rest = ref.partition("://")
+            origin = f"{scheme}://{rest.split('/', 1)[0]}"
+    meta["origin"] = origin or None
+    meta["host"] = (request.headers.get("host") or "").strip() or None
+    meta["forwarded_proto"] = (
+        request.headers.get("x-forwarded-proto") or "").strip() or None
+    sid = sessions.start_session(metadata=meta)
+    print(f"[session] {sid[:8]} origin={meta['origin']} host={meta['host']} "
+          f"secure={meta.get('secure_context')} ua="
+          f"{str(meta.get('ua'))[:40]}", flush=True)
     # A drive cycle rides on the session rather than inventing its own notion of
     # a drive. sessions.py already knows when one starts and ends, including the
     # untidy ending where the client simply vanishes — see _teardown_session.
