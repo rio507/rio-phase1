@@ -57,6 +57,7 @@ import voice_tags
 # a pipeline with a bill and a licence attached, not a branch of this file.
 import places
 import weather
+import localnews
 
 _client: Optional[OpenAI] = None
 _client_lock = threading.Lock()
@@ -107,6 +108,13 @@ PLACES_TOOL_NAME = "find_places"
 # to know it. Server-side, because the key stays here.
 WEATHER_TOOL_NAME = "get_weather"
 
+# What is happening around the car, and what this place is. The same reasoning
+# model and web search deep_dive reaches, asked for FIELDS instead of prose --
+# because a claim from a stranger has to carry a source and a date before RIO
+# may repeat it, and you cannot check a paragraph for a missing timestamp. See
+# localnews.py.
+NEWS_TOOL_NAME = "search_local_news"
+
 VEHICLE_TOOL_NAME = "vehicle_status"
 
 # ...and the one thing on this list she DOES rather than reports. A driver who
@@ -134,7 +142,8 @@ REROUTE_TOOL_NAME = "reroute"
 # by session.update when its condition holds, and removed when it stops.
 def _base_tools():
     return [TOOL_SCHEMA, LOOK_SCHEMA, NAV_SCHEMA, NAV_DIRECTIONS_SCHEMA,
-            PLACES_SCHEMA, WEATHER_SCHEMA, VEHICLE_SCHEMA, NAVIGATE_SCHEMA]
+            PLACES_SCHEMA, WEATHER_SCHEMA, NEWS_SCHEMA, VEHICLE_SCHEMA,
+            NAVIGATE_SCHEMA]
 
 
 TOOL_SCHEMA = {
@@ -146,7 +155,8 @@ TOOL_SCHEMA = {
         "couple of seconds. Takes a few seconds.\n"
         "NOT for: chat; the car's own sensors (vehicle_status); the route "
         "(nav_status, nav_directions); a place near the car (find_places); "
-        "the weather or the forecast (get_weather); or "
+        "the weather or the forecast (get_weather); news, an incident or "
+        "what a place is known for (search_local_news); or "
         "anything you can SEE — the road, a car, a sign, a building — which is "
         "the look tool and the camera. This one has no picture to answer from."
     ),
@@ -333,6 +343,75 @@ WEATHER_SCHEMA = {
         "calling it when weather is genuinely in play costs nothing."
     ),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+}
+
+# WHAT IS HAPPENING AROUND THE CAR, and what this place is. The expensive tool:
+# 3-6 web searches, 20-50 seconds and 6-15 cents a question, measured. So the
+# description spends its length on WHEN NOT TO CALL IT as much as when to, and
+# the holding-line instruction is not optional politeness -- at twenty seconds a
+# silent session is a session the driver thinks has died.
+NEWS_SCHEMA = {
+    "type": "function",
+    "name": NEWS_TOOL_NAME,
+    "description": (
+        "News and local knowledge: what is happening around the car, at a "
+        "specific place, about a topic, in the world — or what a place IS, its "
+        "history and what it is known for.\n"
+        "Call it for: 'any news round here', 'what's going on where I am', "
+        "'why is traffic so bad', 'what happened up ahead', 'any news about "
+        "this place', 'what's in the news today', 'what's happening with "
+        "<topic>', 'what's the story of this place', 'what's this "
+        "neighbourhood known for'.\n"
+        "You do NOT know any of this. What you remember is from training and "
+        "is older than what this returns, and a confident wrong answer about "
+        "an incident is one the driver acts on. Never answer a news question "
+        "from memory and never use the research tool for one.\n"
+        "SAY A HOLDING LINE FIRST and make it true — this takes twenty to "
+        "fifty seconds. 'Give me a second, I'll have a look' — never 'one "
+        "second'. Then answer from what comes back.\n"
+        "Pass `question` as the driver ACTUALLY SAID IT. The wording decides "
+        "whether this is about here, a place, a topic, the world, or the "
+        "history of somewhere — so paraphrasing it is how a question about "
+        "this street becomes a search of the whole world.\n"
+        "For 'this place', pass `place_name` ONLY when the place is already "
+        "confirmed — a find_places result you just read out, or a name the "
+        "driver said. Never pass words off a sign you have not confirmed: "
+        "confirm it with find_places first. Without a confirmed name this "
+        "comes back asking you to check which place they mean, and you ask.\n"
+        "It can come back with nothing. That is an answer — say there is "
+        "nothing much about, and offer the wider view if it suggests one."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": (
+                    "The driver's question, in their own words, as close to "
+                    "verbatim as you have it."
+                ),
+            },
+            "place_name": {
+                "type": "string",
+                "description": (
+                    "The CONFIRMED name of the place they mean, when they "
+                    "asked about a specific one. From a find_places result or "
+                    "from the driver's own words. Leave it out otherwise."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["local", "place", "topic", "world", "mixed"],
+                "description": (
+                    "Only for a FOLLOW-UP whose words no longer say — 'what "
+                    "else?' after a topic question stays on that topic. Leave "
+                    "it out for a fresh question: the wording decides."
+                ),
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
 }
 
 VEHICLE_SCHEMA = {
@@ -708,6 +787,57 @@ WHEN THEY PICK ONE
 "Take me to the second one." "Let's go to the Blue Bottle." That is
 start_navigation, with the place_id the result you already have carries for
 every place you read out — the same place, already resolved.
+
+WHEN THEY ASK WHAT'S GOING ON
+
+"Any news round here?" "What's going on where I am?" "Why is traffic so bad?"
+"What happened up ahead?" "Any news about this place?" "What's in the news
+today?" "What's happening with the Lakers?" "What's the story of this
+neighbourhood?" All of it is search_local_news, and none of it is something you
+know. What you remember about a place is from training, and a driver who is
+told there is a crash ahead changes lanes.
+
+PASS THEIR WORDS THROUGH. The wording is what decides whether this is about
+this street, this building, a topic, the whole world, or the history of where
+you are — so send the question as they said it. "What's going on with tariffs"
+and "what's going on round here" differ by three words and are completely
+different searches.
+
+HOLDING LINE FIRST, AND A TRUE ONE. This takes twenty to fifty seconds. "Give
+me a sec, I'll have a look" — never "one second", and never silence. Then
+answer.
+
+WHAT COMES BACK IS WHAT YOU KNOW. One to three sentences of the thing itself,
+not a list of headlines. "There's utility work closing two lanes on Lincoln
+about half a mile up." Not "according to several reports, there appears to be."
+If there is more, offer it in a clause.
+
+SAY HOW OLD IT IS WHEN THE AGE CHANGES ANYTHING. An incident, a closure, a
+fire — "reported about an hour ago". Something that happened this morning must
+not sound like it is happening now.
+
+NAME THE SOURCE when the claim is contested or consequential — anything
+political, anything about blame, anything about safety. "The city says", "the
+Daily Press reported". For a farmers market, just say it.
+
+WHEN THE SOURCES DISAGREE, SAY SO. The result carries the disagreement when it
+finds one. Two outlets saying opposite things is "there's some confusion about
+whether it's still on" — never whichever one you like better.
+
+NOTHING FOUND IS AN ANSWER. "Nothing much going on round here" — and if it
+offers the wider view, offer it too: "want the bigger headlines?" Never fill
+that gap from memory.
+
+ABOUT A SPECIFIC PLACE, CONFIRM IT FIRST. "Any news about this place?" needs to
+know WHICH place. If find_places just gave you one, or the driver named it,
+pass that name. If all you have is words off a sign or a guess from the camera,
+confirm with find_places first — a confident answer about a same-named business
+in another state is the failure this is guarding against. If it comes back
+saying it cannot tell which place, ask them.
+
+"THE STORY OF" IS NOT "ANY STORIES ABOUT". "What's the story OF this place" is
+its history and what it is known for; "any stories ABOUT this place" is the
+news. The tool works out which from the words, so pass the words.
 
 WHEN THE WEATHER COMES UP
 
@@ -2280,7 +2410,7 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # tracker, the planner, and the queue of sentences waiting to be said.
         return {"ok": False, "note": f"{name} is answered by the panel"}
     if name not in (TOOL_NAME, LOOK_TOOL_NAME, PLACES_TOOL_NAME,
-                    WEATHER_TOOL_NAME):
+                    WEATHER_TOOL_NAME, NEWS_TOOL_NAME):
         return {"ok": False, "note": "unknown tool"}
     if isinstance(arguments, str):
         try:
@@ -2296,6 +2426,19 @@ def run_tool(name: str, arguments, session_key: str = "default",
         # actually said wherever they are available. See look().
         return look(str(arguments.get("question") or ""), session_key,
                     spoken=str(spoken or "") or None, teachers=teachers)
+    if name == NEWS_TOOL_NAME:
+        # The coordinates come from `where` for the same reason weather's do:
+        # the panel is the only thing that knows where the car is. The
+        # QUESTION comes from the model rather than from `spoken`, because a
+        # follow-up ("what else?") is a real question whose scope lives in the
+        # conversation and not in the last transcript line.
+        fix = where if isinstance(where, dict) else {}
+        return localnews.search_local_news(
+            latitude=fix.get("lat"), longitude=fix.get("lng"),
+            question=str(arguments.get("question") or spoken or ""),
+            place_name=str(arguments.get("place_name") or ""),
+            scope=str(arguments.get("scope") or ""),
+            session_key=session_key)
     if name == WEATHER_TOOL_NAME:
         # No arguments: the question is always "here, now". The coordinates
         # come from `where` -- the panel's own fix, already attached to every

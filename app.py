@@ -44,6 +44,7 @@ import insights
 import vehicle_health
 import vehicle_health_policy
 import weather
+import localnews
 from tire_diag import engine as tire_diag
 from tire_diag import codes as tire_codes
 from tire_diag import monitors as tire_monitors
@@ -385,6 +386,11 @@ def health():
             # the one to watch when phase 2 is costed -- route sampling
             # multiplies it by the number of points on the polyline.
             "weather": weather.status(),
+            # Local intelligence. `spend` is the one to watch: news is by a
+            # wide margin the most expensive thing RIO does (~$0.08-$0.15 a
+            # question against $0.00045 for a weather refresh), and this is
+            # where a drive's running total is readable without a bill.
+            "news": localnews.status(),
             "detector_accel": headway_detect.accel_status()}
 
 

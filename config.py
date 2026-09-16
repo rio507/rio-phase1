@@ -1625,6 +1625,116 @@ WEATHER_TIMEOUT_S = 6.0
 WEATHER_MAX_FIX_AGE_S = 180.0
 
 
+# ---------------------------------------------------------------------------
+# Local intelligence: news, incidents and background (localnews.py)
+# ---------------------------------------------------------------------------
+# What is happening around the car, and what this place is. Reached through the
+# SAME vendor and key deep_dive already uses — no second search stack — but
+# through a different call, because deep_dive returns prose and amendment A
+# needs fields that can be refused. See localnews.py's header.
+NEWS_ENABLED = True
+
+# The retrieval model. The same one deep_dive uses: this is one reasoning call
+# with web search, not a new dependency.
+NEWS_MODEL = OPENAI_REASONING_MODEL
+
+# --- the money, which is the reason half the settings below exist -----------
+# MEASURED, not estimated (tools/news_probe.py):
+#
+#   local news question   3-6 searches   22-53 s   $0.06-$0.15
+#   traffic, narrow       3 searches     17 s      $0.06
+#   background            1 search        9 s      $0.014
+#
+# A weather refresh is $0.00045. One local news question is roughly 180 TIMES
+# that. It is the most expensive thing RIO does by a wide margin, and the cost
+# is dominated by the search calls themselves ($10.00 per 1000) plus the ~8-10k
+# input tokens each search stuffs into context.
+#
+# Rates below are used to ESTIMATE spend per question so the budget can refuse
+# before the money is gone. They are list prices and will drift; they are here
+# to be right about the shape of the bill, not to be an invoice.
+NEWS_SEARCH_COST_USD = 0.010            # $10.00 / 1000 web_search calls
+NEWS_IN_COST_USD = 1.25 / 1_000_000     # input tokens, gpt-5 standard tier
+NEWS_OUT_COST_USD = 10.0 / 1_000_000    # output tokens
+
+# Per question. Every query is a search and a search is a cent plus the tokens,
+# so four is the difference between an 8 cent question and a 15 cent one. Four
+# also covers the spec's expansion — neighbourhood, city, city-breaking, and
+# one category query — which is as far as a driver's question usefully reaches.
+NEWS_MAX_QUERIES_PER_QUESTION = 4
+
+# Per DRIVE, and this one has teeth: it is enforced in Python against the
+# searches actually counted in each response, and when it is reached RIO says
+# she cannot look anything else up rather than quietly spending more. At ~4
+# searches a question this is about six questions, which is far more than a
+# drive normally contains and cheap insurance against the one that does not
+# stop asking. A new drive resets it (localnews.reset_spend).
+NEWS_MAX_SEARCHES_PER_DRIVE = 24
+
+# Ceiling on the retrieval call itself. Generous compared with deep_dive's
+# 320+1200 precisely because that budget was MEASURED failing this shape: six
+# searches of reasoning consumed all 1520 tokens and returned nothing after
+# 30.6 seconds. Structured results for several items need room to be written.
+NEWS_MAX_TOKENS = 3000
+NEWS_BACKGROUND_MAX_TOKENS = 1200
+NEWS_BACKGROUND_SEARCH = True
+
+NEWS_TIMEOUT_S = 60.0
+NEWS_GEO_TIMEOUT_S = 8.0
+
+# How many results RIO is ever handed. She says one to three sentences; a list
+# of twelve is twelve chances to pick the wrong one and no extra answer.
+NEWS_MAX_SPOKEN_RESULTS = 6
+
+# --- ranking (the spec's weights, and what happens without geography) -------
+# Geographic scopes get the spec's 40/30/20/10. Topic and world have no
+# geography to weigh, so proximity's share is redistributed to recency and
+# relevance and source reliability RISES — without geography there is nothing
+# corroborating a claim except who made it, which is amendment F's point.
+NEWS_WEIGHTS_GEO = {"geo": 0.40, "recency": 0.30, "relevance": 0.20,
+                    "source": 0.10}
+NEWS_WEIGHTS_FLAT = {"geo": 0.0, "recency": 0.45, "relevance": 0.35,
+                     "source": 0.20}
+
+# How much a source is worth, by what kind of thing it is. An official closure
+# notice and an anonymous post are not the same claim. `social` is deliberately
+# low AND localnews.audit() additionally refuses a result set that is social
+# only — the spec's "supplemental evidence, not verified news on their own".
+NEWS_SOURCE_WEIGHTS = {
+    "official": 1.0,      # city, police, fire, transit agency, the business
+    "news_org": 0.85,     # an established newsroom
+    "aggregator": 0.5,
+    "blog": 0.35,
+    "unknown": 0.3,
+    "social": 0.2,
+}
+
+# The geographic corroboration bar (amendment B). 0.5 is county level: a result
+# that cannot be tied at least to the county the car is in does not survive a
+# local question, however well it scores otherwise. This is the setting that
+# stops a same-named business three states away becoming the answer.
+NEWS_MIN_GEO_MATCH = 0.5
+
+# A publication date slightly in the future is clock skew or a timezone-less
+# page, not a scoop. Past this it is a bad parse and the item is dropped.
+NEWS_FUTURE_TOLERANCE_S = 3600.0
+
+# --- the caches -------------------------------------------------------------
+# The spec's refresh rates. Traffic moves, history does not.
+NEWS_TTL_TRAFFIC_S = 300.0          # 5 min
+NEWS_TTL_EMERGENCY_S = 300.0        # 5 min
+NEWS_TTL_GENERAL_S = 1500.0         # 25 min
+NEWS_TTL_EVENTS_S = 10800.0         # 3 h
+NEWS_TTL_BACKGROUND_S = 604800.0    # a week; what a neighbourhood IS does not
+                                    # change, and this is the cheapest possible
+                                    # answer to the most repeatable question
+
+# A reverse geocode a hundred metres later returns the same four words. The
+# cell is ~1 km, so this is "how long is a neighbourhood name true", which is
+# effectively forever — the cell changing is what invalidates it, not the clock.
+NEWS_GEO_TTL_S = 3600.0
+
+
 # --- replay presentation buffer ---------------------------------------------
 # Seconds the ANALYSIS stream runs ahead of the picture during an uploaded-clip
 # headway run. It is the fix for a rendering fault, not a detection one: a box

@@ -274,7 +274,95 @@ provider is one more implementation of `get_weather_context`, and the
 
 ---
 
-## 4. Other services
+## 4. Web search for news and local knowledge — ONE FINDING BLOCKS PRODUCTION
+
+`localnews.py` answers "any news round here", "why is traffic bad", "what's the
+story of this place". It reaches the web through the **OpenAI Responses API's
+built-in `web_search` tool** — the same vendor, key and API `deep_dive` already
+uses (`realtime.escalate`). **There is no new search vendor here and no second
+search stack**; see §6 of `docs/local_intelligence.md` for why it is
+nonetheless a separate call.
+
+Because the vendor is one RIO already depends on, most of this section is
+short. One line of it is not.
+
+### The blocking finding: citations must be clickable, and RIO speaks
+
+OpenAI's web search documentation requires, verbatim:
+
+> "When displaying web results or information contained in web results to end
+> users, inline citations must be made clearly visible and clickable in your
+> user interface."
+
+**RIO's answer is a sentence said out loud in a moving car.** It has no user
+interface, it cannot be clicked, and the driver is — correctly — not looking at
+a screen. `localnews.py` additionally instructs her *never to read a URL aloud*,
+because reading one out is both useless and unsafe.
+
+So the requirement as written is not satisfied by the current product, and this
+is not a detail to settle later — it is the condition on which the whole feature
+ships. What must be decided before production:
+
+- Whether the dashboard rendering the cited sources — headline, source, link —
+  while RIO speaks satisfies "clearly visible and clickable", given the driver
+  is not looking at it.
+- Whether it satisfies it when the panel is backgrounded, the phone is locked,
+  or the car is driven with the screen off.
+- Whether an audible attribution ("the Daily Press reported") is accepted in
+  place of a clickable one, or is simply a different thing that does not
+  discharge the obligation.
+- Whether a passenger-facing display is required, and whether that changes the
+  product's hardware assumptions.
+
+**What is already done so that the answer is implementable rather than a
+rewrite:** every result kept by `localnews.audit()` retains its `url`, `source`,
+`headline` and `published`, and they travel all the way out to the tool result.
+The data a citation UI needs is present and plumbed. **The UI that renders it
+does not exist yet, and building it is a prerequisite to shipping this feature,
+not an enhancement.** This is the same shape as the Places and Weather
+attribution questions in §2 and §3 — audible answers against display-worded
+terms — but it is the strictest of the three, because "clickable" cannot be
+read aloud at all.
+
+### The rest, which is comparatively settled
+
+| Question | Answer |
+|---|---|
+| Vendor | OpenAI, already in use for conversation, visual Q&A and `deep_dive` |
+| New key / new account surface | **None.** Same `OPENAI_API_KEY` |
+| Cost | **$10.00 per 1,000 `web_search` calls**, plus search-result tokens billed as input at model rates. Measured: **$0.06–$0.15 per news question** |
+| Storage / caching restrictions | **None stated** in the web search documentation. RIO caches answers 5 min (traffic) to 25 min (general), and background for a week, in memory only |
+| Attribution of the underlying publishers | Carried per result as `source`; spoken when the claim is contested or consequential |
+
+### Still open, and to settle before production
+
+- **The citation requirement above.** Everything else in this section is
+  routine; that one is not.
+- **Content provenance and republication.** RIO speaks a summary of a
+  publisher's reporting. Whether summarising a news article aloud in a
+  commercial product raises anything with the PUBLISHERS — independently of
+  OpenAI's terms — is a separate question with a different counterparty, and it
+  is the same class of question as speaking Places business names in §2.
+- **Caching duration against publisher expectations.** OpenAI states nothing;
+  that is not the same as publishers permitting it. Our windows are minutes,
+  which is likely inside anything reasonable, but "likely" is what this file
+  exists to remove.
+- **Reliance on model-reported timestamps.** `published` comes from the model
+  reading the page, not from a feed with structured metadata. `audit()` refuses
+  anything undated and anything outside the intent's window, so a MISSING date
+  is safe — but a MISREAD one would pass. A real news API with structured
+  publication metadata would remove that class of error entirely, and is the
+  main argument for ever adding a second source. Noted here rather than in the
+  design because it is a correctness question with a procurement answer.
+- **Google Geocoding (reverse).** Reverse geocoding the car's position into
+  neighbourhood/city/county/state is the same Geocoding API already reviewed in
+  §2, used in the opposite direction, on the same key. The §2 caching and
+  retention questions apply unchanged; the coordinates are not stored and the
+  resulting four words are held ~1 hour per ~1 km cell.
+
+---
+
+## 5. Other services
 
 | Service | Used for | To review |
 |---|---|---|
@@ -283,7 +371,7 @@ provider is one more implementation of `get_weather_context`, and the
 
 ---
 
-## 5. Privacy posture, stated so it can be checked
+## 6. Privacy posture, stated so it can be checked
 
 Not a licence question, but adjacent and easy to lose track of:
 
