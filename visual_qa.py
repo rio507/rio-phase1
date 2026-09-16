@@ -494,15 +494,28 @@ class VisualAnswer:
         t = self._stage("route", t)
 
         rtype = self.route["request_type"]
-        ring = framebuf.peek_ring(self.session_id)
+        # `ring_for`, NOT `peek_ring`: the key says which buffer, and only the
+        # origin says whose road is in it. This read the key alone until the
+        # 2026-09-16 drive, where a question asked on a phone was answered
+        # from a clip uploaded on a desktop -- both had arrived without a
+        # session id, so both were keyed "default" and the buffer was shared.
+        peeked = framebuf.peek_ring(self.session_id)
+        ring = framebuf.ring_for(self.session_id)
         frames = ring.frames() if ring else []
         self.meta["ring"] = ring.stats() if ring else {"frames": 0}
+        if peeked is not None and ring is None:
+            # There ARE frames; they are somebody else's. Distinguished from an
+            # empty buffer in the log because they are different faults -- one
+            # is a camera that has not started, the other is a session boundary
+            # that leaked -- even though the driver hears the same sentence.
+            self.meta["foreign_ring_origin"] = peeked.origin
 
         if not frames:
             # Nothing to look at. RIO says so rather than answering from a
             # remembered caption, which is the failure mode this whole path
             # exists to remove.
-            self.meta["visual_unavailable"] = "no_frames"
+            self.meta["visual_unavailable"] = (
+                "not_my_frames" if peeked is not None else "no_frames")
             self._build_messages(unavailable=True)
             self._stage("prepare_total", self._t_start)
             return
@@ -1364,7 +1377,12 @@ def answer(session_id: str, question: str, route: dict = None) -> VisualAnswer:
 
 def scene_graph(session_id: str) -> dict:
     """The current scene graph for a session, as the endpoint serves it."""
-    ring = framebuf.peek_ring(session_id)
+    # Same rule as the answer path: a buffer that is not this session's is not
+    # a buffer this session may be shown.
+    if framebuf.peek_ring(session_id) is not None \
+            and framebuf.ring_for(session_id) is None:
+        return {"available": False, "reason": "not_my_frames", "objects": []}
+    ring = framebuf.ring_for(session_id)
     if ring is None:
         return {"available": False, "reason": "no_session_buffer", "objects": []}
     frame = ring.latest()

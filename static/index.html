@@ -948,6 +948,52 @@
   }
   /* Newest entry reads bright; the rest recede. */
   .history .hist-item:first-child { color: var(--t3); box-shadow: inset 2px 0 0 var(--accent-line); }
+  /* ---- pre-drive checklist ------------------------------------------------
+     The dot carries the state and the word repeats it, deliberately: colour
+     alone is not a message a driver can be relied on to read, and one of these
+     rows is the difference between "the search is bad" and "the phone never
+     asked for your location". */
+  .perm-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+  .perm-row {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--t3);
+  }
+  .perm-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--t5); flex: none;
+  }
+  .perm-name { flex: 1; }
+  .perm-state {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t4);
+  }
+  .perm-row.granted .perm-dot { background: var(--good, #56c271); }
+  .perm-row.granted .perm-state { color: var(--good, #56c271); }
+  .perm-row.denied .perm-dot,
+  .perm-row.insecure .perm-dot { background: var(--danger, #e2584d); }
+  .perm-row.denied .perm-state,
+  .perm-row.insecure .perm-state { color: var(--danger, #e2584d); }
+  .perm-row.unavailable .perm-dot { background: var(--warn, #e0a33e); }
+  .perm-row.unavailable .perm-state { color: var(--warn, #e0a33e); }
+  /* A blocking row is the one stopping the drive, and it should be the thing
+     the eye lands on. */
+  .perm-row.blocking { font-weight: 500; }
+  .perm-note {
+    margin-top: 6px; padding: 7px 9px; border-radius: var(--r-ctl);
+    background: var(--inset); color: var(--t3);
+    font-size: 11px; line-height: 1.45;
+  }
+  .perm-note.blocking { box-shadow: inset 2px 0 0 var(--danger, #e2584d); }
+  /* The live fix readout: age and accuracy, because "we have a position" and
+     "we have a position worth answering from" are different claims. */
+  .fixline {
+    margin-top: 6px;
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-mono); color: var(--t4);
+  }
+  .fixline.stale { color: var(--warn, #e0a33e); }
+  .fixline.none { color: var(--danger, #e2584d); }
+
   .hist-time {
     display: block; margin-bottom: 4px;
     font-family: var(--font-mono); font-size: var(--fs-nano);
@@ -1917,6 +1963,29 @@
 
     <button id="drive">Start Drive</button>
 
+    <!-- PRE-DRIVE CHECKLIST. Three permissions, four states each, and the one
+         thing it must never do is stay blank when something was refused.
+         On 2026-09-16 a phone drove with no geolocation prompt at all: place
+         search answered about somewhere else and "news round here" resolved to
+         the wrong area, and nothing on the screen said why. A denied
+         permission is a visible state now, not a value that happens never to
+         change. See static/rio_permissions.js. -->
+    <div class="perm-list" id="permlist">
+      <div class="perm-row" id="perm-camera">
+        <span class="perm-dot"></span><span class="perm-name">Camera</span>
+        <span class="perm-state">not asked</span>
+      </div>
+      <div class="perm-row" id="perm-mic">
+        <span class="perm-dot"></span><span class="perm-name">Microphone</span>
+        <span class="perm-state">not asked</span>
+      </div>
+      <div class="perm-row" id="perm-geo">
+        <span class="perm-dot"></span><span class="perm-name">Location</span>
+        <span class="perm-state">not asked</span>
+      </div>
+      <div class="perm-note" id="permnote" hidden></div>
+    </div>
+
     <div class="manual-controls">
       <button id="frame" class="hud-btn">Send webcam frame</button>
       <label for="upload" class="hud-btn upload-label">Upload image or video</label>
@@ -2329,6 +2398,15 @@ acted on, never consulted by the arbiter.">Shadow</div>
    DOMContentLoaded blocks below can reach it. */
 window.RIO = (function () {
   let sessionId = null;
+  /* One per page load. Not persisted: two tabs are two sources of pictures and
+     should never be confused with each other, and a remembered id would
+     survive into a drive that has nothing to do with the last one. */
+  const clientId = (() => {
+    try {
+      if (window.crypto && crypto.randomUUID) return crypto.randomUUID().slice(0, 18);
+    } catch (e) { /* fall through */ }
+    return 'c' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36).slice(-4);
+  })();
   let videoStream = null;
 
   // iOS Safari only allows programmatic playback on an <audio> element that has
@@ -2355,10 +2433,24 @@ window.RIO = (function () {
     set sessionId(v) { sessionId = v; },
     get driving() { return sessionId !== null; },
 
-    // Append ?session_id=<id> to any endpoint while a drive is active.
+    /* WHO IS ASKING. `session_id` while a drive is active, and `client_id`
+       ALWAYS — including before Start Drive and during a live conversation
+       with no drive at all.
+
+       The client id is what stops two browsers sharing a frame buffer. On
+       2026-09-16 a question asked on a phone was answered from a clip uploaded
+       on a desktop: a live conversation can run without a drive, the server
+       keyed the frame ring on `session_id or "default"`, and both devices had
+       arrived without one. The tab id is minted once per page load, is not a
+       drive session, and never reaches the drive log — it exists only so that
+       "whose pictures are these" has an answer when nobody has pressed Start
+       Drive. */
+    get clientId() { return clientId; },
     url(path) {
-      if (!sessionId) return path;
-      return path + (path.includes('?') ? '&' : '?') + 'session_id=' + encodeURIComponent(sessionId);
+      const sep = () => (path.includes('?') ? '&' : '?');
+      if (sessionId) path += sep() + 'session_id=' + encodeURIComponent(sessionId);
+      path += sep() + 'client_id=' + encodeURIComponent(clientId);
+      return path;
     },
 
     /* A few bytes of silence, as a URL. The ONLY thing an element may be
@@ -2684,6 +2776,92 @@ RIO.ui = (function () {
             : ' (' + Math.round(ageH / 24) + 'd ago)';
       }
       return when;
+    },
+
+    /* ----- the pre-drive checklist ----------------------------------------
+       Paints three rows and, when something is blocking, one sentence saying
+       what to do about it. Called on every permission state change and after
+       every fix, so the position line is live rather than a snapshot taken at
+       Start Drive. */
+    permissions(snap) {
+      if (!snap) return;
+      const WORD = {
+        unknown: 'not asked', granted: 'granted', denied: 'denied',
+        unavailable: 'unavailable', insecure: 'needs HTTPS',
+      };
+      const rows = { camera: 'perm-camera', mic: 'perm-mic', geo: 'perm-geo' };
+      // Camera and location are blocking; the microphone is not. A drive with
+      // no voice is degraded and still worth having; a drive with no picture
+      // or no position answers questions wrongly rather than not at all, which
+      // is worse.
+      const BLOCKS = { camera: true, mic: false, geo: true };
+      Object.keys(rows).forEach((k) => {
+        const el = $(rows[k]);
+        if (!el) return;
+        const st = snap[k] || 'unknown';
+        el.className = 'perm-row ' + st
+          + (BLOCKS[k] && (st === 'denied' || st === 'insecure'
+                           || st === 'unavailable') ? ' blocking' : '');
+        const label = el.querySelector('.perm-state');
+        if (label) label.textContent = WORD[st] || st;
+      });
+
+      const note = $('permnote');
+      if (note) {
+        let msg = '', blocking = false;
+        if (!snap.secure) {
+          blocking = true;
+          msg = 'This page is not on HTTPS, so the browser will not offer the '
+              + 'camera, microphone or location at all. Open it over https:// '
+              + '(or on localhost) — nothing here can be granted until then.';
+        } else if (snap.geo === 'denied') {
+          blocking = true;
+          msg = 'Location is denied, so anything about where you are — places '
+              + 'nearby, local news, the forecast — cannot be answered. '
+              + 'Re-enable it for this site in the browser settings.';
+        } else if (snap.camera === 'denied' || snap.camera === 'unavailable') {
+          blocking = true;
+          msg = 'No camera, so RIO cannot see the road. Questions about what '
+              + 'is out of the window will be refused rather than guessed at.';
+        } else if (snap.mic === 'denied') {
+          msg = 'Microphone denied — you can still drive, but you will have to '
+              + 'use the screen rather than your voice.';
+        } else if (snap.asked && snap.geo === 'unknown') {
+          msg = 'Still waiting on a position fix. Location answers stay off '
+              + 'until one arrives.';
+        }
+        note.textContent = msg;
+        note.hidden = !msg;
+        note.className = 'perm-note' + (blocking ? ' blocking' : '');
+      }
+      RIO.ui.fixLine(snap.fix);
+    },
+
+    /* The position, as the HUD shows it: how old and how good. Both matter and
+       neither was on screen before. A fix that is twenty minutes old or
+       accurate to two kilometres is not a fix RIO should answer "what's near
+       me" from, and until now nothing said which one you had. */
+    fixLine(fix) {
+      let el = $('fixline');
+      if (!el) {
+        const host = $('permlist');
+        if (!host) return;
+        el = document.createElement('div');
+        el.id = 'fixline';
+        host.appendChild(el);
+      }
+      if (!fix) {
+        el.className = 'fixline none';
+        el.textContent = 'position: none yet';
+        return;
+      }
+      const age = Math.round(fix.age_s);
+      const acc = (typeof fix.accuracy_m === 'number' && isFinite(fix.accuracy_m))
+        ? Math.round(fix.accuracy_m) + ' m' : 'accuracy unknown';
+      const stale = age > 120;
+      el.className = 'fixline' + (stale ? ' stale' : '');
+      el.textContent = 'position: ' + (age < 2 ? 'just now' : age + 's ago')
+        + ' · ' + acc;
     },
 
     turnToHistory(driverText, rioText) {
@@ -3496,6 +3674,26 @@ frameBtn.addEventListener('click', async () => {
 <script>
 /* --- Drive mode: session lifecycle + 5s auto-observe --- */
 document.addEventListener('DOMContentLoaded', () => {
+  /* THE PERMISSION MODULE, WIRED TO THE PAGE.
+     Three connections and each closes a hole the 2026-09-16 drive fell into:
+       onChange   the checklist repaints whenever a state moves, so a refusal
+                  appears on screen instead of being a silence;
+       onPosition every real fix feeds the module, so "have we ever had one"
+                  and the age shown in the HUD come from arrivals rather than
+                  from when the watch was armed;
+       probe      the checklist is painted at load, before anything is pressed,
+                  so a browser that has already denied something says so
+                  rather than waiting for a drive to fail. */
+  RIO.permissions.onChange((snap) => { try { RIO.ui.permissions(snap); } catch (e) {} });
+  if (RIO.headway && RIO.headway.onPosition) {
+    RIO.headway.onPosition((pos) => {
+      try { RIO.permissions.noteFix(pos); } catch (e) {}
+    });
+  }
+  RIO.permissions.probe().then((snap) => {
+    try { RIO.ui.permissions(snap); } catch (e) {}
+  }).catch(() => {});
+
   const driveBtn = document.getElementById('drive');
   const status = document.getElementById('drivestatus');
   const video = document.getElementById('video');
@@ -3684,6 +3882,25 @@ document.addEventListener('DOMContentLoaded', () => {
     // Must happen here, before any await, while the tap is still trusted.
     if (RIO.headway) { RIO.headway.unlock(); RIO.headway.startWatch(); }
 
+    /* PERMISSIONS, ASKED HERE AND NOWHERE ELSE, INSIDE THE TAP.
+     *
+     * All three requests are STARTED before the first await below. A gesture
+     * does not survive one, and on 2026-09-16 that was the whole bug: the
+     * geolocation prompt never appeared on the phone, place search answered
+     * about somewhere else, "news round here" resolved to the wrong area, and
+     * nothing on the screen said why.
+     *
+     * The promise is awaited AFTER the source is opened, so the two happen
+     * together rather than one behind the other -- but the asking has already
+     * happened by then, which is the part that needs the tap. */
+    const permAsk = RIO.permissions.request({
+      // A clip on screen is already a picture. Asking for the camera anyway
+      // trains the driver to dismiss prompts, which is how the one that
+      // mattered gets dismissed too.
+      skipCamera: RIO.source.kind() === 'clip',
+      video: RIO.source.videoConstraints ? RIO.source.videoConstraints() : true,
+    });
+
     // WHATEVER THE SOURCE IS. With a clip loaded this opens no camera at all:
     // the driver put a video on the screen and pressing Start Drive on it
     // meant "drive this", not "throw it away and look at me". See
@@ -3702,6 +3919,32 @@ document.addEventListener('DOMContentLoaded', () => {
       say(RIO.mediaError(feed.error || 'no source'));
       return;
     }
+    /* THE GATE. Camera and position are blocking; the microphone is not.
+       A drive with no voice is degraded and still worth having. A drive with
+       no picture or no position ANSWERS WRONGLY rather than not at all --
+       which is the failure that cost the 2026-09-16 drive, and is worth
+       refusing to start for. */
+    const perms = await permAsk;
+    RIO.ui.permissions(perms);
+    if (!perms.secure) {
+      say('Not on HTTPS - the browser will not offer the camera, microphone '
+          + 'or location. Open this page over https:// on the phone.');
+      RIO.source.stopFeed(feed);
+      return;
+    }
+    if (!perms.canSee && RIO.source.kind() !== 'clip') {
+      say('No camera - ' + (perms.detail.camera || perms.camera)
+          + '. RIO would not be able to see the road.');
+      RIO.source.stopFeed(feed);
+      return;
+    }
+    if (perms.geo === 'denied' || perms.geo === 'unavailable') {
+      say('No location - ' + (perms.detail.geo || perms.geo)
+          + '. Places, local news and the forecast all need it.');
+      RIO.source.stopFeed(feed);
+      return;
+    }
+
     const stream = feed.stream;
     // The element frames come from for the rest of this drive. Not `video`:
     // with a clip that element is empty, and capturing it would send black
@@ -4335,7 +4578,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function rearmWatch() {
-    const quiet = (performance.now() - lastFixAt) / 1000;
+    const quiet = lastFixAt === null ? Infinity
+      : (performance.now() - lastFixAt) / 1000;
     rearms++;
     const coarse = rearms > watchCfg.coarse_after;
     noteGps('gps_watch_rearm', { quiet_s: Math.round(quiet * 10) / 10,
@@ -4351,7 +4595,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watchdogTimer !== null) return;
     watchdogTimer = setInterval(() => {
       if (watchId === null) return;
-      const quiet = (performance.now() - lastFixAt) / 1000;
+      const quiet = lastFixAt === null ? Infinity
+      : (performance.now() - lastFixAt) / 1000;
       if (quiet < watchCfg.watchdog_s) return;
       if (rearms >= watchCfg.max_rearms) {
         // The radio is not coming back. Churning it further costs battery and
@@ -4367,7 +4612,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watchId !== null || !navigator.geolocation) return;
     rearms = 0;
     gpsErrors = 0;
-    lastFixAt = performance.now();
+    /* NOT `performance.now()`. This used to stamp the age as "now" the moment
+       the watch was armed, so a drive that never received a single fix
+       reported a FRESH position age for its whole length -- which is exactly
+       how the 2026-09-16 drive looked healthy while answering from nowhere.
+       Null means no fix has arrived, and everything downstream reads it that
+       way. */
+    lastFixAt = null;
     armWatch(false);
     startWatchdog();
   }
@@ -5151,7 +5402,10 @@ document.addEventListener('DOMContentLoaded', () => {
        how long since the last fix, how many times the watch had to be rebuilt,
        how many errors it reported. */
     gpsHealth: () => ({
-      fix_age_s: Math.round((performance.now() - lastFixAt) / 100) / 10,
+      // null, not a number, when nothing has ever arrived. A drive with no
+      // fix must not report a fresh one.
+      fix_age_s: lastFixAt === null ? null
+        : Math.round((performance.now() - lastFixAt) / 100) / 10,
       rearms: rearms, errors: gpsErrors, watching: watchId !== null,
     }),
     // Subscribe to the shared position watch (navigation uses this).
@@ -6029,6 +6283,7 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_output.js"></script>
 <script src="/static/rio_speech.js"></script>
 <script src="/static/rio_voice_eleven.js"></script>
+<script src="/static/rio_permissions.js"></script>
 <script src="/static/rio_realtime.js"></script>
 <!-- The gpt-live-1 controller. Loaded alongside rather than instead of the
      realtime one: VOICE_BACKEND decides which connects (see voiceConnect

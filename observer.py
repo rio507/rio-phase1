@@ -281,15 +281,12 @@ def serve_to(rec: dict, session_key: str) -> bool:
     """
     if not rec:
         return False
-    origin = rec.get("origin")
-    if not origin:
-        return False
-    key = str(session_key or "default")
-    owner = str(origin).split(":", 1)[0]
-    if owner == "api":
-        # Only the keyless caller may be answered from keyless frames.
-        return key == "default"
-    return owner == key
+    # The rule itself lives in framebuf.owns, because this is not the only
+    # reader that needs it -- and for a while it behaved as though it were,
+    # which is how a phone got answered from a desktop's clip.
+    import framebuf
+
+    return framebuf.owns(rec.get("origin"), session_key)
 
 
 def fresh(session_key: str, max_age_s: float = None) -> dict:

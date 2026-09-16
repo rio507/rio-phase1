@@ -26,6 +26,8 @@ from fastapi.responses import (StreamingResponse, HTMLResponse, FileResponse,
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
+import contextvars
+
 import config
 import voice
 import llm_interface
@@ -415,9 +417,46 @@ def last_talk_endpoint():
     return dict(_last_talk)
 
 
-def _visual_key(session_id):
-    """Ring/visual-session key. One driver, so a keyless turn still has state."""
-    return session_id or "default"
+# WHICH TAB IS ASKING, when no drive has been started.
+#
+# Set per request by the middleware below from `?client_id=`, which the page
+# sends on every call whether or not a drive is running. It exists because of
+# the 2026-09-16 drive: the ring key was `session_id or "default"`, a live
+# conversation can run without a drive, and two devices that both arrived
+# without a session id therefore shared one frame buffer. A question asked on
+# the phone was answered from a clip uploaded on a desktop.
+#
+# A client id is NOT a drive session and is deliberately not interchangeable
+# with one: it never reaches sessions.py, it is not logged as a drive, and it
+# exists only to keep two browsers' pictures apart. That is why it is a
+# separate parameter rather than a fake session_id -- a fake one would sail
+# into every endpoint that looks a drive up and fail there instead.
+_client_id: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "rio_client_id", default="")
+
+
+@app.middleware("http")
+async def _carry_client_id(request: Request, call_next):
+    """Put `?client_id=` where _visual_key can see it, for this request only."""
+    token = _client_id.set((request.query_params.get("client_id") or "")[:64])
+    try:
+        return await call_next(request)
+    finally:
+        _client_id.reset(token)
+
+
+def _visual_key(session_id, client_id: str = None):
+    """Ring/visual-session key — whose pictures these are.
+
+    A drive owns its key. Without a drive the TAB owns it, so two browsers can
+    never share a buffer. "default" is left for genuinely keyless callers: a
+    bench, a curl, an acceptance harness — and framebuf.owns() keeps those from
+    ever satisfying a named session.
+    """
+    if session_id:
+        return session_id
+    cid = client_id if client_id is not None else _client_id.get()
+    return f"client:{cid}" if cid else "default"
 
 
 def _frame_origin(session_id, source):
@@ -437,10 +476,10 @@ def _frame_origin(session_id, source):
     kind = str(source or "unknown").strip().lower()[:16] or "unknown"
     if kind not in ("camera", "clip", "upload", "none", "unknown"):
         kind = "unknown"
-    if not session_id:
-        # No session id at all: nothing here is a drive, so it is the API.
-        return f"api:{kind}"
-    return f"{session_id}:{kind}"
+    # The visual key, then the source. Always the SAME key the ring is stored
+    # under, so "which buffer" and "whose road" can never disagree -- they did,
+    # and a phone was answered from a desktop's clip.
+    return f"{_visual_key(session_id)}:{kind}"
 
 
 def _route_and_prepare(transcript: str, session_id: str):
@@ -1544,9 +1583,17 @@ def _headway_ws_tuning() -> dict:
 
 
 @app.websocket("/headway_ws")
-async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=None)):
+async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=None),
+                              client_id: str = Query(default=None)):
     await ws.accept()
+    # The headway session key. Unchanged: this one is the analysis session and
+    # "default" is a fine name for a keyless one.
     key = session_id or "default"
+    # The VISUAL key is a different question -- whose pictures these are -- and
+    # it must follow the tab when no drive has been started, or two browsers
+    # share a frame buffer. Computed once here because the middleware that
+    # carries `client_id` runs on HTTP requests and never on this socket.
+    vkey = _visual_key(session_id, client_id or "")
 
     await ws.send_text(json.dumps({
         "op": "ready", "server_t": time.time(), "tuning": _headway_ws_tuning(),
@@ -1628,7 +1675,7 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
 
             if config.VISUAL_QA_ENABLED:
                 try:
-                    framebuf.get_ring(_visual_key(session_id)).push(
+                    framebuf.get_ring(vkey).push(
                         frame.jpeg, result,
                         origin=_frame_origin(session_id, frame.source))
                 except Exception as e:
@@ -1643,8 +1690,8 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
             # to everything else: after the result, after the ring push, before
             # the send. See the note there.
             if teacher_panel is not None:
-                teacher_panel.on_frame(_visual_key(session_id), result,
-                                       framebuf.peek_ring(_visual_key(session_id)))
+                teacher_panel.on_frame(vkey, result,
+                                       framebuf.peek_ring(vkey))
             try:
                 await ws.send_text(json.dumps(result))
             except Exception:

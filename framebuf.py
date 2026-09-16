@@ -231,6 +231,56 @@ _rings_lock = threading.Lock()
 _MAX_RINGS = 4          # one driver is the expected case; this is a leak guard
 
 
+def owns(origin, session_key: str) -> bool:
+    """May THIS session be answered from frames of THIS origin? One rule.
+
+    It lived in observer.serve_to and nowhere else, which is precisely how the
+    2026-09-16 drive went wrong: the observer was careful about provenance and
+    the main visual path was not. `visual_qa` trusted the ring KEY to mean the
+    frames were the asker's, and the key is `session_id or "default"` -- so two
+    clients that both arrived without a session id shared a buffer, and a
+    question asked on the phone was answered from a clip uploaded on a desktop.
+
+    The key says which buffer. Only the ORIGIN says whose road is in it, and
+    every reader has to ask.
+
+      "<session key>:<source>"   a page that declared itself. Answerable only
+                                 to that session.
+      "api:<source>"             a bench, a curl, an acceptance harness. May
+                                 satisfy the keyless caller that posted them
+                                 and may NEVER satisfy a named drive.
+      None / ""                  nothing has pushed, or an older ring. Unknown
+                                 provenance is not provenance: refused.
+    """
+    if not origin:
+        return False
+    key = str(session_key or "default")
+    # rsplit, not split: the SOURCE is the last segment and the key is
+    # everything before it. A keyless tab's key is "client:<id>", which
+    # contains a colon of its own, and splitting from the left would read its
+    # owner as "client" and hand every tab the same frames -- reintroducing
+    # the exact bug this function exists to close.
+    owner = str(origin).rsplit(":", 1)[0]
+    if owner == "api":
+        return key == "default"
+    return owner == key
+
+
+def ring_for(session_key: str):
+    """The ring a session may actually be answered from, or None.
+
+    The function every reader should call instead of `peek_ring`. It returns
+    None both when there is no buffer and when the buffer belongs to somebody
+    else, because those are the same thing to the driver -- RIO cannot see --
+    and collapsing them here is what stops the second case being forgotten at
+    a call site.
+    """
+    ring = peek_ring(session_key)
+    if ring is None:
+        return None
+    return ring if owns(ring.origin, session_key) else None
+
+
 def get_ring(session_key: str) -> FrameRing:
     key = session_key or "default"
     with _rings_lock:
