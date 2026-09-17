@@ -1498,14 +1498,47 @@ AUDIO_TAGS_MAX_PER_UTTERANCE = 1
 #                     dictated into the live session, and these endpoints are
 #                     what the browser reaches for when a line will not start
 #                     in REALTIME_SPEAK_TIMEOUT_MS. A different voice for one
-#                     late warning, which is the right trade for that warning
-#                     arriving at all.
+#                     late warning, which was once judged the right trade for
+#                     that warning arriving at all. IT IS NOT — see below.
 #   elevenlabs        THE path for everything deterministic — nav, health and
 #                     the calm headway tier all come out of flash on the same
 #                     voice id RIO converses in, which is what made one voice
 #                     everywhere true under that backend without dictating
 #                     anything.
-VOICE_FALLBACK_BACKEND = "elevenlabs"
+#
+# ===========================================================================
+# "none" — AND WHY THE TRADE ABOVE WAS THE WRONG ONE
+# ===========================================================================
+# On the 2026-09-16 drive, a route was set and the turn calls came out in the
+# ElevenLabs voice, UNDER RIO while she was still speaking. A second voice in
+# the car, saying something important, in the background. The driver does not
+# experience that as "the warning arrived at all"; they experience it as the
+# product being broken, and they are right.
+#
+# The trade the comment above describes assumed the fallback's cost was only
+# vocal inconsistency. Its real cost is a second mouth, and a second mouth can
+# talk over the first one — including over a safety line.
+#
+# So the chain is now, for every deterministic line:
+#
+#     realtime dictation  ->  local pre-rendered clip  ->  SILENCE, LOGGED
+#
+# and that is the whole of it. If dictation is down and no clip exists for the
+# line, RIO says nothing and the failure is recorded. A missed non-critical
+# line is a smaller harm than a second voice speaking under her, and the
+# critical lines are exactly the ones that HAVE clips (see CRITICAL_CLIPS in
+# safety_speech.py), so the tier that survives is the tier that matters.
+#
+# THE INTEGRATION IS NOT DELETED. voice.py, rio_voice_eleven.js and the
+# ElevenLabs endpoints all still work, and setting this back to "elevenlabs"
+# restores every one of them. What is removed is every path that could select
+# it WITHOUT somebody editing this line: this value is the only door, and
+# `voice.synthesize_stream` refuses for any other value, which is what makes
+# /headway_voice, /nav/voice, /vehicle/health/voice and the /talk synthesis
+# path all close together rather than one at a time.
+#
+# tools/one_voice_selftest.js asserts that no automatic path reaches it.
+VOICE_FALLBACK_BACKEND = "none"
 
 SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
 

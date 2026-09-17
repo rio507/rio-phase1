@@ -172,7 +172,12 @@ function element(room) {
     entry: null,
     play() {
       el.played++;
-      el.entry = room.begin('elevenlabs-element', el.src || '(preloaded)');
+      /* Named for what it IS, not for what used to come out of it. This
+         said 'elevenlabs-element' back when the only thing an <audio> element
+         ever played was a synthesised line; with that tier gone, the only
+         thing it plays is a pre-rendered clip in RIO's own voice, and the old
+         name made a passing clip look like a second voice. */
+      el.entry = room.begin('clip', el.src || '(preloaded)');
       return Promise.resolve();
     },
     pause() {},
@@ -232,12 +237,26 @@ section('B. the budget expires — and the line she was asked for turns up anywa
   const calls = installFetch(room);
   const el = element(room);
 
+  /* `ttsUrl` is still PASSED, on purpose. Real callers may not all have been
+     updated, and the contract is that an un-updated caller degrades to
+     silence rather than quietly reaching a second voice. */
+  const silences = [];
   const p = speak.provider({ text: 'Left here', channel: 'nav',
                              callType: 'imminent',
-                             ttsUrl: '/nav/voice?call=imminent', element: el });
-  const done = p.play();
+                             ttsUrl: '/nav/voice?call=imminent', element: el,
+                             onSilent: (s) => silences.push(s) });
+  const done = p.play().catch(() => {});
   await sleep(60);                       // past the budget: it has given up
-  ok(calls.length === 1, 'the synthesiser was asked for the line');
+  /* THE CHANGE THIS SUITE EXISTS TO PIN. There used to be a synthesiser here
+     and it is gone: on 2026-09-16 it read the turn calls out in the ElevenLabs
+     voice underneath RIO while she was still speaking. A line with no clip is
+     now SILENT and logged, because a second mouth can talk over the first one
+     and a missed non-critical line cannot. */
+  ok(calls.length === 0,
+     'the synthesiser was NOT asked for the line, even with a ttsUrl passed');
+  ok(silences.length === 1, 'the silence was reported, not swallowed');
+  ok(silences.length === 1 && silences[0].detail === 'no_clip',
+     'and it says why: ' + JSON.stringify(silences[0] && silences[0].detail));
 
   // ...and now the response she was asked for is created.
   h.controller.handle({ type: 'response.created', response: { id: 'late1' } });
@@ -263,8 +282,9 @@ section('B. the budget expires — and the line she was asked for turns up anywa
   await done;
   ok(room.mouths().indexOf('session') < 0,
      'the session never spoke this line (' + room.mouths().join(',') + ')');
-  ok(room.mouths().length === 1,
-     'exactly one mouth in the whole exchange (' + room.mouths().join(',') + ')');
+  ok(room.mouths().length === 0,
+     'NO mouth spoke — silence rather than a second voice ('
+     + room.mouths().join(',') + ')');
   ok(!room.overlapped(), 'at no point were two mouths open at once');
   ok(speak.stats().doubled === 0, 'and nothing was recorded as doubled');
 }
@@ -309,7 +329,40 @@ section('C. she started speaking, and only then did the budget expire');
 }
 
 // ---------------------------------------------------------------------------
-section('D. no session at all: the synthesiser is the mouth, alone');
+section('D. no session at all — THE 2026-09-16 PATH, and what it does now');
+// ---------------------------------------------------------------------------
+/* THIS SECTION USED TO BE CALLED "the synthesiser is the mouth, alone", and it
+   asserted that a nav call with no live session was synthesised. That is the
+   path that, on the 2026-09-16 drive, read the turn calls out in the
+   ElevenLabs voice underneath RIO while she was still speaking — "alone" was
+   never guaranteed, only assumed.
+
+   Two cases now, and neither can reach a second voice:
+     with a clip  the clip plays. This is every line that must not be missed.
+     without one  silence, reported. A turn call is worth losing to keep one
+                  voice in the car; the driver can see the map. */
+{
+  speak.reset();
+  const room = cabin();
+  page.RIO.realtime = { active: () => null };
+  const calls = installFetch(room);
+  const el = element(room);
+  const silences = [];
+  const p = speak.provider({ text: 'Left at the roundabout', channel: 'nav',
+                             ttsUrl: '/nav/voice?call=early', element: el,
+                             onSilent: (s) => silences.push(s) });
+  await p.play().catch(() => {});
+  ok(calls.length === 0,
+     'no session and no clip: the synthesiser is NOT reached');
+  ok(room.mouths().length === 0, 'nothing spoke at all');
+  ok(silences.length === 1 && silences[0].reason === 'no_session',
+     'and the silence is logged with its reason ('
+     + JSON.stringify(silences[0] && silences[0].reason) + ')');
+  ok(speak.stats().tts === 0, 'the tts counter never moved');
+}
+
+// ---------------------------------------------------------------------------
+section('D2. no session, but the line HAS a clip — it is still said');
 // ---------------------------------------------------------------------------
 {
   speak.reset();
@@ -317,14 +370,20 @@ section('D. no session at all: the synthesiser is the mouth, alone');
   page.RIO.realtime = { active: () => null };
   const calls = installFetch(room);
   const el = element(room);
-  const p = speak.provider({ text: 'Left at the roundabout', channel: 'nav',
-                             ttsUrl: '/nav/voice?call=early', element: el });
+  const p = speak.provider({ text: 'Back off', channel: 'headway',
+                             clipUrl: '/static/audio/back_off.mp3',
+                             clipElement: el, element: el,
+                             ttsUrl: '/headway_voice?line=back_off' });
   const done = p.play();
   for (let i = 0; i < 40 && !el.onended; i++) await sleep(2);
   el.finish();
   await done;
-  ok(calls.length === 1, 'the line is synthesised — a turn is still called');
-  ok(!room.overlapped(), 'and it is the only voice');
+  ok(calls.length === 0, 'no synthesiser request');
+  ok(room.mouths().join(',') === 'clip',
+     'the clip is the mouth (' + room.mouths().join(',') + ')');
+  ok(!room.overlapped(), 'and it is the only one');
+  ok(speak.stats().clip === 1 && speak.stats().tts === 0,
+     'counted as a clip, never as tts');
 }
 
 // ---------------------------------------------------------------------------

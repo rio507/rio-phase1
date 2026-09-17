@@ -284,7 +284,12 @@
         // junction cannot be late; the far call, half a mile out, can.
         // Already on the candidate — it is the /nav/voice address above.
         callType: candidate.call_type,
-        ttsUrl: url,
+        /* NO ttsUrl. The synthesiser tier is gone: on 2026-09-16 it read
+           these very turn calls out in the ElevenLabs voice underneath RIO
+           while she was still speaking. A turn call with no clip is now
+           silent and logged — the driver can see the map, and a second voice
+           in the car cannot be un-heard. `url` is still computed above for
+           the log line; nothing plays it. */
         element: navAudio,
       });
     }

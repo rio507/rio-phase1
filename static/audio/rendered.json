@@ -136,14 +136,6 @@
       "sha1": "40bc021c9b1a",
       "voice": "marin"
     },
-    "tire_sensor_lost": {
-      "at": 1788724589.9,
-      "backend": "openai_realtime",
-      "bytes": 46077,
-      "model": "gpt-realtime-2.1",
-      "sha1": "0bf978ca5f9b",
-      "voice": "marin"
-    },
     "too_close": {
       "at": 1789153068.6,
       "backend": "openai_realtime",

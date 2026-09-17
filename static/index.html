@@ -3744,6 +3744,88 @@ document.addEventListener('DOMContentLoaded', () => {
     try { RIO.ui.permissions(snap); } catch (e) {}
   }).catch(() => {});
 
+  /* ---- WHICH MOUTH SAID IT, in the drive log ---------------------------
+   *
+   * rio_speak has counted `dictated / clip / silent` since it was written and
+   * nothing has ever READ those counters. So when turn calls came out in the
+   * wrong voice on 2026-09-16, the drive log could say the line was spoken
+   * (NAV_SPEECH_SPOKEN) and could not say WHAT SPOKE IT — which is the only
+   * question that mattered. Diagnosing it needed the source, not the log.
+   *
+   * Reported on change rather than per line: the tier is the same for every
+   * line of a healthy drive, and a series of identical marks is a log nobody
+   * reads. A silence is ALWAYS reported, because with the synthesiser tier
+   * removed a silence is a real outcome and the one that needs explaining. */
+  let speakLast = '';
+  function reportSpeakTier(force) {
+    try {
+      if (!RIO.driving || !RIO.speak) return;
+      const st = RIO.speak.stats();
+      const key = [st.dictated, st.clip, st.silent, st.tts, st.doubled].join('|');
+      if (!force && key === speakLast) return;
+      speakLast = key;
+      fetch(RIO.url('/session/mark') + '&tag=VOICE_TIERS'
+            + '&note=' + encodeURIComponent(JSON.stringify({
+                dictated: st.dictated, clip: st.clip, silent: st.silent,
+                // Both of these are invariants, not statistics. Anything but
+                // zero is a second voice in the car.
+                tts: st.tts, doubled: st.doubled, last: st.last,
+              })), { method: 'POST' }).catch(() => {});
+    } catch (e) {}
+  }
+  setInterval(() => reportSpeakTier(false), 5000);
+
+  // Every line that was NOT said, with its reason, immediately.
+  if (window.RIO) {
+    RIO.noteSilence = function (info) {
+      try {
+        if (!RIO.driving) return;
+        fetch(RIO.url('/session/mark') + '&tag=VOICE_SILENT'
+              + '&note=' + encodeURIComponent(JSON.stringify(info).slice(0, 400)),
+              { method: 'POST' }).catch(() => {});
+      } catch (e) {}
+    };
+  }
+
+  /* ---- MAIN-THREAD STALL DETECTOR -------------------------------------
+   *
+   * Three stalls on the 2026-09-16 drive, all the same shape:
+   *   FRAMES_STALLED {why:"no_frames_sent", since_sent_ms:~4900,
+   *                   inflight:1, ws_open:TRUE}
+   * The socket was open and nothing had been SENT for five seconds. That is
+   * not a network fault and not a camera fault — it is the page not running.
+   * Audio dropouts (bus_health) landed in the same seconds, which is why
+   * "the feed stalls and the voice cuts" looked like one causing the other.
+   *
+   * They are SIBLINGS, not cause and effect: a page that stops running stops
+   * encoding frames and stops feeding the jitter buffer, at the same moment,
+   * for the same reason. Nothing in the frame path touches the audio path —
+   * that was traced, and the selftest pins it.
+   *
+   * What was missing is any evidence of the freeze itself. A 250 ms timer
+   * that notices it is late is the cheapest possible witness: if it reports a
+   * 5 s gap at the same instant the frames stall, the page froze, and the
+   * next question is why (backgrounded tab, iOS throttling, a long task) —
+   * none of which is fixable by decoupling two things that were never
+   * coupled. */
+  const STALL_TICK_MS = 250;
+  const STALL_REPORT_MS = 1000;     // a gap worth a line in the drive log
+  let stallLast = performance.now();
+  setInterval(() => {
+    const now = performance.now();
+    const late = now - stallLast - STALL_TICK_MS;
+    stallLast = now;
+    if (late < STALL_REPORT_MS) return;
+    try {
+      if (!RIO.driving) return;
+      fetch(RIO.url('/session/mark') + '&tag=MAIN_THREAD_STALL'
+            + '&note=' + encodeURIComponent(JSON.stringify({
+                late_ms: Math.round(late),
+                hidden: document.hidden === true,
+              })), { method: 'POST' }).catch(() => {});
+    } catch (e) {}
+  }, STALL_TICK_MS);
+
   const driveBtn = document.getElementById('drive');
   const status = document.getElementById('drivestatus');
   const video = document.getElementById('video');

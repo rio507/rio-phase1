@@ -110,7 +110,10 @@
       channel: 'health',
       // A clip line gets no TTS url: its whole point is never waiting on the
       // network.
-      ttsUrl: clip ? null : '/vehicle/health/voice?id=' + encodeURIComponent(ann.id),
+      /* NO ttsUrl — see the block in config.py. A health line without a
+         clip is now silent and reported rather than spoken by a second
+         voice. The critical ones have clips (safety_speech.CRITICAL_CLIPS),
+         which is the tier that had to survive. */
       clipUrl: clip,
       element: audio,
     });

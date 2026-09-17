@@ -1928,6 +1928,30 @@ def _headway_text(line: str) -> str:
         return floor
 
 
+def _synth_unavailable():
+    """The deterministic TTS endpoints, when there is no synthesiser to reach.
+
+    Returns a REFUSAL rather than an empty audio stream. Before this, the
+    generator raised inside the StreamingResponse and the caller got
+    `200 audio/mpeg` with zero bytes — which a browser reports as "audio
+    error", i.e. indistinguishable from a decode failure, and which reads from
+    the outside like a working path that happened to be quiet.
+
+    Nothing in the page calls these any more (the synthesiser tier was removed
+    after 2026-09-16 — see config.VOICE_FALLBACK_BACKEND). This is for the
+    stray caller and for anyone probing by hand: say plainly that there is no
+    second voice, rather than returning silence dressed as audio.
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"error": "no synthesiser configured",
+                 "fallback_backend": config.VOICE_FALLBACK_BACKEND,
+                 "detail": ("The deterministic ladder is realtime dictation -> "
+                            "local clip -> silence. Set "
+                            "VOICE_FALLBACK_BACKEND to re-enable a synthesised "
+                            "tier; nothing selects one automatically.")})
+
+
 @app.get("/headway_voice")
 def headway_voice_endpoint(line: str = Query(...)):
     """Live TTS for the amber-tier lines.
@@ -1941,6 +1965,8 @@ def headway_voice_endpoint(line: str = Query(...)):
     if live_policy.LINE_AUDIO.get(line) != "tts":
         return {"error": "unknown or non-TTS line", "line": line}
     text = _headway_text(line)
+    if config.VOICE_FALLBACK_BACKEND == "none":
+        return _synth_unavailable()
     return StreamingResponse(
         voice.synthesize_stream(text), media_type="audio/mpeg",
         headers={
@@ -2145,6 +2171,8 @@ def nav_voice_endpoint(route_id: str = Query(...), m: str = Query(...),
     if not text:
         return {"error": "unknown route, maneuver, call or anchor",
                 "route_id": route_id, "m": m, "call": call}
+    if config.VOICE_FALLBACK_BACKEND == "none":
+        return _synth_unavailable()
     return StreamingResponse(
         voice.synthesize_stream(text), media_type="audio/mpeg",
         headers={
@@ -2708,6 +2736,8 @@ def vehicle_health_voice_endpoint(id: str = Query(...)):
     text = _health_policy.text_for(id)
     if not text:
         return {"error": "unknown or expired announcement", "id": id}
+    if config.VOICE_FALLBACK_BACKEND == "none":
+        return _synth_unavailable()
     return StreamingResponse(
         voice.synthesize_stream(text), media_type="audio/mpeg",
         headers={

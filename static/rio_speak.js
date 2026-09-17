@@ -43,7 +43,11 @@
 (function (root) {
   'use strict';
 
+  /* `tts` STAYS IN THE COUNTERS at zero, rather than being deleted. A
+     counter that disappears cannot be asserted against, and "no line took the
+     synthesiser path" is exactly the claim the selftest needs to make. */
   var stats = { dictated: 0, tts: 0, clip: 0, silent: 0, last: null,
+              last_silent: null,
               /* ONE UTTERANCE, ONE MOUTH. `doubled` counts lines where a
                  second mouth started after the first had already begun
                  speaking -- the phone bug where ElevenLabs read the turn call
@@ -270,6 +274,32 @@
 
     function record(path) { stats[path]++; stats.last = path; }
 
+    /* A LINE THAT WAS NOT SAID, said so. Silence used to be a counter nobody
+       read; with the synthesiser tier gone it is a real outcome and has to be
+       visible, or "RIO went quiet on the motorway" becomes unanswerable in
+       exactly the way the fallback tier used to be.
+
+       `onSilent` is the page's hook; it posts a session mark. Nothing here
+       knows about the session log, for the same reason nothing here knows
+       about the arbiter. */
+    function silent(reason, detail) {
+      record('silent');
+      stats.last_silent = { channel: opts.channel || null,
+                            callType: opts.callType || null,
+                            reason: reason || null, detail: detail || null,
+                            text: text().slice(0, 60), at: Date.now() };
+      /* The caller's hook if it has one, otherwise the page's. Defaulting
+         here rather than at every call site is deliberate: a silence that
+         goes unreported is the failure this whole block exists to end, and it
+         should not depend on each of three callers remembering to pass a
+         function. */
+      var sink = opts.onSilent
+        || (root.RIO && root.RIO.noteSilence) || null;
+      if (typeof sink === 'function') {
+        try { sink(stats.last_silent); } catch (e) {}
+      }
+    }
+
     function fallback(reason) {
       if (stopped) return Promise.resolve();
       /* THE ONE CASE THIS MUST REFUSE. Dictation that never started can be
@@ -284,27 +314,30 @@
         record('silent');
         return Promise.resolve();
       }
-      if (opts.ttsUrl) {
-        record('tts');
-        current = fetchBlobAudio(element, opts.ttsUrl);
-        return current.play().catch(function (e) {
-          // The synthesiser failed too. A pre-rendered clip has no network in
-          // its path at all, which is exactly the situation this is now in.
-          if (opts.clipUrl && !stopped) {
-            record('clip');
-            current = playClip(opts.clipElement || element, opts.clipUrl);
-            return current.play();
-          }
-          record('silent');
-          throw e;
-        });
-      }
+      /* THE SYNTHESISER TIER IS GONE. It used to sit here, between dictation
+         and the clip, and on 2026-09-16 it is what read the turn calls out in
+         the ElevenLabs voice underneath RIO while she was still speaking.
+
+         The trade it was built on was "a different voice is better than a
+         missed line". That is true of vocal consistency and false of a second
+         MOUTH: a mouth can talk over the first one, including over a safety
+         line, and a driver hears two voices rather than a rescued warning.
+
+         So: dictation, then a pre-rendered clip, then silence with a reason.
+         The lines that cannot be missed are exactly the ones that have clips
+         (safety_speech.CRITICAL_CLIPS), so the tier that survives is the tier
+         that matters. `opts.ttsUrl` is ignored if a caller still passes one —
+         deliberately ignored rather than removed from the signature, so an
+         un-updated caller degrades to silence instead of throwing. */
       if (opts.clipUrl) {
         record('clip');
         current = playClip(opts.clipElement || element, opts.clipUrl);
-        return current.play();
+        return current.play().catch(function (e) {
+          silent(reason, 'clip_failed:' + (e && e.message));
+          throw e;
+        });
       }
-      record('silent');
+      silent(reason, 'no_clip');
       return Promise.reject(new Error(reason || 'no audio path'));
     }
 
@@ -372,6 +405,7 @@
       stats.dictated = stats.tts = stats.clip = stats.silent = 0;
       stats.bus = stats.bus_missed = stats.doubled = 0;
       stats.last = null;
+      stats.last_silent = null;
     },
   };
 

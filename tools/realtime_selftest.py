@@ -283,13 +283,14 @@ def run_text_session():
     # suspicion about one tool in particular.
     expected = [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
                 realtime.NAV_TOOL_NAME, realtime.NAV_DIRECTIONS_TOOL_NAME,
-                realtime.PLACES_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
+                realtime.PLACES_TOOL_NAME, realtime.WEATHER_TOOL_NAME,
+                realtime.NEWS_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
                 realtime.NAVIGATE_TOOL_NAME]
     names = [t["name"] for t in text["tools"]]
     for want in expected:
         ok(want in names, f"the text-mode session can call {want}")
-    ok(len(names) == len(expected) == 7 and set(names) == set(expected),
-       f"...and those seven and no others ({len(names)} tools)")
+    ok(len(names) == len(expected) == 9 and set(names) == set(expected),
+       f"...and those nine and no others ({len(names)} tools)")
 
     # --- THE WHOLE INSTRUCTION SET ----------------------------------------
     instr = text["instructions"]
@@ -887,6 +888,9 @@ def run_firewall():
     ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
                         "openai", "config", "visual_qa", "router",
                         "vehicle_health", "places", "observer",
+                        # Both are read-side context sources reached only by a
+                        # tool call, exactly as `places` is.
+                        "weather", "localnews",
                         "base64", "io", "wave", "voice_tags", "rio_prompts"},
        f"and imports only read-side code and stdlib ({sorted(live_imports)})")
     tag_imports = _imports_of(os.path.join(REPO, "voice_tags.py"))
@@ -1151,8 +1155,10 @@ def run_dictation():
         ok("live.speechEnabled(opts.channel)" in speak_js,
            "...and the fallback chain asks the SESSION whether a channel is "
            "dictated, not config — the browser holds no copy of the switch")
-    ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
-       "and the server's TTS endpoints synthesise with ElevenLabs")
+    ok(config.VOICE_FALLBACK_BACKEND == "none",
+       "and the server's TTS endpoints synthesise with NOTHING — the "
+       "synthesiser tier was removed after it read turn calls under RIO on "
+       "2026-09-16; see the block in config.py")
 
     import voice
     gen = voice.synthesize_stream("anything", backend="openai_realtime")
@@ -1223,10 +1229,11 @@ def run_awareness():
     names = [t["name"] for t in s["tools"]]
     ok(names == [realtime.TOOL_NAME, realtime.LOOK_TOOL_NAME,
                  realtime.NAV_TOOL_NAME, realtime.NAV_DIRECTIONS_TOOL_NAME,
-                 realtime.PLACES_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
+                 realtime.PLACES_TOOL_NAME, realtime.WEATHER_TOOL_NAME,
+                 realtime.NEWS_TOOL_NAME, realtime.VEHICLE_TOOL_NAME,
                  realtime.NAVIGATE_TOOL_NAME],
-       f"seven tools: think, look, route, directions, places, car — and go "
-       f"({names})")
+       f"nine tools: think, look, route, directions, places, weather, news, "
+       f"car — and go ({names})")
 
     # By name, not by index. The list has grown once and will again, and an
     # index here means the next tool inserted silently re-points three
@@ -3554,10 +3561,12 @@ def run_backend(live: bool = False):
     ok(callable(voice_dialogue.DialogueSession) and callable(voice.synthesize_stream),
        "the ElevenLabs path still imports and still builds — kept whole so it "
        "is one env var away, not a rewrite away")
-    ok(config.VOICE_FALLBACK_BACKEND == "elevenlabs",
-       "and it is still the SECOND tier of the deterministic ladder, which is "
-       "the one place a dormant backend is allowed to speak: a warning in a "
-       "different voice beats a warning that does not arrive")
+    ok(config.VOICE_FALLBACK_BACKEND == "none",
+       "and it is NO LONGER a tier of the deterministic ladder. The claim it "
+       "used to rest on — a warning in a different voice beats a warning that "
+       "does not arrive — is false when the different voice can speak UNDER "
+       "her, which is what happened on 2026-09-16. The ladder is now "
+       "dictation -> clip -> silence, logged")
 
     # THE INSTRUCTION THE MODEL NEVER GETS. Expressive tags are an ElevenLabs
     # v3 mechanism. A speech-to-speech session has no text between the model
