@@ -3423,6 +3423,24 @@ const LIVE_REPORTED = {
   LIVE_MIC_STATE: 'mic_state',
 };
 
+/* EVERY UNCAUGHT ERROR, INTO THE DRIVE LOG. On 2026-09-17 three drives in a
+   row created their session and never started the frame pipeline, and the
+   log held no reason: the page had thrown, and a throw on a phone in a
+   mount is a silence. Now it is a row, with the message and the line. */
+window.addEventListener('error', (e) => {
+  try {
+    pageMark('PAGE_ERROR', { message: String(e.message || e).slice(0, 200),
+                             where: (e.filename || '').split('/').pop() + ':' + (e.lineno || 0) });
+  } catch (x) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try {
+    const r = e.reason;
+    pageMark('PAGE_ERROR', { message: String((r && (r.stack || r.message)) || r).slice(0, 300),
+                             where: 'unhandledrejection' });
+  } catch (x) {}
+});
+
 /* A page-level fact, into the drive log. The FRAMES_* marks, VOICE_TIERS and
    MAIN_THREAD_STALL each inline this fetch; anything new goes through here. */
 function pageMark(tag, note) {
@@ -4458,23 +4476,50 @@ document.addEventListener('DOMContentLoaded', () => {
      a minute into a route is the auto-lock and not a mystery. Nothing
      recorded whether it was held, and the browser releases it silently the
      moment the page is hidden. */
-  async function takeWakeLock(why) {
-    if (!('wakeLock' in navigator)) { pageMark('WAKE_LOCK', { state: 'unsupported', why }); return; }
-    if (wakeLock) return;
-    try {
-      wakeLock = await navigator.wakeLock.request('screen');
-      pageMark('WAKE_LOCK', { state: 'acquired', why });
+  /* NEVER ON THE CRITICAL PATH. Three drives on 2026-09-17 (21:13, 21:14,
+     21:16, iPhone) created their session and never started the frame
+     pipeline; headless Chromium started 273 frames from the same page. The
+     one iOS-sensitive step between those two points is this request, and
+     on Safari `navigator.wakeLock.request()` can sit PENDING -- never
+     resolving, never rejecting -- when it lands after the tap's activation
+     has expired, which after the /session/start round trip it does. An
+     `await` on it stopped the drive start cold, and left no mark, because
+     neither branch below was ever reached.
+
+     So the request is raced against a short budget. The drive proceeds
+     whatever it does; a request still pending at the budget is recorded as
+     `pending` -- the proof of the hang on the next tap -- and if it settles
+     later it is kept. A screen that stays awake is a convenience; a feed
+     that starts is the drive. */
+  const WAKE_LOCK_BUDGET_MS = 1500;
+  function takeWakeLock(why) {
+    if (!('wakeLock' in navigator)) { pageMark('WAKE_LOCK', { state: 'unsupported', why }); return Promise.resolve(); }
+    if (wakeLock) return Promise.resolve();
+    let settled = false;
+    const request = (async () => {
       try {
-        wakeLock.addEventListener('release', () => {
-          pageMark('WAKE_LOCK', { state: 'released', hidden: document.hidden === true,
-                                  driving: !!RIO.driving });
-          wakeLock = null;
-        });
-      } catch (e) {}
-    } catch (e) {
-      wakeLock = null;
-      pageMark('WAKE_LOCK', { state: 'denied', why, error: (e && e.name) || String(e) });
-    }
+        const lock = await navigator.wakeLock.request('screen');
+        settled = true;
+        wakeLock = lock;
+        pageMark('WAKE_LOCK', { state: 'acquired', why });
+        try {
+          lock.addEventListener('release', () => {
+            pageMark('WAKE_LOCK', { state: 'released', hidden: document.hidden === true,
+                                    driving: !!RIO.driving });
+            if (wakeLock === lock) wakeLock = null;
+          });
+        } catch (e) {}
+      } catch (e) {
+        settled = true;
+        wakeLock = null;
+        pageMark('WAKE_LOCK', { state: 'denied', why, error: (e && e.name) || String(e) });
+      }
+    })();
+    const budget = new Promise((resolve) => setTimeout(() => {
+      if (!settled) pageMark('WAKE_LOCK', { state: 'pending', why, after_ms: WAKE_LOCK_BUDGET_MS });
+      resolve();
+    }, WAKE_LOCK_BUDGET_MS));
+    return Promise.race([request, budget]);
   }
 
   /* THE PAGE GOING AWAY AND COMING BACK, WITH THE AUDIO SESSION IN THE SAME
