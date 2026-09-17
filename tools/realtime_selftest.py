@@ -434,17 +434,61 @@ TPM = 200_000
 # ...and therefore what one response may cost. Four tool turns a minute is
 # eight responses; see run_session_cost for why that is the cadence to size to.
 #
-# NOT TPM // 8, and the reason is that TPM // 8 is now 25,000 -- five times
-# today's prompt, which makes this check a guard that can never fire. The
-# purpose of it was never the economics; it was to catch the prompt growing by
-# a paragraph at a time until a drive goes quiet. So the ceiling is a GROWTH
+# NOT TPM // 8, and the reason is that TPM // 8 is 25,000 -- nearly four times
+# today's prompt, which makes that a guard that can never fire. The purpose of
+# this one was never the economics; it was to catch the prompt growing by a
+# paragraph at a time until a drive goes quiet. So the ceiling is a GROWTH
 # ALARM: a little over today's cost, tight enough that the next section added
 # without a corresponding cut trips it, and far under what the minute can
 # actually afford.
 #
+# RE-DERIVED 2026-09-17, and the arithmetic belongs next to the number.
+#
+# It was 5,200, and it fired -- correctly. Weather and local news added a tool
+# schema and an instruction section each, and 5,200 was a number chosen when
+# RIO had seven tools. A canary sized for a smaller bird goes off when the bird
+# grows, which is what it is for; the answer is to check the cage is still big
+# enough and then re-sit the canary, not to keep trimming the bird.
+#
+#   the real limit        200,000 TPM, measured (see TPM above; the lowest a
+#                         whole drive got to was 190,829 of 200,000)
+#   design cadence        4 tool turns a minute = 8 responses
+#   affordable/response   200,000 / 8            = 25,000
+#   actual/response       6,903  (7,248 while a route is live)
+#   actual capacity       ~14 tool turns a minute at today's cost,
+#                         ~12 if every answer ran to the 1,200-token ceiling
+#   headroom              14 / 4 = 3.5x the cadence this was sized for
+#
+# So the economics are not close, and the check that measures them
+# (AFFORDABLE_PER_RESPONSE) passes with 3.6x to spare.
+#
+# THE MARGIN, AND WHAT IT DOES AND DOES NOT CATCH -- stated exactly, because
+# the comment this replaced overclaimed and that is what made it misleading.
+# Sections in the addendum run 126 to 304 tokens (deep_dive 126, nav 198,
+# directions 213, places 304). The margin is ~200, so:
+#
+#   a section at the median or larger      TRIPS IT      (what it is for)
+#   a small section, ~130 tokens           does not      (accepted)
+#   rewording a paragraph, +/-50 tokens    does not      (deliberate: an alarm
+#                                                        that fires on editing
+#                                                        is one that gets
+#                                                        raised without being
+#                                                        read, which is how the
+#                                                        stale 40,000 survived)
+#
+# Perfect fidelity -- every section trips it -- needs a margin under 126, and
+# at that width ordinary wording changes fire it. This is the trade, made
+# deliberately rather than by rounding.
+#
+# WHAT WOULD MAKE THIS THE WRONG CALL, written down so it is checkable: if the
+# cadence assumption is wrong -- a driver who asks something every four seconds
+# rather than every fifteen -- 14 tool turns a minute stops being 3.5x and
+# starts being the limit. The number to watch is not this one; it is TPM, and a
+# drive reports it on every response.
+#
 # Both numbers are printed by run_session_cost, so the real headroom is still
 # visible next to the alarm rather than replaced by it.
-PER_RESPONSE_CEILING = 5_200
+PER_RESPONSE_CEILING = 7_100
 AFFORDABLE_PER_RESPONSE = TPM // 8
 
 
@@ -509,19 +553,21 @@ def run_session_cost():
 
     # THE BUDGET, AS A TEST RATHER THAN AS A NOTE.
     #
-    # 40,000 tokens a minute is what the account actually has — the session
-    # says so itself on every response, in rate_limits.updated, and that is
-    # where this number comes from rather than from a doc.
+    # THE NUMBER TO READ IS `TPM`, WHICH IS 200,000 AND MEASURED. This comment
+    # used to say 40,000 and derive a 5,000-token response budget from it, long
+    # after TPM itself had been corrected to 200,000 twenty lines above -- so
+    # the file contained both the right number and an argument from the wrong
+    # one, and the argument is what gets read when an alarm fires. It cost an
+    # afternoon of trimming a prompt that was never the problem.
     #
-    # A driver asking something every fifteen seconds is four turns a minute.
-    # If all four need a tool that is eight responses, so a response has 5,000
-    # tokens to spend before the answers start failing — and they fail
-    # silently, as a response the API refuses and nothing said. That is the
-    # ceiling this asserts, and it is asserted rather than noted because the
-    # instructions are exactly the kind of thing that grows by a paragraph at
-    # a time and nobody notices until a drive goes quiet.
+    # Two checks, and they measure different things:
+    #   PER_RESPONSE_CEILING     a GROWTH ALARM, re-sat at today's cost plus a
+    #                            section. Fires on creep, not on cost.
+    #   AFFORDABLE_PER_RESPONSE  the economics, TPM // 8. This is the one that
+    #                            means a drive goes quiet if it is breached.
     #
-    # Room to grow: what is left of the 5,000 after today's prompt.
+    # A response that is refused fails SILENTLY -- nothing is said and nothing
+    # is logged in the cabin -- which is why either is worth asserting at all.
     ok(floor <= PER_RESPONSE_CEILING,
        f"one response stays under the growth alarm: {floor:,} tokens against "
        f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare)")
