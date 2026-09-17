@@ -3436,7 +3436,9 @@ window.addEventListener('error', (e) => {
 window.addEventListener('unhandledrejection', (e) => {
   try {
     const r = e.reason;
-    pageMark('PAGE_ERROR', { message: String((r && (r.stack || r.message)) || r).slice(0, 300),
+    pageMark('PAGE_ERROR', { message: String((r && (r.message || r)) || r).slice(0, 200),
+                             name: (r && r.name) || null,
+                             stack: String((r && r.stack) || '').slice(0, 300),
                              where: 'unhandledrejection' });
   } catch (x) {}
 });
@@ -3446,11 +3448,23 @@ window.addEventListener('unhandledrejection', (e) => {
 function pageMark(tag, note) {
   try {
     if (!(window.RIO && RIO.sessionId)) return;
+    /* Published on RIO below: the drive-mode block is a different <script>
+       and must reach this through RIO, never by bare name -- see the
+       2026-09-17 drive starts that died on that name. */
     fetch(RIO.url('/session/mark') + '&tag=' + encodeURIComponent(tag)
           + '&note=' + encodeURIComponent(JSON.stringify(note || {}).slice(0, 700)),
           { method: 'POST' }).catch(() => {});
   } catch (e) {}
 }
+
+window.RIO = window.RIO || {};
+RIO.pageMark = pageMark;
+/* What the other blocks may ask about the live session, as a function on
+   RIO. `live` and `liveSince` are this block's; another block naming them
+   directly is a ReferenceError waiting for a phone to find it. */
+RIO.liveState = function () {
+  return { live: !!live, since: liveSince, handle: live };
+};
 
 /* WAS THE CAR APPROACHING A JUNCTION WHEN THIS HAPPENED?
  *
@@ -4346,8 +4360,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let sid;
     try {
+      /* FIVE SECONDS, THEN A REASON. A start that never returns used to be a
+         status row that never changed. */
+      const ctl = ('AbortController' in window) ? new AbortController() : null;
+      const startTimer = setTimeout(() => { try { if (ctl) ctl.abort(); } catch (e) {} }, 5000);
       const r = await fetch('/session/start', {
         method: 'POST',
+        signal: ctl ? ctl.signal : undefined,
         headers: { 'Content-Type': 'application/json' },
         /* `secure_context` is the browser's OWN answer, sent rather than
            reconstructed. A secure context is what decides whether the camera,
@@ -4359,12 +4378,17 @@ document.addEventListener('DOMContentLoaded', () => {
           page_origin: location.origin,
         } })
       });
+      clearTimeout(startTimer);
+      if (!r.ok) throw new Error('/session/start ' + r.status);
       sid = (await r.json()).session_id;
       if (!sid) throw new Error('no session_id in response');
     } catch (e) {
       RIO.source.stopFeed(feed);
       source = null;
-      say('Could not start session: ' + e);
+      const why = (e && e.name === 'AbortError') ? 'no answer from /session/start in 5 s'
+                : ((e && e.message) || String(e));
+      say('Could not start session: ' + why);
+      mark('DRIVE_START_FAILED', { error: why.slice(0, 200), step: 'session_start' });
       return;
     }
 
@@ -4464,6 +4488,14 @@ document.addEventListener('DOMContentLoaded', () => {
     driveBtn.disabled = true;
     try {
       if (RIO.driving) await endDrive(); else await startDrive();
+    } catch (e) {
+      /* NEVER "Starting drive..." FOREVER. Every start that died today died
+         silently: the exception left this handler as an unhandled rejection
+         and the status row kept the words it had. Said on the row, and in
+         the log. */
+      const why = (e && e.message) ? e.message : String(e);
+      say('Start failed: ' + why);
+      mark('DRIVE_START_FAILED', { error: why.slice(0, 200), driving: !!RIO.driving });
     } finally {
       busy = false;
       driveBtn.disabled = false;
@@ -4491,35 +4523,53 @@ document.addEventListener('DOMContentLoaded', () => {
      `pending` -- the proof of the hang on the next tap -- and if it settles
      later it is kept. A screen that stays awake is a convenience; a feed
      that starts is the drive. */
+  /* A mark from THIS block. Through RIO, because pageMark is another
+     <script>'s function; and inside a try, because a diagnostic that can
+     throw is a diagnostic that can end a drive -- it did, twice today. */
+  function mark(tag, note) {
+    try { if (RIO.pageMark) RIO.pageMark(tag, note); } catch (e) {}
+  }
   const WAKE_LOCK_BUDGET_MS = 1500;
   function takeWakeLock(why) {
-    if (!('wakeLock' in navigator)) { pageMark('WAKE_LOCK', { state: 'unsupported', why }); return Promise.resolve(); }
-    if (wakeLock) return Promise.resolve();
-    let settled = false;
-    const request = (async () => {
+    /* Whatever happens in here, the promise this returns RESOLVES. The
+       21:25 drive died because the request rejected, the catch's own mark
+       threw, and Promise.race handed that rejection to the drive start. */
+    return new Promise((done) => {
+      let finished = false;
+      const finish = () => { if (!finished) { finished = true; done(); } };
       try {
-        const lock = await navigator.wakeLock.request('screen');
-        settled = true;
-        wakeLock = lock;
-        pageMark('WAKE_LOCK', { state: 'acquired', why });
-        try {
-          lock.addEventListener('release', () => {
-            pageMark('WAKE_LOCK', { state: 'released', hidden: document.hidden === true,
+        if (!('wakeLock' in navigator)) { mark('WAKE_LOCK', { state: 'unsupported', why }); return finish(); }
+        if (wakeLock) return finish();
+        let settled = false;
+        Promise.resolve()
+          .then(() => navigator.wakeLock.request('screen'))
+          .then((lock) => {
+            settled = true;
+            wakeLock = lock;
+            mark('WAKE_LOCK', { state: 'acquired', why });
+            try {
+              lock.addEventListener('release', () => {
+                mark('WAKE_LOCK', { state: 'released', hidden: document.hidden === true,
                                     driving: !!RIO.driving });
-            if (wakeLock === lock) wakeLock = null;
-          });
-        } catch (e) {}
+                if (wakeLock === lock) wakeLock = null;
+              });
+            } catch (e) {}
+          }, (e) => {
+            settled = true;
+            wakeLock = null;
+            mark('WAKE_LOCK', { state: 'denied', why, error: (e && e.name) || String(e) });
+          })
+          .catch(() => {})
+          .then(finish);
+        setTimeout(() => {
+          if (!settled) mark('WAKE_LOCK', { state: 'pending', why, after_ms: WAKE_LOCK_BUDGET_MS });
+          finish();
+        }, WAKE_LOCK_BUDGET_MS);
       } catch (e) {
-        settled = true;
-        wakeLock = null;
-        pageMark('WAKE_LOCK', { state: 'denied', why, error: (e && e.name) || String(e) });
+        mark('WAKE_LOCK', { state: 'error', why, error: String(e) });
+        finish();
       }
-    })();
-    const budget = new Promise((resolve) => setTimeout(() => {
-      if (!settled) pageMark('WAKE_LOCK', { state: 'pending', why, after_ms: WAKE_LOCK_BUDGET_MS });
-      resolve();
-    }, WAKE_LOCK_BUDGET_MS));
-    return Promise.race([request, budget]);
+    });
   }
 
   /* THE PAGE GOING AWAY AND COMING BACK, WITH THE AUDIO SESSION IN THE SAME
@@ -4533,21 +4583,23 @@ document.addEventListener('DOMContentLoaded', () => {
      different stream. This is the one line. */
   document.addEventListener('visibilitychange', () => {
     if (!RIO.driving) return;
-    const note = { state: document.visibilityState, live: !!live,
-                   live_age_s: (live && liveSince)
-                     ? Math.round((performance.now() - liveSince) / 100) / 10 : null,
+    let ls = { live: false, since: 0, handle: null };
+    try { if (RIO.liveState) ls = RIO.liveState(); } catch (e) {}
+    const note = { state: document.visibilityState, live: !!ls.live,
+                   live_age_s: (ls.live && ls.since)
+                     ? Math.round((performance.now() - ls.since) / 100) / 10 : null,
                    wake_lock: !!wakeLock, audio: null, bus: null, camera: null };
-    try { if (live && live.audioState) note.audio = live.audioState(); } catch (e) {}
+    try { if (ls.handle && ls.handle.audioState) note.audio = ls.handle.audioState(); } catch (e) {}
     try { if (RIO.output && RIO.output.state) note.bus = RIO.output.state().context; } catch (e) {}
     try {
       const t = RIO.videoStream && RIO.videoStream.getVideoTracks()[0];
       if (t) note.camera = { muted: !!t.muted, state: t.readyState };
     } catch (e) {}
-    pageMark('PAGE_VISIBILITY', note);
+    mark('PAGE_VISIBILITY', note);
     // Back in front: an interruption may have paused her element and Safari
     // will not resume it by itself. See resumeAudio.
-    if (document.visibilityState === 'visible' && live && live.resumeAudio) {
-      try { live.resumeAudio('visible'); } catch (e) {}
+    if (document.visibilityState === 'visible' && ls.handle && ls.handle.resumeAudio) {
+      try { ls.handle.resumeAudio('visible'); } catch (e) {}
     }
   });
 
