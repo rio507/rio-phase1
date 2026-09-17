@@ -688,6 +688,12 @@
                         half of the same fault, now that superseding a line
                         actually releases the mouth it was holding. */
                      dictation_refused: 0, dictation_cancelled: 0,
+                     /* Suppressions a real transcript arrived behind: the echo
+                        gate's FALSE NEGATIVES, which nothing counted. Read
+                        against false_barge_in -- the same threshold being
+                        wrong in the other direction -- this is the pair that
+                        says whether the phone column is set right. */
+                     barges_missed: 0,
                      // Barge-ins absorbed before they cost anything: the
                      // detector fired, RIO went quiet, the noise stopped
                      // inside the sustain window and she carried straight on.
@@ -1315,8 +1321,27 @@
             return { allow: false, why: 'echo_of_her_own_words' };
         }
         var speakingNow = !!(speaking && !speaking.cancelled);
+        /* A RESPONSE THAT HAS NOT MADE A SOUND IS NOT A VOICE IN THE ROOM.
+         *
+         * The branch below says it is the path a genuine second question takes
+         * while she is waiting on a tool call. It was not: `speaking` is set
+         * from `response.created`, and a response can sit open for seconds
+         * before it produces anything -- the model deliberating, or writing a
+         * function call. The drive of 2026-09-17 has two of them open with no
+         * audio for 12.7 s and 37.3 s. For every one of those seconds
+         * `speakingNow` was true, so the branch could not be reached, and a
+         * question asked into the silence was refused on the grounds that it
+         * might be an echo of a voice that had not spoken.
+         *
+         * `audioAt` is set on the first audio of a response and is the honest
+         * test: no audio yet, and nothing of hers within the echo tail, means
+         * there is nothing for this transcript to be an echo OF. A direct line
+         * is excluded because its audio does not come through the delta path
+         * that sets `audioAt` -- it is audible while looking silent here, and
+         * `lastAudioAt` is what catches it. */
+        var silentSoFar = !!(speaking && !speaking.direct && !speaking.audioAt);
         var tail = now() - lastAudioAt;
-        if (!speakingNow && tail > echoTailMs) {
+        if ((!speakingNow || silentSoFar) && tail > echoTailMs) {
             // Nothing of hers is in the room. A transcript is a question, and
             // this is the path a genuine second question takes while she is
             // waiting on a tool call.
@@ -2193,6 +2218,60 @@
      * real interruption gets mistaken for echo. So the margin is tracked as a
      * running maximum over the firing, and once it has been beaten it stays
      * beaten. */
+    /* THE GATE'S OTHER ERROR, WHICH NOTHING HAS EVER COUNTED.
+     *
+     * `false_barge_in` counts the times the gate stopped her for something
+     * that turned out not to be a person. There is no number anywhere for the
+     * opposite: the times it refused a barge-in that WAS a person. Both are
+     * the same threshold being wrong, in opposite directions, and a drive that
+     * reports only one of them can only ever argue for tightening.
+     *
+     * The evidence is free and nobody was collecting it. A suppression says
+     * "the microphone never beat the loudspeaker, so that was her". If a real
+     * transcript -- not her own words back, not a question already being
+     * answered -- arrives in the moment after one, the gate was wrong: there
+     * was somebody there and she did not stop for them.
+     *
+     * Recorded with the margin that refused it, which is the only number that
+     * can move REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH honestly. The drive of
+     * 2026-09-17 suppressed at -17.3, -1.3 and -6.2 dB against a required
+     * +6 dB and the log could not say whether any of the three was a person.
+     * Until it can, that 6 is not a number anyone should be editing. */
+    var lastSuppress = null;   // { at, responseId, margin, mic, out, reason }
+
+    function noteSuppressed(reason, rid, v) {
+      lastSuppress = {
+        at: now(), responseId: rid || null, reason: reason,
+        margin: (peakMargin === null || peakMargin === undefined)
+                ? null : Math.round(peakMargin * 10) / 10,
+        mic: v && v.mic !== undefined ? Math.round(v.mic * 10) / 10 : null,
+        out: v && v.out !== undefined ? Math.round(v.out * 10) / 10 : null,
+      };
+    }
+
+    /* ...and the other half: a transcript that proves the last suppression
+       wrong. Called from transcriptArrived once the words have been judged
+       real, driver's, and not an answer already in flight. */
+    function noteMissedBarge(text) {
+      if (!lastSuppress) return;
+      var age = now() - lastSuppress.at;
+      var s = lastSuppress;
+      lastSuppress = null;
+      /* Only the moment after. Further out than the window a barge-in would
+         have been confirmed in, the transcript belongs to a later turn and
+         blaming the suppression for it would invent the number this exists to
+         measure honestly. */
+      if (age > bargeConfirmMs) return;
+      counters.barges_missed++;
+      emit('LIVE_BARGE_MISSED', {
+        response_id: s.responseId, reason: s.reason,
+        margin_db: s.margin, mic_db: s.mic, out_db: s.out,
+        required_db: bargeEchoMarginDb,
+        since_suppress_ms: Math.round(age),
+        text: String(text || '').slice(0, 160),
+      });
+    }
+
     function echoShaped() {
       if (!bargeEchoMarginDb) return false;         // desk: the test is off
       var v = readLevels();
@@ -2304,6 +2383,7 @@
       if (echoShaped()) {
         counters.echo_suppressed++;
         var rid0 = speaking ? speaking.responseId : null;
+        noteSuppressed('level_margin', rid0, lastLevels);
         emit('LIVE_ECHO_SUPPRESSED', {
           response_id: rid0,
           mic_db: lastLevels ? Math.round(lastLevels.mic * 10) / 10 : null,
@@ -2341,6 +2421,7 @@
         if (bargeEchoMarginDb && peakMargin !== null &&
             peakMargin < bargeEchoMarginDb) {
           counters.echo_suppressed++;
+          noteSuppressed('level_margin_sustained', rid, lastLevels);
           emit('LIVE_ECHO_SUPPRESSED', {
             response_id: rid,
             margin_db: Math.round(peakMargin * 10) / 10,
@@ -2421,6 +2502,7 @@
       if (onsetHold) {
         clearOnsetHold();
         counters.echo_suppressed++;
+        noteSuppressed('onset_guard', speaking ? speaking.responseId : null, null);
         emit('LIVE_ECHO_SUPPRESSED', {
           response_id: speaking ? speaking.responseId : null,
           reason: 'onset_guard',
@@ -2531,7 +2613,38 @@
                           ? { allow: false, why: 'echo_of_her_own_words' }
                           : { allow: true, why: null })
                : supersedeGate(text);
-      if (real && !gate.allow) {
+      /* A TRANSCRIPT ALREADY BEING ANSWERED IS NOT A PHANTOM, and this is the
+       * `!selfAnswered` that was missing from the drive of 2026-09-17.
+       *
+       * Transcription loses the race with the model, routinely. The server
+       * commits the utterance, creates a response for it, and the words for
+       * that same utterance arrive afterwards -- by which time she has already
+       * started answering them. `speaking` is true, the gate looks for a
+       * confirmed barge-in behind a transcript that never was one, finds
+       * nothing, and files an ordinary question as a refused barge-in.
+       *
+       * ELEVEN OF ELEVEN on that drive. Every phantom in the log was the
+       * driver asking something perfectly normally; not one was an echo, an
+       * interruption, or a gate refusal of anything real. The tally exists to
+       * answer "is her voice coming back through the phone and being taken
+       * for a driver", and it answered with false positives only -- which is
+       * worse than not answering, because the number reads as a diagnosis.
+       *
+       * It also overrode a decision made deliberately thirty lines above: the
+       * `real = false` below cancels the comment that says NOT to do that, so
+       * a genuine barge-in whose transcript happened to be late was then
+       * classified by the block at the bottom of this function as a
+       * false_barge_in with no transcript behind it.
+       *
+       * Nothing is lost by skipping it. selfAnswered already suppresses the
+       * new turn, the supersede and the noise buffer; LIVE_TURN_SELF already
+       * records that this happened. */
+      /* THE SUPPRESSION BEFORE THIS ONE WAS WRONG, if these are a driver's
+         words. Asked before the gate's verdict is acted on, and only for
+         words that are real, not hers, and not an answer already in flight --
+         which is exactly the set a suppression claimed did not exist. */
+      if (real && !selfAnswered && !looksLikeEcho(text)) noteMissedBarge(text);
+      if (real && !selfAnswered && !gate.allow) {
         counters.turns_phantom++;
         emit('LIVE_TURN_PHANTOM', {
           why: gate.why, text: text.slice(0, 160), turn: turnSeq,

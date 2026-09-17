@@ -3353,6 +3353,30 @@ const LIVE_REPORTED = {
   LIVE_ERROR: 'session_error',
   LIVE_TRANSPORT_LOST: 'transport_lost',
   LIVE_SPOKE: 'spoke',
+  /* THE BARGE GATE'S OWN DECISIONS — the stream that was missing entirely.
+   *
+   * On 2026-09-17 the drive log recorded eleven refused transcripts and could
+   * not say, for any of them, whether the detector had fired at all. Three
+   * refusals leave an `echo_suppressed`, one leaves a `blips_absorbed`, and
+   * the two that say the detector FIRED -- and that it was held over her
+   * opening syllable -- were emitted by the controller and reported nowhere.
+   * So "she did not stop when I talked over her" and "the microphone never
+   * heard me" were the same absence in the log.
+   *
+   *   barge_detected  the detector fired, and against which response
+   *   barge_deferred  ...and was held over her opening syllable instead
+   *   barge_missed    a suppression a real transcript then arrived behind:
+   *                   the gate's false NEGATIVES, against false_barge_in's
+   *                   false positives. The pair that says whether the phone
+   *                   column is set right, and neither half was countable.
+   *   turn_self       the transcript arrived after the answer to it had
+   *                   already started. Ordinary, and until now indistinguish-
+   *                   able in the log from a refused barge-in.
+   */
+  LIVE_BARGE_IN: 'barge_detected',
+  LIVE_BARGE_DEFERRED: 'barge_deferred',
+  LIVE_BARGE_MISSED: 'barge_missed',
+  LIVE_TURN_SELF: 'turn_self',
 };
 
 /* WAS THE CAR APPROACHING A JUNCTION WHEN THIS HAPPENED?
@@ -3450,6 +3474,16 @@ function reportLive(ev) {
           // A refused transcript that was already being answered is not a
           // lost question. See LIVE_TURN_PHANTOM.
           self_answered: ev.self_answered === undefined ? null : ev.self_answered,
+          /* THE LEVEL THE GATE WANTED, next to the one it got. A margin
+             without its threshold is a number nobody can act on. */
+          required_db: ev.required_db === undefined ? null : ev.required_db,
+          guard_ms: ev.guard_ms === undefined ? null : ev.guard_ms,
+          holding_ms: ev.holding_ms === undefined ? null : ev.holding_ms,
+          since_suppress_ms: ev.since_suppress_ms === undefined
+                             ? null : ev.since_suppress_ms,
+          item_id: ev.item_id || null,
+          during: ev.during || null,
+          yielded: ev.yielded === undefined ? null : ev.yielded,
           // Where the car was on its route when this happened, if anywhere.
           nav: navContext(),
           // Output-bus health, when that is what is being reported.

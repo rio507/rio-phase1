@@ -1011,7 +1011,16 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                "session_error", "transport_lost",
                # ...and the opposite of all of them: she made a sound, and how
                # long the driver waited for it.
-               "spoke")
+               "spoke",
+               # THE BARGE GATE'S OWN DECISIONS. `barge_missed` is the one
+               # that did not exist: a suppression a real transcript arrived
+               # behind, which is the gate refusing a person. Read against
+               # false_barge_in, it is the only honest argument for moving
+               # REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH in either direction.
+               "barge_detected", "barge_deferred", "barge_missed",
+               # A transcript that arrived after the answer to it had started.
+               # Ordinary; counted so it stops being read as a phantom.
+               "turn_self")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1076,6 +1085,13 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # A refused transcript that was already being
                              # answered is not a lost question.
                              "self_answered",
+                             # The level the gate required, beside the one it
+                             # measured; the guard it was held behind; and how
+                             # long after a suppression the words that
+                             # disproved it arrived.
+                             "required_db", "guard_ms", "holding_ms",
+                             "since_suppress_ms", "item_id", "during",
+                             "yielded",
                              # Where the car was on its route at the time, so
                              # "do cut-offs cluster around maneuvers" is a
                              # query rather than two streams and a wall clock.

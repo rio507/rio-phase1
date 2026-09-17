@@ -37,9 +37,13 @@ import json, sys, os, glob, collections, datetime
 # for it was already in flight.
 LOST = {"cutoff", "dictation_refused", "response_failed", "transport_lost",
         "direct_speech_failed", "resume_failed"}
-HEARTBEAT = {"bus_health", "spoke"}
+# Not failures: the detector firing, it being held over her opening syllable,
+# a transcript arriving after the answer to it started, and the bus heartbeat.
+HEARTBEAT = {"bus_health", "spoke", "barge_detected", "barge_deferred",
+             "turn_self"}
 
 CAUSE_OF = {
+    "barge_missed": "gate refused a person",
     "dictation_refused": "nav contention",
     "response_failed": "rate limit / token cap",
     "transport_lost": "connection",
@@ -205,6 +209,35 @@ def main(argv):
         else:
             print("  no answers were given within 300 m of a maneuver")
 
+    # THE ECHO GATE, JUDGED IN BOTH DIRECTIONS. A drive that counts only
+    # false_barge_in can argue for one thing: tightening. `barge_missed` is
+    # the same threshold being wrong the other way, and until it existed there
+    # was no evidence that could have argued against a tightening.
+    def kinds(*names):
+        return [(r["t"], r["payload"]) for r in rows
+                if r.get("kind") == "live"
+                and (r["payload"] or {}).get("kind") in names]
+
+    fired = kinds("barge_detected")
+    missed = kinds("barge_missed")
+    false_pos = [p for _, p in kinds("cutoff") if p.get("cause") == "false_barge_in"]
+    suppressed = kinds("echo_suppressed")
+    if fired or missed or suppressed or false_pos:
+        print("\n--- the echo gate ---")
+        print("  detector fired        %d" % len(fired))
+        print("  suppressed as her     %d" % len(suppressed))
+        print("  false barge-in        %d   (stopped her for nobody)" % len(false_pos))
+        print("  MISSED barge-in       %d   (refused a person)" % len(missed))
+        if not fired and not missed:
+            print("  note: barge_detected/barge_missed were added on "
+                  "2026-09-17. A drive")
+            print("  older than that cannot say whether the detector fired at "
+                  "all.")
+        for _, p in missed:
+            print("    margin %s dB against %s dB required, %s ms before %s"
+                  % (p.get("margin_db"), p.get("required_db"),
+                     p.get("since_suppress_ms"), json.dumps(p.get("text"))[:50]))
+
     phantoms = [(r["t"], r["payload"]) for r in rows
                 if r.get("kind") == "live"
                 and (r["payload"] or {}).get("kind") == "turn_phantom"]
@@ -219,6 +252,13 @@ def main(argv):
         else:
             print("  %d were already being answered; %d were not"
                   % (len(phantoms) - len(lost), len(lost)))
+    selfs = [r for r in rows if r.get("kind") == "live"
+             and (r["payload"] or {}).get("kind") == "turn_self"]
+    if selfs:
+        print("\n--- transcripts that arrived after the answer began (%d) ---"
+              % len(selfs))
+        print("  Ordinary: transcription loses the race with the model. Before")
+        print("  2026-09-17 these were counted as refused barge-ins.")
     return 0
 
 
