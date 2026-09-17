@@ -1641,6 +1641,15 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
             # the same reason every other frame is.
             if not session.lock.acquire(blocking=False):
                 stats["evicted"] += 1
+                # SAID, NOT SWALLOWED. The browser keeps `inflight` at 1 until
+                # something answers this frame; an eviction that answers with
+                # nothing pins the pipe and guarantees a 4 s stall on the next
+                # tick. See docs/frame_path_contention.md.
+                try:
+                    await ws.send_text(json.dumps({"op": "skip", "seq": frame.seq,
+                                                   "reason": "busy"}))
+                except Exception:
+                    return
                 continue
             try:
                 result = await run_in_threadpool(

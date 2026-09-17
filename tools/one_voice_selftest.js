@@ -261,10 +261,19 @@ section('B. the budget expires — and the line she was asked for turns up anywa
   // ...and now the response she was asked for is created.
   h.controller.handle({ type: 'response.created', response: { id: 'late1' } });
   await sleep(2);
+  /* NOT MUTED YET, and that is the 2026-09-17 change. The element carries one
+     stream; a mute made here, before this response has made a sound, lands
+     on whatever IS sounding -- the tail of the answer before it. The mute
+     waits for this response's own audio: output_audio_buffer.started on
+     WebRTC, or its first transcript delta anywhere. */
+  ok(h.audio.muted === false,
+     'the element is NOT muted at creation -- that mute used to land on the '
+     + 'tail of the previous answer');
+  h.controller.handle({ type: 'output_audio_buffer.started', response_id: 'late1' });
   const heard = h.responseSpeaks('late1', 'Left here');
   ok(heard === null,
-     'her voice does not reach the cabin — the disowned response was muted ' +
-     'before it could speak');
+     'her voice does not reach the cabin — the disowned response is muted ' +
+     'the moment ITS audio starts');
   ok(h.audio.muted === true, 'the element is muted while it dies');
   const byId = h.sent.filter(e => e.type === 'response.cancel' && e.response_id);
   ok(byId.length === 1 && byId[0].response_id === 'late1',

@@ -1027,7 +1027,10 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                # session ended nor what the microphone and the speaker were
                # doing when the page went away. These are that record.
                "session_ended", "peer_state", "audio_interrupted",
-               "audio_resumed", "mic_state")
+               "audio_resumed", "mic_state",
+               # EVERY ANSWER'S AUDIO: generated against heard, and who ended
+               # it. The row that answers "did she stop mid-sentence".
+               "utterance_end", "tail_timeout")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1104,6 +1107,12 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              "state", "ice", "was", "grace_ms", "expired",
                              "recovered", "age_s", "hidden", "paused",
                              "muted", "ready_state", "audio_state",
+                             # The utterance ledger.
+                             "generated_chars", "audio_ms", "muted_ms",
+                             "heard_ms", "heard_frac", "heard_chars_est",
+                             "ended_by", "cancel_reason", "status",
+                             "status_reason", "mute_reasons", "muted_at_end",
+                             "audio_started", "early", "after_ms",
                              # Where the car was on its route at the time, so
                              # "do cut-offs cluster around maneuvers" is a
                              # query rather than two streams and a wall clock.

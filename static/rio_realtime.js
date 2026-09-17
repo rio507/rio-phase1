@@ -636,7 +636,137 @@
     var arbiter = cfg.arbiter;
     var send = cfg.send || function () {};
     var runTool = cfg.tool || function () { return Promise.resolve({ ok: false }); };
-    var audio = cfg.audio || { mute: function () {}, unmute: function () {} };
+    var rawAudio = cfg.audio || { mute: function () {}, unmute: function () {} };
+    /* THE MOUTH, WITH A LEDGER.
+     *
+     * Every mute on this page is a moment the driver stops hearing her, and
+     * until now none of them was written down: `audio.mute()` was called from
+     * seven places for seven reasons and the drive log could say only that an
+     * answer had been cut off -- and only for the two of the seven that
+     * classified themselves. The other five muted the speaker and moved on.
+     *
+     * So the facade keeps the ledger. A mute records its reason and its start;
+     * an unmute closes the span and charges it to whichever utterance was
+     * STREAMING at the time (see `streamingId`) -- which is the only honest
+     * assignment, because under speech-to-speech the element carries one
+     * stream and a mute made "for" one response lands on whatever is coming
+     * out of the speaker, usually the tail of the answer before it. That is
+     * the fault this ledger was built to make visible. */
+    var muted = false;
+    var muteSince = 0;
+    var muteReason = null;
+    var audio = {
+      mute: function (why) {
+        try { rawAudio.mute(); } catch (e) {}
+        if (muted) return;
+        muted = true;
+        muteSince = Date.now();
+        muteReason = why || 'unspecified';
+        if (streamingId && utter[streamingId]) {
+          var u = utter[streamingId];
+          u.mute_reasons[muteReason] = (u.mute_reasons[muteReason] || 0) + 1;
+        }
+      },
+      unmute: function (why) {
+        try { rawAudio.unmute(); } catch (e) {}
+        if (!muted) return;
+        muted = false;
+        chargeMute(Date.now());
+        muteReason = null;
+      },
+      isMuted: function () { return muted; },
+    };
+    /* Close the open mute span against the streaming utterance, if any. */
+    function chargeMute(at) {
+      if (!muteSince) return;
+      var span = Math.max(0, at - muteSince);
+      muteSince = 0;
+      if (streamingId && utter[streamingId]) utter[streamingId].muted_ms += span;
+    }
+
+    /* ---- THE UTTERANCE LEDGER: how much was written, how much was heard ----
+     *
+     * One record per response, kept from `response.created` to the end of
+     * its AUDIO -- not the end of its generation, which under speech-to-
+     * speech is seconds earlier and was the only end this file used to know.
+     * Reported once, as LIVE_UTTERANCE_END, with:
+     *
+     *   generated_chars  the transcript the model wrote
+     *   audio_ms         from output_audio_buffer.started to .stopped/.cleared
+     *   muted_ms         how much of that the element was muted for, and why
+     *   heard_ms/frac    audio_ms less muted_ms; the driver's share
+     *   ended_by         completed | cancelled:<who> | cleared | muted
+     *
+     * "She stopped mid-sentence" is heard_frac < 1 or ended_by != completed,
+     * and the drive of 2026-09-17 could not produce that sentence for a single
+     * response: there was no record of what was written, none of when the
+     * audio started or stopped, and none of the mutes. */
+    var utter = {};
+    var utterOrder = [];
+    var streamingId = null;
+    /* Responses cancelled on sight (noise replies, orphans). They are NOT
+       muted when cancelled -- the mute would land on the tail of the answer
+       before them -- but if their audio does start before the cancel lands,
+       that start is the moment to mute, and only that. */
+    var silencedIds = {};
+    function utterFor(rid, kind) {
+      if (!rid) return null;
+      if (!utter[rid]) {
+        utter[rid] = { response_id: rid, turn_kind: kind || 'conversation',
+                       created_at: Date.now(), audio_started_at: 0,
+                       audio_ended_at: 0, generated_chars: 0, transcript_done: false,
+                       status: null, status_reason: null, cancel_reason: null,
+                       muted_ms: 0, mute_reasons: {}, muted_at_end: false,
+                       ended_by: null, reported: false, done: false };
+        utterOrder.push(rid);
+        while (utterOrder.length > 24) delete utter[utterOrder.shift()];
+      } else if (kind && utter[rid].turn_kind === 'conversation') {
+        utter[rid].turn_kind = kind;
+      }
+      return utter[rid];
+    }
+    /* Our own cancels name themselves; the server's response.done then
+       confirms. A cancel the server reports that nobody here asked for is
+       recorded as the server's. */
+    function noteCancel(rid, why) {
+      var u = rid ? utter[rid] : null;
+      if (u && !u.cancel_reason) u.cancel_reason = why || 'unspecified';
+    }
+    function utteranceEnded(rid, how) {
+      var u = utter[rid];
+      if (!u || u.reported) return;
+      /* Not until BOTH halves are in: the server's verdict on the response
+         and the end of its audio. Whichever comes second reports. A response
+         that never started audio has only the first half to wait for. */
+      var audioOver = !u.audio_started_at || u.audio_ended_at > 0;
+      if (!(u.done && audioOver)) return;
+      u.reported = true;
+      var at = u.audio_ended_at || Date.now();
+      var audioMs = u.audio_started_at ? Math.max(0, at - u.audio_started_at) : 0;
+      var mutedMs = Math.min(audioMs, u.muted_ms);
+      var heardMs = Math.max(0, audioMs - mutedMs);
+      var ended = u.ended_by || how || 'completed';
+      if (ended === 'completed' && u.muted_at_end) ended = 'muted';
+      var frac = audioMs ? Math.round((heardMs / audioMs) * 1000) / 1000 : (u.audio_started_at ? 1 : 0);
+      var reasons = [];
+      for (var k in u.mute_reasons) reasons.push(k + 'x' + u.mute_reasons[k]);
+      counters.utterances++;
+      var early = ended !== 'completed' || frac < 0.98;
+      if (early) counters.utterances_early++;
+      emit('LIVE_UTTERANCE_END', {
+        response_id: rid, turn_kind: u.turn_kind,
+        generated_chars: u.generated_chars, status: u.status,
+        status_reason: u.status_reason, ended_by: ended,
+        cancel_reason: u.cancel_reason,
+        audio_started: !!u.audio_started_at, audio_ms: Math.round(audioMs),
+        muted_ms: Math.round(mutedMs), heard_ms: Math.round(heardMs),
+        heard_frac: frac, muted_at_end: !!u.muted_at_end,
+        mute_reasons: reasons.join(','), early: early,
+        // The driver's share of the words, by time. An ESTIMATE: audio is
+        // not evenly worded, and the log says so by the name.
+        heard_chars_est: Math.round(u.generated_chars * frac),
+      });
+    }
     /* RIO's mouth, when it is not the model's own. Nullable, and null is the
        live-voice path — every `if (sink)` below reads as "unless she is speaking
        for herself", which is what it means. */
@@ -694,6 +824,9 @@
                         wrong in the other direction -- this is the pair that
                         says whether the phone column is set right. */
                      barges_missed: 0,
+                     /* Every response's audio, accounted for: how many, and
+                        how many the driver did not hear the whole of. */
+                     utterances: 0, utterances_early: 0,
                      // Barge-ins absorbed before they cost anything: the
                      // detector fired, RIO went quiet, the noise stopped
                      // inside the sustain window and she carried straight on.
@@ -1401,7 +1534,7 @@
       var aborted = abortStaleTools(reason);
       // The response being generated is about the old question.
       if (speaking && !speaking.cancelled) {
-        cancelGeneration();
+        cancelGeneration('superseded');
         if (rid) endResponse(rid);
       } else {
         // Nothing is playing, but a response may still be on its way from a
@@ -1584,6 +1717,31 @@
       'Read the text below out loud, exactly as written, word for word. ' +
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
     var speakTimeoutMs = cfg.speakTimeoutMs || 700;
+    /* THE MOUTH IS HERS UNTIL THE SOUND STOPS, on a transport that can say
+       when that is. `response.done` is the end of GENERATION; under speech-
+       to-speech the audio streams on for seconds after it, and this file used
+       to hand the mouth back at the first of the two -- so for every one of
+       those seconds a detector firing found `speaking` null, muted the tail
+       without a pendingBarge to classify or absorb it, and never unmuted;
+       and a noise reply created in that window muted the tail on its way to
+       being cancelled. On WebRTC the API sends output_audio_buffer.stopped
+       (or .cleared) at the real end, so connect() sets this and the mouth
+       waits for it. The node harness sends neither, and keeps the old end. */
+    var holdTail = !!cfg.holdTail;
+    var tailFallbackMs = cfg.tailFallbackMs || 15000;
+    var tailTimer = null;
+    function armTail(rid) {
+      if (tailTimer) clearTimeout(tailTimer);
+      tailTimer = setTimeout(function () {
+        tailTimer = null;
+        // The end of the audio never arrived. The mouth is not held forever
+        // for it: give it back and say so.
+        if (speaking && speaking.responseId === rid) {
+          emit('LIVE_TAIL_TIMEOUT', { response_id: rid, after_ms: tailFallbackMs });
+          endResponse(rid);
+        }
+      }, tailFallbackMs);
+    }
     /* A vetted answer read into the session is injected the same way a warning
        is, and waits a different length of time for it. See injectDirect. */
     var directSpeechTimeoutMs = cfg.directSpeechTimeoutMs || 2500;
@@ -1628,7 +1786,11 @@
     /* Stop the model generating, and clear the audio it has already queued.
        Both, always: cancelling generation alone leaves whatever is in the
        output buffer to play out from under a warning. */
-    function cancelGeneration() {
+    function cancelGeneration(why) {
+      if (speaking) noteCancel(speaking.responseId, why || 'unspecified');
+      if (speaking && speaking.direct && directSpeech && directSpeech.realId) {
+        noteCancel(directSpeech.realId, why || 'unspecified');
+      }
       /* A directly-spoken line has no response behind it to cancel -- IN TEXT
          MODE. Sending `response.cancel` with nothing generating is answered
          with an error event, which is a real error in the log for a thing that
@@ -1785,6 +1947,7 @@
       if (dictation && !dictation.responseId) {
         dictation.responseId = responseId;
         markOutOfBand(responseId);
+        utterFor(responseId, 'dictation');
         return;
       }
       /* ...and so does the response a DIRECT LINE was injected as. Same
@@ -1797,6 +1960,7 @@
           && String(responseId || '').indexOf('direct:') !== 0) {
         directSpeech.realId = responseId;
         markOutOfBand(responseId);
+        utterFor(responseId, 'direct');
         return;
       }
       /* A RESPONSE THE SERVER CREATED FOR A FRAGMENT. It is an answer to road
@@ -1809,7 +1973,17 @@
         counters.noise_responses_silenced++;
         try { send({ type: 'response.cancel', response_id: responseId }); }
         catch (e) {}
-        try { audio.mute(); } catch (e) {}
+        /* NOT MUTED HERE. This used to mute the element on the way to
+           cancelling -- and under speech-to-speech the element is one stream,
+           so the mute landed on whatever was coming out of it, which is the
+           tail of the answer before this one. The drive of 2026-09-17 did it
+           twice in five seconds, once across "Didn't catch that." itself.
+           The response is cancelled before it has made a sound; if a sound
+           does arrive, output_audio_buffer.started names it and it is muted
+           THEN. See silencedIds. */
+        silencedIds[responseId] = 1;
+        noteCancel(responseId, 'noise_silenced');
+        utterFor(responseId, 'noise');
         emit('LIVE_NOISE_SILENCED', { response_id: responseId });
         return;
       }
@@ -1828,7 +2002,10 @@
           counters.orphans_silenced++;
           try { send({ type: 'response.cancel', response_id: responseId }); }
           catch (e) {}
-          try { audio.mute(); } catch (e) {}
+          // Same rule as a noise reply: muted if and when its audio starts.
+          silencedIds[responseId] = 1;
+          noteCancel(responseId, 'orphan_silenced');
+          utterFor(responseId, 'orphan');
           emit('LIVE_ORPHAN_SILENCED', { response_id: responseId });
         }
         return;
@@ -1881,13 +2058,14 @@
                     // For the onset guard: when the response opened, and (set
                     // on the first transcript delta) when she began speaking.
                     startedAt: Date.now(), audioAt: 0 };
+      utterFor(responseId, opts.direct ? 'direct' : (resumeExpected ? 'resume' : 'conversation'));
       resumeExpected = false;
       speaking = entry;
       counters.responses++;
       partial = '';
       generated = '';
       if (sink) { try { sink.begin(responseId); } catch (e) {} }
-      audio.unmute();
+      audio.unmute('claim');
       arbiter.say({
         priority: arbiter.P.CONVO,
         group: 'convo',
@@ -1936,8 +2114,8 @@
           entry.cancelled = true;
           entry.said = saidSoFar();     // captured before the deltas stop
           if (speaking !== entry) return;
-          audio.mute();
-          cancelGeneration();
+          audio.mute('preempted');
+          cancelGeneration('preempted');
         },
         onDone: function (reason) {
           var wasCurrent = (speaking === entry);
@@ -1953,7 +2131,7 @@
             counters.interrupted++;
             // Same reason as `stop` above: an entry that is no longer the one
             // speaking must not silence the one that is.
-            if (wasCurrent) audio.mute();
+            if (wasCurrent) audio.mute('interrupted');
             var said = entry.said || saidSoFar();
             if (reason === 'preempted') {
               /* Something that matters more took the mouth mid-sentence. That
@@ -2398,7 +2576,7 @@
       }
       stopEchoWatch();
 
-      audio.mute();                      // instant, always, undoable
+      audio.mute('barge');               // instant, always, undoable
       if (!speaking || pendingBarge) {
         emit('LIVE_BARGE_IN', { response_id: speaking ? speaking.responseId : null });
         return;
@@ -2430,14 +2608,14 @@
           });
           clearBarge();
           try { send({ type: 'input_audio_buffer.clear' }); } catch (e) {}
-          if (speaking && !speaking.cancelled && !stopped) audio.unmute();
+          if (speaking && !speaking.cancelled && !stopped) audio.unmute('barge_absorbed');
           startEchoWatch(rid);
           return;
         }
         pendingBarge.cancelled = true;
         pendingBarge.said = saidSoFar();
         // Sustained past the gate: stop generating and hand back the mouth.
-        cancelGeneration();
+        cancelGeneration('barge');
         endResponse(rid);
         /* Cancelled, and NOT yet blamed on anyone. The clock that decides
            whether there was a person there does not start here -- it starts
@@ -2518,7 +2696,7 @@
         counters.blips_absorbed++;
         emit('LIVE_BARGE_ABSORBED', {
           response_id: speaking ? speaking.responseId : null });
-        if (speaking && !speaking.cancelled && !stopped) audio.unmute();
+        if (speaking && !speaking.cancelled && !stopped) audio.unmute('barge_absorbed');
         return;
       }
       if (pendingBarge.confirm) return;          // already waiting
@@ -2739,7 +2917,7 @@
           counters.turns_coalesced++;
           if (speaking && !speaking.cancelled) {
             var rid0 = speaking.responseId;
-            cancelGeneration();
+            cancelGeneration('coalesced');
             endResponse(rid0);
           }
           emit('LIVE_TURN_COALESCED', {
@@ -2773,7 +2951,7 @@
         // now rather than waiting out a timer that is about to agree.
         if (real && speaking && speaking.responseId === rid) {
           var heard = saidSoFar();
-          cancelGeneration();
+          cancelGeneration('barge');
           endResponse(rid);
           noteCutoff('barge_in', { response_id: rid, said: heard });
         }
@@ -2814,7 +2992,7 @@
       emit('LIVE_DRIVER_COMMAND', { command: kind, text: text.slice(0, 160),
                                     turn: turnSeq });
       if (kind === 'silence') {
-        try { audio.mute(); } catch (e) {}
+        try { audio.mute('driver_command'); } catch (e) {}
         try {
           if (root.RIO && RIO.speech && RIO.speech.clear) RIO.speech.clear('convo');
         } catch (e) {}
@@ -3216,6 +3394,27 @@
             stopBackstop();
             break;
           case 'output_audio_buffer.started':
+            (function () {
+              var now0 = Date.now();
+              /* A mute open across the change of speaker is charged to the
+                 utterance it was actually on, then restarted for this one. */
+              if (muted) { chargeMute(now0); muteSince = now0; }
+              var u0 = utterFor(ev.response_id);
+              if (u0 && !u0.audio_started_at) u0.audio_started_at = now0;
+              streamingId = ev.response_id;
+              if (u0 && muted && muteReason) {
+                u0.mute_reasons[muteReason] = (u0.mute_reasons[muteReason] || 0) + 1;
+              }
+            })();
+            if (silencedIds[ev.response_id]) {
+              /* A response cancelled on sight has made a sound anyway: the
+                 cancel was in flight. NOW it is muted -- and the buffer is
+                 cleared -- because now the mute lands on it and not on the
+                 answer before it. */
+              audio.mute('silenced_started');
+              try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+              break;
+            }
             if (dictation && dictation.responseId === ev.response_id) {
               // The line is being spoken. Whatever fallback was armed against
               // this taking too long can stand down.
@@ -3247,6 +3446,47 @@
             break;
           case 'response.done':
           case 'output_audio_buffer.stopped':
+          case 'output_audio_buffer.cleared':
+            (function () {
+              var rid1 = (ev.response && ev.response.id) || ev.response_id;
+              var u1 = utterFor(rid1);
+              var now1 = Date.now();
+              if (!u1) return;
+              if (ev.type === 'response.done') {
+                var det1 = (ev.response && ev.response.status_details) || {};
+                u1.done = true;
+                u1.status = (ev.response && ev.response.status) || null;
+                u1.status_reason = det1.reason || det1.type || null;
+                if (u1.status === 'cancelled') {
+                  u1.ended_by = 'cancelled:' + (u1.cancel_reason || 'server');
+                } else if (u1.status === 'incomplete') {
+                  u1.ended_by = 'incomplete:' + (det1.reason || 'unknown');
+                } else if (u1.status === 'failed') {
+                  u1.ended_by = 'failed';
+                }
+              } else {
+                /* The sound stopped. If the element was muted at that
+                   instant, the driver did not hear the end of it -- and that
+                   is the fact this whole ledger exists to record. */
+                if (muted && streamingId === rid1) {
+                  chargeMute(now1); muteSince = now1;
+                  u1.muted_at_end = true;
+                }
+                if (!u1.audio_ended_at) u1.audio_ended_at = now1;
+                if (ev.type === 'output_audio_buffer.cleared' && !u1.ended_by) {
+                  u1.ended_by = 'cancelled:' + (u1.cancel_reason || 'cleared');
+                }
+                if (streamingId === rid1) streamingId = null;
+                if (silencedIds[rid1]) {
+                  delete silencedIds[rid1];
+                  if (!stopped && !speaking) audio.unmute('silenced_ended');
+                }
+                if (tailTimer && speaking && speaking.responseId === rid1) {
+                  clearTimeout(tailTimer); tailTimer = null;
+                }
+              }
+              utteranceEnded(rid1);
+            })();
             if (dictation && dictation.responseId ===
                 ((ev.response && ev.response.id) || ev.response_id)) {
               finishDictation(null);
@@ -3300,7 +3540,24 @@
                 responseFailed(ev.response.id, det.error || {});
               }
             }
-            finishResponse((ev.response && ev.response.id) || ev.response_id);
+            /* GENERATION IS OVER; THE SOUND MAY NOT BE. On WebRTC the mouth
+               is held until output_audio_buffer.stopped (or .cleared) says
+               the audio is, so a detector firing into the tail meets a
+               response to classify and absorb against, instead of a mute with
+               no owner. `finishing` still lets the next response take over.
+               A response that never started audio has no tail to wait for. */
+            (function () {
+              var rid2 = (ev.response && ev.response.id) || ev.response_id;
+              var u2 = utter[rid2];
+              if (holdTail && !sink && ev.type === 'response.done'
+                  && speaking && speaking.responseId === rid2
+                  && u2 && u2.audio_started_at && !u2.audio_ended_at) {
+                speaking.finishing = true;
+                armTail(rid2);
+                return;
+              }
+              finishResponse(rid2);
+            })();
             break;
           /* TEXT MODE. The words, as they are written, forwarded to whatever
              is speaking them. Nothing is buffered here and no phrasing is
@@ -3337,6 +3594,24 @@
                echoes exactly as readily as an answer does. */
             noteSaid(ev.delta || '');
             noteFirstAudio(ev.response_id);
+            (function () {
+              var u3 = utter[ev.response_id];
+              if (u3 && !u3.transcript_done) u3.generated_chars += (ev.delta || '').length;
+              // The earliest evidence audio is on its way; on a transport
+              // that never sends output_audio_buffer.started, the only one.
+              if (u3 && !u3.audio_started_at) {
+                u3.audio_started_at = Date.now();
+                if (!streamingId) streamingId = ev.response_id;
+              }
+              /* A response cancelled on sight, speaking anyway. Muted NOW,
+                 on its own first words, and not a moment earlier -- see the
+                 noise-silence branch of beginResponse for why earlier was
+                 the tail of somebody else's answer. */
+              if (silencedIds[ev.response_id] && !muted) {
+                audio.mute('silenced_started');
+                try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+              }
+            })();
             if ((!dictation || dictation.responseId !== ev.response_id)
                 && (!directSpeech || directSpeech.realId !== ev.response_id)) {
               partial += (ev.delta || '');
@@ -3355,6 +3630,13 @@
           case 'response.output_audio_transcript.done':
             // What the model says it said. The tests compare it with what it
             // was asked to say; in the car it is what the log records.
+            (function () {
+              var u4 = utter[ev.response_id];
+              if (u4 && ev.transcript) {
+                u4.generated_chars = ev.transcript.length;
+                u4.transcript_done = true;
+              }
+            })();
             if (dictation && dictation.responseId === ev.response_id) {
               dictation.transcript = ev.transcript || '';
             } else if (directSpeech && directSpeech.realId === ev.response_id) {
@@ -3708,9 +3990,10 @@
         stopped = true;
         clearOnsetHold();
         stopEchoWatch();
-        audio.mute();
+        audio.mute('session_stopped');
         clearBarge();
         pendingResume = null;
+        if (tailTimer) { clearTimeout(tailTimer); tailTimer = null; }
         if (dictation) finishDictation('session_stopped');
         if (speaking) endResponse(speaking.responseId);
         // The dialogue socket is one per live session and dies with it. Left
@@ -4145,6 +4428,8 @@
           // no numbers of its own to drift from the ones the tests check.
           resumeInstruction: session.resume_instruction,
           bargeConfirmMs: session.barge_confirm_ms,
+          // WebRTC sends output_audio_buffer.stopped: the mouth waits for it.
+          holdTail: true,
           /* THE PHONE COLUMN OR THE DESK COLUMN. Both travel with the session
              (config.py decides them, realtime.mint_client_secret sends them)
              and the machine picks its own — see isTouchDevice. The fallback to

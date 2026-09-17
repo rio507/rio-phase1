@@ -332,6 +332,24 @@ def main(argv):
         print("  %s  drive log closed: %s"
               % (hhmmss(r["t"]), (r["payload"] or {}).get("reason")))
 
+    # EVERY ANSWER'S AUDIO. The question "did she stop mid-sentence" answered
+    # per response: what was written, how much was heard, who ended it.
+    ends = kinds("utterance_end")
+    print("\n--- utterances: written vs heard ---")
+    if not ends:
+        print("  NOT RECORDED in this log. utterance_end (generated chars,")
+        print("  audio ms, muted ms, ended_by) was added 2026-09-17. This drive")
+        print("  can name only the cut-offs that classified themselves.")
+    else:
+        early = [(t, p) for t, p in ends if p.get("early")]
+        print("  %d utterances, %d ended early" % (len(ends), len(early)))
+        for t, p in early:
+            print("  %s  %-12s wrote %4s chars, heard ~%4s (%.0f%% of %s ms audio)  %s%s"
+                  % (hhmmss(t), p.get("turn_kind"), p.get("generated_chars"),
+                     p.get("heard_chars_est"), 100 * (p.get("heard_frac") or 0),
+                     p.get("audio_ms"), p.get("ended_by"),
+                     ("  muted by " + p["mute_reasons"]) if p.get("mute_reasons") else ""))
+
     selfs = [r for r in rows if r.get("kind") == "live"
              and (r["payload"] or {}).get("kind") == "turn_self"]
     if selfs:

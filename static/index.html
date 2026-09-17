@@ -3409,6 +3409,13 @@ const LIVE_REPORTED = {
    *   audio_resumed      ...and played again
    *   mic_state          the capture track muted, un-muted or ended
    */
+  /* EVERY ANSWER'S AUDIO, ACCOUNTED FOR. Generated characters against the
+   * audio that actually reached the speaker, with every mute charged to the
+   * utterance it landed on and named. "She stopped mid-sentence" is
+   * `early: true` here, with `ended_by` saying who did it. The drive of
+   * 2026-09-17 could not produce this line for one response. */
+  LIVE_UTTERANCE_END: 'utterance_end',
+  LIVE_TAIL_TIMEOUT: 'tail_timeout',
   LIVE_SESSION_ENDED: 'session_ended',
   LIVE_PEER_STATE: 'peer_state',
   LIVE_AUDIO_INTERRUPTED: 'audio_interrupted',
@@ -3546,6 +3553,22 @@ function reportLive(ev) {
           muted: ev.muted === undefined ? null : ev.muted,
           ready_state: ev.ready_state === undefined ? null : ev.ready_state,
           audio_state: ev.audio_state || null,
+          /* The utterance ledger: what was written, what was heard, who
+             ended it. heard_chars_est is an estimate by time and says so. */
+          generated_chars: ev.generated_chars === undefined ? null : ev.generated_chars,
+          audio_ms: ev.audio_ms === undefined ? null : ev.audio_ms,
+          muted_ms: ev.muted_ms === undefined ? null : ev.muted_ms,
+          heard_ms: ev.heard_ms === undefined ? null : ev.heard_ms,
+          heard_frac: ev.heard_frac === undefined ? null : ev.heard_frac,
+          heard_chars_est: ev.heard_chars_est === undefined ? null : ev.heard_chars_est,
+          ended_by: ev.ended_by || null,
+          cancel_reason: ev.cancel_reason || null,
+          status: ev.status || null,
+          status_reason: ev.status_reason || null,
+          mute_reasons: ev.mute_reasons || null,
+          muted_at_end: ev.muted_at_end === undefined ? null : ev.muted_at_end,
+          audio_started: ev.audio_started === undefined ? null : ev.audio_started,
+          early: ev.early === undefined ? null : ev.early,
           // Where the car was on its route when this happened, if anywhere.
           nav: navContext(),
           // Output-bus health, when that is what is being reported.
