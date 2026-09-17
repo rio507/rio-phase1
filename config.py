@@ -181,6 +181,18 @@ def speak_timeout_ms(channel: str = None, call_type: str = None) -> int:
 # giving up would have been the faster route to a sentence.
 REALTIME_DIRECT_SPEECH_TIMEOUT_MS = 2500
 
+# HOW LONG A PEER CONNECTION MAY SAY `disconnected` BEFORE IT IS BELIEVED.
+#
+# The WebRTC spec calls `disconnected` a state a connection passes through --
+# "may trigger intermittently and resolve just as spontaneously" -- and on a
+# phone it does: a cell handover, a page going to the background and having
+# its socket paused, a run of lost consent checks. The page used to treat the
+# first such event as death and tear the live session down for the rest of
+# the drive. Only `failed` and `closed` are final; this is the grace the
+# transient state gets before it is declared a loss. Reported either way as
+# peer_state in the drive log.
+REALTIME_PEER_DISCONNECT_GRACE_MS = 8000
+
 # Channels dictated to the live voice. Per-channel because they are not the
 # same kind of speech: a turn instruction six seconds out and a gap warning
 # that is already late have completely different tolerance for a few hundred

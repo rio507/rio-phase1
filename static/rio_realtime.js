@@ -3786,6 +3786,70 @@
    * Wrong in the safe direction on a touchscreen laptop: it would get the
    * phone numbers, which cost a fifth of a second on an interruption nobody
    * would notice, and it does not cost an answer. */
+  /* IS THE PEER CONNECTION GONE, OR JUST GOING THROUGH A TUNNEL?
+   *
+   * `connectionState === 'disconnected'` used to be treated as death: one
+   * event, and transportLost() tore the whole session down for the rest of
+   * the drive. The WebRTC spec says the opposite -- `disconnected` is a state
+   * a connection passes THROUGH, "may trigger intermittently and resolve just
+   * as spontaneously", and on a phone it does exactly that: a cell handover,
+   * a page going to the background and its socket being paused, a few lost
+   * consent checks. Only `failed` and `closed` mean it is over.
+   *
+   * So `disconnected` starts a clock instead of a teardown. Come back to
+   * `connected` inside the grace and nothing happened but a line in the log;
+   * stay gone past it and the loss is declared with the same reason it
+   * always had. The drive of 2026-09-17 cannot say whether this ever fired --
+   * peer state was not reported -- which is why every transition is now an
+   * event, and why the number that decides it lives in config.py rather than
+   * here. */
+  function peerWatch(o) {
+    o = o || {};
+    var graceMs = o.graceMs || 8000;
+    var timer = null;
+    var last = null;
+    var lost = false;
+    var setT = o.setTimeout || root.setTimeout;
+    var clearT = o.clearTimeout || root.clearTimeout;
+    function say(state, extra) {
+      if (typeof o.emit !== 'function') return;
+      var ev = { type: 'LIVE_PEER_STATE', state: state,
+                 ice: o.ice ? o.ice() : null, was: last };
+      if (extra) for (var k in extra) ev[k] = extra[k];
+      try { o.emit(ev); } catch (e) {}
+    }
+    function declare(reason) {
+      if (lost) return;
+      lost = true;
+      if (typeof o.onLost === 'function') { try { o.onLost(reason); } catch (e) {} }
+    }
+    return {
+      state: function (state) {
+        if (lost) return;
+        if (state === 'disconnected') {
+          say(state, { grace_ms: graceMs });
+          if (!timer) {
+            timer = setT(function () {
+              timer = null;
+              say('disconnected', { grace_ms: graceMs, expired: true });
+              declare('peer_disconnected');
+            }, graceMs);
+          }
+        } else if (state === 'failed' || state === 'closed') {
+          if (timer) { clearT(timer); timer = null; }
+          say(state);
+          declare('peer_' + state);
+        } else {
+          var recovered = !!timer && state === 'connected';
+          if (timer) { clearT(timer); timer = null; }
+          say(state, recovered ? { recovered: true } : null);
+        }
+        last = state;
+      },
+      stop: function () { if (timer) { clearT(timer); timer = null; } lost = true; },
+    };
+  }
+
   function isTouchDevice() {
     try {
       var nav = root.navigator || {};
@@ -3922,6 +3986,35 @@
         var pc = new RTCPeerConnection();
         var channel = pc.createDataChannel('oai-events');
         mic.getTracks().forEach(function (t) { pc.addTrack(t, mic); });
+        /* Set by stop(), read by every listener below: a track that ends and
+           an element that pauses because the session was CLOSED are not
+           interruptions, and reporting them as such would put a fault in the
+           log at the end of every healthy drive. */
+        var closed = false;
+
+        /* THE MICROPHONE, WATCHED. iOS mutes a page's capture track when it
+           goes to the background, when a call comes in, when Siri takes the
+           audio session -- and un-mutes it, usually, on the way back. While it
+           is muted she hears nothing, and a driver who talks into a muted
+           microphone and gets no answer reports that she stopped talking.
+           None of that left a mark before. `ended` is worse: the capture was
+           revoked and cannot be re-opened without a tap, so it is reported and
+           NOT silently retried. */
+        mic.getTracks().forEach(function (t) {
+          function micState(state) {
+            if (closed || !opts.onEvent) return;
+            try {
+              opts.onEvent({ type: 'LIVE_MIC_STATE', state: state,
+                             muted: !!t.muted, ready_state: t.readyState,
+                             hidden: !!(root.document && root.document.hidden) });
+            } catch (e) {}
+          }
+          try {
+            t.addEventListener('mute', function () { micState('muted'); });
+            t.addEventListener('unmute', function () { micState('unmuted'); });
+            t.addEventListener('ended', function () { micState('ended'); });
+          } catch (e) {}
+        });
 
         /* THE ONE PATH iOS COULD ALREADY CANCEL. A remote MediaStream on an
            element is rendered by the same WebRTC stack that owns the capture,
@@ -3936,6 +4029,62 @@
           // The meter cannot be built until there is something to measure.
           armMeter();
         };
+
+        /* HER MOUTH, WATCHED, AND RE-OPENED.
+         *
+         * Under speech-to-speech her voice is this element. iOS pauses a
+         * playing media element when the audio session is interrupted -- a
+         * call, Siri, another app taking the output -- and Safari does NOT
+         * resume it when the interruption ends: the page has to call play()
+         * again, and this page never did. So an interruption that lasted
+         * three seconds silenced her for the rest of the drive while the
+         * session underneath kept generating answers into a paused element.
+         *
+         * A pause that was not stop() is therefore reported AND answered: one
+         * play() a moment later, in case the interruption is already over,
+         * and again from resumeAudio() when the page comes back to the front.
+         * `playing` says whether either worked. */
+        var replayTimer = null;
+        function replay(why) {
+          if (closed || !element.srcObject) return;
+          try {
+            var pp = element.play();
+            if (pp && pp.catch) {
+              pp.catch(function (err) {
+                if (closed || !opts.onEvent) return;
+                try {
+                  opts.onEvent({ type: 'LIVE_AUDIO_INTERRUPTED', state: 'play_refused',
+                                 why: why, error: (err && err.name) || String(err) });
+                } catch (e) {}
+              });
+            }
+          } catch (e) {}
+        }
+        function elementEvent(state, why) {
+          if (closed || !opts.onEvent) return;
+          try {
+            opts.onEvent({ type: state === 'playing' ? 'LIVE_AUDIO_RESUMED'
+                                                     : 'LIVE_AUDIO_INTERRUPTED',
+                           state: state, why: why || null,
+                           paused: !!element.paused, muted: !!element.muted,
+                           hidden: !!(root.document && root.document.hidden) });
+          } catch (e) {}
+        }
+        try {
+          element.addEventListener('pause', function () {
+            if (closed || !element.srcObject) return;
+            elementEvent('paused', 'element_pause');
+            if (replayTimer) root.clearTimeout(replayTimer);
+            replayTimer = root.setTimeout(function () {
+              replayTimer = null;
+              if (element.paused) replay('after_pause');
+            }, 250);
+          });
+          element.addEventListener('playing', function () {
+            if (closed || !element.srcObject) return;
+            elementEvent('playing');
+          });
+        } catch (e) {}
 
         /* WHICH MOUTH, AND HOW IT CAN CHANGE MID-DRIVE
          *
@@ -4146,12 +4295,15 @@
            dead channel to tell the controller about it. */
         channel.onclose = function () { controller.transportLost('datachannel_closed'); };
         channel.onerror = function () { controller.transportLost('datachannel_error'); };
-        pc.onconnectionstatechange = function () {
-          if (pc.connectionState === 'failed' || pc.connectionState === 'closed'
-              || pc.connectionState === 'disconnected') {
-            controller.transportLost('peer_' + pc.connectionState);
-          }
-        };
+        /* `disconnected` is a state a connection passes through, not the
+           end of one. See peerWatch. */
+        var peer = peerWatch({
+          graceMs: session.peer_disconnect_grace_ms || 8000,
+          ice: function () { try { return pc.iceConnectionState; } catch (e) { return null; } },
+          emit: function (ev) { if (opts.onEvent) opts.onEvent(ev); },
+          onLost: function (reason) { controller.transportLost(reason); },
+        });
+        pc.onconnectionstatechange = function () { peer.state(pc.connectionState); };
 
         /* The relay and the model are opened together rather than in a line.
            Both are a round trip the driver is waiting through, and they have
@@ -4244,7 +4396,43 @@
               voiceBackend: function () {
                 return controller.state().voice_backend;
               },
+              /* WHAT THE AUDIO SESSION LOOKS LIKE RIGHT NOW. Read by the
+                 page on every visibility change, so the drive log carries
+                 the state of the mouth and the microphone at the moment the
+                 page went away and the moment it came back -- which is the
+                 whole of what "she went quiet when I locked the phone" needs
+                 in order to be answered. */
+              audioState: function () {
+                var t = mic.getTracks()[0] || null;
+                return {
+                  element_paused: !!element.paused,
+                  element_muted: !!element.muted,
+                  element_ready: element.readyState,
+                  has_remote: !!element.srcObject,
+                  mic_muted: t ? !!t.muted : null,
+                  mic_state: t ? t.readyState : null,
+                  peer: pc.connectionState || null,
+                  ice: pc.iceConnectionState || null,
+                  channel: channel.readyState || null,
+                };
+              },
+              /* The page is back, or the interruption is over: give the
+                 element another play() and wake the shared bus. Idempotent
+                 and cheap, so it is called on every return to the front. */
+              resumeAudio: function (why) {
+                replay(why || 'resume');
+                try {
+                  var o = root.RIO && root.RIO.output;
+                  if (o && o.context) {
+                    var c = o.context();
+                    if (c && c.state === 'suspended' && c.resume) c.resume().catch(function () {});
+                  }
+                } catch (e) {}
+              },
               stop: function () {
+                closed = true;
+                if (replayTimer) { root.clearTimeout(replayTimer); replayTimer = null; }
+                peer.stop();
                 controller.stop();
                 if (sink) { try { sink.close(); } catch (e) {} }
                 try { channel.close(); } catch (e) {}
@@ -4294,10 +4482,13 @@
        that is testable without any of the three. */
     _connectBudgets: _connectBudgets,
     _step: step,
+    // The peer-state clock, for tools/page_background_selftest.js.
+    _peerWatch: peerWatch,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = { createController: createController, navStatus: navStatus,
+                       peerWatch: peerWatch,
                        // The connect deadlines, for tools/realtime_selftest.js.
                        // See the export block above for why these are seams.
                        _connectBudgets: _connectBudgets, _step: step,

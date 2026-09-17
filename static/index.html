@@ -3159,6 +3159,20 @@ function stopRec() {
    mid-word. That is not incidental: it is the only reason a continuously open
    microphone is safe to have in a car. */
 let live = null, liveMode = true, liveBusy = false;
+// When the open session opened, so its end can say how old it was.
+let liveSince = 0;
+
+/* EVERY WAY A LIVE SESSION ENDS, SAID SO. Called with the session still up,
+   so the snapshot is of the mouth and microphone as they were, not as stop()
+   leaves them. */
+function reportSessionEnded(reason, extra) {
+  const ev = { type: 'LIVE_SESSION_ENDED', reason: reason,
+               age_s: liveSince ? Math.round((performance.now() - liveSince) / 100) / 10 : null,
+               hidden: document.hidden === true, audio_state: null };
+  try { if (live && live.audioState) ev.audio_state = live.audioState(); } catch (e) {}
+  if (extra) Object.assign(ev, extra);
+  reportLive(ev);
+}
 /* WHICH SESSION AN EVENT BELONGS TO.
  *
  * Ending a conversation is not instantaneous down in rio_realtime.js: stop()
@@ -3377,7 +3391,41 @@ const LIVE_REPORTED = {
   LIVE_BARGE_DEFERRED: 'barge_deferred',
   LIVE_BARGE_MISSED: 'barge_missed',
   LIVE_TURN_SELF: 'turn_self',
+  /* THE SESSION AND THE AUDIO SESSION — why she stopped, when it was not an
+   * answer that stopped.
+   *
+   * On 2026-09-17 the live session ended at 18:36:37.7 and the page went to
+   * the background two seconds later. The log could say neither. The end was
+   * only readable afterwards as a bus_health report that arrived off its
+   * cadence -- the forced closing one stopBusWatch posts -- and the cause of
+   * it (the talk button, a lost transport, a failed connect) was not written
+   * anywhere. Every way a session can end now says so, with how old it was
+   * and what the microphone and the speaker were doing at the time.
+   *
+   *   session_ended      and why: talk_button | transport:<why> | ...
+   *   peer_state         every connectionState transition, with the grace
+   *                      clock when it is `disconnected`
+   *   audio_interrupted  her element paused, or refused to play again
+   *   audio_resumed      ...and played again
+   *   mic_state          the capture track muted, un-muted or ended
+   */
+  LIVE_SESSION_ENDED: 'session_ended',
+  LIVE_PEER_STATE: 'peer_state',
+  LIVE_AUDIO_INTERRUPTED: 'audio_interrupted',
+  LIVE_AUDIO_RESUMED: 'audio_resumed',
+  LIVE_MIC_STATE: 'mic_state',
 };
+
+/* A page-level fact, into the drive log. The FRAMES_* marks, VOICE_TIERS and
+   MAIN_THREAD_STALL each inline this fetch; anything new goes through here. */
+function pageMark(tag, note) {
+  try {
+    if (!(window.RIO && RIO.sessionId)) return;
+    fetch(RIO.url('/session/mark') + '&tag=' + encodeURIComponent(tag)
+          + '&note=' + encodeURIComponent(JSON.stringify(note || {}).slice(0, 700)),
+          { method: 'POST' }).catch(() => {});
+  } catch (e) {}
+}
 
 /* WAS THE CAR APPROACHING A JUNCTION WHEN THIS HAPPENED?
  *
@@ -3484,6 +3532,20 @@ function reportLive(ev) {
           item_id: ev.item_id || null,
           during: ev.during || null,
           yielded: ev.yielded === undefined ? null : ev.yielded,
+          /* Peer, element and microphone state, and whether the page was
+             hidden when it changed -- the question a backgrounded drive asks. */
+          state: ev.state || null,
+          ice: ev.ice || null,
+          was: ev.was || null,
+          grace_ms: ev.grace_ms === undefined ? null : ev.grace_ms,
+          expired: ev.expired === undefined ? null : ev.expired,
+          recovered: ev.recovered === undefined ? null : ev.recovered,
+          age_s: ev.age_s === undefined ? null : ev.age_s,
+          hidden: ev.hidden === undefined ? null : ev.hidden,
+          paused: ev.paused === undefined ? null : ev.paused,
+          muted: ev.muted === undefined ? null : ev.muted,
+          ready_state: ev.ready_state === undefined ? null : ev.ready_state,
+          audio_state: ev.audio_state || null,
           // Where the car was on its route when this happened, if anywhere.
           nav: navContext(),
           // Output-bus health, when that is what is being reported.
@@ -3599,11 +3661,19 @@ async function toggleLive() {
      means there is "end the conversation that has already started", not
      "cancel the connect that has already finished". */
   if (live) {
+    /* THE TALK BUTTON, IN THE LOG. On 2026-09-17 this branch ran at
+       18:36:37.7 -- eight seconds after "Hello.", with her 28 characters into
+       the answer -- and the drive log recorded nothing of it. "Why did she
+       stop talking" for the last four minutes of that drive was answered by
+       reading a bus_health report's timing. A tap is the most ordinary way a
+       session ends and it must be the easiest to see. */
+    reportSessionEnded('talk_button');
     // Spend the generation FIRST, so anything stop() shakes loose on the way
     // out is already disowned by the time it reaches the handler.
     liveGen++;
     live.stop();
     live = null;
+    liveSince = 0;
     stopLiveFrames();
     stopBusWatch();
     setMicState('idle');
@@ -3712,6 +3782,29 @@ async function toggleLive() {
         // obligation attaches to what was shown rather than to which turn won.
         else if (ev.type === 'LIVE_SOURCES') RIO.ui.sources(ev);
         else if (ev.type === 'LIVE_ERROR') console.warn('[live]', ev.error);
+        /* THE SESSION DIED UNDER THE PAGE. The controller has already stopped
+           itself; nothing here did, so the button went on saying "listening"
+           over a closed channel, the bus watch went on reporting a bus
+           carrying nothing, and the next tap "ended" a session that had been
+           dead for minutes. Torn down here, on the next task -- this event is
+           emitted from inside the peer connection's own handler -- and the
+           mic stays in live mode so a tap reconnects rather than recording. */
+        else if (mine && ev.type === 'LIVE_TRANSPORT_LOST') {
+          const why = ev.reason || 'closed';
+          setTimeout(() => {
+            if (gen !== liveGen || !live) return;
+            reportSessionEnded('transport:' + why);
+            liveGen++;
+            try { live.stop(); } catch (e) {}
+            live = null;
+            liveSince = 0;
+            stopLiveFrames();
+            stopBusWatch();
+            setMicState('failed');
+            RIO.ui.voice('idle');
+            obs.textContent = 'Live session lost (' + why + ') — tap to reconnect.';
+          }, 0);
+        }
         else if (mine && ev.type === 'LIVE_RESUME') {
           // Say so on screen. An answer that finishes itself after a warning is
           // a good thing that looks like a glitch if it is never explained.
@@ -3727,10 +3820,12 @@ async function toggleLive() {
        owns the player at this instant, which is exactly why cancelling had to
        forbid a second connect rather than allow one. */
     if (gen !== liveGen) {
+      reportSessionEnded('cancelled_during_connect');
       try { live.stop(); } catch (e) { /* a half-built session is still gone */ }
       live = null;
       return;
     }
+    liveSince = performance.now();
     setMicState('listening');
     RIO.ui.voice('listening');
     // The bus is now carrying her voice. Watch it for the length of the
@@ -3924,7 +4019,15 @@ document.addEventListener('DOMContentLoaded', () => {
    * 5 s gap at the same instant the frames stall, the page froze, and the
    * next question is why (backgrounded tab, iOS throttling, a long task) —
    * none of which is fixable by decoupling two things that were never
-   * coupled. */
+   * coupled.
+   *
+   * WHAT IT FOUND, 2026-09-17: nothing. Eight FRAMES_STALLED across the
+   * drive, every one `inflight:1, ws_open:true, since_result ~4 s`, and this
+   * detector -- deployed and running -- reported no gap at all. The page was
+   * not frozen; one frame was in flight and its result never came back, and
+   * the 118 s the page then spent hidden ran twelve heartbeats and thirteen
+   * hundred frames. So a frame stall of that shape is the frame path waiting
+   * on a result, and is not evidence about the page or the voice. */
   const STALL_TICK_MS = 250;
   const STALL_REPORT_MS = 1000;     // a gap worth a line in the drive log
   let stallLast = performance.now();
@@ -4230,9 +4333,7 @@ document.addEventListener('DOMContentLoaded', () => {
     RIO.videoStream = stream || null;
 
     // Keep the screen awake; a sleeping screen throttles the timer to nothing.
-    try {
-      if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
-    } catch (e) { /* optional */ }
+    await takeWakeLock('drive_start');
 
     document.body.classList.add('driving');
     driveBtn.classList.add('active');
@@ -4329,11 +4430,62 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // If the browser drops the wake lock (tab backgrounded), take it again on return.
+  /* THE WAKE LOCK, IN THE LOG. It is the thing standing between a drive and
+     the phone locking itself; if it was never granted, the page going hidden
+     a minute into a route is the auto-lock and not a mystery. Nothing
+     recorded whether it was held, and the browser releases it silently the
+     moment the page is hidden. */
+  async function takeWakeLock(why) {
+    if (!('wakeLock' in navigator)) { pageMark('WAKE_LOCK', { state: 'unsupported', why }); return; }
+    if (wakeLock) return;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      pageMark('WAKE_LOCK', { state: 'acquired', why });
+      try {
+        wakeLock.addEventListener('release', () => {
+          pageMark('WAKE_LOCK', { state: 'released', hidden: document.hidden === true,
+                                  driving: !!RIO.driving });
+          wakeLock = null;
+        });
+      } catch (e) {}
+    } catch (e) {
+      wakeLock = null;
+      pageMark('WAKE_LOCK', { state: 'denied', why, error: (e && e.name) || String(e) });
+    }
+  }
+
+  /* THE PAGE GOING AWAY AND COMING BACK, WITH THE AUDIO SESSION IN THE SAME
+     LINE. FRAMES_HIDDEN said the page was hidden and nothing else: not
+     whether a live session was up, not whether her element was still
+     playing, not whether the microphone had been muted, not whether the bus
+     had been suspended. The drive of 2026-09-17 went hidden for 118 s and
+     ran at full speed the whole time -- twelve heartbeats, thirteen hundred
+     frames -- with the camera going black at 25 s and the voice session
+     already gone; every one of those facts had to be reconstructed from a
+     different stream. This is the one line. */
+  document.addEventListener('visibilitychange', () => {
+    if (!RIO.driving) return;
+    const note = { state: document.visibilityState, live: !!live,
+                   live_age_s: (live && liveSince)
+                     ? Math.round((performance.now() - liveSince) / 100) / 10 : null,
+                   wake_lock: !!wakeLock, audio: null, bus: null, camera: null };
+    try { if (live && live.audioState) note.audio = live.audioState(); } catch (e) {}
+    try { if (RIO.output && RIO.output.state) note.bus = RIO.output.state().context; } catch (e) {}
+    try {
+      const t = RIO.videoStream && RIO.videoStream.getVideoTracks()[0];
+      if (t) note.camera = { muted: !!t.muted, state: t.readyState };
+    } catch (e) {}
+    pageMark('PAGE_VISIBILITY', note);
+    // Back in front: an interruption may have paused her element and Safari
+    // will not resume it by itself. See resumeAudio.
+    if (document.visibilityState === 'visible' && live && live.resumeAudio) {
+      try { live.resumeAudio('visible'); } catch (e) {}
+    }
+  });
+
   document.addEventListener('visibilitychange', async () => {
     if (document.visibilityState !== 'visible' || !RIO.driving) return;
-    if ('wakeLock' in navigator && !wakeLock) {
-      try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
-    }
+    await takeWakeLock('visible');
     // Coming back is exactly when this page is most likely to be talking to a
     // server that has moved on without it, and its timers have just been
     // throttled for however long it was hidden. Ask straight away rather than

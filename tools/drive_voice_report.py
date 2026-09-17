@@ -252,6 +252,86 @@ def main(argv):
         else:
             print("  %d were already being answered; %d were not"
                   % (len(phantoms) - len(lost), len(lost)))
+    # THE PAGE AND THE SESSION. When she stopped because the session ended
+    # or the page went away, no answer above applies, and before 2026-09-17
+    # the log could not say which of those had happened either.
+    def marks(*tags):
+        out = []
+        for r in rows:
+            p = r.get("payload") or {}
+            if r.get("kind") == "mark" and p.get("tag") in tags:
+                try:
+                    note = json.loads(p.get("note") or "{}")
+                except ValueError:
+                    note = {}
+                out.append((r["t"], p["tag"], note))
+        return out
+
+    started = [r["t"] for r in rows if r.get("kind") == "live"
+               and (r["payload"] or {}).get("event") == "session_started"]
+    ended = kinds("session_ended")
+    lastlive = [r["t"] for r in rows if r.get("kind") == "live"
+                and (r["payload"] or {}).get("event") == "cutoff"]
+    vis = marks("PAGE_VISIBILITY", "FRAMES_HIDDEN", "FRAMES_VISIBLE")
+    wake = marks("WAKE_LOCK")
+    stalls = marks("MAIN_THREAD_STALL")
+    audio = kinds("audio_interrupted", "audio_resumed", "mic_state", "peer_state")
+    endrow = [r for r in rows if r.get("kind") == "session_end"]
+    print("\n--- the page and the session ---")
+    for t in started:
+        print("  %s  voice session started" % hhmmss(t))
+    if ended:
+        for t, p in ended:
+            a = p.get("audio_state") or {}
+            print("  %s  voice session ENDED: %s  (age %ss%s)"
+                  % (hhmmss(t), p.get("reason"), p.get("age_s"),
+                     ", page hidden" if p.get("hidden") else ""))
+            if a:
+                print("            mouth paused=%s mic muted=%s peer=%s"
+                      % (a.get("element_paused"), a.get("mic_muted"), a.get("peer")))
+    elif started:
+        print("  voice session end: NOT RECORDED (session_ended was added "
+              "2026-09-17).")
+        if lastlive:
+            print("  last live event %s -- the end can only be placed after it."
+                  % hhmmss(lastlive[-1]))
+    hidden_at = None
+    for t, tag, note in vis:
+        state = note.get("state") if tag == "PAGE_VISIBILITY" else (
+            "hidden" if tag == "FRAMES_HIDDEN" else "visible")
+        if state != "visible":
+            hidden_at = t
+            extra = ""
+            if tag == "PAGE_VISIBILITY":
+                a = note.get("audio") or {}
+                extra = "  live=%s bus=%s mic_muted=%s mouth_paused=%s wake_lock=%s" % (
+                    note.get("live"), note.get("bus"), a.get("mic_muted"),
+                    a.get("element_paused"), note.get("wake_lock"))
+            print("  %s  page HIDDEN%s" % (hhmmss(t), extra))
+        else:
+            dur = "" if hidden_at is None else " after %.0f s" % (t - hidden_at)
+            hidden_at = None
+            print("  %s  page visible%s" % (hhmmss(t), dur))
+    if vis and not any(tag == "PAGE_VISIBILITY" for _, tag, _ in vis):
+        print("  (FRAMES_* only: the audio-session snapshot on PAGE_VISIBILITY "
+              "was added 2026-09-17)")
+    for t, tag, note in wake:
+        print("  %s  wake lock %s%s" % (hhmmss(t), note.get("state"),
+              (" (" + note["error"] + ")") if note.get("error") else ""))
+    if not wake and started:
+        print("  wake lock: NOT RECORDED (WAKE_LOCK was added 2026-09-17)")
+    if stalls:
+        print("  main-thread stalls: %d (largest %s ms)"
+              % (len(stalls), max(n.get("late_ms") or 0 for _, _, n in stalls)))
+    else:
+        print("  main-thread stalls: none reported by the 250 ms detector")
+    for t, p in audio:
+        print("  %s  %-18s %s%s" % (hhmmss(t), p.get("kind"),
+              p.get("state") or "", "  (page hidden)" if p.get("hidden") else ""))
+    for r in endrow:
+        print("  %s  drive log closed: %s"
+              % (hhmmss(r["t"]), (r["payload"] or {}).get("reason")))
+
     selfs = [r for r in rows if r.get("kind") == "live"
              and (r["payload"] or {}).get("kind") == "turn_self"]
     if selfs:

@@ -1020,7 +1020,14 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                "barge_detected", "barge_deferred", "barge_missed",
                # A transcript that arrived after the answer to it had started.
                # Ordinary; counted so it stops being read as a phantom.
-               "turn_self")
+               "turn_self",
+               # THE PAGE AND THE AUDIO SESSION. On 2026-09-17 the live
+               # session ended at 18:36:37 and the page went to the background
+               # two seconds later, and the log could say neither why the
+               # session ended nor what the microphone and the speaker were
+               # doing when the page went away. These are that record.
+               "session_ended", "peer_state", "audio_interrupted",
+               "audio_resumed", "mic_state")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1092,6 +1099,11 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              "required_db", "guard_ms", "holding_ms",
                              "since_suppress_ms", "item_id", "during",
                              "yielded",
+                             # Peer / element / microphone state, and whether
+                             # the page was hidden when it changed.
+                             "state", "ice", "was", "grace_ms", "expired",
+                             "recovered", "age_s", "hidden", "paused",
+                             "muted", "ready_state", "audio_state",
                              # Where the car was on its route at the time, so
                              # "do cut-offs cluster around maneuvers" is a
                              # query rather than two streams and a wall clock.
@@ -1528,6 +1540,10 @@ def mint_client_secret() -> dict:
         # deadline. See REALTIME_DIRECT_SPEECH_TIMEOUT_MS.
         "direct_speech_timeout_ms":
             int(config.REALTIME_DIRECT_SPEECH_TIMEOUT_MS),
+        # A transient `disconnected` on the peer connection is not a dead
+        # session. See config.REALTIME_PEER_DISCONNECT_GRACE_MS.
+        "peer_disconnect_grace_ms":
+            int(config.REALTIME_PEER_DISCONNECT_GRACE_MS),
     }
 
 
