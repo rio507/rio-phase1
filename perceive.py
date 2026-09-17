@@ -99,7 +99,11 @@ def _query_qwen(pil: Image.Image) -> str:
         {"type": "text", "text": PERCEIVE_PROMPT},
     ]}]
     import torch
+    import vision as _vision
+    t_wait = time.time()
     with lock:
+        _vision.note_holder("perceive")
+        _LAST_LOCK_WAIT["ms"] = (time.time() - t_wait) * 1000.0
         inputs = processor.apply_chat_template(
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
@@ -108,9 +112,18 @@ def _query_qwen(pil: Image.Image) -> str:
             out = model.generate(
                 **inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False
             )
-        return processor.batch_decode(
+        text = processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
+        _vision.clear_holder()
+        return text
+
+
+# How long the last /perceive waited for the Qwen lock, split out of `qwen`
+# so a 45 s call reads as "waited 43 s behind the observer" and not as a
+# generate that took 45 s. The drive of 2026-09-17 had two such calls and the
+# log could not tell those apart.
+_LAST_LOCK_WAIT = {"ms": 0.0}
 
 
 def _downscale(pil: Image.Image):
@@ -252,7 +265,7 @@ def _parse(text: str, width: int, height: int):
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-def perceive(image_bytes: bytes, debug: bool = False) -> dict:
+def perceive(image_bytes: bytes, debug: bool = False, skip_qwen: bool = False) -> dict:
     """One frame -> a caption, the ego corridor, and the lane lines.
 
     Plus `qwen_boxes`: what the model said it saw, as a record beside the
@@ -274,9 +287,17 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "timing_ms": {"total": 0.0},
         }
 
-    raw = _query_qwen(_downscale(pil))
+    _LAST_LOCK_WAIT["ms"] = 0.0
+    if skip_qwen:
+        # THE GEOMETRY WITHOUT THE MODEL. The corridor and the lanes are
+        # deterministic and cost ~10 ms; the caption comes from the observer,
+        # which the endpoint attaches. See app.perceive_endpoint.
+        raw, caption, parsed = None, "", []
+    else:
+        raw = _query_qwen(_downscale(pil))
+        caption, parsed = _parse(raw, width, height)
     t_qwen = time.time()
-    caption, parsed = _parse(raw, width, height)
+    qwen_lock_wait_ms = _LAST_LOCK_WAIT["ms"]
 
     # BGR uint8 for the lane detector: every headway consumer is OpenCV-native.
     frame_bgr = np.ascontiguousarray(np.asarray(pil)[:, :, ::-1])
@@ -340,6 +361,7 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
             "raw": raw,
             "timing_ms": {
                 "qwen": round((t_qwen - t0) * 1000, 1),
+            "qwen_lock_wait": round(qwen_lock_wait_ms, 1),
                 "geometry": round((t_end - t_qwen) * 1000, 1),
                 "total": round((t_end - t0) * 1000, 1),
             },
@@ -363,9 +385,11 @@ def perceive(image_bytes: bytes, debug: bool = False) -> dict:
         "image": {"w": width, "h": height},
         "timing_ms": {
             "qwen": round((t_qwen - t0) * 1000, 1),
+            # How much of `qwen` was waiting for the model lock, not using it.
             "geometry": round((t_end - t_qwen) * 1000, 1),
             "total": round((t_end - t0) * 1000, 1),
         },
+        "skipped_qwen": bool(skip_qwen),
     }
 
 

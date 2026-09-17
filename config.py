@@ -193,6 +193,12 @@ REALTIME_DIRECT_SPEECH_TIMEOUT_MS = 2500
 # peer_state in the drive log.
 REALTIME_PEER_DISCONNECT_GRACE_MS = 8000
 
+# /perceive DEFERS TO THE OBSERVER while headway frames are flowing for the
+# session -- a frame processed inside this many seconds counts as flowing.
+# Measured 2026-09-17: its own Qwen generate went from 2.7 s idle to 21-53 s
+# under the frame loop, holding the model lock and starving the observer.
+PERCEIVE_DEFER_WHILE_FLOWING_S = 4.0
+
 # Channels dictated to the live voice. Per-channel because they are not the
 # same kind of speech: a turn instruction six seconds out and a gap warning
 # that is already late have completely different tolerance for a few hundred

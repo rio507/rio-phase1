@@ -1,90 +1,95 @@
-# Frame path: the headway loop shares the GPU with a 1 Hz Qwen generate
+# Frame path: what shares the card with the headway loop, measured
 
-*Parked 2026-09-17. Finding is complete; the fix needs a measurement first.*
+*2026-09-17. Measured on the pod (H200), against the running server, with
+`tools/frame_contention_probe.py` and `tools/frame_transport_bench.py`.*
 
-## What the drive showed (session 0233da0d, iPhone, 2026-09-17)
+## The drive (session 0233da0d)
 
-Eight `FRAMES_STALLED` across 5.7 minutes, every one the same shape:
-`why:no_frames_sent, inflight:1, ws_open:true, since_result_ms 3.7–4.6 s`.
-The client had one frame out, the socket was open, and no result came back
-for four seconds — so it rebuilt the socket (`FRAMES_WS_LOST` → `_WS_READY`,
-~1 s), dropping the frame in flight and resetting the fps/inflight ramp.
+Eight `FRAMES_STALLED` in 5.7 minutes, every one `inflight:1, ws_open:true,
+since_result ~4 s`; the client rebuilt the socket each time and lost the frame
+in flight. Before seven of the eight, the last processed frame shows the depth
+pass at 375–457 ms against its 7.6 ms median, and the next frame never
+completes — the worker is inside `session.process()` when the client gives up
+and its task is cancelled at close, so no row is ever written for it.
 
-The server side, from the headway rows (4073 frames, `server_ms` p50 18 /
-p90 26 / p99 34):
+The page-side `MAIN_THREAD_STALL` detector reported nothing across all eight:
+the page was not frozen.
 
-| stall (client) | last frame before the gap | its `depth` stage | gap with no rows |
-|---|---|---|---|
-| 18:33:04 | idx 86, server 441 ms | 389 ms | 4.2 s |
-| 18:33:50 | idx 624, server 425 ms | 384 ms | 4.3 s |
-| 18:35:39 | idx 1990, server 612 ms | (decode 471) | 5.0 s |
-| 18:36:22 | idx 2525, server 515 ms | 457 ms | 5.1 s |
-| 18:36:47 | idx 2798, server 413 ms | 378 ms | 5.5 s |
-| 18:37:35 | idx 3410, server 16 ms | — | 5.8 s |
-| 18:38:17 | idx 3888, server 418 ms | 379 ms | 4.8 s |
-| 18:38:35 | idx 4058, server 412 ms | 375 ms | 5.4 s |
+## What the measurements say
 
-The depth pass costs ~7.6 ms on this card. In the frame before each gap it
-costs ~380–460 ms (50×), and the frame after it never completes at all: the
-worker is inside `session.process()` when the client gives up and the task is
-cancelled at close, so no row is ever written for it.
+| condition | headway `server_ms` p50/p99/max | depth max | `/perceive` | observer |
+|---|---|---|---|---|
+| bench alone (no observer) | 28 / 42 / 46 | 15 | — | not running |
+| bench + `/perceive` every 2 s | 28 / 40 / 46 | 15 | **53 s each** | not running |
+| probe: observer live, perceive every 15 s (pre-fix) | 17 / 30 / 445 | **400** | **53 s, 21 s** | **3 ticks / 90 s**, lock wait up to 52.5 s |
+| probe, same, after the fix | 17 / 26 / 453 | 406 | **5 ms** (caption from the observer, ~0.5 s old) | **85 ticks / 90 s**, lock wait 0 |
+| headway frames while the observer's generate runs (post-fix) | 22.5 / 27 / 29 | 13 | | |
 
-`MAIN_THREAD_STALL` (the 250 ms page-side detector) reported nothing across
-all eight. The page was not frozen. The 2026-09-16 attribution — "the page
-not running" — is refuted by the detector built to test it.
+Read across:
 
-## The mechanism
+1. **A Qwen generate does not slow the headway loop.** `/perceive` ran for
+   53 s beside the bench and the loop's p99 did not move. The morning's
+   "observer on the same GPU starves the loop" claim is refuted for the
+   decode phase. The measured tax of the observer generating at the same
+   instant as a frame is ~6 ms (22.5 vs 16.7 ms p50), no spikes.
+2. **`/perceive`'s own generate is pathological under load.** 2.7 s on an
+   idle card; 21–53 s while frames flow (the `SIGUSR1` stack dump shows the
+   thread inside `perceive._query_qwen → generate` the whole time — not
+   waiting on the lock). It holds the model lock for that long, so the
+   observer — RIO's eyes — got 3 ticks in 90 s instead of ~90 and waited up
+   to 52.5 s for the lock; on the drive that is why two `/perceive` calls
+   took 45.7 s and 52.7 s and why `look` answers described old frames.
+3. **The 400 ms depth spike is a prefill on the shared default stream.** In
+   the pre-fix probe both spikes land within 400 ms of a `/perceive` start
+   (768 px image → a burst of large kernels the depth kernels queue behind).
+   The drive's spikes match `/perceive` and `look` starts.
+4. **The teachers did not do it.** Alpamayo and Cosmos are separate
+   processes on this card (18 GB and 23 GB, 3.8 s and 7.1 s generates), the
+   exact shape that would freeze a frame for seconds from outside — but the
+   client pauses them whenever a voice session is live (`paused()` /
+   `TEACHER_PAUSE_DURING_SESSION`), their service logs show no `/infer`
+   during the drive, and the corpus has no rows from today. Caveat: the pause
+   has a TTL (`TEACHER_SESSION_TTL_S` = 180 s) that a 218 s conversation
+   outlives.
+5. **The 4–5 s gap did not reproduce** in three 90 s probe runs (0 gaps,
+   0 late frames). Its cause is not established. Two candidates are now
+   instrumented rather than argued: the event loop freezing (a session-row
+   `write()` on the FUSE volume measured 603 ms once in 1320) and a teacher
+   pass after the pause expired.
 
-* `headway/live.py` takes `_gpu_lock` around lanes, depth and detect. Nothing
-  else takes that lock.
-* `vision.py` holds `_lock` around every Qwen3-VL-8B generate — the observer,
-  `/perceive`, and `look`. That lock is NOT `_gpu_lock`; the two run on the
-  same H200 with no coordination, so a Qwen prefill (a ~100 KB image) is a
-  burst of large kernels the headway kernels queue behind.
-* `OBSERVER_PERIOD_S = 1.0`: while a drive is live the observer runs a
-  generate **every second** (`max_new_tokens 60` at 512 px). `/perceive`
-  runs another every 15 s in headway mode — "only to keep the Perception
-  caption column alive" — and on this drive two of those waited **45.7 s
-  and 52.7 s** in `timing_ms.qwen` (the vision lock queue behind the
-  observer and two `look` calls), five more 2.7–7 s.
-* Four of the eight gaps fall inside a logged long `/perceive`; the others
-  fall inside the observer's cadence, which is not logged per pass.
+## What changed
 
-So: a 1 Hz caption model starves the safety loop it shares a card with, the
-client reads the resulting 4 s wait as a dead pipe, and rebuilds.
+* `/perceive` **defers to the observer while headway frames are flowing**
+  (`PERCEIVE_DEFER_WHILE_FLOWING_S`, 4 s): deterministic geometry only, the
+  caption is the observer's latest with its age, and the observer is started
+  if none is running. Measured: 53 s → 5 ms; observer 3 → 85 ticks / 90 s.
+* Session rows are written by a **writer thread**, never on the event loop;
+  `end_session` flushes before closing.
+* A frame refused for a busy session lock gets `skip busy` instead of a
+  silence that pinned the client's `inflight`.
 
-## What was done now (small, certain)
+## Witnesses added (all in the drive's JSONL)
 
-* `app.py` headway worker: a frame refused because the session lock is busy
-  now gets `{"op":"skip","reason":"busy"}` back. It used to be evicted
-  **silently**, which left the client's `inflight` pinned at 1 — a guaranteed
-  4 s stall on the very next tick.
+* every headway row: `vision_busy` at frame start and `vision_busy_end` at
+  frame end — is the Qwen lock held, by whom (`observe` / `perceive` /
+  `anchor`), for how long;
+* `observer_tick` per generate: duration, `lock_wait_ms`;
+* `/perceive` rows: `timing_ms.qwen_lock_wait`, `caption_source`,
+  `caption_age_s`, `skipped`;
+* `teacher_pass` per teacher inference: service, latency, queue, trigger;
+* `server_loop_stall {late_ms}` from a 250 ms loop-lag task — the server's
+  `MAIN_THREAD_STALL`;
+* `kill -USR1 <pid>` dumps every thread's stack to `uvicorn.log`
+  (`faulthandler`; py-spy cannot attach in this container).
 
-## What is parked, and what would decide it
+## Still open
 
-1. **Client: a late result on an open socket is not a dead pipe.** In
-   `rio_frames.js` `supervise()`, when `stalled()` fires with `mode==='ws'
-   && wsOpen && inflight > 0`, release the inflight slot and keep sending
-   (the server slot is newest-wins and evicts the stale frame) and note
-   `FRAMES_LATE_RESULT`; rebuild only on the existing `no_results`
-   (2×stallMs) branch or a closed socket. Results must be seq-aware so the
-   late result does not release the next frame's slot.
-2. **Server: priority.** The safety loop should not queue behind a caption.
-   Candidate: run lanes/depth/detect on a high-priority CUDA stream
-   (`torch.cuda.Stream(priority=-1)`), so headway kernels are scheduled
-   ahead of Qwen's at kernel boundaries. Must be measured, not assumed:
-   `tools/frame_transport_bench.py --seconds 40 --unshaped` alone, then with
-   a `/perceive` every 2 s, then the same with the stream — compare
-   `server_ms` p99/max and the count of gaps > 1 s in the session JSONL.
-   If it does not move, the alternative is coordination: the observer yields
-   (longer period, or skips a tick) while a headway frame is inside
-   `_gpu_lock`, and `/perceive` is not requested at all in headway mode.
-3. **Witnesses, cheap:** stamp every headway row with `vision_busy` (is the
-   Qwen lock held, and by which caller) so the correlation above is a field
-   rather than a timestamp overlay; split `/perceive`'s `qwen` timing into
-   lock-wait and generate; add a 250 ms event-loop lag task on the server,
-   the counterpart of the page's `MAIN_THREAD_STALL`.
-
-None of this touches the voice path: the realtime session is browser ↔ API,
-the pod's GPU is not in it. Frame contention delays tool answers (a `look`
-took 4.3 s), which delays first audio; it does not stop audio.
+* A residual ~400 ms depth spike, twice per 90 s, with the Qwen lock free at
+  both ends of the frame and no teacher pass. Unexplained; the witnesses
+  above will place it.
+* The client still rebuilds the socket on one late result. The right
+  response is documented in the previous version of this file (release the
+  inflight slot, keep sending, rebuild only on `no_results`); not done.
+* GPU priority for the safety loop (`torch.cuda.Stream(priority=-1)`) was
+  not tried: the measurement says the decode phase is not the problem and
+  the prefill spike is 400 ms, so the case for it is weaker than assumed.

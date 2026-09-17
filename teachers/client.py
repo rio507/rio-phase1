@@ -351,6 +351,25 @@ class TeacherClient:
         reading["queue_ms"] = round((t_send - float(job.get("submitted_at")
                                                     or t_send)) * 1000.0, 1)
         reading["freshness_s"] = round(time.time() - float(job.get("t0") or t_send), 2)
+        # ONE ROW PER PASS, IN THE DRIVE'S LOG. A teacher generate is seconds
+        # of another process's kernels on the same card as the headway loop,
+        # and the pause that keeps it out of a live session has a TTL
+        # (TEACHER_SESSION_TTL_S) that can expire inside a long conversation.
+        # Until this row existed the only record of a pass was a corpus row,
+        # written only once BOTH teachers answered, with no timing.
+        try:
+            key = str(job.get("session_key") or "")
+            if len(key) == 36 and key.count("-") == 4:
+                import sessions as _sessions
+                _sessions.log_live(key, "teacher_pass", {
+                    "service": self.name,
+                    "latency_ms": round((time.time() - t_send) * 1000.0, 1),
+                    "ok": bool(reading.get("ok", True)),
+                    "queue_ms": reading["queue_ms"],
+                    "trigger": job.get("trigger"),
+                })
+        except Exception:
+            pass
         # A reading that cannot be filed is a reading lost, never a worker
         # thread lost. The next keyframe still gets one.
         self._deliver(job, reading)

@@ -9,6 +9,7 @@ the same way.
 """
 
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -62,6 +63,9 @@ def start_session(metadata: Optional[dict] = None) -> str:
 def end_session(session_id: str, reason: str = "closed") -> bool:
     _write(session_id, "session_end", {"reason": reason})
     _last_seen.pop(session_id, None)
+    # The rows queued for this session are written by the writer thread;
+    # the handle is closed only once they are on disk.
+    flush()
     f = _open_handles.pop(session_id, None)
     if f:
         f.close()
@@ -139,6 +143,10 @@ def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, 
         "image": result.get("image", {}),
         "timing_ms": result.get("timing_ms", {}),
         "latency_ms": round(latency_ms, 1),
+        # Where the caption came from, and whether Qwen was skipped for it.
+        "caption_source": result.get("caption_source", "qwen"),
+        "caption_age_s": result.get("caption_age_s"),
+        "skipped": result.get("skipped"),
     })
 
 
@@ -181,6 +189,10 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "voice_reason": result.get("voice_reason"),
         "voice_line": result.get("voice_line"),
         "speed_degraded": result.get("speed_degraded"),
+        # Was the Qwen lock held when this frame started, and by whom. The
+        # field that makes "the model was running" a fact on the row.
+        "vision_busy": result.get("vision_busy"),
+        "vision_busy_end": result.get("vision_busy_end"),
         "tau_bias_s": result.get("tau_bias_s"),
         "confidence": result.get("confidence"),
         "depth_conf": result.get("depth_conf"),
@@ -429,15 +441,66 @@ def is_active(session_id: str) -> bool:
     return session_id in _open_handles
 
 
-def _write(session_id: str, kind: str, payload: dict) -> None:
+# OFF THE EVENT LOOP. Every row used to be written by whoever produced it --
+# for a headway frame that is the socket worker coroutine, ON the loop, with
+# a line-buffered handle on /workspace, which is a FUSE network volume
+# (mfs#us-nc-1.runpod.net). Measured 2026-09-17: one write() in 1320 took
+# 603 ms. A write that stalls there stalls the loop: no frame processed, no
+# result sent, no heartbeat answered, for as long as the volume takes -- which
+# is the shape of the drive's 4-5 s gaps, whether or not it was the cause.
+# So rows go onto a queue and a daemon thread does the writing. Order is
+# preserved per process; nothing is lost unless the queue is full, and that
+# is counted rather than blocked on.
+import queue as _queue
+_ROWS: "_queue.Queue[tuple]" = _queue.Queue(maxsize=20000)
+_DROPPED = {"n": 0}
+
+
+def _write_now(session_id: str, line: str) -> None:
     f = _open_handles.get(session_id)
     if not f:
         # Session not active. Drop the event but keep a breadcrumb in a stray file.
         stray = SESSIONS_DIR / f"stray-{session_id}.jsonl"
         with stray.open("a") as g:
-            g.write(_format(kind, payload) + "\n")
+            g.write(line + "\n")
         return
-    f.write(_format(kind, payload) + "\n")
+    f.write(line + "\n")
+
+
+def _writer_loop() -> None:
+    while True:
+        sid, line = _ROWS.get()
+        try:
+            if sid is None:          # a flush marker: nothing to write
+                continue
+            _write_now(sid, line)
+        except Exception as e:
+            print(f"[sessions] write failed: {type(e).__name__}: {e}", flush=True)
+        finally:
+            _ROWS.task_done()
+
+
+threading.Thread(target=_writer_loop, name="session-writer", daemon=True).start()
+
+
+def _write(session_id: str, kind: str, payload: dict) -> None:
+    line = _format(kind, payload)
+    try:
+        _ROWS.put_nowait((session_id, line))
+    except _queue.Full:
+        _DROPPED["n"] += 1
+        if _DROPPED["n"] in (1, 100, 10000):
+            print(f"[sessions] row queue full, dropped {_DROPPED['n']}", flush=True)
+
+
+def flush(timeout_s: float = 5.0) -> bool:
+    """Wait for every queued row to reach the file. -> True if it did."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _ROWS.unfinished_tasks == 0:
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def _format(kind: str, payload: dict) -> str:

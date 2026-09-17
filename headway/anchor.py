@@ -786,6 +786,11 @@ class LeadAnchor:
             {"type": "text", "text": ANCHOR_PROMPT},
         ]}]
         with lock:
+            try:
+                import vision as _vision
+                _vision.note_holder("anchor")
+            except Exception:
+                pass
             inputs = processor.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt",

@@ -197,6 +197,19 @@ def _reap_abandoned_sessions():
             print(f"[sessions] reaper error: {type(e).__name__}: {e}", flush=True)
 
 
+# WHAT IS EVERY THREAD DOING, RIGHT NOW. `kill -USR1 <pid>` writes every
+# thread's stack to stderr (uvicorn.log). py-spy cannot attach in this
+# container (no SYS_PTRACE), and on 2026-09-17 the question "what held the
+# card while that frame took four seconds" had no way to be asked of the
+# running server at all. This is the way. Costs nothing until asked.
+try:
+    import faulthandler as _faulthandler
+    import signal as _signal
+    _faulthandler.register(_signal.SIGUSR1, all_threads=True, chain=False)
+except Exception as _e:
+    print(f"[diag] faulthandler not registered: {_e}", flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Warm on a daemon thread so uvicorn reports ready immediately. vision._lock
@@ -204,6 +217,28 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=_warm_vision, name="vision-warm", daemon=True).start()
     threading.Thread(target=_reap_abandoned_sessions, name="session-reaper",
                      daemon=True).start()
+    # THE SERVER'S OWN MAIN-THREAD STALL DETECTOR, the counterpart of the page's.
+    # A 250 ms tick that notices it is late says the event loop was not running
+    # -- a blocking write, a GIL convoy, a sync call that should have been in
+    # the threadpool -- and writes that into every active drive's log, so a
+    # frame gap can be laid beside "the loop was frozen for 4 s" as a fact.
+    async def _loop_lag_watch():
+        tick = 0.25
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(tick)
+            now = time.monotonic()
+            late = (now - last - tick) * 1000.0
+            last = now
+            if late >= 500.0:
+                print(f"[loop] event loop late by {late:.0f} ms", flush=True)
+                try:
+                    for sid in list(sessions.active_sessions().keys()):
+                        sessions.log_live(sid, "server_loop_stall",
+                                          {"late_ms": round(late, 1)})
+                except Exception:
+                    pass
+    asyncio.create_task(_loop_lag_watch())
     if teacher_panel is not None:
         try:
             teacher_panel.start()
@@ -1340,7 +1375,42 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
     import time as _t
     _t0 = _t.time()
     image_bytes = await image.read()
-    result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug))
+    # NOT UNDER THE SAFETY LOOP. Measured 2026-09-17 (tools/frame_contention_
+    # probe.py): this endpoint's Qwen generate takes 2.7 s on an idle card and
+    # 21-53 s while the headway loop is feeding the same card, holds the model
+    # lock the whole way, starves the observer for it (3 ticks in 90 s, waits
+    # of 52 s), and its 768 px prefill puts a ~400 ms spike into the depth
+    # pass of whatever frame it lands on. The page asks for this every 15 s in
+    # headway mode "only to keep the Perception caption column alive" -- and
+    # the observer writes that caption every second. So while frames are
+    # flowing the caption is the observer's, with its age, and only the
+    # deterministic geometry is computed here.
+    flowing = headway_live.frames_flowing(session_id or "default",
+                                          float(getattr(config, "PERCEIVE_DEFER_WHILE_FLOWING_S", 4.0)))
+    if flowing:
+        result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug), True)
+        vkey = _visual_key(session_id)
+        rec = {}
+        try:
+            import observer
+            rec = observer.cached(vkey) or {}
+            # A drive with no voice session has no observer running; it is
+            # started here and idles out on its own (OBSERVER_IDLE_S). The
+            # first call answers with an empty caption; the next has one.
+            if not rec:
+                observer.start(vkey)
+            else:
+                observer.touch(vkey)
+        except Exception as e:
+            print(f"[perceive] observer unavailable: {type(e).__name__}: {e}", flush=True)
+        text = (rec.get("text") or "") if isinstance(rec, dict) else ""
+        result["caption"] = text
+        result["observation"] = text
+        result["caption_source"] = "observer"
+        result["caption_age_s"] = rec.get("age_s") if isinstance(rec, dict) else None
+        result["skipped"] = "headway_live"
+    else:
+        result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug))
     sessions.log_perceive(session_id, len(image_bytes), result, (_t.time() - _t0) * 1000)
     return result
 
@@ -1634,6 +1704,13 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
                     return
                 continue
             t0 = time.time()
+            # WHAT ELSE HAD THE CARD when this frame started. Sampled once,
+            # before the models run: the lock is held or it is not, and the
+            # row says so beside the stage timings it may have cost.
+            try:
+                vision_busy = vision.busy()
+            except Exception:
+                vision_busy = None
             session = headway_live.get_session(key, use_qwen=config.VISION_ENABLED)
             # Still taken, and still non-blocking: this worker is serial by
             # construction, so the lock can only be held by the POST path, and
@@ -1681,6 +1758,13 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
             result["queue_ms"] = round((t0 - frame.recv_t) * 1000.0, 1)
             result["server_ms"] = round((done - t0) * 1000.0, 1)
             result["dropped"] = stats["evicted"]
+            result["vision_busy"] = vision_busy
+            # ...and at the END: a generate that starts mid-frame is stamped
+            # on the frame it hit, not missed because it began 5 ms late.
+            try:
+                result["vision_busy_end"] = vision.busy()
+            except Exception:
+                result["vision_busy_end"] = None
 
             if config.VISUAL_QA_ENABLED:
                 try:

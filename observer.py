@@ -161,7 +161,21 @@ def _tick(key, state):
     jpeg = getattr(frame, "jpeg", None)
     if not jpeg:
         return False
+    _t_obs = time.time()
     text = _clean(vision.observe(jpeg, frame_id=getattr(frame, "frame_id", None)))
+    # ONE ROW PER GENERATE, in the drive log. The observer is the only thing
+    # that runs Qwen every second of a drive, and until now no log said when
+    # it ran or how long -- so a frame stall could only be laid beside it by
+    # guessing. `lock_wait_ms` says how much of the tick was queueing.
+    try:
+        import sessions as _sessions
+        _sessions.log_live(_session_id_of(key), "observer_tick", {
+            "ms": round((time.time() - _t_obs) * 1000.0, 1),
+            "lock_wait_ms": round(vision.last_lock_wait_ms(), 1),
+            "chars": len(text or ""),
+        })
+    except Exception:
+        pass
     if not text:
         # Includes the case where the model returned one of its own prompt's
         # examples: vision refuses those outright. Nothing is recorded, so
@@ -181,6 +195,17 @@ def _tick(key, state):
                 print(f"[observer] {key}: not in her voice ({rec['faults']}): "
                       f"{text!r}", flush=True)
     return True
+
+
+def _session_id_of(key):
+    """The drive's session id, if this key is one. app._visual_key hands a
+    drive its own session id as the key and a tab a `client:` key; only the
+    former has a session log to write to, and a wrong id would become a stray
+    file rather than a row."""
+    k = str(key or "")
+    if len(k) == 36 and k.count("-") == 4:
+        return k
+    return None
 
 
 def _loop(key, state):

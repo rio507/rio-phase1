@@ -25,6 +25,35 @@ TEACHER_PROMPT = OBSERVER_PROMPT
 _processor = None
 _model = None
 _lock = threading.Lock()
+# WHO HOLDS THE MODEL, for the drive log. Every caller that takes `_lock`
+# names itself here on the way in and clears it on the way out, so a headway
+# row can say "the Qwen lock was held by the observer when this frame ran"
+# as a field rather than as two timestamps lined up by hand. Best-effort: a
+# name is a hint, the lock is the fact.
+_holder = None
+_held_since = 0.0
+
+
+def busy():
+    """-> {'held': bool, 'holder': str|None, 'held_ms': float|None}"""
+    held = _lock.locked()
+    return {"held": held, "holder": _holder if held else None,
+            "held_ms": round((time.time() - _held_since) * 1000.0, 1)
+                       if held and _held_since else None}
+
+
+def note_holder(name):
+    global _holder, _held_since
+    _holder = name
+    _held_since = time.time()
+
+
+def clear_holder():
+    global _holder, _held_since
+    _holder = None
+    _held_since = 0.0
+
+
 _last_observation = ""
 # WHEN that observation was made, and of what. The cache used to be a bare
 # string, which was fine while its only reader asked "what did she last see"
@@ -98,14 +127,25 @@ def _downscale(pil, max_side: int):
                       Image.BILINEAR)
 
 
+# How long the last observe() waited for the lock before it could start.
+_last_lock_wait_ms = 0.0
+
+
+def last_lock_wait_ms() -> float:
+    return _last_lock_wait_ms
+
+
 def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
     """Run VLM on a new frame, cache + return the observation."""
-    global _last_observation, _last_observed_at, _last_observed_frame
+    global _last_observation, _last_observed_at, _last_observed_frame, _last_lock_wait_ms
     if not config.VISION_ENABLED:
         return ""
     if max_side is None:
         max_side = config.OBSERVER_MAX_SIDE_PX
+    t_wait = time.time()
     with _lock:
+        note_holder("observe")
+        _lock_wait_ms = (time.time() - t_wait) * 1000.0
         _ensure_loaded()
         pil = _downscale(Image.open(io.BytesIO(image_bytes)).convert("RGB"),
                          max_side)
@@ -134,10 +174,13 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
             if _parroted in (1, 10, 100):
                 print(f"[vision] observation refused -- prompt example verbatim "
                       f"({_parroted} so far): {text!r}", flush=True)
+            clear_holder()
             return ""
         _last_observation = text
         _last_observed_at = time.time()
         _last_observed_frame = frame_id
+        _last_lock_wait_ms = _lock_wait_ms
+        clear_holder()
         return text
 
 

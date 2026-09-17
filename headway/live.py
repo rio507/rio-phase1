@@ -807,6 +807,21 @@ def get_session(key: str, use_qwen: bool = True) -> LiveSession:
         return s
 
 
+def frames_flowing(key: str, within_s: float = 4.0) -> bool:
+    """Has this session processed a frame in the last `within_s` seconds?
+
+    The question /perceive asks before it runs Qwen. Measured 2026-09-17:
+    a /perceive generate that takes 2.7 s on an idle card takes 21-53 s while
+    the headway loop is feeding this card frames, holds the model lock the
+    whole way, and starves the observer -- RIO's eyes -- for the duration.
+    While frames are flowing the observer is the one Qwen consumer there is
+    room for, and the caption column is served from it instead.
+    """
+    with _sessions_lock:
+        s = _sessions.get(key)
+        return bool(s) and (time.time() - s.last_used) <= within_s
+
+
 def reset_session(key: str) -> bool:
     with _sessions_lock:
         return _sessions.pop(key, None) is not None
