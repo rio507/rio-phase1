@@ -999,7 +999,19 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                # A transcript that was not a driver turn: her own voice back
                # through the speaker, or speech the barge gate never confirmed.
                # The number that says whether the echo loop is closed.
-               "turn_phantom", "bus_health")
+               "turn_phantom", "bus_health",
+               # WHY SHE STOPPED TALKING, where the tally had nothing to say.
+               # Not cut-offs: an answer the API refused was never started, and
+               # a deterministic line that could not get the mouth is not an
+               # answer at all. Counted beside them so a drive's silence is
+               # accounted for without being blamed on the barge gate.
+               "response_failed", "response_retry",
+               "dictation_refused", "dictation_failed", "direct_speech_failed",
+               "orphan_silenced", "resume_failed", "voice_fallback",
+               "session_error", "transport_lost",
+               # ...and the opposite of all of them: she made a sound, and how
+               # long the driver waited for it.
+               "spoke")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1043,7 +1055,31 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # they said the bus was fine -- which was true and
                              # was not the question. Concealment, jitter depth
                              # and clock drift are the question.
-                             "audio")})
+                             "audio",
+                             # WHICH STEP THE CONNECT DIED ON. The browser has
+                             # been sending these since connect_failed existed
+                             # and this filter has been dropping all three, so
+                             # the event that was added to say WHY a session
+                             # never opened arrived saying only that one had
+                             # not. mint | mic | voice | offer | negotiate |
+                             # answer, with the error and the backend it was
+                             # talking to.
+                             "step", "error", "backend",
+                             # The API's own refusal, and the retry it names.
+                             "code", "message", "retrying", "after_ms",
+                             # Two deterministic lines and one mouth: what was
+                             # refused, and what was holding it.
+                             "holder", "holder_started", "holder_age_ms",
+                             "channel",
+                             # Turn end -> first audio, per kind of line.
+                             "turn_kind", "wait_ms", "create_ms", "asked_ms",
+                             # A refused transcript that was already being
+                             # answered is not a lost question.
+                             "self_answered",
+                             # Where the car was on its route at the time, so
+                             # "do cut-offs cluster around maneuvers" is a
+                             # query rather than two streams and a wall clock.
+                             "nav")})
         _cutoffs["recent"].append(rec)
         if len(_cutoffs["recent"]) > _CUTOFF_RECENT_MAX:
             _cutoffs["recent"] = _cutoffs["recent"][-_CUTOFF_RECENT_MAX:]

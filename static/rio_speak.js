@@ -252,6 +252,18 @@
        those two moments is the whole of this bug. */
     var dictationStarted = false;
     function noteDictationStart() { dictationStarted = true; }
+    /* WHICH DICTATION IS OURS, so stop() can give the mouth back.
+       Handed over synchronously by the session inside speak(), because the
+       arbiter can supersede a line in the same tick it started it. */
+    var dictationToken = 0;
+    function noteDictationToken(tok) { dictationToken = tok; }
+    function dictateOpts() {
+      return { timeoutMs: budget(), onStart: noteDictationStart,
+               onToken: noteDictationToken,
+               // Which channel this line belongs to, so the drive log can say
+               // whether a nav line or a warning was the one that was slow.
+               channel: opts.channel || null, callType: opts.callType || null };
+    }
 
     function text() { return (opts.text || '').trim(); }
 
@@ -365,8 +377,7 @@
       return current.play().catch(function (e) {
         if (stopped) return;
         if (dictate) {
-          return live.speak(text(), { timeoutMs: budget(),
-                                      onStart: noteDictationStart })
+          return live.speak(text(), dictateOpts())
             .then(function (r) { record('dictated'); return r; })
             .catch(function (err) { return fallback(err && err.message); });
         }
@@ -379,8 +390,7 @@
         if (stopped) return Promise.resolve();
         if (opts.clipFirst && opts.clipUrl) return clipThenMouth();
         if (!dictate) return fallback('no_session');
-        return live.speak(text(), { timeoutMs: budget(),
-                                    onStart: noteDictationStart })
+        return live.speak(text(), dictateOpts())
           .then(function (r) { record('dictated'); return r; })
           .catch(function (e) {
             // Dictation did not start in time, the session went away, or it was
@@ -391,8 +401,31 @@
       stop: function () {
         stopped = true;
         if (current && current.abort) current.abort();
-        // A dictation in flight is cancelled by the arbiter's own pre-emption
-        // of the item that owns it; nothing to do here but stop the fallback.
+        /* AND THE DICTATION, WHICH NOTHING ELSE WAS CANCELLING.
+         *
+         * This used to say that a dictation in flight is cancelled by the
+         * arbiter's own pre-emption of the item that owns it. It is not. The
+         * arbiter pre-empts by calling exactly this function, so "the arbiter
+         * does it" resolved to "nobody does it", and a superseded line went on
+         * holding the session's single dictation slot until its own budget ran
+         * out.
+         *
+         * What that cost, on the drive of 2026-09-17: a route started, the
+         * depart call was dictated, the near call for the same maneuver
+         * superseded it 26 ms later, and the near call's own `live.speak` was
+         * refused `busy` by the line it had just replaced. No clip exists for
+         * a sentence naming a road, so it went silent -- "Turn left onto
+         * Palisades Dr.", 150 m and 4.8 s from the junction.
+         *
+         * `stopped` is set FIRST, so the rejection this cancel provokes lands
+         * in fallback() and returns quietly there. A line the arbiter took
+         * away is not a silence to report: it was superseded, the arbiter has
+         * already said so, and the line that replaced it is the one that
+         * matters now. */
+        if (dictationToken && live && live.cancelSpeak) {
+          try { live.cancelSpeak(dictationToken, 'superseded'); } catch (e) {}
+          dictationToken = 0;
+        }
       },
     };
   }

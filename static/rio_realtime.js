@@ -679,6 +679,15 @@
     var counters = { responses: 0, interrupted: 0, barge_ins: 0,
                      tool_calls: 0, tool_failures: 0,
                      dictated: 0, dictation_failures: 0,
+                     /* A deterministic line the mouth could not take, and one
+                        the caller took back. `dictation_refused` is contention
+                        -- a second line arriving while the first still holds
+                        the single dictation slot -- and on the drive of
+                        2026-09-17 exactly one of these was the junction call
+                        that never got said. `dictation_cancelled` is the other
+                        half of the same fault, now that superseding a line
+                        actually releases the mouth it was holding. */
+                     dictation_refused: 0, dictation_cancelled: 0,
                      // Barge-ins absorbed before they cost anything: the
                      // detector fired, RIO went quiet, the noise stopped
                      // inside the sustain window and she carried straight on.
@@ -801,6 +810,15 @@
       : function () { return Date.now(); };
 
     var lastTranscript = '';
+    /* The instant the detector said the driver had finished. Paired with the
+       first audio of the answer in `noteFirstAudio`. */
+    var turnEndAt = 0;
+    /* Responses already reported as having made a sound. One event per
+       response, not one per delta. */
+    var firstAudioSeen = {};
+    var firstAudioIds = [];
+    // Set by tryResume, claimed by the response it asked for.
+    var resumeExpected = false;
     /* What she has said so far in the response now playing, accumulated from
        the audio transcript deltas. This is what a resume carries: without it
        the continuation is a guess, and a model asked to continue from a guess
@@ -1183,6 +1201,66 @@
      *
      * Two gates, and the first one is the load-bearing one.
      */
+    /* SHE MADE A SOUND — and how long the driver waited for it.
+     *
+     * Emitted once per response, on the first transcript delta, which is the
+     * earliest evidence that audio is on its way out of the speaker. Three
+     * clocks, because "slow" means a different thing for each kind of line:
+     *
+     *   wait_ms    turn end to first audio. THE number: what the driver
+     *              actually experienced, across the tool call, the model and
+     *              the network. Only meaningful for a line that answers a
+     *              question, so it is null for anything the driver did not ask
+     *              for -- a turn call is not late because nobody spoke first.
+     *   create_ms  the response opening to first audio: the session's own
+     *              share of that wait, with the driver's timing taken out.
+     *   asked_ms   for a dictated or direct line, how long from asking for it
+     *              to hearing it. This is the number the speak budgets are
+     *              set against, and until now nothing recorded whether they
+     *              were right.
+     *
+     * The kind matters as much as the number: an answer, a warning read
+     * verbatim, a vetted line spoken straight, and a resumed half-answer have
+     * four different acceptable latencies and used to be one undifferentiated
+     * silence in the log. */
+    function noteFirstAudio(responseId) {
+      if (!responseId || firstAudioSeen[responseId]) return;
+      firstAudioSeen[responseId] = 1;
+      firstAudioIds.push(responseId);
+      /* Bounded, and small: this is a dedupe set for responses that are alive
+         now, not a record of the drive. */
+      while (firstAudioIds.length > 32) delete firstAudioSeen[firstAudioIds.shift()];
+      var at = Date.now();
+      var kind = 'conversation';
+      var asked = 0;
+      var channel = null;
+      if (dictation && dictation.responseId === responseId) {
+        kind = 'dictation'; asked = dictation.at || 0;
+        channel = dictation.channel || null;
+      } else if (directSpeech && directSpeech.realId === responseId) {
+        kind = 'direct'; asked = directSpeech.at || 0;
+      } else if (speaking && speaking.responseId === responseId
+                 && speaking.resumed) {
+        kind = 'resume';
+      }
+      var opened = (speaking && speaking.responseId === responseId)
+        ? speaking.startedAt : 0;
+      emit('LIVE_SPOKE', {
+        response_id: responseId,
+        turn_kind: kind,
+        channel: channel,
+        turn: turnSeq,
+        /* A turn call answers nobody, so "how long since the driver stopped
+           talking" is not a wait it can be judged on. Null rather than a
+           large number, so an average over a drive stays an average of
+           answers. */
+        wait_ms: (kind === 'conversation' || kind === 'direct' || kind === 'resume')
+                 && turnEndAt ? Math.round(at - turnEndAt) : null,
+        create_ms: opened ? Math.round(at - opened) : null,
+        asked_ms: asked ? Math.round(at - asked) : null,
+      });
+    }
+
     function noteSaid(text) {
         if (!text) return;
         var at = now();
@@ -1432,6 +1510,9 @@
        does not claim the mouth (its caller already holds it, at its own
        priority) and it does not enter the conversation history. */
     var dictation = null;
+    /* One per dictated line, so a caller that started one can cancel THAT one
+       and nothing else. See speak()/cancelSpeak. */
+    var dictationSeq = 0;
     /* A vetted line being spoken by the SESSION rather than by a synthesiser.
        Only ever set under the speech-to-speech backend; see speakDirect. */
     var directSpeech = null;
@@ -1523,12 +1604,44 @@
        Both, always: cancelling generation alone leaves whatever is in the
        output buffer to play out from under a warning. */
     function cancelGeneration() {
-      /* A directly-spoken line has no response behind it to cancel. Sending
-         `response.cancel` with nothing generating is answered with an error
-         event, which is a real error in the log for a thing that worked. */
-      if (!(speaking && speaking.direct)) {
-        try { send({ type: 'response.cancel' }); } catch (e) {}
+      /* A directly-spoken line has no response behind it to cancel -- IN TEXT
+         MODE. Sending `response.cancel` with nothing generating is answered
+         with an error event, which is a real error in the log for a thing that
+         worked.
+       *
+       * UNDER SPEECH-TO-SPEECH THE SAME LINE IS A RESPONSE, and that is the
+       * half this used to get wrong. There is no sink to push words into, so
+       * speakDirect reaches injectDirect, which creates a real out-of-band
+       * response and reads the line through it. Skipping the cancel there does
+       * not leave "nothing generating" -- it leaves the model producing a line
+       * whose mouth has just been taken away, audible underneath the turn call
+       * that pre-empted it, with its own audio still queued in the output
+       * buffer. And when the direct budget then expires, its recovery
+       * `response.create` fires a fresh conversational answer roughly two and
+       * a half seconds behind the warning.
+       *
+       * So the test is not "is this direct" but "is there a response behind
+       * it": cancel by id where injectDirect has one, disown it where the id
+       * has not arrived yet (the orphan path, exactly as the budget's own
+       * timeout does), and stay quiet only where there is genuinely nothing to
+       * cancel. */
+      var oob = (speaking && speaking.direct) ? directSpeech : null;
+      if (!(speaking && speaking.direct) || oob) {
+        var oobId = oob ? oob.realId : null;
+        /* Not yet bound to a response: the create is still in flight and the
+           response that lands belongs to nobody. Marked so it is silenced on
+           sight rather than claiming the mouth. `orphanOutOfBand` is
+           incremented by finish() below, which owns that bookkeeping. */
+        if (oob && !oobId) silenceOrphan = true;
+        try {
+          send(oobId ? { type: 'response.cancel', response_id: oobId }
+                     : { type: 'response.cancel' });
+        } catch (e) {}
         try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        /* Told it was pre-empted rather than merely failed, because the two
+           want opposite things: a line that never started is worth asking for
+           again, and one that was outranked by a turn call is not. */
+        if (oob) { try { oob.finish(false, 'preempted'); } catch (e) {} }
       }
       /* The same two things, on the other side of the mouth: stop the words
          being produced, and throw away the sound already made from them. In
@@ -1582,6 +1695,10 @@
       pendingResume = null;
       resumeChain++;
       counters.resumed++;
+      /* The next response to open is this resume. Consumed in beginResponse
+         so the latency of a resumed half-answer is not read as the latency of
+         an answer to a question nobody asked twice. */
+      resumeExpected = true;
       emit('LIVE_RESUME', { cause: r.cause, said: r.said });
       try {
         send({
@@ -1735,10 +1852,11 @@
         endResponse(speaking.responseId);
       }
       var entry = { responseId: responseId, resolve: null, cancelled: false,
-                    direct: !!opts.direct,
+                    direct: !!opts.direct, resumed: resumeExpected,
                     // For the onset guard: when the response opened, and (set
                     // on the first transcript delta) when she began speaking.
                     startedAt: Date.now(), audioAt: 0 };
+      resumeExpected = false;
       speaking = entry;
       counters.responses++;
       partial = '';
@@ -2281,6 +2399,16 @@
      */
     function speechStopped() {
       speechActive = false;
+      /* WHEN THE DRIVER STOPPED TALKING -- the start of the only latency
+         measurement that describes what the drive felt like.
+       *
+       * "She takes ages to answer" is a stopwatch from the end of the
+       * question to the first sound of the answer, and until this clock
+       * existed the drive log had neither end of it. It had tool durations,
+       * which are a component and not the number: a `look` that took 4.3 s is
+       * not the same fact as a driver waiting 6 s in silence, and on the drive
+       * of 2026-09-17 the log could state the first and not the second. */
+      turnEndAt = Date.now();
       // The detector got there on its own, which is the ordinary case and the
       // one the backstop must never pre-empt.
       stopBackstop();
@@ -2410,6 +2538,21 @@
           speaking: !!(speaking && !speaking.cancelled),
           said_chars: (saidSoFar() || '').length,
           since_audio_ms: Math.round(now() - lastAudioAt),
+          /* WAS IT ANSWERED ANYWAY? The difference between a lost question and
+             a harmless one, and the log could not tell them apart.
+           *
+           * A refused transcript whose response already exists -- same
+           * item_id, created by the server when the utterance was committed --
+           * is being answered as these words arrive. It is not a new turn and
+           * does not supersede, which is all the gate refused; nothing was
+           * lost. A refused transcript WITHOUT one goes to the noise buffer
+           * and is answered two seconds later, apologised for, or dropped.
+           *
+           * The drive of 2026-09-17 logged eleven phantoms, every one of them
+           * a real question the driver asked out loud, and reading that tally
+           * honestly meant cross-checking each against the fragment events
+           * that did not follow it. Written down instead. */
+          self_answered: selfAnswered,
         });
         real = false;
       }
@@ -2672,7 +2815,7 @@
     function injectDirect(line, release, onSpoken) {
       return new Promise(function (resolve) {
         var d = { line: line, realId: null, started: false, timer: null,
-                  onSpoken: onSpoken };
+                  onSpoken: onSpoken, at: Date.now() };
         d.finish = function (okay, why) {
           if (directSpeech !== d) return;
           directSpeech = null;
@@ -2689,8 +2832,18 @@
                question answered late instead of not at all -- the same
                recovery the mouth-was-busy branch makes. Nothing was written
                into the history claiming she spoke, because that is written
-               from `started` and this line never started. */
-            try { send({ type: 'response.create' }); } catch (e) {}
+               from `started` and this line never started.
+             *
+             * ...EXCEPT WHEN SOMETHING MORE URGENT TOOK THE MOUTH. The
+             * recovery exists for a line that never got out at all. A line
+             * pre-empted by a turn call was not lost, it was OUTRANKED, and
+             * the arbiter has already given the mouth to the warning. Asking
+             * for a response here puts a conversational answer underneath
+             * that warning and -- on the direct budget -- roughly two and a
+             * half seconds after the driver stopped hearing it. */
+            if (why !== 'preempted') {
+              try { send({ type: 'response.create' }); } catch (e) {}
+            }
           }
           release();
           resolve(okay);
@@ -3070,6 +3223,7 @@
                recognising her own voice on the way back in, and a nav line
                echoes exactly as readily as an answer does. */
             noteSaid(ev.delta || '');
+            noteFirstAudio(ev.response_id);
             if ((!dictation || dictation.responseId !== ev.response_id)
                 && (!directSpeech || directSpeech.realId !== ev.response_id)) {
               partial += (ev.delta || '');
@@ -3175,12 +3329,48 @@
            waiting out the dictation budget would cost a warning most of a
            second for no reason at all. */
         if (sink) return Promise.reject(new Error('text_mode'));
-        if (dictation) return Promise.reject(new Error('busy'));
+        /* THE MOUTH IS ALREADY DICTATING SOMETHING ELSE, and this is the
+         * refusal that cost a junction on the drive of 2026-09-17.
+         *
+         * There is one dictation slot, and until cancelSpeak existed nothing
+         * outside this file could give it back. So when the arbiter superseded
+         * the depart call with the near call for the same maneuver -- 26 ms
+         * apart, the ordinary shape of a route starting -- the depart line's
+         * `stop()` did not release the slot, the near line arrived here, was
+         * refused `busy`, had no clip of its own to fall back to, and went
+         * silent. "Turn left onto Palisades Dr.", 150 m and 4.8 s from the
+         * junction, never said.
+         *
+         * The refusal itself stays: two lines cannot share one mouth. What is
+         * new is that it is REPORTED, with the line that is holding the slot
+         * named, so a silence on the road is readable afterwards as contention
+         * rather than as the mouth having stopped working. */
+        if (dictation) {
+          counters.dictation_refused++;
+          emit('LIVE_DICTATION_REFUSED', {
+            text: line, reason: 'busy',
+            holder: dictation.text, holder_started: !!dictation.started,
+            holder_age_ms: Math.round(Date.now() - dictation.at),
+          });
+          return Promise.reject(new Error('busy'));
+        }
+        /* WHICH DICTATION THIS IS, so the caller can take it back.
+           The slot is single and global; a token is what lets `stop()` on the
+           item that started THIS line cancel it without any chance of
+           cancelling the line that replaced it. */
+        var token = ++dictationSeq;
         return new Promise(function (resolve, reject) {
           dictation = {
             text: line, resolve: resolve, reject: reject, started: false,
             responseId: null, transcript: '', onStart: opts.onStart, timer: null,
+            token: token, at: Date.now(), channel: opts.channel || null,
           };
+          /* Handed over synchronously, inside the executor, because the
+             arbiter can supersede this line in the same tick it started it --
+             which is exactly what a route beginning does. */
+          if (typeof opts.onToken === 'function') {
+            try { opts.onToken(token); } catch (e) {}
+          }
           dictation.timer = setTimeout(function () {
             /* NEVER HEARD IT START -- AND IT IS STILL COMING.
              *
@@ -3219,6 +3409,51 @@
             finishDictation('send_failed');
           }
         });
+      },
+
+      /* GIVE THE MOUTH BACK, NOW — the other half of speak().
+       *
+       * THE FAULT THIS CLOSES. rio_speak's `stop()` carried a comment saying a
+       * dictation in flight is cancelled by the arbiter's own pre-emption of
+       * the item that owns it. It is not: the arbiter's `stopCurrent` calls
+       * exactly that `stop()`, and `stop()` cancelled only the clip. So a
+       * superseded or pre-empted line went on holding the single dictation
+       * slot for the rest of its budget -- up to 2500 ms for a depart call --
+       * and every line that landed in that window was refused `busy`. One
+       * mouth, held by a line nobody was listening for any more.
+       *
+       * Cancelling is the same pair of moves the budget's own timeout makes,
+       * and they split on whether the response exists yet:
+       *
+       *   BOUND    cancel it BY ID and clear the output buffer. Naming it
+       *            matters -- a bare `response.cancel` cancels whatever is
+       *            active, which a moment later is the line that replaced
+       *            this one.
+       *   UNBOUND  the create is still in flight and the response that lands
+       *            belongs to nobody. Disowned through the orphan path, so it
+       *            is silenced on sight instead of claiming the mouth and
+       *            reading out a turn the car has already taken.
+       *
+       * Either way `finishDictation` frees the slot SYNCHRONOUSLY, which is
+       * what lets the arbiter start the replacement line in the same tick --
+       * the tick it already starts it in.
+       *
+       * The token is checked rather than trusted: by the time a slow caller
+       * gets round to stopping, the slot may hold a different line, and
+       * cancelling that one would turn one missed call into two. */
+      cancelSpeak: function (token, reason) {
+        if (!dictation) return false;
+        if (token && dictation.token !== token) return false;
+        var rid = dictation.responseId;
+        if (!rid) { silenceOrphan = true; orphanOutOfBand++; }
+        try {
+          send(rid ? { type: 'response.cancel', response_id: rid }
+                   : { type: 'response.cancel' });
+        } catch (e) {}
+        try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        counters.dictation_cancelled++;
+        finishDictation(reason || 'cancelled');
+        return true;
       },
 
       /* TIER 2: ElevenLabs is not answering at all, and RIO takes her own
@@ -3863,6 +4098,15 @@
                  turns and health announcements come through here; each of
                  them already holds the mouth at its own priority. */
               speak: function (text, o) { return controller.speak(text, o); },
+              /* ...and give it back. The arbiter takes the mouth away from a
+                 line by calling `stop()` on the item that owns it, and until
+                 this was reachable from there the line went on holding the
+                 session's single dictation slot to the end of its own budget
+                 -- so the line that replaced it was refused `busy` and, with
+                 no clip of its own, went silent. */
+              cancelSpeak: function (token, reason) {
+                return controller.cancelSpeak(token, reason);
+              },
               speechEnabled: function (channel) {
                 if (session.speech_enabled === false) return false;
                 var chans = session.speech_channels || {};

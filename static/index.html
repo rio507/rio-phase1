@@ -3319,7 +3319,66 @@ const LIVE_REPORTED = {
   // whole point of reporting it: the fix is visible in /realtime/cutoffs as
   // one tally going up while the other goes to zero.
   LIVE_ECHO_SUPPRESSED: 'echo_suppressed',
+  /* WHY SHE STOPPED TALKING — the half of that question the log could not
+   * answer, added after the drive of 2026-09-17.
+   *
+   * Everything above this line describes an answer that was CUT OFF. None of
+   * it describes an answer that was refused, a deterministic line that could
+   * not get the mouth, or a session that erred — and those are three of the
+   * five things the driver hears as "her voice cut out". They were all being
+   * emitted by the controller and none of them was being reported, so the
+   * drive log's answer to "why did she go quiet" was an absence, and an
+   * absence reads the same whatever caused it.
+   *
+   *   response_failed     the API refused the response outright. This is where
+   *                       the token-per-minute ceiling lands, and it is the
+   *                       one cause the tally was explicitly asked for and
+   *                       could not produce: with a retry armed it emitted
+   *                       LIVE_RESPONSE_FAILED and reported NOTHING, so a
+   *                       rate-limited drive and a healthy one left the same
+   *                       mark.
+   *   dictation_refused   two deterministic lines, one mouth. The junction
+   *                       call that went silent on 2026-09-17 is this event,
+   *                       and it did not exist to be logged.
+   *   spoke               she made a sound, and how long the driver waited.
+   */
+  LIVE_RESPONSE_FAILED: 'response_failed',
+  LIVE_RESPONSE_RETRY: 'response_retry',
+  LIVE_DICTATION_REFUSED: 'dictation_refused',
+  LIVE_DICTATION_FAILED: 'dictation_failed',
+  LIVE_DIRECT_SPEECH_FAILED: 'direct_speech_failed',
+  LIVE_ORPHAN_SILENCED: 'orphan_silenced',
+  LIVE_RESUME_FAILED: 'resume_failed',
+  LIVE_VOICE_FALLBACK: 'voice_fallback',
+  LIVE_ERROR: 'session_error',
+  LIVE_TRANSPORT_LOST: 'transport_lost',
+  LIVE_SPOKE: 'spoke',
 };
+
+/* WAS THE CAR APPROACHING A JUNCTION WHEN THIS HAPPENED?
+ *
+ * "Do the cut-offs cluster around maneuvers" is a question about every event
+ * in the log, not about the nav events, and answering it from the log of
+ * 2026-09-17 meant lining two streams up by wall clock and guessing. Asked
+ * here, once, for everything reported: the nav state is in this page and the
+ * controller has no business knowing about it.
+ *
+ * Null when there is no route, which is itself the answer for most of a drive.
+ */
+function navContext() {
+  try {
+    if (!(window.RIO && RIO.nav && RIO.nav.route)) return null;
+    const st = RIO.nav.state ? RIO.nav.state() : null;
+    if (!st) return { route: true };
+    return {
+      route: true,
+      maneuver_id: st.maneuver_id || null,
+      maneuver_state: st.maneuver_state || null,
+      to_maneuver_m: st.to_maneuver_m === undefined ? null : st.to_maneuver_m,
+      tta_s: st.tta_s === undefined ? null : st.tta_s,
+    };
+  } catch (e) { return null; }
+}
 
 function reportLive(ev) {
   const kind = ev && LIVE_REPORTED[ev.type];
@@ -3369,6 +3428,30 @@ function reportLive(ev) {
           n: ev.n === undefined ? null : ev.n,
           span_ms: ev.span_ms === undefined ? null : ev.span_ms,
           since_reply_ms: ev.since_reply_ms === undefined ? null : ev.since_reply_ms,
+          /* THE API REFUSED IT, and with which code. `rate_limit_exceeded`
+             here is the token-per-minute ceiling — the cause a drive tally
+             was asked for and had no way to name. */
+          code: ev.code || null,
+          message: ev.message || null,
+          retrying: ev.retrying === undefined ? null : ev.retrying,
+          after_ms: ev.after_ms === undefined ? null : ev.after_ms,
+          /* TWO LINES, ONE MOUTH: what was refused, and what was holding the
+             mouth when it was refused. Without the holder a `busy` says only
+             that something was in the way. */
+          holder: ev.holder || null,
+          holder_started: ev.holder_started === undefined ? null : ev.holder_started,
+          holder_age_ms: ev.holder_age_ms === undefined ? null : ev.holder_age_ms,
+          channel: ev.channel || null,
+          /* HOW LONG THE DRIVER WAITED, and for what kind of line. */
+          turn_kind: ev.turn_kind || null,
+          wait_ms: ev.wait_ms === undefined ? null : ev.wait_ms,
+          create_ms: ev.create_ms === undefined ? null : ev.create_ms,
+          asked_ms: ev.asked_ms === undefined ? null : ev.asked_ms,
+          // A refused transcript that was already being answered is not a
+          // lost question. See LIVE_TURN_PHANTOM.
+          self_answered: ev.self_answered === undefined ? null : ev.self_answered,
+          // Where the car was on its route when this happened, if anywhere.
+          nav: navContext(),
           // Output-bus health, when that is what is being reported.
           covered: ev.covered === undefined ? null : ev.covered,
           context: ev.context || null,

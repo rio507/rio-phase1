@@ -859,12 +859,20 @@ section('the fallback chain — a warning never waits on a cloud call');
     const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
                                  ttsUrl: '/headway_voice?line=too_close',
                                  element: b.element });
-    await src.play();
-    ok(speak.stats().last === 'tts',
-       'with NO session, it falls straight through to the synthesiser — a '
-       + 'warning does not depend on a conversation being open');
-    ok(b.played.some(p => p.indexOf('/headway_voice') >= 0),
-       'through the endpoint that already existed');
+    /* THE SYNTHESISER TIER IS GONE, and this is where that shows.
+       It used to sit between dictation and the clip and, on 2026-09-16, read
+       turn calls out in a second voice underneath RIO. A warning with no
+       session and no clip is now a reported SILENCE -- which is worse for
+       this one line and better for the driver, because the alternative was a
+       second mouth that could talk over a safety line. The lines that must
+       not be missed are exactly the ones that have clips. */
+    let refused = false;
+    await src.play().catch(() => { refused = true; });
+    ok(speak.stats().last === 'silent' && refused,
+       'with NO session and no clip, the line is silent and says so — the '
+       + 'synthesiser tier that used to catch it was a second voice');
+    ok(!b.played.some(p => p.indexOf('/headway_voice') >= 0),
+       'and nothing is synthesised behind her back');
   }
 
   {
@@ -874,9 +882,9 @@ section('the fallback chain — a warning never waits on a cloud call');
     const src = speak.provider({ text: 'Turn left by the Shell station.',
                                  channel: 'nav', ttsUrl: '/nav/voice?x=1',
                                  element: b.element });
-    await src.play();
-    ok(speak.stats().last === 'tts',
-       'a channel switched off falls back too, session or no session');
+    await src.play().catch(() => {});
+    ok(speak.stats().last === 'silent',
+       'a channel switched off goes silent too, session or no session');
   }
 
   {
@@ -887,9 +895,10 @@ section('the fallback chain — a warning never waits on a cloud call');
     const src = speak.provider({ text: 'You\'re too close.', channel: 'headway',
                                  ttsUrl: '/headway_voice?line=too_close',
                                  element: b.element });
-    await src.play();
-    ok(speak.stats().last === 'tts',
-       'dictation that times out falls back rather than going silent');
+    await src.play().catch(() => {});
+    ok(speak.stats().last === 'silent',
+       'dictation that times out with no clip under it is a silence, and is '
+       + 'counted as one');
   }
 
   {
@@ -904,8 +913,8 @@ section('the fallback chain — a warning never waits on a cloud call');
                                  element: b.element });
     await src.play();
     ok(speak.stats().last === 'clip',
-       'and when the synthesiser is unreachable too, the pre-rendered clip '
-       + 'plays — no network left in the path');
+       'and the pre-rendered clip catches it — no network left in the path, '
+       + 'and the lines that cannot be missed are the ones that have clips');
     ok(b.played.some(p => p.indexOf('too_close.mp3') >= 0), 'from the local file');
   }
 
@@ -1081,8 +1090,16 @@ section('the clip bypass is untouched');
      'the red tier still plays its preloaded element directly, with no provider '
      + 'and no network in the path');
   const health = fs.readFileSync(path.join(__dirname, '..', 'static', 'rio_health.js'), 'utf8');
-  ok(health.indexOf("ttsUrl: clip ? null :") >= 0,
-     'and a health clip line is given no synthesiser url at all, so it cannot '
+  /* STRONGER THAN IT USED TO BE, and asserted against the file rather than
+     against one spelling of it. This used to look for `ttsUrl: clip ? null :`
+     -- a health line withholding the synthesiser only when it had a clip.
+     The synthesiser tier is gone, so rio_health names no ttsUrl at all, and
+     the old string stopped existing while the invariant it stood for got
+     wider. A test that looks for deleted code fails for the opposite of the
+     reason it was written. Matched as a PROPERTY KEY: the file still names
+     the option in the comment explaining why it does not pass one. */
+  ok(!/ttsUrl\s*:/.test(health),
+     'and a health line is given no synthesiser url at all, so it cannot '
      + 'wait on one');
 }
 

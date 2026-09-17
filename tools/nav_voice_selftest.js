@@ -152,18 +152,32 @@ async function runLines(session, label) {
   const dead = await runLines(null, 'no session');
   ok(dead.stats.dictated === 0,
      `with no live session nothing is dictated (${dead.stats.dictated})`);
-  ok(dead.stats.tts === NAV_LINES.length,
-     `and all ${NAV_LINES.length} come out of the synthesiser `
-     + `(${dead.stats.tts}) — in Ava, which is the complaint`);
+  /* WHAT THE COMPLAINT WOULD SOUND LIKE TODAY. When this test was written the
+     eleven lines came out of the synthesiser, in Ava, which is what the drive
+     of 2026-09-16 reported. That tier has since been removed -- a second mouth
+     can talk over a safety line, and it did -- so the same broken session now
+     produces eleven SILENCES, each with `no_session` recorded against it.
+     The diagnosis is unchanged and is still the point of this file: the voice
+     was never the fault, the missing session was. */
+  ok(dead.stats.tts === 0,
+     `and none of them reaches a second voice (${dead.stats.tts}) — the `
+     + `synthesiser tier that made this sound like a voice bug is gone`);
+  ok(dead.stats.silent === NAV_LINES.length,
+     `all ${NAV_LINES.length} are silent instead (${dead.stats.silent}), which `
+     + `is the same fault heard differently`);
   ok(dead.reasons.length === 0 || dead.reasons.every(r => r === 'no_session'),
      `every one of them for the same reason: no_session `
      + `(${JSON.stringify(dead.reasons.slice(0, 2))})`);
 
-  section('a session that is too slow still falls back — but says so');
+  section('a session that is too slow gives up — and says so');
   const slow = await runLines(fakeSession({ slowerThanBudget: true }), 'slow');
-  ok(slow.stats.tts === NAV_LINES.length,
-     `a dictation that misses its budget is synthesised (${slow.stats.tts}) — `
-     + `a line at a junction is never held for a voice that is not ready`);
+  ok(slow.stats.tts === 0,
+     `a dictation that misses its budget is not handed to a second voice `
+     + `(${slow.stats.tts}) — that is what read turn calls out under her`);
+  ok(slow.stats.silent === NAV_LINES.length,
+     `it is given up on and reported (${slow.stats.silent}) — a line at a `
+     + `junction is never HELD for a voice that is not ready, which is the `
+     + `half of this that has not changed`);
   ok(slow.stats.dictated === 0, 'and is not counted as hers');
 
   section('the dictation path does no local GPU work — the teachers are not in it');
