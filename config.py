@@ -10,6 +10,18 @@ from dotenv import load_dotenv
 # still calls it, and the first call wins.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# WHERE CHROMIUM IS, for any process that never went through a shell.
+#
+# The browser the two playwright suites drive lives on the persistent volume
+# (/workspace/.cache/ms-playwright) rather than in ~/.cache, so that a pod
+# rebuild does not take it. boot.sh exports this and /workspace/env.sh sets it,
+# but a tool run straight out of an editor, a cron entry or an agent has been
+# through neither -- and playwright's failure mode is to exit 2 with an install
+# hint, which in a long suite run reads almost exactly like a pass.
+#
+# setdefault, so an explicitly chosen value always wins.
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/workspace/.cache/ms-playwright")
+
 # RIO prompts now sourced from rio_prompts.py (compiled from behavior bible v1)
 from rio_prompts import RIO_SYSTEM_PROMPT
 

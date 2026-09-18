@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Alpamayo 1.5, behind a socket.
 
-    /opt/teachers/venvs/alpamayo/bin/python -m teachers.service.alpamayo_service \
+    /workspace/teachers/venvs/alpamayo/bin/python -m teachers.service.alpamayo_service \
         --port 8801 --precision bf16
 
 RUN IT WITH THE ALPAMAYO VENV AND NOTHING ELSE. It needs Python 3.12,

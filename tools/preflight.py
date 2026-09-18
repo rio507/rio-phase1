@@ -194,10 +194,15 @@ def check_detector():
 
 
 def check_browser():
-    head("playwright + chromium (boot.sh step 5d) — the suites that were never run")
-    fix = ("pip install --no-cache-dir playwright && "
-           "python -m playwright install-deps chromium && "
-           "python -m playwright install chromium")
+    # Importing config is what points this at the volume when the shell did
+    # not -- see the setdefault there. Stated in the heading, because "which
+    # browser did it find" is the question when a suite that passed yesterday
+    # cannot start today.
+    import config  # noqa: F401
+    browsers = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "~/.cache/ms-playwright")
+    where = "volume" if str(browsers).startswith("/workspace") else "CONTAINER"
+    head(f"playwright + chromium (boot.sh step 5d) — {browsers} [{where}]")
+    fix = ("bash /workspace/rio-phase1/boot.sh   # step 5d, onto the volume")
 
     # WHY THIS IS HERE AT ALL. On 2026-09-09 both browser suites had been
     # unrunnable on this pod for as long as anyone had been asking for "the
@@ -517,7 +522,8 @@ def check_teachers():
               "       Nothing below is required for a drive; it is what a "
               "collection\n"
               "       session would need. docs/teacher_panel.md")
-    venvs = Path("/opt/teachers/venvs")
+    from teachers import paths as _tpaths
+    venvs = Path(_tpaths.VENVS["alpamayo"]).parent.parent.parent
     src = Path("/workspace/teachers/src")
 
     for name, mods in (("alpamayo", ("torch", "transformers", "alpamayo1_5")),

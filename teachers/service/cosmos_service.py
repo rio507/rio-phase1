@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Cosmos-Reason2-8B, behind a socket.
 
-    /opt/teachers/venvs/cosmos/bin/python -m teachers.service.cosmos_service \
+    /workspace/teachers/venvs/cosmos/bin/python -m teachers.service.cosmos_service \
         --port 8802 --precision bf16
 
 RUN IT WITH THE COSMOS VENV. transformers 4.57.3 and torch 2.9 -- a different

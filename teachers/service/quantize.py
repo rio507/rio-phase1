@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """FP8, by NVIDIA's recipe — for both teachers, from one file.
 
-    /opt/teachers/venvs/<venv>/bin/python -m teachers.service.quantize \
+    /workspace/teachers/venvs/<venv>/bin/python -m teachers.service.quantize \
         --model cosmos --out /workspace/teachers/fp8
 
 WHY THIS EXISTS WHEN THE PANEL RUNS BF16

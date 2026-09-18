@@ -14,16 +14,47 @@
 #
 #   bash /workspace/boot.sh
 #
-# A COMPLETELY FRESH POD STARTS WITH ONE COMMAND:
+# A COMPLETELY FRESH POD IS ONE COMMAND AND ABOUT FIVE MINUTES:
+#
+#   bash /workspace/rio-phase1/boot.sh
+#
+# That is everything -- and on a pod whose volume came back, almost all of it
+# is already there. What a fresh container actually pays for, measured on this
+# pod on 2026-09-18:
+#
+#   python environment: requirements.txt, torch cu128,
+#     rfdetr, scipy, playwright wheels                        210 s
+#   apt (ffmpeg nano git tmux) and the browser's apt half      ~30 s
+#   lane + detector weights, and the detector smoke check       24 s
+#   uvicorn up and answering /health                            16 s
+#   preflight                                                   31 s
+#   ------------------------------------------------------------------
+#   about five and a half minutes, and Qwen3-VL finishes warming
+#   ~40 s after that
+#
+# The same run on a pod whose container is merely being re-provisioned --
+# nothing to download, everything already where it was left -- was measured at
+# 96 s end to end on 2026-09-18.
+#
+# ...and what it pays NOTHING for, because the volume kept it: the repo, the
+# 16 GB of Qwen weights, the lane and detector weights, node, npm, Claude Code,
+# chromium, and the teacher environments. The single biggest change is what is
+# no longer here at all: the two teacher services are out of the live stack
+# (see step 5e), so a fresh pod no longer builds 14 GB of environments or waits
+# for two 8-to-10B models to load into 38 GB of VRAM.
+#
+# Every step times itself and the run ends with a table of where the time went,
+# in /workspace/boot.log -- so the next fresh pod reports its own number rather
+# than trusting this comment.
+#
+# JUST THE ENVIRONMENT, without the provisioning:
 #
 #   bash /workspace/rio-phase1/boot.sh bootstrap
 #
-# That is the cheap half -- the python environment, node, claude, tmux, the
-# PATH file, and :8888 taken back from whatever the template left on it -- and
-# it is what a pod needs before it can run ANY of this repository, including
-# the rest of this script. `bash boot.sh` with no argument runs it first and
-# then does everything else. See "WHAT SURVIVES A POD REBUILD" below for what
-# it puts where, and why the venv exists at all.
+# The python environment, node, claude, tmux, the PATH file, and :8888 taken
+# back from whatever the template left on it. It is what a pod needs before it
+# can run ANY of this repository, including the rest of this script, and the
+# full run does it first as step 0.
 #
 # JUST BOUNCING THE SERVER? Do not reach for pkill -- it kills the shell that
 # runs it, which is explained at length above rio_pids() below. Use:
@@ -90,6 +121,20 @@ VENV_UVICORN="$VENV/bin/uvicorn"
 NODE_DIR=/workspace/node
 NODE_VERSION=${RIO_NODE_VERSION:-22.11.0}
 
+# CHROMIUM ON THE VOLUME. playwright's default is ~/.cache/ms-playwright, which
+# is the container layer, so the browser went with every rebuild and the two
+# suites that need it -- the shared audio bus and its unlock, and the mobile
+# layout -- were unrunnable until someone re-ran the install. It is 130 MB
+# against the volume's spare terabytes, and it is the difference between a
+# fresh pod that can verify itself and one that cannot.
+#
+# Named here and exported into $ENV_FILE, and config.py defaults the same value
+# for any python process that never saw a shell -- because a browser suite that
+# cannot find its browser exits 2 with an install hint, which reads like a pass
+# at a glance.
+PLAYWRIGHT_DIR=/workspace/.cache/ms-playwright
+export PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_DIR"
+
 # $PY and $PIP are what every step below invokes, and they are the VENV's --
 # never a bare `python`, which means whatever the caller's PATH happens to say
 # and, on a fresh pod, means an interpreter with none of this project's
@@ -111,6 +156,54 @@ exec > >(tee -a "$BOOT_LOG") 2>&1
 printf '\n===== boot.sh %s (pid %s) =====\n' "$(date -Is)" "$$"
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# WHERE THE TIME WENT — measured on the pod, printed at the end
+# ---------------------------------------------------------------------------
+# "How long does a fresh pod take?" was, until now, answerable only as somebody
+# remembering. It is the question that decides whether a rebuild is a coffee or
+# an evening, and it changes every time a step is added or removed -- most
+# recently by 28 GB of teacher environments leaving. So each step says how long
+# it took, in a log that survives the pod, and the summary at the end is the
+# answer with no arithmetic.
+#
+# `step` replaces `log` for anything in the provisioning body: same heading,
+# plus a stopwatch.
+STEP_TIMES=()
+STEP_NAME=""
+STEP_T0=0
+BOOT_T0=$(date +%s)
+
+_step_close() {
+    local now
+    now=$(date +%s)
+    [ -n "$STEP_NAME" ] && STEP_TIMES+=("$((now - STEP_T0))|$STEP_NAME")
+    STEP_NAME=""
+}
+
+step() {
+    _step_close
+    STEP_NAME="$*"
+    STEP_T0=$(date +%s)
+    log "$*"
+}
+
+step_summary() {
+    _step_close
+    local row secs name total
+    total=$(( $(date +%s) - BOOT_T0 ))
+    log "where the time went"
+    for row in ${STEP_TIMES[@]+"${STEP_TIMES[@]}"}; do
+        secs=${row%%|*}; name=${row#*|}
+        # Only the steps worth a line. A list where twelve rows say 0 s buries
+        # the two that say 300.
+        [ "$secs" -ge 2 ] && printf "   %5s s  %s\n" "$secs" "$name"
+    done
+    printf "   %5s s  TOTAL  (%s min)\n" "$total" "$(( (total + 30) / 60 ))"
+    echo "   Steps under 2 s are not listed. Times are this pod, this network,"
+    echo "   and this volume's warm caches -- which is the point: a fresh pod"
+    echo "   reading this log is reading its own number, not an estimate."
+}
 
 # ---------------------------------------------------------------------------
 # WHAT SURVIVES A POD REBUILD, AND WHAT DOES NOT
@@ -165,8 +258,12 @@ fs_kind() {
 
 persistence_report() {
     echo "   Only /workspace survives a pod rebuild. VOLUME rows come back on their"
-    echo "   own; CONTAINER rows are re-made by \`bash boot.sh\` -- and the first four"
-    echo "   of them by \`bash boot.sh bootstrap\` alone."
+    echo "   own; CONTAINER rows are re-made by \`bash boot.sh\`."
+    echo
+    echo "   There are three CONTAINER rows left, and all three are apt or a line"
+    echo "   in a file apt owns. Everything that is expensive to fetch or slow to"
+    echo "   build -- the python environment, node, Claude Code, chromium, the"
+    echo "   weights, and the teacher environments -- is on the volume now."
     echo
     printf '   %-9s  %-7s  %-31s  %s\n' WHERE STATE PATH WHAT
     local spec path what state
@@ -182,7 +279,7 @@ persistence_report() {
         "$BOOT_LOG|every run of this script, oldest first" \
         "$TEACHERS_ROOT|ON DEMAND: teacher checkouts, fp8, uv cache" \
         "$TEACHERS_VENVS|ON DEMAND: teacher envs, built by boot.sh teachers" \
-        "$HOME/.cache/ms-playwright|chromium, for the two browser selftests" \
+        "$PLAYWRIGHT_DIR|chromium, for the two browser selftests" \
         "$HOME/.bashrc|the one line that sources $ENV_FILE" \
         "/usr/bin/tmux|tmux -- run the slow half of boot.sh inside it" \
         "/usr/bin/ffmpeg|apt: ffmpeg (audio muxing), nano, git" \
@@ -232,6 +329,9 @@ write_env_file() {
 #   . $ENV_FILE
 #
 export HF_HOME=$HF_HOME_DIR
+# Chromium for the browser selftests, on the volume rather than in ~/.cache,
+# so it survives a pod rebuild like everything else that is expensive to fetch.
+export PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_DIR
 
 # The two directories holding the things that RUN this repo, both on the
 # volume: the venv's bin (python, pip, uvicorn) and node's (node, npm, npx,
@@ -871,14 +971,15 @@ rio_wait_healthy() {
 #                               volume: they are ~50 MB and re-cloning them on
 #                               every pod start is a network dependency at boot
 #                               for no benefit.
-#   /opt/teachers/venvs         the environments. CONTAINER LAYER, deliberately,
-#                               and rebuilt by this script -- unlike RIO's own
-#                               environment, which moved to $REPO/.venv on the
-#                               volume in step 0. These two are ~14 GB EACH and
-#                               they are derived from a lockfile; the volume's
-#                               quota is better spent on weights, and a teacher
-#                               that is missing costs a shadow column, not a
-#                               drive.
+#   /workspace/teachers/venvs   the environments, ON THE VOLUME since
+#                               2026-09-18 -- 13.9 GB together, hardlinked out
+#                               of the uv cache beside them, so a pod that was
+#                               rebuilt can serve teachers without building
+#                               anything. See teachers/paths.py for why that
+#                               reasoning inverted.
+#   /workspace/teachers/pythons uv's standalone interpreters, with them: a venv
+#                               on the volume whose python is in the image is
+#                               dead weight the moment the pod comes back.
 #   $HF_HOME                    the weights, on the volume, like Qwen3-VL's.
 #   /workspace/teachers/fp8     the FP8 checkpoints, on the volume, because
 #                               regenerating one takes 20 minutes and the L40S
@@ -888,8 +989,13 @@ rio_wait_healthy() {
 # did before the panel existed: /health reports them degraded, the Teachers
 # card says which one is not answering, and nothing else changes.
 TEACHERS_ROOT=/workspace/teachers
-TEACHERS_VENVS=/opt/teachers/venvs
-TEACHERS_LOGS=/opt/teachers/logs
+# ON THE VOLUME, and teachers/paths.py is where that decision is written down
+# and why. The short version: boot.sh no longer builds these, so a rebuild is
+# somebody waiting; they are 13.9 GB against the 75 GB of uv cache that existed
+# to make rebuilding them fast; and on the same filesystem as that cache, uv
+# hardlinks them out of it rather than copying.
+TEACHERS_VENVS="$TEACHERS_ROOT/venvs"
+TEACHERS_LOGS="$TEACHERS_ROOT/logs"
 # uv's DOWNLOAD AND UNPACK CACHE, ON THE VOLUME. Not a tidiness preference:
 # the container layer is 60 GB and the two teacher environments are ~28 GB of
 # it, so there is no room left on it for uv to also keep an unpacked copy of
@@ -903,9 +1009,20 @@ TEACHERS_LOGS=/opt/teachers/logs
 # On the volume it also survives a pod rebuild, so `teachers-build` after a
 # restart is a copy rather than a 28 GB download.
 export UV_CACHE_DIR="$TEACHERS_ROOT/uv-cache"
-# ...and so is the ephemeral environment a PEP-723 script resolves into, which
-# is a separate directory uv places beside the cache.
-export UV_LINK_MODE=copy
+# UV_LINK_MODE is deliberately NOT forced to "copy" any more: that was for a
+# cache on the volume and venvs in the container layer, which hardlinks cannot
+# cross. Both live on the volume now, so uv's default hardlinking applies and
+# the venvs cost almost nothing beyond the cache that was already there.
+#
+# THAT CACHE IS 75 GB, and with the venvs beside it it is no longer buying
+# much: it exists to make a rebuild fast, and there is now nothing to rebuild
+# on a fresh pod. It is safe to delete and it will refill itself the next time
+# `teachers-build` genuinely has to resolve something:
+#
+#   rm -rf /workspace/teachers/uv-cache
+#
+# Left in place rather than deleted by this script, because 75 GB is not a
+# thing a boot script should decide to throw away on somebody's behalf.
 ALPAMAYO_REPO=https://github.com/NVlabs/alpamayo1.5.git
 ALPAMAYO_SHA=36aeb4c5938cbc2eb2aed33b22434773da4ab639
 COSMOS_REPO=https://github.com/nvidia-cosmos/cosmos-reason2.git
@@ -980,8 +1097,30 @@ teachers_clone() {
     done
 }
 
+# A teacher environment is BUILT when it imports what the service imports --
+# not when a bin/python exists there.
+#
+# The difference is not academic: moving these onto the volume landed
+# TEACHERS_VENVS on top of an abandoned attempt from 2026-09-10, whose
+# bin/python ran perfectly and whose site-packages were empty. The existence
+# test said "built", the build was skipped, and `boot.sh teachers` would then
+# have started a service that dies on `import alpamayo1_5` -- which is a
+# failure that reads as a crashed model rather than a missing install. This is
+# the same lesson as bootstrap_venv's "prove it runs before trusting it", one
+# layer up: prove it imports.
+teacher_env_ok() {
+    local py="$TEACHERS_VENVS/$1/bin/python" mods
+    [ -x "$py" ] || return 1
+    case "$1" in
+        alpamayo) mods="torch, transformers, alpamayo1_5" ;;
+        cosmos)   mods="torch, transformers" ;;
+        *)        return 1 ;;
+    esac
+    "$py" -c "import $mods" > /dev/null 2>&1
+}
+
 teachers_build() {
-    log "teacher environments (isolated, container layer)"
+    log "teacher environments (isolated, on the volume, built on demand)"
     export PATH="$HOME/.local/bin:$PATH"
     if ! command -v uv > /dev/null 2>&1; then
         echo "   installing uv"
@@ -990,13 +1129,16 @@ teachers_build() {
     fi
     teachers_clone || return 1
     mkdir -p "$TEACHERS_VENVS" "$TEACHERS_LOGS"
-    # Copy rather than hardlink (set with UV_CACHE_DIR above): the cache and
-    # the venvs are on different filesystems, and hardlinks do not cross that.
-    export UV_PYTHON_INSTALL_DIR=/opt/teachers/pythons
+    # --clear on both `uv venv` calls below: uv refuses to write into an
+    # existing environment, and this code only runs when teacher_env_ok has
+    # already said the one that is there does not import what it must. An
+    # abandoned venv from 2026-09-10 sat exactly there and turned the rebuild
+    # into "error: A virtual environment already exists".
+    export UV_PYTHON_INSTALL_DIR="$TEACHERS_ROOT/pythons"
     mkdir -p "$UV_CACHE_DIR"
     echo "   uv cache: $UV_CACHE_DIR ($(du -sh "$UV_CACHE_DIR" 2>/dev/null | cut -f1))"
 
-    if [ ! -x "$TEACHERS_VENVS/alpamayo/bin/python" ]; then
+    if ! teacher_env_ok alpamayo; then
         echo "   building alpamayo env (python 3.12, torch 2.8)"
         # --no-install-package flash-attn: flash-attn compiles from source
         # against nvcc and takes half an hour. The upstream README documents
@@ -1014,7 +1156,7 @@ teachers_build() {
         # in its own PEP-723 environment now for that reason; only the small
         # runtime half belongs here.
         ( cd "$TEACHERS_ROOT/src/alpamayo1.5" \
-          && uv venv --python 3.12 "$TEACHERS_VENVS/alpamayo" \
+          && uv venv --clear --python 3.12 "$TEACHERS_VENVS/alpamayo" \
           && VIRTUAL_ENV="$TEACHERS_VENVS/alpamayo" uv sync --active \
                --no-install-package flash-attn \
           && uv pip install -q --python "$TEACHERS_VENVS/alpamayo/bin/python" \
@@ -1026,12 +1168,12 @@ teachers_build() {
         'import torch,transformers;print("torch",torch.__version__,"tf",transformers.__version__)' \
         2>/dev/null || echo 'NOT BUILT')"
 
-    if [ ! -x "$TEACHERS_VENVS/cosmos/bin/python" ]; then
+    if ! teacher_env_ok cosmos; then
         echo "   building cosmos env (python 3.12, torch 2.9)"
         # No vendor package: Cosmos-Reason2 is a Qwen3-VL architecture and
         # loads through plain transformers. The cosmos-reason2 checkout is here
         # for its quantization recipe and its prompts, not for inference.
-        ( uv venv --python 3.12 "$TEACHERS_VENVS/cosmos" \
+        ( uv venv --clear --python 3.12 "$TEACHERS_VENVS/cosmos" \
           && uv pip install -q --python "$TEACHERS_VENVS/cosmos/bin/python" \
                --extra-index-url https://download.pytorch.org/whl/cu128 \
                --index-strategy unsafe-best-match \
@@ -1084,8 +1226,7 @@ teacher_weights() {
 teachers_start() {
     log "teacher services (shadow — on demand)"
     mkdir -p "$TEACHERS_LOGS"
-    if [ ! -x "$TEACHERS_VENVS/alpamayo/bin/python" ] \
-       || [ ! -x "$TEACHERS_VENVS/cosmos/bin/python" ]; then
+    if ! teacher_env_ok alpamayo || ! teacher_env_ok cosmos; then
         echo "   environments are missing — building them first (~28 GB, from"
         echo "   $UV_CACHE_DIR if it is warm, which makes it a copy)"
         teachers_build || return 1
@@ -1300,6 +1441,7 @@ trap 'printf "\n!! boot.sh was INTERRUPTED (signal). The pod is PARTIALLY\n"; \
 # land that will still be there tomorrow. This is the same `bash boot.sh
 # bootstrap` a fresh pod is told to run on its own, it is idempotent, and on a
 # pod that has already had it it costs seconds.
+step "bootstrap (step 0)"
 bootstrap || {
     echo
     echo "!! bootstrap failed. Nothing below this line can work without it, so"
@@ -1315,7 +1457,7 @@ bootstrap || {
 # re-downloads all 16GB of Qwen3-VL-8B on every pod start. Step 0 has already
 # written it into $ENV_FILE and sourced it; this states it again for this
 # script's own children, which is the same reason rio_start states it.
-log "HF_HOME -> $HF_HOME_DIR"
+step "HF_HOME -> $HF_HOME_DIR"
 export HF_HOME="$HF_HOME_DIR"
 mkdir -p "$HF_HOME_DIR"
 
@@ -1339,7 +1481,7 @@ mkdir -p "$HF_HOME_DIR"
 # apt's nodejs is version 12 in the container layer, reinstalled on every boot;
 # $NODE_DIR is a current one that survives the rebuild, and it brings npm,
 # which apt's nodejs does not and which is how Claude Code gets here.
-log "apt packages (ffmpeg nano git)"
+step "apt packages (ffmpeg nano git)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends ffmpeg nano git
@@ -1356,7 +1498,7 @@ apt-get install -y -qq --no-install-recommends ffmpeg nano git
 # below this line runs $PY. bootstrap_venv is stamped with the hash of
 # requirements.txt, so a re-run is a no-op and a changed requirements.txt is a
 # real install.
-log "python dependencies"
+step "python dependencies"
 echo "   $("$VENV_PY" -V 2>&1) at $VENV_PY"
 echo "   requirements.txt installed there by step 0"
 
@@ -1369,22 +1511,42 @@ echo "   requirements.txt installed there by step 0"
 # afterwards and wins. --force-reinstall (not plain install) because pip
 # considers 2.11.0 already-satisfied and would no-op on a re-run of this script
 # after a partial/mixed install.
-log "torch cu128 force-reinstall"
+# ...AND IT IS SKIPPED WHEN IT IS ALREADY DONE. The force-reinstall exists
+# because pip's metadata can say 2.11.0 over a half-installed tree, so the
+# question is asked of the RUNTIME instead: the right version, and a CUDA
+# context that actually initialises. That is a stronger test than pip's, and it
+# takes ~3 GB of download off every re-run of this script while leaving a cold
+# pod paying exactly what it paid before.
+step "torch cu128"
+if "$VENV_PY" - <<'PY'
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (torch.__version__ == "2.11.0+cu128"
+               and torch.cuda.is_available()) else 1)
+PY
+then
+    echo "   already torch 2.11.0+cu128 with a working CUDA runtime — skipped"
+else
+echo "   installing torch 2.11.0+cu128 (~3 GB)"
 "$PIP" install --no-cache-dir --force-reinstall \
     torch==2.11.0+cu128 \
     torchvision==0.26.0+cu128 \
     torchaudio==2.11.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
+fi
 
 # The torch wheels are ~3GB; the cache is on the container layer but the disk
 # pressure is real during install.
-log "pip cache purge"
+step "pip cache purge"
 "$PIP" cache purge || true
 
 # ---------------------------------------------------------------------------
 # 5. GPU sanity
 # ---------------------------------------------------------------------------
-log "GPU sanity"
+step "GPU sanity"
 "$PY" - <<'PY'
 import torch
 print(f"  torch        : {torch.__version__}")
@@ -1410,7 +1572,7 @@ PY
 # Deliberately NOT fatal: without it headway falls back to the static trapezoid
 # corridor and logs corridor_source=static, which is the pre-UFLDv2 behaviour.
 # A pod that comes up with no lane model should still come up.
-log "UFLDv2 lane weights"
+step "UFLDv2 lane weights"
 "$PY" -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headway will use the static corridor"
 
 # ---------------------------------------------------------------------------
@@ -1437,7 +1599,7 @@ log "UFLDv2 lane weights"
 # lead AND for the visual conversation's scene graph (docs/visual_qa.md), so a
 # missing scipy is a pod where the gap warnings never fire and RIO cannot see
 # anything to talk about. The smoke check below is what catches it.
-log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
+step "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
 "$PIP" install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
 "$PIP" install --no-cache-dir --no-deps scipy
 # Both of the next two run `python -m` / import from the repo, so they need the
@@ -1446,7 +1608,7 @@ log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
 # was too late to help them.
 cd "$REPO"
 
-log "RF-DETR weights"
+step "RF-DETR weights"
 "$PY" -m tools.fetch_detector_weights || log "  !! detector weights unavailable - headway will have no candidates"
 
 # Prove the two things that have actually broken here before, while the log is
@@ -1455,7 +1617,7 @@ log "RF-DETR weights"
 #     and silently died when the pod was rebuilt on 3.11)
 #   * CSRT, which disappears if anything drags opencv-python 5.x in on top of
 #     the pinned contrib-headless build
-log "detector + tracker smoke check"
+step "detector + tracker smoke check"
 "$PY" - <<'PY' || log "  !! SMOKE CHECK FAILED - no headway candidates AND an empty scene graph"
 import cv2
 from headway import detect
@@ -1487,12 +1649,16 @@ PY
 # at a glance, which is the whole reason this step is here and logs when it
 # fails.
 #
-# The browser lands in ~/.cache/ms-playwright, which is the container layer and
-# does NOT survive a pod restart -- like the apt packages above, and unlike the
-# python environment, which moved to the volume in step 0. Left container-local
-# on purpose: it is ~115 MB of pure test dependency, nothing about the server
-# needs it, and re-fetching it is a minute against the PLAYWRIGHT_BROWSERS_PATH
-# it would take to keep it. `bash boot.sh status` says which side it is on.
+# THE BROWSER IS ON THE VOLUME NOW ($PLAYWRIGHT_DIR, exported at the top of
+# this file and into $ENV_FILE). It used to land in ~/.cache/ms-playwright --
+# the container layer -- so every rebuild took it, and the two suites that need
+# it went quiet again until somebody noticed. 130 MB is nothing against what
+# this volume already holds, and `python -m playwright install chromium` on a
+# pod that still has it is a no-op that prints one line.
+#
+# The apt half (fonts, libnss3, xvfb and the rest) is NOT on the volume and
+# cannot be: those are system packages, so install-deps runs on every boot like
+# the rest of apt.
 #
 # Three commands, because the browser is three things: the python package, the
 # apt half it needs to run (fonts, libnss3, xvfb and the rest), and the browser
@@ -1500,7 +1666,7 @@ PY
 # one message -- there is no useful half-installed state to carry forward, and
 # the message says what is lost rather than which of the three fell over. The
 # log line above it is what says how far it got.
-log "playwright + chromium (browser selftests)"
+step "playwright + chromium (browser selftests)"
 "$PIP" install --no-cache-dir playwright \
     && "$PY" -m playwright install-deps chromium \
     && "$PY" -m playwright install chromium \
@@ -1543,7 +1709,7 @@ log "playwright + chromium (browser selftests)"
 #
 # Step 0 already did this. It is repeated because a full run takes the better
 # part of an hour, and anything at all may have taken the port back meanwhile.
-log "freeing :$PORT"
+step "freeing :$PORT"
 free_port
 
 # Also clear any uvicorn from a previous run of this script, so a re-run doesn't
@@ -1558,7 +1724,7 @@ rio_stop
 # One implementation, shared with `bash boot.sh restart` -- see rio_start near
 # the top for why it is setsid'd and why HF_HOME is stated rather than
 # inherited.
-log "launching uvicorn on :$PORT"
+step "launching uvicorn on :$PORT"
 rio_start
 
 # ---------------------------------------------------------------------------
@@ -1566,7 +1732,7 @@ rio_start
 # ---------------------------------------------------------------------------
 # uvicorn reports ready before the model is warm (vision warms on a daemon
 # thread), so /health answers in a few seconds. 60s is generous headroom.
-log "health check"
+step "health check"
 rio_wait_healthy
 
 # Model warm runs in the background and takes ~40s more. Not fatal, just noted.
@@ -1584,7 +1750,7 @@ echo "   (Qwen3-VL warm continues in background — watch: tail -f $REPO/uvicorn
 # Non-fatal on purpose -- the server is already up by this point and taking it
 # down over a missing lane model would be the wrong trade -- but it prints what
 # is missing and what breaks because of it, into a log that survives the pod.
-log "preflight"
+step "preflight"
 "$PY" -m tools.preflight || {
     echo "   !! this pod is INCOMPLETE — see the list above"
     echo "   !! for the repair commands: python -m tools.preflight --fix"
@@ -1617,8 +1783,10 @@ bootstrap_claude
 # log is the only account of what was here. Every VOLUME row is something the
 # next pod starts with; every CONTAINER row is something this script had to
 # make, and will have to make again.
-log "volume vs container"
+step "volume vs container"
 persistence_report
+
+step_summary
 
 log "boot complete — RIO on :$PORT"
 echo "   restore this environment in any shell:  . $ENV_FILE"

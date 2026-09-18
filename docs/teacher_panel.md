@@ -80,7 +80,7 @@ panel pulls in no `torch`, no `transformers` and no `alpamayo1_5`.
 
 ```
 /workspace/teachers/src/{alpamayo1.5,cosmos-reason2}   pinned upstream checkouts (volume)
-/opt/teachers/venvs/{alpamayo,cosmos}                  the environments (container layer, rebuilt by boot.sh)
+/workspace/teachers/venvs/{alpamayo,cosmos}                  the environments (VOLUME; built on demand by boot.sh teachers)
 $HF_HOME/hub/models--nvidia--*                         the weights (volume)
 /workspace/teachers/fp8/                               the FP8 checkpoints (volume)
 /workspace/teachers/secrets.env                        the HF token — outside the git worktree, always
@@ -579,8 +579,8 @@ python -m tools.teacher_replay --clip runs/road_clip.mp4 --keyframes 10
 FP8, by NVIDIA's recipe:
 
 ```bash
-/opt/teachers/venvs/cosmos/bin/python   -m teachers.service.quantize --model cosmos
-/opt/teachers/venvs/alpamayo/bin/python -m teachers.service.quantize --model alpamayo
+/workspace/teachers/venvs/cosmos/bin/python   -m teachers.service.quantize --model cosmos
+/workspace/teachers/venvs/alpamayo/bin/python -m teachers.service.quantize --model alpamayo
 ```
 
 Cosmos shells out to `scripts/quantize.py` from the pinned cosmos-reason2
@@ -710,7 +710,7 @@ failed.
 | weights | `/workspace/.cache/huggingface` (volume) |
 | FP8 checkpoints | `/workspace/teachers/fp8` (volume) |
 | pinned checkouts | `/workspace/teachers/src` (volume) |
-| the two venvs | `/opt/teachers/venvs` (container layer, rebuilt by boot.sh) |
+| the two venvs | `/workspace/teachers/venvs` (volume; built on demand by `boot.sh teachers`) |
 | HF token | `/workspace/teachers/secrets.env` (volume, outside the worktree) |
 
 ## 10d. RIO may draw on them. They may not write her lines.

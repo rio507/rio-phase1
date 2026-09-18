@@ -1,7 +1,7 @@
 """The teacher services — run OUTSIDE RIO's interpreter, on purpose.
 
 Nothing in this directory may be imported by RIO. It is written for the two
-isolated environments under /opt/teachers/venvs (Python 3.12, their own torch
+isolated environments under /workspace/teachers/venvs (Python 3.12, their own torch
 and transformers pins, one per model), and RIO's own environment cannot import
 most of it. tools/teacher_firewall_selftest.py asserts that no RIO module
 imports `teachers.service`, which is the machine-checkable half of this
