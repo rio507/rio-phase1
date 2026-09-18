@@ -496,6 +496,71 @@ def run_mobile(page):
            f"({round(l['box']['height'])}px)")
 
 
+# WHAT THE PAGE'S OWN POLL GETS WHILE THIS SUITE RUNS.
+#
+# rio_teachers.js asks /teachers/state on load and DELETES the card when the
+# answer says the panel is off -- which, since 2026-09-18, is what a normal
+# server says. Without this route the suite would be testing the pod's
+# deployment rather than the card: 58 checks about a node that a correct server
+# had just removed. The fixture is already the point of this file (see the
+# docstring); this extends it to the one question the card asks before drawing
+# anything.
+ROUTE = {"payload": None}
+
+
+def _install_route(page, payload):
+    ROUTE["payload"] = payload
+
+    def handler(route):
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(ROUTE["payload"]))
+
+    page.route("**/teachers/state*", handler)
+
+
+def run_panel_off(page, url, errors):
+    """The card is GONE when the panel is off -- not empty, not hidden: gone.
+
+    The failure this exists to catch is the friendly one: a Teachers card that
+    stays on the dashboard drawing two columns of "no reading yet" for two
+    services nobody started. That reads like something is broken on a pod where
+    nothing is, and it is exactly what the old behaviour did.
+    """
+    section("panel off — the card is not on the page at all")
+    ROUTE["payload"] = {"enabled": False, "session": "fixture",
+                        "models": {}, "tally": {}, "services": {}}
+    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+    page.wait_for_timeout(900)
+    ok(page.evaluate("() => document.getElementById('teachcard') === null"),
+       "#teachcard has been removed from the DOM")
+    ok(page.evaluate("() => !document.querySelector('.teach-col')"),
+       "no teacher column is drawn anywhere on the page")
+    # The rest of the dashboard is untouched by its going.
+    ok(page.evaluate("() => !!document.querySelector('.cam-wrap')"),
+       "the camera feed is still there")
+    ok(not errors, f"removing the card threw nothing ({errors[:2]})")
+
+    # ...and the same question asked of THIS server, unstubbed, so the suite
+    # also reports what the pod it is running on actually serves.
+    section("panel off — against this server's real /teachers/state")
+    page.unroute("**/teachers/state*")
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/teachers/state",
+                                    timeout=5) as r:
+            live_enabled = bool(json.loads(r.read().decode()).get("enabled"))
+    except Exception as e:
+        ok(False, f"/teachers/state answered ({e})")
+        return
+    page.goto(url, wait_until="domcontentloaded", timeout=20000)
+    page.wait_for_timeout(900)
+    present = page.evaluate("() => document.getElementById('teachcard') !== null")
+    if live_enabled:
+        ok(present, "this server has the panel ENABLED and the card is drawn")
+    else:
+        ok(not present, "this server has the panel off and the card is absent")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8888/")
@@ -515,6 +580,7 @@ def main():
                                           "height": DESKTOP[1]})
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
+        _install_route(page, FIXTURE)
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=20000)
         except Exception as e:
@@ -527,6 +593,7 @@ def main():
         run_live_columns(page, args.shot)
         run_layers(page)
         run_mobile(page)
+        run_panel_off(page, args.url, errors)
         section("no page errors")
         ok(not errors, f"the page threw nothing while rendering ({errors[:2]})")
         browser.close()

@@ -180,8 +180,8 @@ persistence_report() {
         "$REPO/weights|UFLDv2 lane + RF-DETR detector weights" \
         "$REPO/cert|TLS certificate (a phone needs https)" \
         "$BOOT_LOG|every run of this script, oldest first" \
-        "$TEACHERS_ROOT|teacher checkouts, fp8 checkpoints, uv cache" \
-        "$TEACHERS_VENVS|teacher environments (~14 GB each, derived)" \
+        "$TEACHERS_ROOT|ON DEMAND: teacher checkouts, fp8, uv cache" \
+        "$TEACHERS_VENVS|ON DEMAND: teacher envs, built by boot.sh teachers" \
         "$HOME/.cache/ms-playwright|chromium, for the two browser selftests" \
         "$HOME/.bashrc|the one line that sources $ENV_FILE" \
         "/usr/bin/tmux|tmux -- run the slow half of boot.sh inside it" \
@@ -815,6 +815,14 @@ rio_start() {
     fi
     echo "   started: $pids"
     echo "   python:  $VENV_UVICORN (HF_HOME=$HF_HOME_DIR)"
+    # Stated on every start, because it decides 38 GB of VRAM and it is decided
+    # HERE, at startup, from the environment this shell happens to carry.
+    if [ "${RIO_TEACHERS_ENABLED-0}" = "0" ]; then
+        echo "   teachers: off — the live pipeline only (bash boot.sh teachers)"
+    else
+        echo "   teachers: ON (RIO_TEACHERS_ENABLED=$RIO_TEACHERS_ENABLED) — the"
+        echo "             panel will poll :8801/:8802 and write corpus rows"
+    fi
 }
 
 # uvicorn answers /health well before the model is warm (vision warms on a
@@ -1068,9 +1076,20 @@ teacher_weights() {
     fi
 }
 
+# THE ONE COMMAND THAT BRINGS THE PANEL BACK.
+#
+# Builds the environments first if they are not there -- that is the step the
+# full boot used to do and no longer does, so this has to, or `boot.sh
+# teachers` on a fresh pod would just print "no environment" twice.
 teachers_start() {
-    log "teacher services"
+    log "teacher services (shadow — on demand)"
     mkdir -p "$TEACHERS_LOGS"
+    if [ ! -x "$TEACHERS_VENVS/alpamayo/bin/python" ] \
+       || [ ! -x "$TEACHERS_VENVS/cosmos/bin/python" ]; then
+        echo "   environments are missing — building them first (~28 GB, from"
+        echo "   $UV_CACHE_DIR if it is warm, which makes it a copy)"
+        teachers_build || return 1
+    fi
     teachers_stop
     local spec prec weights py port mod
     for model in alpamayo cosmos; do
@@ -1106,10 +1125,43 @@ teachers_start() {
         sleep 3
     done
     teachers_status
+    # AND THE HALF THAT IS NOT A PROCESS. The server decides at STARTUP whether
+    # it reads the panel at all (config.TEACHERS_ENABLED, off by default), so
+    # two healthy services and an unchanged uvicorn is a corpus that never gets
+    # written and a card that never appears. Say so, with the command.
+    log "the server still has to be told"
+    echo "   These two are serving, but this server was started without them."
+    echo "   To collect a corpus:"
+    echo
+    echo "     RIO_TEACHERS_ENABLED=1 bash boot.sh restart"
+    echo
+    echo "   That restart is what puts the Teachers card back on the dashboard"
+    echo "   and starts writing corpus rows. Plain 'bash boot.sh restart' turns"
+    echo "   the panel off again and leaves these services running -- stop them"
+    echo "   with 'bash boot.sh teachers-stop' to get the 38 GB back."
 }
 
 teachers_status() {
-    local port name body
+    local port name body answering=0
+    # NOTHING RUNNING IS THE NORMAL STATE. Two lines of "no answer on :8801"
+    # read like a fault, and after 2026-09-18 they are not one: the panel is
+    # off unless a collection session asked for it. Only say something is wrong
+    # when the server was told to expect them.
+    for port in 8801 8802; do
+        curl -sf -m 2 "http://127.0.0.1:$port/health" > /dev/null 2>&1 \
+            && answering=$((answering + 1))
+    done
+    if [ "$answering" -eq 0 ]; then
+        echo "   not running — and that is the default: the live stack does not"
+        echo "   use them. 38 GB of VRAM, a corpus for post-training, on demand:"
+        echo "      bash boot.sh teachers   (then: RIO_TEACHERS_ENABLED=1 bash boot.sh restart)"
+        if [ "${RIO_TEACHERS_ENABLED-0}" != "0" ]; then
+            echo "   !! but THIS shell has RIO_TEACHERS_ENABLED=$RIO_TEACHERS_ENABLED —"
+            echo "   !! a server restarted from here would poll two services that"
+            echo "   !! are not there and write no corpus rows."
+        fi
+        return 0
+    fi
     for spec in "8801|alpamayo1.5" "8802|cosmos-reason2"; do
         port=${spec%%|*}; name=${spec#*|}
         printf '   %-16s ' "$name"
@@ -1214,7 +1266,7 @@ case "${1-}" in
              log "https"; tls_start; exit $rc ;;
     status)  log "RIO on :$PORT"; rio_status
              log "https"; tls_status
-             log "teachers"; teachers_status
+             log "teachers (shadow — not part of a drive)"; teachers_status
              log "volume vs container — what a fresh pod would still have"
              persistence_report; exit 0 ;;
     https)   log "starting tls proxy on :$HTTPS_PORT"; tls_start; exit $? ;;
@@ -1455,17 +1507,29 @@ log "playwright + chromium (browser selftests)"
     || log "  !! playwright unavailable - output_bus_selftest and mobile_layout_selftest cannot run"
 
 # ---------------------------------------------------------------------------
-# 5e. The teacher panel's two environments (docs/teacher_panel.md)
+# 5e. The teacher panel is NOT BUILT HERE ANY MORE (docs/teacher_panel.md)
 # ---------------------------------------------------------------------------
-# Two AV foundation models in shadow, each in its own Python. Deliberately NOT
-# fatal and deliberately late: a pod that comes up without them drives exactly
-# as it did before the panel existed, and the two `uv sync` runs are ~28 GB of
-# wheels that must not stand between a fresh pod and a working server.
+# It used to be: two `uv sync` runs, ~28 GB of wheels, on every fresh pod. Then
+# step 8c started both services, and they sat there holding 38 GB of VRAM
+# (alpamayo 21408 MB, cosmos 16760 MB) for the whole life of the pod.
 #
-# The services themselves are started AFTER uvicorn (step 8c), so a pod whose
-# weights are missing still gets a dashboard.
-log "teacher environments"
-teachers_build || log "  !! teacher environments unavailable - the panel's two columns will be empty"
+# For a drive that buys NOTHING. The panel is shadow by construction: nothing
+# either model says can reach the arbiter, the speech path, look() or the
+# observer cache -- tools/teacher_firewall_selftest.py asserts it from the AST.
+# What they produce is a corpus for post-training, and a corpus is collected in
+# sessions, deliberately, not continuously. Paying for it on every pod and
+# during every drive meant paying the entire cost of the capability for none of
+# its value -- and it set the floor on what GPU this car needs, which is the
+# thing that made it worth changing.
+#
+# So they are ON DEMAND now, and one command brings them back:
+#
+#   bash boot.sh teachers                     builds if needed, then serves
+#   RIO_TEACHERS_ENABLED=1 bash boot.sh restart    the server then reads them
+#
+# Nothing was deleted. The package, the schema, the corpus, the association and
+# the replay path are untouched, `teachers-build` still builds, and every
+# teacher selftest sets config.TEACHERS_ENABLED itself, so they all still run.
 
 # ---------------------------------------------------------------------------
 # 6. Free port 8888
@@ -1527,12 +1591,12 @@ log "preflight"
 }
 
 # ---------------------------------------------------------------------------
-# 8c. The teacher services
+# 8c. The teacher services are NOT STARTED HERE ANY MORE
 # ---------------------------------------------------------------------------
-# After the server, because they are the shadow and it is the drive. FP8 if a
-# quantized checkpoint is on the volume, BF16 otherwise -- see teacher_weights.
-log "teacher services"
-teachers_start || log "  !! teacher services did not start - the panel's columns will be empty"
+# See step 5e. A pod that comes up without them is COMPLETE, not degraded:
+# /health says nothing about them, preflight counts nothing against them, and
+# the dashboard has no Teachers card. `bash boot.sh teachers` is the one
+# command that brings the whole thing back for a collection session.
 
 # ---------------------------------------------------------------------------
 # 9. Claude Code — installed by step 0, onto the volume

@@ -388,6 +388,11 @@
   #vehcol { flex: 1 1 340px; max-width: 420px; min-width: 300px; }
 
   .col { display: flex; flex-direction: column; min-width: 0; }
+  /* `hidden` has to be said in CSS here: the attribute's UA rule is
+     display:none, and .col above overrides it. The Teachers card ships hidden
+     and rio_teachers.js either unhides it or removes it outright, depending on
+     what /teachers/state says -- see the comment above that card. */
+  .col[hidden] { display: none; }
 
   .col-head { margin-bottom: 14px; }
   .col-title {
@@ -2197,7 +2202,15 @@
        /teachers/state -- there is not one model name, prompt, number or
        sentence written into this markup, for the same reason the Vehicle
        Health column has no sensor names in it. -->
-  <section class="col panel" id="teachcard">
+  <!-- SHIPPED HIDDEN, AND USUALLY REMOVED. The teachers are off by default
+       (config.TEACHERS_ENABLED): two shadow models resident cost 38 GB of VRAM
+       and cannot, by construction, change anything about a drive, so a normal
+       pod runs without them and is COMPLETE without them. rio_teachers.js asks
+       /teachers/state once on load: `enabled: false` deletes this node, and
+       `enabled: true` unhides it. Hidden rather than absent from the markup so
+       that a collection session gets the card with no flash of an empty panel,
+       and so this stays one file's worth of layout rather than a template. -->
+  <section class="col panel" id="teachcard" hidden>
     <div class="col-head teach-head">
       <div>
         <div class="col-title">Teachers</div>

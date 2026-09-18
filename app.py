@@ -241,7 +241,10 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_loop_lag_watch())
     if teacher_panel is not None:
         try:
-            teacher_panel.start()
+            # sessions.log_live is PASSED, not imported by the panel: the
+            # package may write a drive-log row and may not reach anything.
+            # See teachers/client.set_drive_logger.
+            teacher_panel.start(log_live=sessions.log_live)
         except Exception as e:
             print(f"[teachers] start failed: {type(e).__name__}: {e}", flush=True)
     yield

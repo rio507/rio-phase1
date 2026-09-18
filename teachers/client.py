@@ -156,6 +156,29 @@ def live_status():
                 getattr(config, "TEACHER_MAX_CONCURRENT", 1) or 1))}
 
 
+# THE DRIVE LOG, HANDED IN RATHER THAN IMPORTED.
+#
+# The row below used to be written through `import sessions` inside the worker,
+# and that one line was the only place this package reached back into the live
+# system. tools/teacher_firewall_selftest.py rule A caught it: the claim this
+# package makes is that it CANNOT reach the loop, and "it only writes a log
+# row" is exactly the kind of exception that turns a checked claim into a
+# remembered one -- `sessions` owns live session state, and an import is reach
+# whatever today's call happens to do with it.
+#
+# So app.py, which is the one door, hands the panel `sessions.log_live` at
+# start() and the panel hands it here. The traffic stays one-way: this package
+# can write a row and can learn nothing. Unset, the row is simply not written
+# -- which is what happens in every selftest and in the replay path.
+_LOG_LIVE = None
+
+
+def set_drive_logger(fn) -> None:
+    """Called once by teachers.panel.start(). None means no drive-log row."""
+    global _LOG_LIVE
+    _LOG_LIVE = fn
+
+
 class TeacherClient:
     """The RIO-side half of one teacher service."""
 
@@ -359,9 +382,8 @@ class TeacherClient:
         # written only once BOTH teachers answered, with no timing.
         try:
             key = str(job.get("session_key") or "")
-            if len(key) == 36 and key.count("-") == 4:
-                import sessions as _sessions
-                _sessions.log_live(key, "teacher_pass", {
+            if len(key) == 36 and key.count("-") == 4 and _LOG_LIVE is not None:
+                _LOG_LIVE(key, "teacher_pass", {
                     "service": self.name,
                     "latency_ms": round((time.time() - t_send) * 1000.0, 1),
                     "ok": bool(reading.get("ok", True)),

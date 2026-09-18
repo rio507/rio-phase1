@@ -51,6 +51,7 @@ from . import project
 from . import schema
 from .client import TeacherClient
 from .client import hold_gpu as _hold_gpu
+from .client import set_drive_logger as _set_drive_logger
 from .client import hold_status as _hold_status
 from .client import live_status as _live_status
 from .client import session_note as _session_note
@@ -69,11 +70,18 @@ _started = False
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------
-def start() -> bool:
-    """Bring up the two clients. Idempotent; called from the app lifespan."""
+def start(log_live=None) -> bool:
+    """Bring up the two clients. Idempotent; called from the app lifespan.
+
+    `log_live` is sessions.log_live, handed in by app.py rather than imported
+    here -- see teachers/client.set_drive_logger for why that direction is the
+    only one allowed. None (every selftest, the replay path) means a pass
+    writes no drive-log row and nothing else changes.
+    """
     global _started
     if not getattr(config, "TEACHERS_ENABLED", False):
         return False
+    _set_drive_logger(log_live)
     with _lock:
         if _started:
             return False
@@ -506,12 +514,19 @@ def state(session_key: str) -> dict:
     change what the next corpus row says.
     """
     key = str(session_key or "default")
+    # OFF MEANS OFF, and it is answered before anything else is read. The card
+    # asks this endpoint whether it should exist at all, so a session dict left
+    # over from a collection run earlier in this process's life must not report
+    # `enabled: True` and redraw a panel for two services that are not running.
+    if not getattr(config, "TEACHERS_ENABLED", False):
+        return {"enabled": False, "session": key, "models": {}, "tally": {},
+                "services": {}}
     fresh_s = float(getattr(config, "TEACHER_READING_FRESH_S", 4.0))
     now = time.time()
     with _lock:
         st = _sessions.get(key)
         if st is None:
-            return {"enabled": bool(getattr(config, "TEACHERS_ENABLED", False)),
+            return {"enabled": True,
                     "session": key, "models": {}, "tally": {}, "services": _svc()}
         out = {
             "enabled": True,

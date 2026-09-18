@@ -63,6 +63,19 @@ def head(title):
 
 # ---------------------------------------------------------------------------
 
+def note(ok, name, detail=""):
+    """Say what is there without it counting for or against the pod.
+
+    A check() that cannot be satisfied on a healthy pod is noise, and noise in
+    this list is what made the teacher rows worth removing: with the panel off
+    by default, two services that are not running is the CORRECT state, and a
+    MISS beside them says the opposite. These lines are for someone about to
+    run a collection session and wanting to know what it would have to build.
+    """
+    print(f"  [{'have' if ok else ' -- '}] {name}" + (f"  {detail}" if detail else ""))
+    return bool(ok)
+
+
 def check_interpreter():
     head("interpreter")
     print(f"  python {sys.version.split()[0]} at {sys.executable}")
@@ -481,7 +494,29 @@ def check_teachers():
     tell you it is missing, which is the entire reason these checks are in the
     same list as the detector's.
     """
-    head("teacher panel (shadow — docs/teacher_panel.md)")
+    import config as _cfg
+    enabled = bool(getattr(_cfg, "TEACHERS_ENABLED", False))
+
+    # NOT IN THE LIVE STACK, AND SO NOT A DEFECT. The panel is off unless a
+    # collection session asks for it (config.TEACHERS_ENABLED), because two
+    # resident teachers cost 38 GB of VRAM and cannot change anything about a
+    # drive. A pod without them is COMPLETE. So when they are off, everything
+    # below reports with note() -- visible, countable by a human, counted by
+    # nothing -- and when a session HAS turned them on, every line goes back to
+    # being a real check, because then a teacher that cannot load is a corpus
+    # that does not get written.
+    report = check if enabled else (lambda ok, name, consequence, fix="":
+                                    note(ok, name))
+    head("teacher panel (shadow — "
+         + ("ENABLED for this server" if enabled else
+            "off: not in the live stack, bash boot.sh teachers")
+         + ")")
+    if not enabled:
+        print("       Two AV foundation models for corpus collection, 38 GB of "
+              "VRAM.\n"
+              "       Nothing below is required for a drive; it is what a "
+              "collection\n"
+              "       session would need. docs/teacher_panel.md")
     venvs = Path("/opt/teachers/venvs")
     src = Path("/workspace/teachers/src")
 
@@ -495,7 +530,7 @@ def check_teachers():
             ok = subprocess.call([str(py), "-c", probe],
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL) == 0
-        check(ok, f"teacher env: {name}",
+        report(ok, f"teacher env: {name}",
               f"the {name} service cannot start, so its column on the "
               f"Teachers card stays empty and no corpus row is written "
               f"(the drive itself is unaffected)",
@@ -504,7 +539,7 @@ def check_teachers():
     for name, sha in (("alpamayo1.5", "36aeb4c"), ("cosmos-reason2", "a3b4a1d")):
         d = src / name
         ok = (d / ".git").exists()
-        check(ok, f"teacher source: {name} @ {sha}",
+        report(ok, f"teacher source: {name} @ {sha}",
               f"{name}'s pinned inference code is missing — the environment "
               f"cannot be rebuilt from it",
               "bash /workspace/boot.sh teachers-build")
@@ -523,7 +558,7 @@ def check_teachers():
                     pass
         ok = size > gb * 0.8 * 1024 ** 3
         pretty = repo.replace("models--", "").replace("--", "/")
-        check(ok, f"weights: {pretty} ({round(size / 1024 ** 3, 1)} GB)",
+        report(ok, f"weights: {pretty} ({round(size / 1024 ** 3, 1)} GB)",
               f"{pretty} is not cached — that teacher cannot load. "
               f"Cosmos-Reason2 is a GATED repo and needs an HF token whose "
               f"account has accepted the licence; Alpamayo needs it too, "
@@ -531,7 +566,7 @@ def check_teachers():
               "hf download " + pretty)
 
     tok = Path("/workspace/teachers/secrets.env")
-    check(tok.exists(), "HF token for the gated Cosmos repo",
+    report(tok.exists(), "HF token for the gated Cosmos repo",
           "nvidia/Cosmos-Reason2-8B is gated; without a token NEITHER teacher "
           "loads, because Alpamayo reads its tokenizer and VLM config from "
           "that repo",
@@ -547,7 +582,7 @@ def check_teachers():
                 ok = bool(_json.loads(r.read().decode()).get("loaded"))
         except Exception:
             ok = False
-        check(ok, f"teacher service: {name} on :{port}",
+        report(ok, f"teacher service: {name} on :{port}",
               f"{name} is not answering — its column stays empty and no "
               f"corpus row is written for any keyframe",
               "bash /workspace/boot.sh teachers")

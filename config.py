@@ -3794,7 +3794,26 @@ NAV_VERIFY_DEPTH_MIN_CONF = 0.35
 # ...AND IT IS A SWITCH, not a constant. A shadow feature that cannot be turned
 # off without an edit is a shadow feature nobody turns off to find out whether
 # it is the problem -- which is exactly the measurement this needed.
-TEACHERS_ENABLED = (os.getenv("RIO_TEACHERS_ENABLED", "1").strip().lower()
+#
+# OFF BY DEFAULT, AND THAT IS THE 2026-09-18 DECISION. Both services resident
+# cost 38 GB of VRAM (alpamayo 21408 MB, cosmos 16760 MB) and contribute
+# NOTHING to a drive: by construction nothing they say can reach the arbiter,
+# the speech path, look() or the observer cache. What they produce is a corpus
+# for post-training, which is collected in sessions, not continuously -- so
+# paying for them on every pod, during every drive, was paying the whole cost
+# of the capability for none of its value, and it set the floor on what GPU
+# this car needs.
+#
+# So a drive runs the live pipeline alone, and a collection session turns them
+# on deliberately:
+#
+#   bash boot.sh teachers                    # build if needed, then serve
+#   RIO_TEACHERS_ENABLED=1 bash boot.sh restart
+#
+# Nothing else changed. The panel, the schema, the corpus, the association and
+# the replay path are exactly as they were, and every teacher selftest sets
+# this flag itself -- so "off" is a deployment choice, not a deletion.
+TEACHERS_ENABLED = (os.getenv("RIO_TEACHERS_ENABLED", "0").strip().lower()
                     not in ("0", "false", "no", "off"))
 
 # Where the two services listen. Loopback only -- these are not on the network,

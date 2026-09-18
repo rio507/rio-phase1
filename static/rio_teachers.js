@@ -394,9 +394,28 @@
     host.innerHTML = bits.join(' &nbsp;·&nbsp; ');
   }
 
+  /* THE SERVER DECIDES WHETHER THIS CARD EXISTS AT ALL.
+   *
+   * The teachers are off by default now (config.TEACHERS_ENABLED): two models
+   * resident cost 38 GB of VRAM and, by construction, can change nothing about
+   * a drive. A pod without them is COMPLETE, not degraded -- so the card does
+   * not belong on the page saying "no reading yet" about two services nobody
+   * started. That reads like something is broken; nothing is.
+   *
+   * `enabled: false` therefore takes the card OFF the page rather than drawing
+   * it empty, and returns false so the caller can stop polling and let go of
+   * the IMU. The markup ships hidden for the same reason: no flash of an empty
+   * panel between load and the first answer.
+   */
   function render(state) {
+    var card = $('teachcard');
+    if (state && state.enabled === false) {
+      if (card && card.parentNode) card.parentNode.removeChild(card);
+      return false;
+    }
+    if (card && card.hidden) card.hidden = false;
     var cols = $('teachcols');
-    if (!cols) return;
+    if (!cols) return true;
     cols.textContent = '';
     var models = state.models || {};
     ORDER.forEach(function (name) {
@@ -408,6 +427,7 @@
     if (root.RIO && root.RIO.overlay && root.RIO.overlay.teachers) {
       root.RIO.overlay.teachers(state);
     }
+    return true;
   }
 
   /* ---------------------------------------------------------------------
@@ -563,16 +583,29 @@
     var pollMs = 0;
     var lastFrameAt = 0;
     var stopped = false;
+    var off = false;        // the server said the panel is not enabled
 
     function url(path) {
       var sid = sessionId();
       return path + (sid ? '?session_id=' + encodeURIComponent(sid) : '');
     }
 
+    /* The panel is off on this server: take the card off the page, stop
+       polling for good, and let go of the IMU. Nothing here is retryable --
+       whether the teachers are enabled is decided when the server starts, so
+       a second ask would get the same answer for the life of this page. */
+    function retire() {
+      off = true;
+      stopped = true;
+      if (poll) { root.clearTimeout(poll); poll = null; pollMs = 0; }
+      ego.stop();
+    }
+
     function tick() {
+      if (off) return;
       fetch(url('/teachers/state'))
         .then(function (r) { return r.json(); })
-        .then(function (j) { if (j) render(j); })
+        .then(function (j) { if (j && render(j) === false) retire(); })
         .catch(function () { /* the card keeps its last paint */ });
     }
 
@@ -593,7 +626,7 @@
        fragile identification and it is not this file's to fix -- but a poll
        that collides with it is this file's to avoid.) */
     function pace() {
-      if (stopped) return;
+      if (stopped || off) return;
       var flowing = (Date.now() - lastFrameAt) < FRAME_IDLE_MS;
       pollMs = flowing ? POLL_MS : IDLE_POLL_MS;
       if (poll) root.clearTimeout(poll);
@@ -620,6 +653,7 @@
          asked again for the life of the page -- so arming the card at load
          would quietly cost every drive after it its yaw rate. */
       arm: function () {
+        if (off) return;
         stopped = false;
         tick();
         pace();
@@ -627,6 +661,10 @@
       /* The drive: pacing AND the IMU stream. Called from the Start Drive
          tap, because that tap is the gesture the permission needs. */
       start: function () {
+        // No IMU permission prompt for a panel that is not there. On iOS that
+        // request can only be asked once per page, so asking on behalf of a
+        // disabled panel would spend it for nothing.
+        if (off) return false;
         stopped = false;
         tick();
         pace();
@@ -648,7 +686,7 @@
       ego: ego,
       /* RIO said something. One POST, one direction. */
       spoken: function (text, kind) {
-        if (!text) return;
+        if (off || !text) return;
         fetch(url('/teachers/spoken'), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: text, kind: kind || 'speech' })
