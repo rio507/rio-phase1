@@ -830,9 +830,19 @@ def run_paths():
     ok(env.get("HF_HOME") == paths_mod.HF_HOME,
        "...and the right HF_HOME, so a subprocess cannot re-download 21 GB "
        "into a directory that is about to disappear")
-    ok(env.get("UV_LINK_MODE") == "copy",
-       "with copy linking, because the cache and the venvs are on different "
-       "filesystems and hardlinks do not cross that")
+    # UV_LINK_MODE USED TO BE FORCED TO "copy" HERE, and this asserted it. It
+    # was right while the uv cache was on the volume and the venvs were in the
+    # container layer, because a hardlink does not cross a filesystem. Both are
+    # on the volume since 2026-09-18 (teachers/paths.py says why), so forcing
+    # copy would now mean copying 14 GB out of a cache sitting on the same
+    # disk. What must still hold is that the environment is not pinned to the
+    # old answer and that the interpreters are somewhere that survives a pod.
+    ok("UV_LINK_MODE" not in env,
+       "uv chooses its own link mode now: cache and venvs share a filesystem, "
+       "so hardlinking is available and forcing a copy would cost 14 GB")
+    ok(str(env.get("UV_PYTHON_INSTALL_DIR", "")).startswith("/workspace"),
+       "and uv's interpreters are on the volume, so a venv there does not "
+       "point at a python the next pod will not have")
 
     # And the tools actually use it, rather than building their own env dict.
     here = os.path.dirname(os.path.abspath(__file__))

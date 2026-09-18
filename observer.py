@@ -42,6 +42,7 @@ import threading
 import time
 
 import config
+import gpu_health
 import persona
 
 _lock = threading.Lock()
@@ -218,6 +219,12 @@ def _loop(key, state):
             # A failed observation costs a sentence, never the conversation.
             # Counted rather than printed every second: on a GPU that is out of
             # memory this would otherwise be the loudest thing in the log.
+            #
+            # ...and that is exactly the case worth telling somebody about, so
+            # it is also counted where /health can see it. The quiet handling
+            # here was right and it was the whole problem: a drive with no
+            # observations looked identical to a drive with nothing to say.
+            gpu_health.note("observer", e)
             with _lock:
                 state["errors"] += 1
                 if state["errors"] in (1, 10, 100):
@@ -387,6 +394,7 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
 
         text = _clean(vision.observe(frame.jpeg, frame_id=frame.frame_id))
     except Exception as e:
+        gpu_health.note("observer", e)
         print(f"[observer] {key}: on-demand observation failed: "
               f"{type(e).__name__}: {e}", flush=True)
         return {}

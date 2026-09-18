@@ -41,6 +41,7 @@ import threading
 import time
 
 import config
+import gpu_health
 import scene as scene_mod
 
 # --- prompts ----------------------------------------------------------------
@@ -496,5 +497,8 @@ def enrich_objects(frame, track_ids, cache: EnrichmentCache,
             cache.put(tid, value)
             out[tid] = value
         except Exception as e:
+            # One failed track is one description missing. All of them failing
+            # at once is the card, not the tracks.
+            gpu_health.note("enrich", e)
             print(f"[enrich] {tid} failed: {type(e).__name__}: {e}", flush=True)
     return out

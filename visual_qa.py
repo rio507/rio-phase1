@@ -46,6 +46,7 @@ from typing import Optional
 
 import config
 import enrich as enrich_mod
+import gpu_health
 import framebuf
 import frameselect
 import resolve as resolve_mod
@@ -1283,6 +1284,7 @@ class VisualAnswer:
                 parts.append(delta)
                 yield delta
         except Exception as e:
+            gpu_health.note("visual_qa", e)
             self.meta["error"] = f"{type(e).__name__}: {e}"
             print(f"[visual_qa] generation failed: {self.meta['error']}", flush=True)
         self.timing["gpt"] = round((time.perf_counter() - t0) * 1000, 1)

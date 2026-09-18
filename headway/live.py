@@ -39,6 +39,11 @@ import time
 import numpy as np
 from PIL import Image
 
+# Repo-root module, not a headway one: the OOM counter is shared with
+# the observer, enrichment and /perceive, because a card that is short
+# is short for all of them at once. See gpu_health.py.
+import gpu_health
+
 from . import anchor as anchor_mod
 from . import depth as depth_mod
 from . import detect as detect_mod
@@ -354,6 +359,12 @@ class LiveSession:
                 # dependency of it. If it fails the trapezoid is still there,
                 # so the loop keeps running on exactly the geometry it used
                 # before UFLDv2 existed. Recorded once, not once per frame.
+                # Counted centrally as well as recorded here, because this
+                # exception has two meanings: a missing checkpoint (fine, the
+                # trapezoid was always the fallback) and a card that is out of
+                # memory (not fine, and invisible from outside the process
+                # until gpu_health existed).
+                gpu_health.note("lanes", e)
                 if self.lane_error is None:
                     self.lane_error = f"{type(e).__name__}: {e}"
                     print(f"[headway.live] lane detection off: {self.lane_error}",

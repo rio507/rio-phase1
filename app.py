@@ -28,6 +28,7 @@ from openai import OpenAI
 
 import contextvars
 
+import gpu_health
 import config
 import voice
 import llm_interface
@@ -131,6 +132,7 @@ def _warm_vision():
             headway_lanes.warm()
             print("[vision] lane detection warm", flush=True)
         except Exception as e:
+            gpu_health.note("lanes", e)
             print(f"[vision] lane detection unavailable: {e}", flush=True)
         # RF-DETR is now the headway candidate source and runs on EVERY frame,
         # so an unwarmed first call would put a ~3 s weight load inside a live
@@ -377,6 +379,14 @@ def health():
                         "fix": "bash boot.sh teachers"})
         except Exception:
             pass
+    # THE CARD ITSELF. Last of the component rows and first in importance when
+    # it is there: everything above can be degraded for a reason that is only
+    # about that component, and this one means the pipeline does not fit.
+    # Measured in tools/vram_budget.py; the silence it replaces is described at
+    # the top of gpu_health.py.
+    _gpu = gpu_health.degraded_entry()
+    if _gpu:
+        degraded.append(_gpu)
     if not _warm_done.is_set():
         degraded.append({
             "component": "warm",

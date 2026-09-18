@@ -38,6 +38,7 @@ import numpy as np
 from PIL import Image
 
 import config
+import gpu_health
 import vision
 from headway import anchor as anchor_mod
 from headway import lanes as lanes_mod
@@ -316,7 +317,9 @@ def perceive(image_bytes: bytes, debug: bool = False, skip_qwen: bool = False) -
         lane_result = lanes_mod.detect_lanes(frame_bgr)
     except Exception as e:
         # Same contract as headway.live: no lanes means the trapezoid, not a
-        # failed frame.
+        # failed frame. And the same second meaning, so it is counted the same
+        # way -- see gpu_health.
+        gpu_health.note("lanes", e)
         print(f"[perceive] lane detection unavailable: {e}", flush=True)
     corridor, lane_info = anchor_mod.build_corridor(base_corridor, lane_result)
 
