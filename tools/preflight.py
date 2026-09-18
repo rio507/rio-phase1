@@ -78,17 +78,19 @@ def check_apt():
     check(shutil.which("ffmpeg"), "ffmpeg",
           "Whisper gets no audio: /talk fails on every utterance.",
           "apt-get install -y ffmpeg")
+    # NOT apt's any more: node lives on the volume at /workspace/node, so the
+    # fix is bootstrap rather than an install that disappears with the image.
     check(shutil.which("node") or shutil.which("nodejs"), "nodejs",
           "the two JavaScript test suites cannot run: `node tools/nav_selftest.js` "
           "and `node tools/realtime_selftest.js` are the only checks the route "
           "tracker and the speech arbiter have, and both live in the browser.",
-          "apt-get install -y nodejs")
+          "bash /workspace/rio-phase1/boot.sh bootstrap   # node on the volume")
     check(shutil.which("git"), "git", "no version control in the container.",
           "apt-get install -y git")
 
 
 def check_core_packages():
-    head("python packages (boot.sh step 3)")
+    head("python packages (boot.sh step 0 — the venv on the volume)")
     for mod, why in (
         ("fastapi", "no server at all."),
         ("uvicorn", "no server at all."),
@@ -102,7 +104,7 @@ def check_core_packages():
             ok = True
         except Exception:
             ok = False
-        check(ok, mod, why, "pip install -r requirements.txt")
+        check(ok, mod, why, "bash /workspace/rio-phase1/boot.sh bootstrap")
 
 
 def check_torch():
@@ -362,7 +364,7 @@ def check_voice():
               "to cedar for every drive." if mod == "websockets" else
               "the per-utterance fallback cannot run, so a slow v3 line is a "
               "silent line.",
-              "pip install -r requirements.txt")
+              "bash /workspace/rio-phase1/boot.sh bootstrap")
 
 
 def check_persistent():
@@ -383,12 +385,34 @@ def check_persistent():
           ". /workspace/env.sh   # written by boot.sh step 1, and sourced from "
           "~/.bashrc for new shells")
 
+    # THE PYTHON ENVIRONMENT IS ON THE VOLUME NOW, and that is the answer to
+    # the 2026-09-17 rebuild: the pod came back with this repository and all 16
+    # GB of weights and no interpreter that could import any of it, because pip
+    # had always installed into the image. Two questions, because they fail
+    # separately: does the environment exist, and is THIS shell using it.
+    venv = REPO / ".venv"
+    check((venv / "bin" / "uvicorn").exists(), f"{venv} present",
+          "there is no Python environment on the volume: nothing in this repo "
+          "can run, and the next pod rebuild starts from the same place this "
+          "one did.",
+          "bash /workspace/rio-phase1/boot.sh bootstrap")
+
+    # sys.prefix, not sys.executable: a venv built with symlinks (the default)
+    # has bin/python pointing at /usr/bin, so resolving the executable answers
+    # "which interpreter binary" when the question is "which environment".
+    in_venv = Path(sys.prefix).resolve() == venv.resolve()
+    check(in_venv, f"running from the venv ({sys.executable})",
+          "this shell's python is not the project's, so every import above was "
+          "asked of the wrong interpreter and anything installed from here "
+          "lands in the container layer and is gone on the next rebuild.",
+          ". /workspace/env.sh")
+
     env_file = Path("/workspace/env.sh")
     has_env = env_file.exists() and "HF_HOME" in env_file.read_text()
     check(has_env, "/workspace/env.sh present",
           "there is no durable copy of the pod's environment to source, so "
           "HF_HOME exists only in whatever shell boot.sh happened to run in.",
-          "bash /workspace/boot.sh   # step 1 writes it")
+          "bash /workspace/rio-phase1/boot.sh bootstrap   # writes it")
 
     boot_log = Path("/workspace/boot.log")
     check(boot_log.exists(), "boot.log present",

@@ -1,14 +1,29 @@
 #!/usr/bin/env bash
 # boot.sh — rebuild this pod's container layer from scratch.
 #
-# Only /workspace survives a pod restart; everything installed into the image
-# layer (apt packages, site-packages, Claude Code) does not. Run this once after
-# every fresh pod start to put the box back the way it was.
+# Only /workspace survives a pod restart, and everything installed into the
+# image layer does not. What that used to cost is written out under "WHAT
+# SURVIVES A POD REBUILD" below; the short version is that the python
+# environment, node and Claude Code have MOVED ONTO THE VOLUME, and what is
+# still in the image layer -- apt packages, the teacher environments, the
+# playwright browser -- is rebuilt by this script. Run it once after every
+# fresh pod start to put the box back the way it was.
 #
 # Idempotent: safe to re-run at any time. Re-running reinstalls packages,
 # restarts uvicorn, and leaves exactly one server on :8888.
 #
 #   bash /workspace/boot.sh
+#
+# A COMPLETELY FRESH POD STARTS WITH ONE COMMAND:
+#
+#   bash /workspace/rio-phase1/boot.sh bootstrap
+#
+# That is the cheap half -- the python environment, node, claude, tmux, the
+# PATH file, and :8888 taken back from whatever the template left on it -- and
+# it is what a pod needs before it can run ANY of this repository, including
+# the rest of this script. `bash boot.sh` with no argument runs it first and
+# then does everything else. See "WHAT SURVIVES A POD REBUILD" below for what
+# it puts where, and why the venv exists at all.
 #
 # JUST BOUNCING THE SERVER? Do not reach for pkill -- it kills the shell that
 # runs it, which is explained at length above rio_pids() below. Use:
@@ -57,9 +72,37 @@
 set -euo pipefail
 
 REPO=/workspace/rio-phase1
-PORT=8888
+# 8888 is the port RunPod's proxy exposes, so it is not really a choice. It is
+# overridable only so that the port-ownership paths below -- who holds it, and
+# taking it back -- can be exercised against a decoy without touching the real
+# server. Same idiom as RIO_HTTPS_PORT further down.
+PORT=${RIO_PORT:-8888}
 HF_HOME_DIR=/workspace/.cache/huggingface
 ENV_FILE=/workspace/env.sh
+
+# The things that RUN this repo, all three on the persistent volume. See
+# "WHAT SURVIVES A POD REBUILD" below for why they are not simply installed
+# into the image like everything else.
+VENV="$REPO/.venv"
+VENV_PY="$VENV/bin/python"
+VENV_PIP="$VENV/bin/pip"
+VENV_UVICORN="$VENV/bin/uvicorn"
+NODE_DIR=/workspace/node
+NODE_VERSION=${RIO_NODE_VERSION:-22.11.0}
+
+# $PY and $PIP are what every step below invokes, and they are the VENV's --
+# never a bare `python`, which means whatever the caller's PATH happens to say
+# and, on a fresh pod, means an interpreter with none of this project's
+# packages in it. The fallback to a bare python3 exists for ONE case: `status`
+# and `bootstrap` on a pod that has no venv yet, which must still run.
+rio_resolve_python() {
+    if [ -x "$VENV_PY" ]; then
+        PY="$VENV_PY"; PIP="$VENV_PIP"
+    else
+        PY=python3; PIP=pip
+    fi
+}
+rio_resolve_python
 
 # On the PERSISTENT volume, deliberately. A boot log inside the container layer
 # is a boot log that disappears with the thing it was describing.
@@ -68,6 +111,334 @@ exec > >(tee -a "$BOOT_LOG") 2>&1
 printf '\n===== boot.sh %s (pid %s) =====\n' "$(date -Is)" "$$"
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# WHAT SURVIVES A POD REBUILD, AND WHAT DOES NOT
+# ---------------------------------------------------------------------------
+# /workspace is a network volume and it is the ONLY thing that comes back.
+# /usr, /opt, /root and every site-packages directory pip has ever written into
+# the image are the container layer, and they are gone the next time this pod
+# is recreated.
+#
+# That distinction cost 45 minutes on 2026-09-17. The volume came back with the
+# repository and the 16 GB HF cache intact, so the pod LOOKED provisioned --
+# and nothing that RUNS the code was there. pip had installed into the image,
+# so there was no Python environment at all; node, npm and Claude Code were
+# gone; tmux was gone, so the long-running half of this script had nothing safe
+# to run inside; and RunPod's own jupyter-lab held :8888, so the first uvicorn
+# died on "[Errno 98] address already in use" -- a message that reads like a
+# leftover RIO and was not one.
+#
+# The fix is not to reinstall faster. It is to put the things that RUN the code
+# on the volume beside the repository that needs them:
+#
+#   $REPO/.venv        the Python environment. Every path in this script names
+#                      .venv/bin/python and .venv/bin/uvicorn explicitly rather
+#                      than `python`, which means whatever the caller's PATH
+#                      says and on a fresh pod means an empty interpreter.
+#   /workspace/node    node, npm, and Claude Code as an npm global (npm's
+#                      prefix resolves to $NODE_DIR because node lives there).
+#   /workspace/env.sh  the PATH that ties those two to any shell, restored by
+#                      one line, because ~/.bashrc cannot be.
+#
+# Everything else is still deliberately container-local and still reinstalled
+# on every boot: apt packages, the two ~14 GB teacher environments, the
+# playwright browser. They are derived, they are large, and the volume's quota
+# is better spent on weights. `bash boot.sh status` prints the whole split,
+# marked VOLUME or CONTAINER, with what is actually present right now.
+
+# Volume or container, decided by comparing the device the path is really on
+# against /workspace's -- not by a table in this file that can go stale. For a
+# path that does not exist yet, the nearest ancestor that does is the answer.
+fs_kind() {
+    local probe=$1
+    while [ ! -e "$probe" ] && [ "$probe" != "/" ] && [ "$probe" != "." ]; do
+        probe=$(dirname "$probe")
+    done
+    if [ "$(stat -c %d "$probe" 2>/dev/null || echo x)" \
+       = "$(stat -c %d /workspace 2>/dev/null || echo y)" ]; then
+        echo VOLUME
+    else
+        echo CONTAINER
+    fi
+}
+
+persistence_report() {
+    echo "   Only /workspace survives a pod rebuild. VOLUME rows come back on their"
+    echo "   own; CONTAINER rows are re-made by \`bash boot.sh\` -- and the first four"
+    echo "   of them by \`bash boot.sh bootstrap\` alone."
+    echo
+    printf '   %-9s  %-7s  %-31s  %s\n' WHERE STATE PATH WHAT
+    local spec path what state
+    for spec in \
+        "$REPO|the repository, and the drive logs under runs/" \
+        "$VENV|PYTHON ENV: .venv/bin/python, .venv/bin/uvicorn" \
+        "$NODE_DIR|node + npm" \
+        "$NODE_DIR/bin/claude|Claude Code (npm global, prefix $NODE_DIR)" \
+        "$ENV_FILE|PATH + HF_HOME. Restore with: . $ENV_FILE" \
+        "$HF_HOME_DIR|model weights (Qwen3-VL, ~16 GB)" \
+        "$REPO/weights|UFLDv2 lane + RF-DETR detector weights" \
+        "$REPO/cert|TLS certificate (a phone needs https)" \
+        "$BOOT_LOG|every run of this script, oldest first" \
+        "$TEACHERS_ROOT|teacher checkouts, fp8 checkpoints, uv cache" \
+        "$TEACHERS_VENVS|teacher environments (~14 GB each, derived)" \
+        "$HOME/.cache/ms-playwright|chromium, for the two browser selftests" \
+        "$HOME/.bashrc|the one line that sources $ENV_FILE" \
+        "/usr/bin/tmux|tmux -- run the slow half of boot.sh inside it" \
+        "/usr/bin/ffmpeg|apt: ffmpeg (audio muxing), nano, git" \
+        ; do
+        path=${spec%%|*}; what=${spec#*|}
+        if [ -e "$path" ]; then state=present; else state=MISSING; fi
+        # ~/.bashrc exists on every pod; what this report is asking about it is
+        # whether it still has the line, which a rebuild is exactly what takes
+        # away.
+        if [ "$path" = "$HOME/.bashrc" ]; then
+            grep -qF ". $ENV_FILE" "$path" 2>/dev/null && state=present || state=MISSING
+        fi
+        printf '   %-9s  %-7s  %-31s  %s\n' "$(fs_kind "$path")" "$state" "$path" "$what"
+    done
+    echo
+    echo "   A CONTAINER row reading MISSING is normal on a fresh pod: that is the"
+    echo "   half this script rebuilds. A VOLUME row reading MISSING is not -- it"
+    echo "   means the volume did not come back the way it was left."
+}
+
+# ---------------------------------------------------------------------------
+# bootstrap — make a fresh pod able to run this repository, in one command
+# ---------------------------------------------------------------------------
+#
+#   bash boot.sh bootstrap
+#
+# Idempotent and safe to re-run: everything here checks for what it is about to
+# make and says "present" instead of remaking it. Nothing in it needs the
+# network for anything already on the volume, so on a pod that has been
+# bootstrapped before it takes seconds.
+#
+# It does the CHEAP half. It deliberately does NOT do torch cu128, the Qwen
+# weights, the lane and detector weights, playwright, or the teacher
+# environments -- those are tens of gigabytes and they are the rest of this
+# script. `bash boot.sh` runs bootstrap first and then all of it.
+
+# The environment, on the volume, written by both `bootstrap` and step 1 so the
+# two can never disagree about what PATH should be.
+write_env_file() {
+    cat > "$ENV_FILE" <<EOF
+# Generated by boot.sh. ON THE PERSISTENT VOLUME ON PURPOSE: ~/.bashrc lives in
+# the container layer, so every line ever appended to it is gone on the next
+# pod start -- "it is in .bashrc" was only ever true until the rebuild. This
+# file survives, and one line restores the whole environment in any shell, with
+# no login and no .bashrc:
+#
+#   . $ENV_FILE
+#
+export HF_HOME=$HF_HOME_DIR
+
+# The two directories holding the things that RUN this repo, both on the
+# volume: the venv's bin (python, pip, uvicorn) and node's (node, npm, npx,
+# claude). Ahead of /usr/bin deliberately -- the image's python is not the one
+# with this project's packages, and on a fresh pod it has none of them at all.
+#
+# Guarded rather than prepended blindly: this file is sourced from ~/.bashrc,
+# by agents, and by hand, several times a session, and an unguarded prepend
+# leaves PATH holding four copies of the same directory by lunchtime.
+for _rio_dir in "\$HOME/.local/bin" $NODE_DIR/bin $VENV/bin; do
+    case ":\$PATH:" in
+        *":\$_rio_dir:"*) ;;
+        *) PATH="\$_rio_dir:\$PATH" ;;
+    esac
+done
+unset _rio_dir
+export PATH
+EOF
+    echo "   wrote $ENV_FILE  (restore any shell with: . $ENV_FILE)"
+
+    # grep-guarded so re-runs don't stack duplicate lines into .bashrc. This
+    # line is container-local and has to be re-added after every rebuild; what
+    # it points at is not, which is the whole arrangement.
+    if ! grep -qF ". $ENV_FILE" ~/.bashrc 2>/dev/null; then
+        printf '\n# RIO environment (persistent volume -- see %s)\n' "$ENV_FILE" >> ~/.bashrc
+        printf '[ -f %s ] && . %s\n' "$ENV_FILE" "$ENV_FILE" >> ~/.bashrc
+        echo "   sourced from ~/.bashrc (container-local, re-added every rebuild)"
+    else
+        echo "   already sourced from ~/.bashrc"
+    fi
+}
+
+bootstrap_venv() {
+    log "python environment (VOLUME) -> $VENV"
+    if [ ! -f "$REPO/requirements.txt" ]; then
+        echo "   !! no $REPO/requirements.txt — is the volume mounted?"
+        return 1
+    fi
+
+    # A venv whose interpreter cannot run is the failure mode this arrangement
+    # can still have: `python3 -m venv` records the image's interpreter, and
+    # while the binary is copied in (--copies below) its shared libraries are
+    # not. If the pod comes back on an image with a different python, the venv
+    # on the volume is so much dead weight -- so prove it runs before trusting
+    # it, and rebuild it from requirements.txt if it does not.
+    if [ -e "$VENV" ] && ! "$VENV_PY" -c 'import sys' > /dev/null 2>&1; then
+        echo "   !! $VENV_PY does not run — this venv was built against an"
+        echo "      interpreter this pod no longer has. Removing and rebuilding it."
+        rm -rf "$VENV"
+    fi
+
+    if [ ! -x "$VENV_PY" ]; then
+        # --copies rather than symlinks: a symlink into /usr/bin is a pointer
+        # into the container layer, and the point of this directory is to not
+        # be one.
+        echo "   creating: python3 -m venv --copies $VENV"
+        python3 -m venv --copies "$VENV" || {
+            echo "   !! could not create the venv (is python3-venv installed?)"
+            return 1
+        }
+        "$VENV_PY" -m pip install --quiet --upgrade pip setuptools wheel \
+            || echo "   !! could not upgrade pip in the new venv — continuing"
+    fi
+    rio_resolve_python
+    echo "   python:  $("$VENV_PY" -V 2>&1) at $VENV_PY"
+
+    # Stamped with the hash of requirements.txt, so re-running bootstrap on a
+    # provisioned pod is a no-op rather than a five-minute dependency resolve.
+    # The import check is there because a stamp can outlive the packages it
+    # describes -- a half-finished install, or a venv someone pruned.
+    local stamp want have
+    stamp="$VENV/.requirements.sha256"
+    want=$(sha256sum "$REPO/requirements.txt" | cut -d' ' -f1)
+    have=$(cat "$stamp" 2>/dev/null || true)
+    if [ "$want" = "$have" ] && "$VENV_PY" -c 'import fastapi, uvicorn' > /dev/null 2>&1; then
+        echo "   packages: requirements.txt unchanged since the last install"
+    else
+        echo "   pip install -r requirements.txt  (the slow part, a few minutes)"
+        "$PIP" install --no-cache-dir -r "$REPO/requirements.txt" || {
+            echo "   !! pip install failed — the server will not start"
+            return 1
+        }
+        echo "$want" > "$stamp"
+    fi
+    echo "   uvicorn: $VENV_UVICORN"
+
+    # Which torch, stated rather than assumed. requirements.txt pins 2.4.1 from
+    # PyPI; step 4 of the full run is what replaces it with the cu128 build
+    # this pod's driver actually needs. A bootstrap-only pod can therefore be
+    # sitting on the wrong one, and that is worth one line here rather than a
+    # confusing CUDA error later.
+    "$VENV_PY" - <<'PY' 2>/dev/null || echo "   torch:   not installed — run the full: bash boot.sh"
+import torch
+print("   torch:   %s (cuda build %s, available %s)"
+      % (torch.__version__, torch.version.cuda, torch.cuda.is_available()))
+PY
+}
+
+bootstrap_node() {
+    log "node (VOLUME) -> $NODE_DIR"
+    if [ -x "$NODE_DIR/bin/node" ] && "$NODE_DIR/bin/node" -v > /dev/null 2>&1; then
+        echo "   present: node $("$NODE_DIR/bin/node" -v), npm $("$NODE_DIR/bin/npm" -v 2>/dev/null || echo '?')"
+        return 0
+    fi
+    # NOT apt's nodejs, which is what this script used to install: that is node
+    # 12, in the container layer, gone on the next rebuild and reinstalled on
+    # every boot. An official tarball unpacked onto the volume is both current
+    # and permanent, and it brings npm -- which apt's nodejs does not.
+    local arch url tmp
+    case "$(uname -m)" in
+        x86_64)  arch=x64 ;;
+        aarch64) arch=arm64 ;;
+        *)       echo "   !! no node build for $(uname -m) — the two JS selftests cannot run"
+                 return 0 ;;
+    esac
+    url="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-$arch.tar.xz"
+    tmp=$(mktemp -d)
+    echo "   downloading node $NODE_VERSION ($arch)"
+    if ! curl -fsSL "$url" -o "$tmp/node.tar.xz"; then
+        echo "   !! download failed: $url"
+        echo "   !! node, npm and claude will be unavailable on this pod"
+        rm -rf "$tmp"
+        return 0
+    fi
+    mkdir -p "$NODE_DIR"
+    # --strip-components=1: the tarball's one top-level directory is dropped so
+    # that bin/ lands directly in $NODE_DIR. That is what makes npm's global
+    # prefix resolve to $NODE_DIR, which is what puts `claude` on the volume
+    # instead of in ~/.local/bin.
+    tar -xJf "$tmp/node.tar.xz" -C "$NODE_DIR" --strip-components=1 || {
+        echo "   !! could not unpack node"
+        rm -rf "$tmp"
+        return 0
+    }
+    rm -rf "$tmp"
+    echo "   installed: node $("$NODE_DIR/bin/node" -v), npm $("$NODE_DIR/bin/npm" -v 2>/dev/null || echo '?')"
+}
+
+bootstrap_claude() {
+    log "Claude Code (VOLUME) -> $NODE_DIR/bin/claude"
+    if [ ! -x "$NODE_DIR/bin/npm" ]; then
+        echo "   no npm on the volume — skipped"
+        return 0
+    fi
+    if [ -x "$NODE_DIR/bin/claude" ]; then
+        echo "   present: $(PATH="$NODE_DIR/bin:$PATH" claude --version 2>/dev/null || echo 'installed')"
+        return 0
+    fi
+    # The npm global, NOT claude.ai/install.sh -- that installer writes to
+    # ~/.local/bin, which is the container layer, which is how this pod lost it
+    # in the first place.
+    echo "   npm install -g @anthropic-ai/claude-code"
+    PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/npm" install -g --silent @anthropic-ai/claude-code \
+        || { echo "   !! npm install failed — claude will not be available"; return 0; }
+    echo "   installed: $(PATH="$NODE_DIR/bin:$PATH" claude --version 2>/dev/null || echo 'installed')"
+}
+
+bootstrap_tmux() {
+    log "tmux (CONTAINER — apt, so this runs again on every rebuild)"
+    if command -v tmux > /dev/null 2>&1; then
+        echo "   present: $(tmux -V)"
+        return 0
+    fi
+    # It is here because of the header's first warning: the slow half of this
+    # script downloads ~19 GB, and a dropped terminal SIGHUPs it into a
+    # half-provisioned pod. tmux is what makes that not happen, so a pod
+    # without it cannot safely run the thing that would install it.
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq --no-install-recommends tmux \
+        || { echo "   !! apt could not install tmux — use: nohup bash boot.sh &"; return 0; }
+    echo "   installed: $(tmux -V)"
+}
+
+bootstrap() {
+    log "bootstrap — putting this pod back together"
+    echo "   volume    (survives a rebuild): $VENV, $NODE_DIR, $ENV_FILE"
+    echo "   container (rebuilt every time): apt packages, teacher venvs, chromium"
+
+    log "env -> $ENV_FILE"
+    write_env_file
+    # shellcheck source=/dev/null
+    . "$ENV_FILE"
+
+    bootstrap_venv || {
+        log "bootstrap FAILED at the python environment"
+        echo "   Nothing in this repo can run without it. The rest was skipped."
+        return 1
+    }
+    bootstrap_node
+    bootstrap_claude
+    bootstrap_tmux
+
+    log "port $PORT"
+    free_port || true
+
+    log "what this pod has now"
+    persistence_report
+
+    log "bootstrap complete"
+    echo "   restore this environment in any shell:  . $ENV_FILE"
+    echo "   start the server:                       bash boot.sh start"
+    echo "   see what is running:                    bash boot.sh status"
+    echo
+    echo "   NOT done here, because it is the expensive half: torch cu128, the"
+    echo "   Qwen3-VL weights, the lane and detector weights, playwright, and the"
+    echo "   teacher environments. For those, inside tmux:  bash boot.sh"
+}
 
 # ---------------------------------------------------------------------------
 # The server: find it, stop it, start it -- and the subcommands that do only
@@ -96,24 +467,178 @@ log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 # the server, and the shell doing the asking.
 #
 # The fix is to stop matching on the command line alone. A shell is never the
-# server: keep only the candidates whose /proc/<pid>/comm is the interpreter
-# uvicorn actually runs as, and never the current shell.
+# server, so the question to ask is not "does this string appear" but "is this
+# process actually uvicorn running app:app" -- which is a question about argv.
+#
+# AND IT IS NOT A QUESTION ABOUT /proc/<pid>/comm, which is what this function
+# used to ask. On 2026-09-17 `status` printed "uvicorn: not running" while RIO
+# was serving every request on :8888. comm was `pt_main_thread`: torch RENAMES
+# THE MAIN THREAD the moment app.py imports it, so the one process that really
+# was the server is exactly the one a comm filter of python/python3/uvicorn
+# throws away. comm is 15 bytes any library is free to overwrite, and this one
+# does, on the only process we care about.
+#
+# argv cannot be overwritten like that, and it separates us from the shell for
+# free: RIO's argv holds `uvicorn` and the literal word `app:app` as SEPARATE
+# arguments, while a shell that merely mentions them carries the whole command
+# as ONE argv word -- that is what `bash -c` is. So an exact-word test over
+# /proc/<pid>/cmdline answers both questions at once.
+
+# True when this pid IS uvicorn serving app:app -- not a shell talking about it.
+rio_is_ours() {
+    local pid=$1 word saw_uvicorn=0 saw_app=0
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' word; do
+        case "$word" in
+            uvicorn|*/uvicorn) saw_uvicorn=1 ;;
+            app:app)           saw_app=1 ;;
+        esac
+    done < "/proc/$pid/cmdline"
+    [ "$saw_uvicorn" -eq 1 ] && [ "$saw_app" -eq 1 ]
+}
+
+# True when any of the given words is a WHOLE argv element of this pid. Same
+# test as rio_is_ours, for the processes named by a module path instead: the
+# tls proxy and the two teacher services are started as `python -m <module>`,
+# so the module is one argv word, and a shell that merely says the name carries
+# it inside a much longer one.
+proc_argv_has() {
+    local pid=$1 word want
+    shift
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' word; do
+        for want in "$@"; do
+            [ "$word" = "$want" ] && return 0
+        done
+    done < "/proc/$pid/cmdline"
+    return 1
+}
 
 # Every RUNNING uvicorn for this app, one pid per line, and nothing that merely
 # mentions it.
 rio_pids() {
-    local pid comm
+    local pid
     for pid in $(pgrep -f 'uvicorn app:app' 2>/dev/null || true); do
         [ "$pid" = "$$" ] && continue
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
-        case "$comm" in
-            uvicorn|python|python3|python3.*) echo "$pid" ;;
-        esac
+        # An `if`, not `rio_is_ours && echo`: a for loop returns the status of
+        # its last iteration, so a final candidate that is NOT ours would make
+        # this function itself "fail" -- and then `pids=$(rio_pidline)` fails
+        # with it under `set -e`. Which is to say: a shell that merely mentions
+        # uvicorn would abort the script that was carefully ignoring it.
+        if rio_is_ours "$pid"; then
+            echo "$pid"
+        fi
     done
+    return 0
 }
 
 # The pids on one line, trimmed, or empty. Used for reporting only.
 rio_pidline() { rio_pids | tr '\n' ' ' | sed 's/ *$//'; }
+
+# A pid described the way a person needs it in a report: its command line,
+# trimmed. comm is appended in brackets because it is what `ps` and `ss` will
+# show them, and on this box that is the misleading `pt_main_thread`.
+proc_desc() {
+    local pid=$1 comm cmd
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')
+    # `|| cmd=` because a pid can exit between the listing and this line, and
+    # a failed redirect inside a command substitution is a failed assignment.
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-120) || cmd=""
+    [ -n "$cmd" ] || cmd='(no command line)'
+    printf '%s [%s]' "$cmd" "$comm"
+}
+
+# Every pid LISTENING on a port, whoever it belongs to. The question `status`
+# has to answer first: something answering on :8888 is not evidence that it is
+# us, and for 45 minutes on 2026-09-17 it was jupyter-lab.
+# The `|| true` is load-bearing. Nothing listening is the NORMAL answer here,
+# and it is also a FAILING one under `set -o pipefail`: grep matches nothing
+# and returns 1, so `pids=$(port_pids ...)` inherits a non-zero status and
+# `set -e` takes the whole script down at that assignment. On a fresh pod --
+# where :8888 being free is the good case -- that was every run of bootstrap.
+port_pids() {
+    ss -lntpH "sport = :$1" 2>/dev/null | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u || true
+}
+
+# Take :$PORT back from whatever is squatting on it, and never from ourselves.
+#
+# RunPod's template starts jupyter-lab on 8888 -- the port the pod's proxy
+# exposes, and so the only port RIO can be reached on. A fresh pod therefore
+# meets "[Errno 98] address already in use" before it ever serves a page, and
+# that message never says who is holding it.
+#
+# Targeted by pid from the listener itself, never by `pkill -f jupyter` (which
+# this script used to do): -f matches every process's whole command line, and
+# an agent's `bash -c '... jupyter ...'` wrapper matches ITSELF. That is the
+# same foot-gun documented at length above rio_pids, in the other direction.
+free_port() {
+    local pid pids desc alien i
+    alien=""
+    pids=$(port_pids "$PORT")
+    if [ -z "$pids" ]; then
+        echo "   :$PORT is free"
+        return 0
+    fi
+    for pid in $pids; do
+        desc=$(proc_desc "$pid")
+        if rio_is_ours "$pid"; then
+            echo "   :$PORT held by RIO itself (pid $pid) — left alone"
+        else
+            echo "   :$PORT held by a process that is NOT RIO — taking the port back"
+            echo "      pid $pid: $desc"
+            alien="$alien $pid"
+        fi
+    done
+    [ -n "$alien" ] || return 0
+    # shellcheck disable=SC2086
+    kill $alien 2>/dev/null || true
+    for i in $(seq 1 20); do
+        [ -z "$(port_pids "$PORT")" ] && break
+        sleep 0.5
+    done
+    for pid in $alien; do
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "      pid $pid ignored SIGTERM after 10s — SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 0.5
+    pids=$(port_pids "$PORT" | tr '\n' ' ' | sed 's/ *$//')
+    if [ -n "$pids" ]; then
+        echo "   !! :$PORT is STILL held (pids $pids) — uvicorn will fail to bind"
+        return 1
+    fi
+    echo "   :$PORT freed"
+}
+
+# "<http status><TAB><body>" for one GET, or "000<TAB>" when nothing answered.
+# Deliberately without -L: a redirect is an answer about some other page.
+http_probe() {
+    local out
+    out=$(curl -s -m 5 -w '\n%{http_code}' "$1" 2>/dev/null) || { printf '000\t'; return 0; }
+    printf '%s\t%s' "${out##*$'\n'}" "${out%$'\n'*}"
+}
+
+# OUR /health body, or nothing -- and the whole point is the "our".
+#
+# `curl -sf .../health` was the other half of the 2026-09-17 status bug. With
+# jupyter-lab on :8888, /health answered 302 to its login page: -f only fails
+# from 400 up, a redirect body is empty, and the caller printed a blank line
+# under the word "health" and reported the pod up. A health check that another
+# process can pass is not a health check.
+#
+# So: 200 or nothing, and the body must carry RIO's own service marker.
+rio_health_body() {
+    local probe code body
+    probe=$(http_probe "http://127.0.0.1:$PORT/health")
+    code=${probe%%$'\t'*}
+    body=${probe#*$'\t'}
+    [ "$code" = "200" ] || return 1
+    case "$body" in
+        *'"service":"rio-phase1"'*|*'"service": "rio-phase1"'*) printf '%s' "$body" ;;
+        *) return 1 ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # TLS, so a phone can be asked for the camera, the microphone and a position
@@ -137,7 +662,23 @@ rio_pidline() { rio_pids | tr '\n' ' ' | sed 's/ *$//'; }
 HTTPS_PORT=${RIO_HTTPS_PORT:-8443}
 CERT_FILE="$REPO/cert/rio-cert.pem"
 
-tls_pids() { pgrep -f 'tools.tls_proxy' 2>/dev/null || true; }
+# AND THE SAME TEST HERE, because this function is how the lesson above got
+# re-learned. On 2026-09-18 `boot.sh restart` killed the shell that ran it: a
+# bare `pgrep -f tools.tls_proxy` handed tls_stop the pid of the caller's own
+# `bash -c`, whose command line happened to contain that string, and tls_stop
+# killed it. The server restarted perfectly; the terminal asking for it died
+# mid-sentence. Every function in this file that kills by pattern has to ask
+# what a process IS, not what it mentions.
+tls_pids() {
+    local pid
+    for pid in $(pgrep -f 'tools.tls_proxy' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        if proc_argv_has "$pid" tools.tls_proxy; then
+            echo "$pid"
+        fi
+    done
+    return 0
+}
 
 tls_stop() {
     local pids
@@ -156,7 +697,7 @@ tls_start() {
         return 0
     fi
     tls_stop
-    setsid nohup python3 -m tools.tls_proxy --listen "$HTTPS_PORT" --to "$PORT" \
+    setsid nohup "$PY" -m tools.tls_proxy --listen "$HTTPS_PORT" --to "$PORT" \
         > "$REPO/tls.log" 2>&1 < /dev/null &
     sleep 1
     if [ -z "$(tls_pids)" ]; then
@@ -178,7 +719,7 @@ tls_status() {
         echo "   tls proxy: $(echo "$pids" | tr '\n' ' ')  (:$HTTPS_PORT)"
     fi
     if [ -f "$CERT_FILE" ]; then
-        python3 -m tools.tls_proxy --check 2>&1 | sed 's/^/   /'
+        "$PY" -m tools.tls_proxy --check 2>&1 | sed 's/^/   /'
     else
         echo "   certificate: none (python -m tools.make_cert)"
     fi
@@ -211,6 +752,26 @@ rio_stop() {
 
 rio_start() {
     cd "$REPO"
+    # The interpreter is named, not looked up. A bare `uvicorn` is whatever the
+    # caller's PATH says, and on a pod that has not been bootstrapped it is
+    # either nothing at all or the image's python with none of this project's
+    # packages -- which is a server that dies on `import app` rather than one
+    # that never starts, and reads like a code bug.
+    if [ ! -x "$VENV_UVICORN" ]; then
+        echo "   !! no uvicorn at $VENV_UVICORN"
+        echo "   !! this pod has no python environment — run: bash boot.sh bootstrap"
+        return 1
+    fi
+    # Whoever is on the port right now is about to become "[Errno 98] address
+    # already in use" in a log nobody is tailing yet. Name them here instead.
+    local holder
+    for holder in $(port_pids "$PORT"); do
+        rio_is_ours "$holder" && continue
+        echo "   !! :$PORT is held by something that is not RIO, so uvicorn cannot bind:"
+        echo "   !!    pid $holder: $(proc_desc "$holder")"
+        echo "   !! free it with: bash boot.sh bootstrap"
+        return 1
+    done
     # The log of the run you are restarting BECAUSE OF is the one thing you
     # need after a crash, and `>` erases it.
     #
@@ -237,8 +798,12 @@ rio_start() {
     # line people copy out of the log and re-run by hand, and a uvicorn started
     # without HF_HOME re-downloads 16 GB of Qwen3-VL into a container layer that
     # is about to disappear.
-    setsid env HF_HOME="$HF_HOME_DIR" nohup \
-        uvicorn app:app --host 0.0.0.0 --port "$PORT" \
+    #
+    # PATH is stated for the same reason: what this server shells out to --
+    # ffmpeg, node, and its own python -- must be the volume's copies, not
+    # whatever the shell that happened to start it had.
+    setsid env HF_HOME="$HF_HOME_DIR" PATH="$VENV/bin:$NODE_DIR/bin:$PATH" nohup \
+        "$VENV_UVICORN" app:app --host 0.0.0.0 --port "$PORT" \
         > "$REPO/uvicorn.log" 2>&1 < /dev/null &
     sleep 1
     local pids
@@ -248,25 +813,35 @@ rio_start() {
         tail -20 "$REPO/uvicorn.log"
         return 1
     fi
-    echo "   started: $pids (HF_HOME=$HF_HOME_DIR)"
+    echo "   started: $pids"
+    echo "   python:  $VENV_UVICORN (HF_HOME=$HF_HOME_DIR)"
 }
 
 # uvicorn answers /health well before the model is warm (vision warms on a
 # daemon thread), so this waits for the SERVER, not for readiness.
 rio_wait_healthy() {
-    local i
+    local i body holder
     for i in $(seq 1 60); do
-        if curl -sf "http://127.0.0.1:$PORT/health" > /dev/null 2>&1; then
-            echo "   up after ${i}s: $(curl -s "http://127.0.0.1:$PORT/health")"
+        # rio_health_body, not `curl -sf`: it waits for OUR health answer, and
+        # something else on this port answering 302 is not this server coming
+        # up -- see the note above that function.
+        if body=$(rio_health_body); then
+            echo "   up after ${i}s: $body"
             return 0
-        fi
-        if [ "$i" -eq 60 ]; then
-            echo "   !! no response after 60s — tail of uvicorn.log:"
-            tail -20 "$REPO/uvicorn.log"
-            return 1
         fi
         sleep 1
     done
+    echo "   !! no RIO /health on :$PORT after 60s"
+    for holder in $(port_pids "$PORT"); do
+        if rio_is_ours "$holder"; then
+            echo "   !! :$PORT is ours (pid $holder) but it is not answering /health yet"
+        else
+            echo "   !! :$PORT is held by something else — pid $holder: $(proc_desc "$holder")"
+        fi
+    done
+    echo "   !! tail of uvicorn.log:"
+    tail -20 "$REPO/uvicorn.log"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -289,11 +864,13 @@ rio_wait_healthy() {
 #                               every pod start is a network dependency at boot
 #                               for no benefit.
 #   /opt/teachers/venvs         the environments. CONTAINER LAYER, deliberately,
-#                               and rebuilt by this script -- exactly like the
-#                               pip packages in step 3 and the torch wheels in
-#                               step 4. They are ~14 GB each and they are
-#                               derived from a lockfile; the volume's quota is
-#                               better spent on weights.
+#                               and rebuilt by this script -- unlike RIO's own
+#                               environment, which moved to $REPO/.venv on the
+#                               volume in step 0. These two are ~14 GB EACH and
+#                               they are derived from a lockfile; the volume's
+#                               quota is better spent on weights, and a teacher
+#                               that is missing costs a shadow column, not a
+#                               drive.
 #   $HF_HOME                    the weights, on the volume, like Qwen3-VL's.
 #   /workspace/teachers/fp8     the FP8 checkpoints, on the volume, because
 #                               regenerating one takes 20 minutes and the L40S
@@ -331,15 +908,25 @@ COSMOS_SHA=a3b4a1db4065fe13c4b1f4d2fb8605bad647f4b9
 # of that file. Never echoed.
 [ -f "$TEACHERS_ROOT/secrets.env" ] && . "$TEACHERS_ROOT/secrets.env"
 
+# By argv, not by comm, for exactly the reason rio_is_ours is: these two
+# processes load torch, torch renames the main thread to pt_main_thread, and a
+# comm filter of python/python3 therefore stops matching a teacher service the
+# moment it has finished loading -- i.e. from the point it starts being worth
+# stopping. `teachers-stop` would have reported "no teacher services running"
+# with both of them holding 30 GB of VRAM.
+#
+# A module path is one argv word (`python -m teachers.service.cosmos_service`),
+# so an exact-word test separates the service from any shell mentioning it.
 teacher_pids() {
-    local pid comm
+    local pid
     for pid in $(pgrep -f 'teachers.service.(alpamayo|cosmos)_service' 2>/dev/null || true); do
         [ "$pid" = "$$" ] && continue
-        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
-        case "$comm" in
-            python|python3|python3.*) echo "$pid" ;;
-        esac
+        if proc_argv_has "$pid" teachers.service.alpamayo_service \
+                                teachers.service.cosmos_service; then
+            echo "$pid"
+        fi
     done
+    return 0
 }
 
 teachers_stop() {
@@ -535,7 +1122,7 @@ teachers_status() {
             echo "no answer on :$port"
             continue
         fi
-        printf '%s' "$body" | python3 -c 'import json,sys
+        printf '%s' "$body" | "$PY" -c 'import json,sys
 try:
     h = json.load(sys.stdin)
 except Exception:
@@ -547,22 +1134,77 @@ print(("loaded  " if h.get("loaded") else "NOT LOADED  ")
     done
 }
 
+# What is actually running, in three answers that do not borrow from each
+# other: is one of OUR processes alive, is the port OURS, and does OUR server
+# say it is healthy.
+#
+# Both halves of this used to lie, on the same evening. It printed "uvicorn:
+# not running" while RIO served every request (comm said pt_main_thread -- see
+# rio_is_ours), and on the pod before that it printed a healthy-looking line
+# that was jupyter-lab's 302 to its own login page. The second is the worse
+# failure: a status that reports someone else's answer as ours is worse than
+# one that reports nothing, because it ends the investigation.
 rio_status() {
-    local pids
+    local pids lp body probe code lpids ours_on_port=0
     pids=$(rio_pidline)
     if [ -z "$pids" ]; then
-        echo "   uvicorn: not running"
+        echo "   uvicorn: no RIO process — nothing on this box has 'uvicorn app:app' as its argv"
     else
         echo "   uvicorn: $pids"
+        for lp in $pids; do
+            echo "            pid $lp: $(proc_desc "$lp")"
+        done
     fi
-    echo "   :$PORT   $(ss -lntp 2>/dev/null | grep ":$PORT" || echo 'nothing listening')"
-    echo "   health:  $(curl -s -m 5 "http://127.0.0.1:$PORT/health" 2>/dev/null || echo 'no answer')"
+
+    lpids=$(port_pids "$PORT")
+    if [ -z "$lpids" ]; then
+        echo "   :$PORT   nothing is listening"
+    else
+        for lp in $lpids; do
+            if rio_is_ours "$lp"; then
+                ours_on_port=1
+                echo "   :$PORT   OURS — pid $lp: $(proc_desc "$lp")"
+            else
+                echo "   :$PORT   NOT OURS — pid $lp: $(proc_desc "$lp")"
+                echo "            RIO cannot bind while that holds the port."
+                echo "            Take it back with: bash boot.sh bootstrap"
+            fi
+        done
+    fi
+
+    if [ -z "$lpids" ]; then
+        echo "   health:  not asked — nothing is listening on :$PORT"
+        return 0
+    fi
+    probe=$(http_probe "http://127.0.0.1:$PORT/health")
+    code=${probe%%$'\t'*}
+    if [ "$ours_on_port" -ne 1 ]; then
+        echo "   health:  NOT ASKED OF RIO — the listener on :$PORT is not ours."
+        echo "            It answered /health with HTTP $code. That is ITS answer;"
+        echo "            it is not evidence of anything about this server."
+        return 0
+    fi
+    if body=$(rio_health_body); then
+        echo "   health:  $body"
+    else
+        echo "   health:  OURS, BUT NOT HEALTHY — /health returned HTTP $code"
+        echo "            (still starting, or it failed during startup:"
+        echo "             tail -40 $REPO/uvicorn.log)"
+    fi
 }
 
+# Everything below runs `python -m tools.something` sooner or later, and those
+# imports are relative to the repository. The script is documented as
+# `bash /workspace/boot.sh`, which leaves cwd wherever the caller was standing.
+cd "$REPO"
+
 # Dispatch before the provisioning traps below are installed: none of these
-# subcommands provisions anything, so none of them should abort saying the pod
-# is half-built.
+# subcommands provisions the pod in the expensive sense, so none of them should
+# abort saying the pod is half-built. `bootstrap` is here for that reason too:
+# it reports its own failures, in the terms of the thing that failed.
 case "${1-}" in
+    bootstrap) bootstrap; exit $? ;;
+    storage|persistence) log "volume vs container"; persistence_report; exit 0 ;;
     restart) log "restarting uvicorn on :$PORT"; rio_stop; rio_start
              log "health check"; rio_wait_healthy; rc=$?
              log "https"; tls_start; exit $rc ;;
@@ -572,15 +1214,18 @@ case "${1-}" in
              log "https"; tls_start; exit $rc ;;
     status)  log "RIO on :$PORT"; rio_status
              log "https"; tls_status
-             log "teachers"; teachers_status; exit 0 ;;
+             log "teachers"; teachers_status
+             log "volume vs container — what a fresh pod would still have"
+             persistence_report; exit 0 ;;
     https)   log "starting tls proxy on :$HTTPS_PORT"; tls_start; exit $? ;;
     https-stop) log "stopping tls proxy"; tls_stop; exit 0 ;;
-    cert)    shift; python3 -m tools.make_cert "$@"; exit $? ;;
+    cert)    shift; "$PY" -m tools.make_cert "$@"; exit $? ;;
     teachers)       teachers_start; exit $? ;;
     teachers-stop)  log "stopping teacher services"; teachers_stop; exit 0 ;;
     teachers-build) teachers_build; exit $? ;;
     "")      ;;
-    *)       echo "usage: bash boot.sh [restart|stop|start|status|cert|https|https-stop|teachers|teachers-stop|teachers-build]" >&2; exit 2 ;;
+    *)       echo "usage: bash boot.sh [bootstrap|storage|restart|stop|start|status|cert|https|https-stop|teachers|teachers-stop|teachers-build]" >&2
+             echo "       (no argument: the full provision, bootstrap included)" >&2; exit 2 ;;
 esac
 
 # `set -e` makes this script abort on the first failure, which is right -- but a
@@ -589,81 +1234,79 @@ esac
 trap 'rc=$?; printf "\n!! boot.sh ABORTED at line %s (exit %s): %s\n" \
       "$LINENO" "$rc" "$BASH_COMMAND"; \
       printf "   The pod is PARTIALLY provisioned. What is missing:\n"; \
-      printf "     cd %s && python -m tools.preflight\n" "$REPO"; \
+      printf "     cd %s && %s -m tools.preflight\n" "$REPO" "$PY"; \
       printf "   Full log: %s\n" "$BOOT_LOG"; exit $rc' ERR
 trap 'printf "\n!! boot.sh was INTERRUPTED (signal). The pod is PARTIALLY\n"; \
-      printf "   provisioned -- run: cd %s && python -m tools.preflight\n" "$REPO"; \
+      printf "   provisioned -- run: cd %s && %s -m tools.preflight\n" "$REPO" "$PY"; \
       exit 130' HUP INT TERM
+
+# ---------------------------------------------------------------------------
+# 0. bootstrap — the environment this script itself runs in
+# ---------------------------------------------------------------------------
+# FIRST, and not optional, because every step below this one invokes $PY and
+# $PIP: a `pip install` is only worth doing once there is somewhere for it to
+# land that will still be there tomorrow. This is the same `bash boot.sh
+# bootstrap` a fresh pod is told to run on its own, it is idempotent, and on a
+# pod that has already had it it costs seconds.
+bootstrap || {
+    echo
+    echo "!! bootstrap failed. Nothing below this line can work without it, so"
+    echo "!! this run stops here rather than installing into a pod that has"
+    echo "!! nowhere to put it. Full log: $BOOT_LOG"
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # 1. HF_HOME — keep model weights on the persistent volume
 # ---------------------------------------------------------------------------
 # Without this, transformers caches into ~/.cache inside the container layer and
-# re-downloads all 16GB of Qwen3-VL-8B on every pod start.
+# re-downloads all 16GB of Qwen3-VL-8B on every pod start. Step 0 has already
+# written it into $ENV_FILE and sourced it; this states it again for this
+# script's own children, which is the same reason rio_start states it.
 log "HF_HOME -> $HF_HOME_DIR"
 export HF_HOME="$HF_HOME_DIR"
 mkdir -p "$HF_HOME_DIR"
 
-# The environment itself goes on the PERSISTENT volume, for the same reason the
-# boot log does. ~/.bashrc is in the container layer: every line ever appended
-# to it is gone on the next pod start, so "it is in .bashrc" was only ever true
-# until the rebuild -- and preflight, run from any shell that had not been
-# through boot.sh, reported HF_HOME unset.
-#
-# So the value lives HERE, in a file on /workspace, and ~/.bashrc gets one line
-# that sources it. That line still has to be re-added after every rebuild (it is
-# in the container layer too), but what it points at survives, and anything that
-# needs the environment without a login shell -- a cron entry, an agent, a
-# hand-restarted uvicorn -- can just `. /workspace/env.sh`.
-log "env -> $ENV_FILE"
-cat > "$ENV_FILE" <<EOF
-# Generated by boot.sh step 1. On the persistent volume on purpose: ~/.bashrc
-# does not survive a pod rebuild and this does. Source it from anything that
-# needs RIO's environment without going through a login shell:
-#
-#   . $ENV_FILE
-#
-export HF_HOME=$HF_HOME_DIR
-# Claude Code installs to ~/.local/bin, which isn't on the default PATH.
-export PATH="\$HOME/.local/bin:\$PATH"
-EOF
-echo "   wrote $ENV_FILE"
-
-# grep-guarded so re-runs don't stack duplicate lines into .bashrc.
-if ! grep -qF ". $ENV_FILE" ~/.bashrc 2>/dev/null; then
-    printf '\n# RIO environment (persistent volume -- see %s)\n' "$ENV_FILE" >> ~/.bashrc
-    printf '[ -f %s ] && . %s\n' "$ENV_FILE" "$ENV_FILE" >> ~/.bashrc
-    echo "   sourced from ~/.bashrc"
-else
-    echo "   already sourced from ~/.bashrc"
-fi
-
-# shellcheck source=/dev/null
-. "$ENV_FILE"
+# The environment itself -- PATH and HF_HOME -- is written to $ENV_FILE on the
+# volume by write_env_file, which step 0 has already called. It used to be
+# inlined here; it moved so that `bootstrap` and a full run cannot disagree
+# about what PATH is supposed to be. See that function for why ~/.bashrc is not
+# the place for it.
 
 # ---------------------------------------------------------------------------
 # 2. System packages
 # ---------------------------------------------------------------------------
 # ffmpeg: ElevenLabs audio muxing. nano: editing on the box. git: push/pull.
 #
-# nodejs: two of this project's test suites are JavaScript, because two of the
-# things worth testing are -- the arbiter and the route tracker both run in the
-# browser, and both are written as pure modules precisely so `node` can drive
-# them without a page. Without it, `node tools/nav_selftest.js` and
-# `node tools/realtime_selftest.js` are 240-odd checks nobody can run, and the
-# pod comes up able to verify only half of itself. Ubuntu's node is 12, which
-# is ancient and entirely sufficient: those files are deliberately ES5/ES6 with
-# no build step.
-log "apt packages (ffmpeg nano git nodejs)"
+# NODE IS NOT HERE ANY MORE, and neither is tmux: both are step 0's, and node
+# is on the volume. Two of this project's test suites are JavaScript, because
+# two of the things worth testing are -- the arbiter and the route tracker both
+# run in the browser, and both are written as pure modules precisely so `node`
+# can drive them without a page, which makes `node tools/nav_selftest.js` and
+# `node tools/realtime_selftest.js` 240-odd checks that need an interpreter.
+# apt's nodejs is version 12 in the container layer, reinstalled on every boot;
+# $NODE_DIR is a current one that survives the rebuild, and it brings npm,
+# which apt's nodejs does not and which is how Claude Code gets here.
+log "apt packages (ffmpeg nano git)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends ffmpeg nano git nodejs
+apt-get install -y -qq --no-install-recommends ffmpeg nano git
 
 # ---------------------------------------------------------------------------
-# 3. Python dependencies
+# 3. Python dependencies — installed in step 0, and here is why they moved
 # ---------------------------------------------------------------------------
-log "pip install -r requirements.txt"
-pip install --no-cache-dir -r "$REPO/requirements.txt"
+# This step used to be `pip install -r requirements.txt` against whatever pip
+# was on PATH, which was the image's: the packages went into the container
+# layer, and on 2026-09-17 this pod came back with the repository and all 16 GB
+# of weights intact and NO PYTHON ENVIRONMENT AT ALL to run them with.
+#
+# They now go into $VENV on the volume, in step 0, early -- because everything
+# below this line runs $PY. bootstrap_venv is stamped with the hash of
+# requirements.txt, so a re-run is a no-op and a changed requirements.txt is a
+# real install.
+log "python dependencies"
+echo "   $("$VENV_PY" -V 2>&1) at $VENV_PY"
+echo "   requirements.txt installed there by step 0"
 
 # ---------------------------------------------------------------------------
 # 4. Torch cu128 — MUST come after requirements.txt
@@ -675,7 +1318,7 @@ pip install --no-cache-dir -r "$REPO/requirements.txt"
 # considers 2.11.0 already-satisfied and would no-op on a re-run of this script
 # after a partial/mixed install.
 log "torch cu128 force-reinstall"
-pip install --no-cache-dir --force-reinstall \
+"$PIP" install --no-cache-dir --force-reinstall \
     torch==2.11.0+cu128 \
     torchvision==0.26.0+cu128 \
     torchaudio==2.11.0+cu128 \
@@ -684,13 +1327,13 @@ pip install --no-cache-dir --force-reinstall \
 # The torch wheels are ~3GB; the cache is on the container layer but the disk
 # pressure is real during install.
 log "pip cache purge"
-pip cache purge || true
+"$PIP" cache purge || true
 
 # ---------------------------------------------------------------------------
 # 5. GPU sanity
 # ---------------------------------------------------------------------------
 log "GPU sanity"
-python - <<'PY'
+"$PY" - <<'PY'
 import torch
 print(f"  torch        : {torch.__version__}")
 print(f"  cuda build   : {torch.version.cuda}")
@@ -716,7 +1359,7 @@ PY
 # corridor and logs corridor_source=static, which is the pre-UFLDv2 behaviour.
 # A pod that comes up with no lane model should still come up.
 log "UFLDv2 lane weights"
-python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headway will use the static corridor"
+"$PY" -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headway will use the static corridor"
 
 # ---------------------------------------------------------------------------
 # 5c. RF-DETR detector (Apache-2.0) — the headway candidate source
@@ -743,8 +1386,8 @@ python -m tools.fetch_lane_weights || log "  !! lane weights unavailable - headw
 # missing scipy is a pod where the gap warnings never fire and RIO cannot see
 # anything to talk about. The smoke check below is what catches it.
 log "RF-DETR (--no-deps: its dep tree breaks the pinned cv2/transformers)"
-pip install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
-pip install --no-cache-dir --no-deps scipy
+"$PIP" install --no-cache-dir --no-deps rfdetr==1.5.0 supervision==0.29.1 pycocotools peft
+"$PIP" install --no-cache-dir --no-deps scipy
 # Both of the next two run `python -m` / import from the repo, so they need the
 # repo as cwd. The script is documented as `bash /workspace/boot.sh`, which
 # leaves cwd wherever the caller happened to be; the cd further down (step 7)
@@ -752,7 +1395,7 @@ pip install --no-cache-dir --no-deps scipy
 cd "$REPO"
 
 log "RF-DETR weights"
-python -m tools.fetch_detector_weights || log "  !! detector weights unavailable - headway will have no candidates"
+"$PY" -m tools.fetch_detector_weights || log "  !! detector weights unavailable - headway will have no candidates"
 
 # Prove the two things that have actually broken here before, while the log is
 # still being read, rather than discovering them mid-drive as an UNKNOWN band:
@@ -761,7 +1404,7 @@ python -m tools.fetch_detector_weights || log "  !! detector weights unavailable
 #   * CSRT, which disappears if anything drags opencv-python 5.x in on top of
 #     the pinned contrib-headless build
 log "detector + tracker smoke check"
-python - <<'PY' || log "  !! SMOKE CHECK FAILED - no headway candidates AND an empty scene graph"
+"$PY" - <<'PY' || log "  !! SMOKE CHECK FAILED - no headway candidates AND an empty scene graph"
 import cv2
 from headway import detect
 detect._rfdetr_models()          # also proves scipy is present: matcher imports it
@@ -793,10 +1436,11 @@ PY
 # fails.
 #
 # The browser lands in ~/.cache/ms-playwright, which is the container layer and
-# does NOT survive a pod restart -- the same as apt packages, pip packages and
-# torch above, and the reason all of them are reinstalled here on every boot.
-# It is ~115 MB, against torch's ~3 GB, so it is not worth the persistent
-# volume and a PLAYWRIGHT_BROWSERS_PATH to go with it.
+# does NOT survive a pod restart -- like the apt packages above, and unlike the
+# python environment, which moved to the volume in step 0. Left container-local
+# on purpose: it is ~115 MB of pure test dependency, nothing about the server
+# needs it, and re-fetching it is a minute against the PLAYWRIGHT_BROWSERS_PATH
+# it would take to keep it. `bash boot.sh status` says which side it is on.
 #
 # Three commands, because the browser is three things: the python package, the
 # apt half it needs to run (fonts, libnss3, xvfb and the rest), and the browser
@@ -805,9 +1449,9 @@ PY
 # the message says what is lost rather than which of the three fell over. The
 # log line above it is what says how far it got.
 log "playwright + chromium (browser selftests)"
-pip install --no-cache-dir playwright \
-    && python -m playwright install-deps chromium \
-    && python -m playwright install chromium \
+"$PIP" install --no-cache-dir playwright \
+    && "$PY" -m playwright install-deps chromium \
+    && "$PY" -m playwright install chromium \
     || log "  !! playwright unavailable - output_bus_selftest and mobile_layout_selftest cannot run"
 
 # ---------------------------------------------------------------------------
@@ -826,10 +1470,17 @@ teachers_build || log "  !! teacher environments unavailable - the panel's two c
 # ---------------------------------------------------------------------------
 # 6. Free port 8888
 # ---------------------------------------------------------------------------
-# RunPod starts JupyterLab on 8888, which is the port the proxy exposes and the
-# port RIO needs. Jupyter has to go.
-log "killing jupyter"
-pkill -f jupyter || echo "   no jupyter running"
+# RunPod starts JupyterLab on 8888, which is the port the proxy exposes and so
+# the only port RIO can be reached on. Jupyter has to go -- and it goes BY PID,
+# taken from the listener itself, rather than by `pkill -f jupyter`, which is
+# what this step used to be: -f matches the pattern against every process's
+# whole command line, the shell running the pkill included. See free_port, and
+# the longer version of that story above rio_pids.
+#
+# Step 0 already did this. It is repeated because a full run takes the better
+# part of an hour, and anything at all may have taken the port back meanwhile.
+log "freeing :$PORT"
+free_port
 
 # Also clear any uvicorn from a previous run of this script, so a re-run doesn't
 # leave two servers fighting over the port. Through rio_stop, which is careful
@@ -870,7 +1521,7 @@ echo "   (Qwen3-VL warm continues in background — watch: tail -f $REPO/uvicorn
 # down over a missing lane model would be the wrong trade -- but it prints what
 # is missing and what breaks because of it, into a log that survives the pod.
 log "preflight"
-python -m tools.preflight || {
+"$PY" -m tools.preflight || {
     echo "   !! this pod is INCOMPLETE — see the list above"
     echo "   !! for the repair commands: python -m tools.preflight --fix"
 }
@@ -884,14 +1535,26 @@ log "teacher services"
 teachers_start || log "  !! teacher services did not start - the panel's columns will be empty"
 
 # ---------------------------------------------------------------------------
-# 9. Claude Code
+# 9. Claude Code — installed by step 0, onto the volume
 # ---------------------------------------------------------------------------
-log "Claude Code"
-if command -v claude > /dev/null 2>&1; then
-    echo "   already installed: $(claude --version)"
-else
-    curl -fsSL https://claude.ai/install.sh | bash
-    echo "   installed: $("$HOME/.local/bin/claude" --version)"
-fi
+# This used to be `curl -fsSL https://claude.ai/install.sh | bash`, which puts
+# the binary in ~/.local/bin: the container layer. So it went with the rebuild,
+# and the fresh pod had no agent on it to ask about the fresh pod. It is an npm
+# global under $NODE_DIR now, which is why bootstrap_node comes first.
+#
+# Called again rather than assumed: this is a long script, and step 0 ran
+# before ~30 GB of downloads that can fail in ways that leave the box tidy.
+bootstrap_claude
+
+# ---------------------------------------------------------------------------
+# 10. What this pod keeps, and what it will lose
+# ---------------------------------------------------------------------------
+# Last, because it is the part worth reading when the pod comes back and this
+# log is the only account of what was here. Every VOLUME row is something the
+# next pod starts with; every CONTAINER row is something this script had to
+# make, and will have to make again.
+log "volume vs container"
+persistence_report
 
 log "boot complete — RIO on :$PORT"
+echo "   restore this environment in any shell:  . $ENV_FILE"
