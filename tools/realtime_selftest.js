@@ -65,6 +65,25 @@ const speech = require(path.join(__dirname, '..', 'static', 'rio_speech.js'));
 const navcore = require(path.join(__dirname, '..', 'static', 'rio_navcore.js'));
 
 let checks = 0, failures = 0;
+/* SETTING `navigator` IN NODE 22.
+ *
+ * Node 22 defines globalThis.navigator itself, as a getter-only accessor, so
+ * the plain `global.navigator = {...}` these harnesses used since node 12
+ * throws "Cannot set property navigator of #<Object> which has only a getter"
+ * and takes the whole suite down before its first check. That is exactly what
+ * happened when node moved onto the volume and went from apt's 12 to 22 --
+ * 111 checks in the sibling suite kept passing and this one stopped running
+ * at all, which is the failure shape a skipped suite always has.
+ *
+ * defineProperty replaces the accessor with a writable data property, which
+ * is what the assignment was trying to do, and works on both.
+ */
+function setNavigator(value) {
+  Object.defineProperty(global, 'navigator', {
+    value: value, writable: true, configurable: true, enumerable: true,
+  });
+}
+
 function ok(cond, what) {
   checks++;
   if (!cond) { failures++; console.log('  FAIL  ' + what); }
@@ -2188,8 +2207,8 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
     return { preload: '', muted: false, currentTime: 0,
              play: () => Promise.resolve(), pause: () => {} };
   };
-  global.navigator = { geolocation: { getCurrentPosition: (okc) => okc({
-    coords: { latitude: ROUTE_LAT, longitude: ROUTE_LNG, accuracy: 8 } }) } };
+  setNavigator({ geolocation: { getCurrentPosition: (okc) => okc({
+    coords: { latitude: ROUTE_LAT, longitude: ROUTE_LNG, accuracy: 8 } }) } });
 
   global.RIO = global.RIO || {};
   global.RIO.sessionId = 'sel';
@@ -2593,13 +2612,13 @@ function installBrowser(base, sessionId, origin) {
   // where the panel's subscription lands, so this harness can drive the car
   // along the route afterwards exactly as a real fix would.
   const gps = { sink: null };
-  global.navigator = {
+  setNavigator({
     geolocation: {
       getCurrentPosition: (okc) => okc({ coords: { latitude: origin.lat,
                                                    longitude: origin.lng,
                                                    accuracy: 8 } }),
     },
-  };
+  });
   /* EXTEND the page's namespace, never REPLACE it.
    *
    * Every panel file registers itself on `window.RIO` from an IIFE that runs
