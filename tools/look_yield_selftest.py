@@ -26,9 +26,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config                                               # noqa: E402
 
 _fails = []
+# A VERDICT WITH NO TOTAL CANNOT TELL YOU IT RAN. This counted failures only, so
+# "PASS: 0 failure(s)" was printed by a suite asserting dozens of things and
+# would have read identically from one asserting none -- which is how 23f4185,
+# source_selftest.js and https_selftest's own unreachable section E all stayed
+# hidden. tools/suite_sweep.py flags it as NO COUNT. A list rather than an int so
+# ok() needs no `global`.
+_checks = []
 
 
 def ok(name, cond, extra=""):
+    _checks.append(1)
     if cond:
         print(f"  ok   {name}")
     else:
@@ -116,7 +124,8 @@ def main() -> int:
        and float(config.OBSERVER_ANSWER_MAX_AGE_S) > config.OBSERVER_FRESH_S)
 
     print("\n" + "-" * 56)
-    print(f'  {"PASS" if not _fails else "FAIL"}: {len(_fails)} failure(s)')
+    print(f'  {"PASS" if not _fails else "FAIL"}: {len(_fails)} failure(s)'
+          f' of {len(_checks)} checks')
     for f in _fails:
         print(f"    - {f}")
     return len(_fails)

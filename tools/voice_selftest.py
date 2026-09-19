@@ -80,6 +80,7 @@ def ok(cond, what):
 import assert_guard as _guard                              # noqa: E402
 
 ok_all, ok_none, non_empty = _guard.bind(ok, order="cond_first")
+SKIPPED = _guard.Skips()
 
 
 def section(name):
@@ -1160,21 +1161,43 @@ def main() -> int:
     run_persona()
     run_firewall()
     run_clips()
+    # THREE OPT-IN SECTIONS, AND THEY USED TO GO QUIET. A default run printed
+    # "97/97 checks passed" with 34 of this file's 131 assertion sites never
+    # executed and nothing saying so -- tools/suite_sweep.py reported it as
+    # EXITS EARLY at 74%. They stay opt-in: one opens real ElevenLabs sockets,
+    # one briefly consumes every dialogue seat the account has, and one needs a
+    # running server. What changes is that "passed" no longer means "passed, and
+    # also three sections you were not told about did not run".
     if args.live:
         run_voice_support()
         asyncio.run(run_live())
         asyncio.run(run_other_transport())
         asyncio.run(run_fallbacks())
+    else:
+        SKIPPED.skip("the live voice — the real dialogue socket, the other "
+                     "transport, and the fallback chain",
+                     "pass --live (opens real ElevenLabs sockets)")
     if args.pool:
         asyncio.run(run_no_seat())
+    else:
+        SKIPPED.skip("the seat-exhaustion path — what a car does with no "
+                     "dialogue seat left",
+                     "pass --pool (slow, and briefly uses every seat the "
+                     "account has)")
     if args.server:
         run_relay(args.server.rstrip("/"))
         if args.live:
             run_observer_voice(args.server.rstrip("/"))
+        else:
+            SKIPPED.skip("the observer's voice through the relay",
+                         "needs --server AND --live together")
+    else:
+        SKIPPED.skip("the relay against a running server",
+                     "pass --server http://127.0.0.1:8888")
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)
-    print(f"{len(PASS)}/{total} checks passed")
+    print(f"{len(PASS)}/{total} checks passed" + SKIPPED.summary())
     if FAIL:
         print("\nFAILED:")
         for f in FAIL:

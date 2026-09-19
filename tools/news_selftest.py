@@ -46,9 +46,17 @@ import localnews as ln                                      # noqa: E402
 
 OK, BAD = "ok  ", "FAIL"
 _fails = []
+# A VERDICT WITH NO TOTAL CANNOT TELL YOU IT RAN. This counted failures only, so
+# "PASS: 0 failure(s)" was printed by a suite asserting dozens of things and
+# would have read identically from one asserting none -- which is how 23f4185,
+# source_selftest.js and https_selftest's own unreachable section E all stayed
+# hidden. tools/suite_sweep.py flags it as NO COUNT. A list rather than an int so
+# ok() needs no `global`.
+_checks = []
 
 
 def ok(name, cond, extra=""):
+    _checks.append(1)
     if cond:
         print(f"  {OK} {name}")
     else:
@@ -429,7 +437,8 @@ def main() -> int:
     if not a.offline:
         t_live()
     print("\n" + "-" * 58)
-    print(f'  {"PASS" if not _fails else "FAIL"}: {len(_fails)} failure(s)')
+    print(f'  {"PASS" if not _fails else "FAIL"}: {len(_fails)} failure(s)'
+          f' of {len(_checks)} checks')
     for f in _fails:
         print(f"    - {f}")
     return len(_fails)
