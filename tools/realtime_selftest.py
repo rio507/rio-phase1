@@ -49,6 +49,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 import config          # noqa: E402
 import places          # noqa: E402
+import llm_provider
 import realtime        # noqa: E402
 from navigation import model as M  # noqa: E402
 import rio_prompts     # noqa: E402
@@ -739,15 +740,33 @@ class _Result:
                        for _ in range(searches)]
 
 
+def _reasoning_fake():
+    """The fake currently answering the reasoning role, or None.
+
+    Named, because two places in this file used to read realtime._client
+    directly -- and when escalate() stopped using that global they read None and
+    raised. Asking the provider which fake is installed is the same question
+    without the coupling.
+    """
+    return llm_provider._override.get("reasoning")
+
+
 def _with_client(behaviour):
+    """Fake the REASONING client.
+
+    Through llm_provider.override rather than by assigning realtime._client:
+    escalate() asks the provider for its client now, so the old assignment
+    stopped intercepting and let the real API answer a scripted test. The seam is
+    named for what it fakes.
+    """
     fake = _FakeClient(behaviour)
-    realtime._client = fake
+    llm_provider.override("reasoning", fake)
     return fake
 
 
 def run_failure():
     section("D. failure — every way it can go wrong ends the same way")
-    original = realtime._client
+    original = _reasoning_fake()
     try:
         fake = _with_client(lambda kw: _Result("Because the map says so."))
         r = realtime.escalate("why", context="driver asked about the route")
@@ -839,12 +858,14 @@ def run_failure():
         try:
             config.REALTIME_WEB_SEARCH = False
             realtime.escalate("anything")
-            ok(not (realtime._client.responses.calls[-1].get("tools") or []),
+            ok(not (_reasoning_fake().responses.calls[-1].get("tools") or []),
                "web search is a config switch, and off means off")
         finally:
             config.REALTIME_WEB_SEARCH = old
     finally:
-        realtime._client = original
+        llm_provider.clear_overrides()
+        if original is not None:
+            llm_provider.override("reasoning", original)
 
 
 # ---------------------------------------------------------------------------
@@ -931,8 +952,15 @@ def run_firewall():
     # tags it may use is GENERATED from the same list the validator enforces,
     # and two hand-written copies of that list is how a model ends up being
     # told it may do something that is silently undone.
+    # `llm_provider` is routing and nothing else: it maps a ROLE to a client, a
+    # model id and a capability record, so that escalate() can ask for "the
+    # reasoning model" without naming a vendor. It reaches no policy, holds no
+    # state about the drive, and cannot start a sentence -- it is `config` with a
+    # switch in front of it. It is on this list rather than exempted from it
+    # because a module that chooses which API answers a tool call is exactly the
+    # sort of thing that should have to justify itself here.
     ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
-                        "openai", "config", "visual_qa", "router",
+                        "openai", "config", "llm_provider", "visual_qa", "router",
                         "vehicle_health", "places", "observer",
                         # Both are read-side context sources reached only by a
                         # tool call, exactly as `places` is.
@@ -1007,7 +1035,7 @@ def run_endpoints():
         return asyncio.run(app_mod.realtime_tool_endpoint(
             request or _Req(), body, session_id=None))
 
-    original = realtime._client
+    original = _reasoning_fake()
     try:
         _with_client(lambda kw: _Result("A lean condition."))
         r = _call({"name": realtime.TOOL_NAME,
@@ -1040,7 +1068,9 @@ def run_endpoints():
         ok(took < 2.0,
            f"...without waiting out the tool it abandoned ({took:.2f}s of a 5s call)")
     finally:
-        realtime._client = original
+        llm_provider.clear_overrides()
+        if original is not None:
+            llm_provider.override("reasoning", original)
 
     st = realtime.status()
     ok(st["model"] == config.OPENAI_REALTIME_MODEL and

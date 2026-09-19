@@ -51,6 +51,7 @@ from typing import Optional
 from openai import OpenAI
 
 import config
+import llm_provider
 import rio_prompts
 import voice_tags
 # Place search lives in its own module for the same reason visual_qa does: it is
@@ -1738,8 +1739,16 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
     try:
         # `with_options` rather than a thread: the SDK's own timeout aborts the
         # request, where a thread would leave it running and still billed.
-        resp = client().with_options(timeout=timeout).responses.create(
-            model=config.OPENAI_REASONING_MODEL,
+        kw = {}
+        effort = llm_provider.reasoning_effort("reasoning")
+        if effort:
+            # Sent only when the vendor takes it. grok-4.6 reasons hard by
+            # default and it is most of deep_dive's latency; see
+            # config.XAI_REASONING_EFFORT for the measurement.
+            kw["reasoning"] = {"effort": effort}
+        resp = llm_provider.client("reasoning").with_options(
+            timeout=timeout).responses.create(
+            model=llm_provider.model_of("reasoning"),
             instructions=(
                 "You are the research and reasoning step behind a car "
                 "assistant's spoken answer. Answer the question directly, in "
@@ -1762,6 +1771,7 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
             # say. See config.DEEP_REASONING_MAX_TOKENS.
             max_output_tokens=int(config.DEEP_ANSWER_MAX_TOKENS
                                   + config.DEEP_REASONING_MAX_TOKENS),
+            **kw,
         )
     except Exception as e:
         took = round((time.time() - t0) * 1000, 1)
@@ -1786,10 +1796,32 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
     reasoning_tokens = getattr(
         getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
     out_tokens = getattr(usage, "output_tokens", None)
-    searches = sum(1 for item in (getattr(resp, "output", None) or [])
-                   if getattr(item, "type", "") == "web_search_call")
+    # ASKED, NOT COUNTED IN ONE VENDOR'S SHAPE. This used to count output items
+    # of type web_search_call, which is how OpenAI reports a search and not how
+    # xAI does -- xAI puts the number in usage.num_server_side_tools_used, so the
+    # old line would have reported zero searches on a call that ran five. That
+    # matters where it is debited from a budget (localnews._charge).
+    searches = llm_provider.searches_of("reasoning", resp)
+    # WHAT IT ACTUALLY COST, when the vendor says. None means it did not, which
+    # is the OpenAI path and is why the news constants exist to estimate with.
+    spent = llm_provider.cost_usd("reasoning", usage)
     shape = (f"status={status} reason={why} out_tokens={out_tokens} "
-             f"reasoning_tokens={reasoning_tokens} searches={searches}")
+             f"reasoning_tokens={reasoning_tokens} searches={searches}"
+             + (f" ${spent:.5f}" if spent is not None else ""))
+    # A CAP THAT IS NOT ENFORCED IS NOT A CAP, AND THIS PATH HAS TO SAY SO.
+    # max_output_tokens above is sent as one number covering the thinking and the
+    # answer together, because the OpenAI path enforces it. Measured on xAI it
+    # does not: asked for 200, grok-4.6 returned 849 output tokens and called
+    # itself completed. So on a vendor that ignores it the only bound on this
+    # tool is the client timeout, and an overrun is worth a line in the log
+    # rather than a silence -- it is the shape of a bill getting away from us.
+    if not llm_provider.capability("reasoning", "enforces_token_cap"):
+        cap = int(config.DEEP_ANSWER_MAX_TOKENS + config.DEEP_REASONING_MAX_TOKENS)
+        if (out_tokens or 0) > cap:
+            print(f"[realtime] deep_dive overran an unenforced cap: "
+                  f"{out_tokens} output tokens against {cap} asked for "
+                  f"({llm_provider.label('reasoning')} does not enforce it)",
+                  flush=True)
 
     if not text:
         # NAMED, not just counted. "It thought until the budget was gone" and
@@ -1811,7 +1843,12 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
         print(f"[realtime] deep_dive {took} ms — {shape}", flush=True)
     return {
         "ok": True, "answer": text, "took_ms": took,
-        "model": config.OPENAI_REASONING_MODEL,
+        "model": llm_provider.model_of("reasoning"),
+        "vendor": llm_provider.vendor_of("reasoning"),
+        # The vendor's own figure where there is one, so a drive log records what
+        # deep_dive spent rather than what a rate table thinks it spent.
+        "usd": spent,
+        "searches": searches,
         "rules": (
             "Say this in your own voice, and keep it to three or four "
             "sentences. If it ends by saying there is more, offer that in a "

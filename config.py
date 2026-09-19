@@ -47,6 +47,107 @@ from rio_prompts import RIO_SYSTEM_PROMPT
 #               verifier. Two transcribers would make two records that
 #               disagree, and the disagreement would only ever show up in a
 #               drive nobody could reproduce.
+# ---------------------------------------------------------------------------
+# WHICH VENDOR ANSWERS WHICH ROLE, AND ONE STAGE AT A TIME
+# ---------------------------------------------------------------------------
+# The migration to xAI is staged, and the order is the point: deep_dive first
+# (async, behind a holding line), then news, then the live session, then the
+# voice. Each is measured against the stack it replaces before the next starts.
+# So the switch is PER ROLE rather than global -- a single VENDOR flag would make
+# every stage happen at once and make none of them measurable.
+#
+# llm_provider.py is the only file that knows what these names mean. Nothing else
+# should read them; ask it for a client, a model or a capability instead.
+REASONING_VENDOR = os.getenv("REASONING_VENDOR", "openai")
+NEWS_VENDOR = os.getenv("NEWS_VENDOR", "openai")
+CHAT_VENDOR = os.getenv("CHAT_VENDOR", "openai")
+
+# --- xAI's side of each role ------------------------------------------------
+# Pinned versioned names, not aliases, for the same reason the realtime model is
+# pinned: an alias moving under a running drive is a change nobody made.
+XAI_REASONING_MODEL = os.getenv("XAI_REASONING_MODEL", "grok-4.6")
+XAI_CHAT_MODEL = os.getenv("XAI_CHAT_MODEL", "grok-4.3")
+
+# HOW HARD THE REASONING MODEL THINKS, and this is a latency decision.
+#
+# grok-4.6 reasons by default, and on RIO's own deep_dive questions that is most
+# of the wait. Measured on one question, the shipped instructions, 2026-09-19:
+#
+#   effort        first answer     output tokens   reasoning tokens   cost
+#   low              12.5 s             441              315        $0.0032
+#   (default)        20.5 s             977              826        $0.0064
+#   high            24.6 s            1279             1154        $0.0082
+#
+# The answers were 716, 832 and 712 characters -- the same answer, for two and a
+# half times the wait and two and a half times the money.
+#
+# THAT TABLE WAS MEASURED WITHOUT SEARCH AND IS NOT THE SHIPPED PATH. Re-run
+# through realtime.escalate itself, with web_search on and the real instructions,
+# three questions:
+#
+#   grok-4.6, effort low     17.8 s median (17.8 / 17.8 / 22.3)   2-4 searches
+#   gpt-5.6-sol, no effort    4.8 s median ( 3.6 / 4.8 /  7.0)    0-1 searches
+#
+# So `low` buys about 20% against the default's 31.7 s median, not the halving
+# the search-free probe suggested, and the honest figure for this path is 17.8 s
+# against 4.8 s -- 3.7x slower. The first version of this comment said 12.5 s
+# "keeps the promise", which was a number from the wrong experiment; it is
+# corrected here rather than quietly replaced, because that is the mistake this
+# whole file has been full of.
+#
+# WHY IT IS SLOWER IS NOT MOSTLY SPEED. grok-4.6 chose to run 2-4 searches on
+# questions where gpt-5.6-sol ran 0-1. It is doing more work, and may well be
+# better sourced for it; what it is not is a drop-in with the same wall clock.
+#
+# 17.8 s median and 22.3 s worst of three still fits inside the "ten to
+# twenty-five seconds" the session instructions put in her mouth, which is the
+# constraint that matters -- but it fits with seconds to spare rather than with
+# room, and a slower question would break the promise rather than the budget.
+# DEEP_ANSWER_TIMEOUT_S is 45 s, so nothing times out; the line she says is the
+# thing to watch.
+#
+# NOT the same scale as the voice model's, which takes high|none only. See
+# static/rio_provider.js -- two scales on one vendor, which is why
+# llm_provider.reasoning_effort checks the value against the vendor before
+# sending it rather than trusting this constant.
+XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "low")
+# Left empty for OpenAI: the shipped path sends no effort at all and its latency
+# was measured at 8.2 s, so there is nothing to fix and no reason to start
+# sending a parameter this stack has never sent.
+OPENAI_REASONING_EFFORT_DEEP = os.getenv("OPENAI_REASONING_EFFORT_DEEP", "")
+
+
+def vendor_key(env_name: str):
+    """The key for a vendor, or None to let the SDK find it itself."""
+    return os.getenv(env_name) or None
+
+
+def reasoning_model() -> str:
+    return (XAI_REASONING_MODEL if REASONING_VENDOR == "xai"
+            else OPENAI_REASONING_MODEL)
+
+
+def news_model() -> str:
+    """The retrieval model. Still the same one deep_dive uses -- one search
+    stack, per localnews.py's header -- but resolved through the NEWS role so
+    stage 2 can move without stage 1 moving with it."""
+    return (XAI_REASONING_MODEL if NEWS_VENDOR == "xai"
+            else OPENAI_REASONING_MODEL)
+
+
+def chat_model() -> str:
+    return XAI_CHAT_MODEL if CHAT_VENDOR == "xai" else OPENAI_CHAT_MODEL
+
+
+def reasoning_effort_for(role: str):
+    """The effort string for a role, or "" for none."""
+    vendor = {"reasoning": REASONING_VENDOR, "news": NEWS_VENDOR,
+              "chat": CHAT_VENDOR}.get(role, "openai")
+    if vendor == "xai":
+        return XAI_REASONING_EFFORT
+    return OPENAI_REASONING_EFFORT_DEEP if role == "reasoning" else ""
+
+
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1")
 OPENAI_REASONING_MODEL = os.getenv("OPENAI_REASONING_MODEL", "gpt-5.6-sol")
 OPENAI_CHAT_MODEL = "gpt-5.5"
