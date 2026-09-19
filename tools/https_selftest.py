@@ -67,6 +67,16 @@ def ok(name, cond, extra=""):
         print(f"  {BAD} {name}{('  ' + str(extra)) if extra else ''}")
 
 
+# `all([])` is True, so a claim about every member of a collection passes when the
+# collection is empty -- and a DOM query that matched nothing returns exactly
+# that. See tools/assert_guard.py; tools/news_selftest.py is where this stopped
+# being hypothetical.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import assert_guard as _guard                                # noqa: E402
+
+ok_all, ok_none, non_empty = _guard.bind(ok, order="name_first")
+
+
 def section(t):
     print(f"\n== {t}")
 
@@ -212,8 +222,14 @@ def t_browser(https_url, http_url):
            "https://" in note, note[:80])
         ok("...and names the port to use", ":8443" in note, note[:120])
         rows = p2.eval_on_selector_all(".perm-row", "els => els.map(e => e.className)")
-        ok("all three rows show the insecure state",
-           all("insecure" in c for c in rows), rows)
+        # "all THREE rows" over a list that could be empty: a selector matching
+        # nothing -- the permission panel never rendered, which is a real way for
+        # this to break -- makes all() True and the sentence a lie in the same
+        # breath. ok_all fails on empty and prints the count it actually saw, so
+        # "three" is now something the output states rather than something the
+        # name claims.
+        ok_all("all three rows show the insecure state",
+               rows, lambda c: "insecure" in c, rows)
 
         section("F. the hint names the RIGHT url for the deployment")
         # Two deployments, two different right answers. Naming the wrong one is

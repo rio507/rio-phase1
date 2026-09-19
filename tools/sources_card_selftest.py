@@ -50,6 +50,16 @@ def ok(name, cond, extra=""):
         print(f"  {BAD} {name}{('  ' + str(extra)) if extra else ''}")
 
 
+# `all([])` is True, so a claim about every member of a collection passes when the
+# collection is empty -- and a DOM query that matched nothing returns exactly
+# that. See tools/assert_guard.py; tools/news_selftest.py is where this stopped
+# being hypothetical.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import assert_guard as _guard                                # noqa: E402
+
+ok_all, ok_none, non_empty = _guard.bind(ok, order="name_first")
+
+
 # Two answers, so the scrollback claim can be tested. The second deliberately
 # carries a citation with no URL and one with no publication date.
 ANSWER_1 = {
@@ -183,8 +193,24 @@ def main() -> int:
         all_rows = page.eval_on_selector_all(
             "#sourceshistory .src-row",
             "rows => rows.map(r => !!r.querySelector('a.src-link'))")
-        ok("a citation with no URL is left out, not rendered dead",
-           all(all_rows), all_rows)
+        # THE CHECK THAT CARRIES SECTION 4, AND IT PASSED ON AN EMPTY CARD.
+        # `all_rows` is one boolean per rendered row. If the selector matched
+        # nothing -- the card never un-hidden, the renderer thrown halfway, the
+        # block never appended -- the list is empty, all() is True, and the
+        # assertion that every citation is clickable reports green over a card
+        # with no citations on it at all. That is the exact failure LICENSING.md
+        # section 4 promises cannot happen, asserted by a check that could not
+        # see it. The row count is asserted immediately below, but on its own
+        # RE-QUERY: this line was vacuous by itself, and this line is the one
+        # whose name makes the licensing claim.
+        #
+        # It matters now rather than in principle: stage 2 moves citations to
+        # bare [1][2] text markers with no url_citation objects behind them, so
+        # the parser feeding this card is about to be rewritten. A check that
+        # cannot tell "every row is clickable" from "there are no rows" is no
+        # use for reviewing that.
+        ok_all("a citation with no URL is left out, not rendered dead",
+               all_rows, lambda has_link: has_link, all_rows)
         ok("...and the linkless one did not silently kill the block",
            page.eval_on_selector_all("#sourceshistory .src-row",
                                      "e => e.length") == 3)
