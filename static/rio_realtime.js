@@ -633,6 +633,27 @@
      --------------------------------------------------------------------- */
   function createController(cfg) {
     cfg = cfg || {};
+    /* WHICH VENDOR IS ON THE OTHER END, AND THE ONE THING THIS FILE IS ALLOWED
+     * TO KNOW ABOUT IT: nothing.
+     *
+     * The provider (static/rio_provider.js) does two jobs at this boundary. It
+     * maps the vendor's event names onto the ones the switch below speaks, so
+     * that no xAI event name — or any future vendor's — ever appears in this
+     * file. And it answers capability questions as FACTS, so that the code
+     * downstream asks "does anything know when the audio ended?" instead of
+     * "is this WebRTC?". The second half is the one that matters: a vendor
+     * check spreads, a fact does not.
+     *
+     * OPTIONAL, and that is deliberate. ~4,000 lines of
+     * tools/realtime_selftest.js build a controller with no provider and feed
+     * it canonical events directly. Without one, `normalise` is identity and
+     * every cfg flag behaves exactly as it did — which is what makes this a
+     * refactor rather than a rewrite, and is asserted in
+     * tools/provider_adapter_selftest.js. */
+    var provider = cfg.provider || null;
+    var normalise = (provider && provider.normalise)
+      ? provider.normalise
+      : function (ev) { return ev; };
     var arbiter = cfg.arbiter;
     var send = cfg.send || function () {};
     var runTool = cfg.tool || function () { return Promise.resolve({ ok: false }); };
@@ -1726,8 +1747,18 @@
        and a noise reply created in that window muted the tail on its way to
        being cancelled. On WebRTC the API sends output_audio_buffer.stopped
        (or .cleared) at the real end, so connect() sets this and the mouth
-       waits for it. The node harness sends neither, and keeps the old end. */
-    var holdTail = !!cfg.holdTail;
+       waits for it. The node harness sends neither, and keeps the old end.
+
+       NOW ASKED RATHER THAN ASSERTED. This used to be `connect()` passing a
+       hardcoded `true` under a comment naming WebRTC, which meant the one
+       dependency on the transport was written down in a comment and nowhere a
+       program could read. The provider answers it from `tailEvidence`, which
+       distinguishes the API having said the sound stopped from OUR OWN playout
+       queue having drained — both hold the tail, on very different evidence,
+       and the second is a downgrade worth being able to see in a log rather
+       than inferring from a version number. `cfg.holdTail` still wins when
+       there is no provider, which is every existing test. */
+    var holdTail = provider ? provider.holdTail() : !!cfg.holdTail;
     var tailFallbackMs = cfg.tailFallbackMs || 15000;
     var tailTimer = null;
     function armTail(rid) {
@@ -3376,6 +3407,15 @@
          decided here, which is what makes it testable without a microphone. */
       handle: function (ev) {
         if (!ev || !ev.type || stopped) return;
+        /* THE DOOR. Past this line every name is one this file chose.
+         *
+         * Before the `stopped` check would be wrong — a session being torn
+         * down should not be renaming events — and after the switch would be
+         * too late. Identity and allocation-free when there is nothing to map,
+         * which is every event on the current stack; null when the provider
+         * says the controller must not see this one at all. */
+        ev = normalise(ev);
+        if (!ev || !ev.type) return;
         switch (ev.type) {
           case 'response.created':
             /* The response being created now is the model's answer to the
@@ -4428,8 +4468,22 @@
           // no numbers of its own to drift from the ones the tests check.
           resumeInstruction: session.resume_instruction,
           bargeConfirmMs: session.barge_confirm_ms,
-          // WebRTC sends output_audio_buffer.stopped: the mouth waits for it.
-          holdTail: true,
+          /* THE VENDOR, AS A RECORD RATHER THAN AS KNOWLEDGE.
+             This used to be `holdTail: true` under a comment reading "WebRTC
+             sends output_audio_buffer.stopped: the mouth waits for it" — true,
+             and the only written record of the dependency. The provider now
+             answers it, along with every other capability question, so the
+             controller holds no vendor names and this call site holds no
+             transport assumptions. See static/rio_provider.js.
+
+             The backend travels with the session (config.VOICE_BACKEND, sent
+             by mint_client_secret), and `elevenlabs` resolves to the same
+             OpenAI event stream it has always been — it changes the mouth, not
+             the wire. */
+          provider: (root.RIO && root.RIO.provider)
+            ? root.RIO.provider.forVoiceBackend(session.voice_backend
+                                                || 'openai_realtime')
+            : null,
           /* THE PHONE COLUMN OR THE DESK COLUMN. Both travel with the session
              (config.py decides them, realtime.mint_client_secret sends them)
              and the machine picks its own — see isTouchDevice. The fallback to
