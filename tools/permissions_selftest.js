@@ -38,7 +38,14 @@ require(path.join(__dirname, '..', 'static', 'rio_permissions.js'));
 const { makePermissions } = root.RIO;
 
 let fails = 0;
+/* A VERDICT WITH NO TOTAL CANNOT TELL YOU IT RAN. This file counted failures
+   only, so "PASS: 0 failure(s)" was printed by a suite that asserted 46 things
+   and would have been printed identically by one that asserted none -- which is
+   exactly how 23f4185 and source_selftest.js stayed hidden. tools/suite_sweep.js
+   flags it as NO COUNT. */
+let checks = 0;
 function ok(name, cond, extra) {
+  checks++;
   if (cond) { console.log('  ok   ' + name); }
   else { fails++; console.log('  FAIL ' + name + (extra !== undefined ? '  ' + extra : '')); }
 }
@@ -224,6 +231,7 @@ function runFix() {
 
 function done() {
   console.log('\n' + '-'.repeat(58));
-  console.log('  ' + (fails ? 'FAIL' : 'PASS') + ': ' + fails + ' failure(s)');
+  console.log('  ' + (fails ? 'FAIL' : 'PASS') + ': ' + fails
+              + ' failure(s) of ' + checks + ' checks');
   process.exit(fails);
 }

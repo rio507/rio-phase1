@@ -134,15 +134,33 @@ function watch(graceMs) {
        && html.indexOf("LIVE_AUDIO_INTERRUPTED: 'audio_interrupted'") > 0,
        'all of it is REPORTED, not merely emitted -- the gap every one of '
        + 'today\'s fixes has been about');
-    ok(html.indexOf("pageMark('PAGE_VISIBILITY'") > 0
+    /* EITHER NAME, AND THE REASON THERE ARE TWO. These three checks looked for
+     * `pageMark(` and `live.resumeAudio(`, and had been failing since 16f5e95
+     * -- the commit whose whole subject is that `pageMark` was not defined where
+     * the drive block called it. The fix there was a local `mark()` wrapping
+     * `RIO.pageMark` (index.html ~4542), because the two live in different
+     * <script> blocks and the outer function is not in scope in the inner one.
+     * The behaviour these assert is present and correct; only the call site's
+     * spelling moved, and nobody updated the tests.
+     *
+     * So this suite spent months reporting FAILED 3/32 over working code, which
+     * is its own kind of silence: a suite that is always a bit red is one whose
+     * red stops being read. tools/suite_sweep.js calls it FAILS HONESTLY and
+     * that is exactly what it was doing -- the failure was nobody looking.
+     *
+     * Matching either helper rather than pinning the new one: both are real, a
+     * call site may legitimately use whichever is in scope, and a test that
+     * breaks when a wrapper is renamed is the thing being fixed here. */
+    const marks = /\b(?:RIO\.)?(?:page)?[Mm]ark\(/.source;
+    ok(new RegExp(marks + "'PAGE_VISIBILITY'").test(html)
        && /live_age_s/.test(html) && /wake_lock: !!wakeLock/.test(html),
        'a visibility change carries the live session, its age, the audio '
        + 'state and the wake lock in one line');
-    ok(html.indexOf("pageMark('WAKE_LOCK', { state: 'denied'") > 0
+    ok(new RegExp(marks + "'WAKE_LOCK', \\{ state: 'denied'").test(html)
        && html.indexOf("state: 'released'") > 0,
        'the wake lock reports denial and release -- a page that goes hidden a '
        + 'minute into a route with no lock is the auto-lock, not a mystery');
-    ok(html.indexOf("live.resumeAudio('visible')") > 0,
+    ok(/\.resumeAudio\('visible'\)/.test(html),
        'and coming back to the front replays her element -- Safari does not '
        + 'resume a paused element after an interruption by itself');
   }

@@ -60,7 +60,21 @@ function stubPage() {
     RIO: {},
   };
   global.document = global.window.document;
-  global.navigator = global.window.navigator;
+  /* NOT `global.navigator = ...`, AND THIS SUITE SPENT ITS WHOLE LIFE ON THAT
+     ONE LINE. Node 18 made `navigator` a real global, and by node 22 it is an
+     accessor with no setter — so a plain assignment throws
+     "Cannot set property navigator of #<Object> which has only a getter". It
+     threw here, inside the first stubPage(), before check one: 38 assertion
+     sites, zero checks printed, exit 1.
+     Nobody saw it, because the failure was at the shell rather than at a check.
+     It is the same shape as 23f4185 (the realtime suite stopped running the
+     moment node moved to the volume) and tools/suite_sweep.js exists because
+     both were found by accident. defineProperty is what
+     tools/realtime_selftest.js already uses, for exactly this. */
+  Object.defineProperty(global, 'navigator', {
+    value: global.window.navigator,
+    writable: true, configurable: true, enumerable: true,
+  });
   delete require.cache[require.resolve(
     path.join(__dirname, '..', 'static', 'rio_source.js'))];
   const src = require(path.join(__dirname, '..', 'static', 'rio_source.js'));

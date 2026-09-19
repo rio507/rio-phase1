@@ -55,6 +55,41 @@ def ok(name, cond, extra=""):
         print(f"  {BAD} {name}{('  ' + str(extra)) if extra else ''}")
 
 
+def ok_all(name, items, pred, extra=""):
+    """A claim about EVERY member, which empty must not satisfy.
+
+    `all([])` is True, and that is how this suite came to report a live news
+    question as fully audited when audit() had kept nothing. The run of
+    2026-09-19 spent 23 cents, dropped its one result, and printed three green
+    checks -- dated, sourced, geographically corroborated -- over an empty list.
+    The run that went wrong is exactly the run those checks called clean.
+
+    So empty FAILS here, and it fails saying that nothing was checked rather
+    than that something was wrong. That distinction matters because an empty
+    result set is a legitimate ANSWER for RIO -- localnews' own instruction says
+    an empty list is correct and better than a padded one -- but it is never a
+    legitimate TEST. A suite that spends real money to look at nothing should
+    say so in red, not in green.
+
+    The node suites have the same thing in tools/assert_guard.js, and
+    tools/suite_sweep.js is what finds the shape.
+    """
+    items = list(items or [])
+    if not items:
+        _fails.append(name)
+        print(f"  {BAD} {name}  — NOTHING TO ASSERT ON: the collection was "
+              f"empty, so this check proved nothing. Empty is not a pass for a "
+              f"claim about every member.")
+        return
+    bad = [x for x in items if not pred(x)]
+    if bad:
+        _fails.append(name)
+        print(f"  {BAD} {name}  ({len(items) - len(bad)}/{len(items)})"
+              f"{('  ' + str(extra)) if extra else ''}")
+    else:
+        print(f"  {OK} {name} ({len(items)}/{len(items)})")
+
+
 def section(t):
     print(f"\n== {t}")
 
@@ -390,16 +425,15 @@ def t_live():
         for x in r["results"][:4]:
             print(f"       {x['age_h']:>5}h {x['geo_level']:<13} "
                   f"{x['source'][:24]:<24} {x['headline'][:54]}")
-        ok("every spoken result is dated",
-           all(x.get("published_ts") for x in r["results"]))
-        ok("every spoken result carries a source",
-           all((x.get("source") or "").strip() for x in r["results"]))
-        ok("every spoken result corroborates geographically",
-           all(x["geo_score"] >= config.NEWS_MIN_GEO_MATCH
-               for x in r["results"]),
-           [(x["city"], x["geo_level"]) for x in r["results"]])
-        ok("nothing older than the window survived",
-           all(x["age_s"] <= ln.TIMEFRAME_S["24h"] for x in r["results"]))
+        ok_all("every spoken result is dated", r["results"],
+               lambda x: x.get("published_ts"))
+        ok_all("every spoken result carries a source", r["results"],
+               lambda x: (x.get("source") or "").strip())
+        ok_all("every spoken result corroborates geographically", r["results"],
+               lambda x: x["geo_score"] >= config.NEWS_MIN_GEO_MATCH,
+               [(x["city"], x["geo_level"]) for x in r["results"]])
+        ok_all("nothing older than the window survived", r["results"],
+               lambda x: x["age_s"] <= ln.TIMEFRAME_S["24h"])
 
     # The second identical question must be free.
     r2 = ln.search_local_news(34.0195, -118.4912,

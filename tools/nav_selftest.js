@@ -931,7 +931,28 @@ section('the arbiter — one mouth (unchanged contracts)');
 // ---------------------------------------------------------------------------
 // Optional: the same checks against a route saved from /nav/route.
 // ---------------------------------------------------------------------------
+/* AN OPTIONAL SECTION HAS TO SAY SO OUT LOUD.
+ *
+ * This ran only when a route fixture was passed as argv[2], and when it was not,
+ * four assertions about real geometry simply did not happen -- under a summary
+ * reading "PASSED 111 checks" that did not mention them. tools/suite_sweep.js
+ * found them as four permanently cold sites, which is the same quiet as a
+ * crashed suite: a clean verdict over work that did not occur.
+ *
+ * The section is still optional -- it needs a route captured from /nav/route and
+ * there is none in the repo -- so the fix is not to force it. It is to make
+ * "passed" stop being able to mean "passed, and also a section you were not told
+ * about did not run". See tools/assert_guard.js. */
+const guard = require(path.join(__dirname, 'assert_guard.js'));
+const skipped = guard.skips();
 const fixture = process.argv[2];
+if (fixture && !fs.existsSync(fixture)) {
+  skipped.skip('real geometry — the fixture named on the command line is not there',
+               `no file at ${fixture}`);
+} else if (!fixture) {
+  skipped.skip('real geometry — 4 checks against a route from /nav/route',
+               'pass a saved route: node tools/nav_selftest.js route.json');
+}
 if (fixture && fs.existsSync(fixture)) {
   section('real geometry — ' + path.basename(fixture));
   const route = JSON.parse(fs.readFileSync(fixture, 'utf8'));
@@ -950,7 +971,8 @@ if (fixture && fs.existsSync(fixture)) {
   r.spoken.slice(0, 8).forEach(t => console.log('    "' + t + '"'));
 }
 
-console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ') + checks + ' checks');
+console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ') + checks
+            + ' checks' + skipped.summary());
 process.exit(failures ? 1 : 0);
 }
 
