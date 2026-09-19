@@ -121,21 +121,63 @@ without it.
 
 ---
 
-## 5. What it costs, measured
+## 5. What it costs — searches and seconds observed, dollars withdrawn
 
-| shape | searches | time | cost |
+**The dollar column below was wrong and is struck rather than restated.** It was
+`est_cost_usd` from `localnews.retrieve()`, which multiplies real token counts by
+the rates in `config.py` — and those rates priced tokens at gpt-5's standard tier
+($1.25 / $10.00) while `NEWS_MODEL` is `gpt-5.6-sol` ($5.00 / $30.00). Input was
+understated **4×**, output **3×**. The table also said *measured*, citing
+`tools/news_probe.py`, which **does not exist in any commit**: the searches and
+the seconds are counted from real responses, the money never was.
+
+| shape | searches | time | ~~cost~~ |
 |---|---:|---:|---:|
-| local news | 4–5 | 34–46 s | $0.11–0.12 |
-| place (confirmed entity) | 3 | 30 s | $0.08 |
-| traffic (narrow, nothing found) | 1 | 13 s | $0.03 |
-| topic (7 d) | 6 | 57 s | $0.15 |
-| world | 3 | 35 s | $0.09 |
-| **background** | **0–1** | **4–9 s** | **$0.008–0.014** |
+| local news | 4–5 | 34–46 s | ~~$0.11–0.12~~ |
+| place (confirmed entity) | 3 | 30 s | ~~$0.08~~ |
+| traffic (narrow, nothing found) | 1 | 13 s | ~~$0.03~~ |
+| topic (7 d) | 6 | 57 s | ~~$0.15~~ |
+| world | 3 | 35 s | ~~$0.09~~ |
+| **background** | **0–1** | **4–9 s** | ~~$0.008–0.014~~ |
 | any of them, cached | 0 | ~0 s | $0.00 |
 
 At **$10.00 per 1,000 `web_search` calls** plus ~8–10k input tokens per search.
-One local news question is roughly **180× a weather refresh**. A drive with
-three questions is ~$0.25.
+
+### What one real question cost, at the corrected rates
+
+`tools/news_selftest.py` run live (not `--offline`), Santa Monica, 2026-09-19:
+
+| shape | searches | time | cost |
+|---|---:|---:|---:|
+| local news | 4 | 60.0 s | **$0.2326** |
+
+Roughly **2×** the $0.11 that used to be quoted for this shape — which is what a
+4× input and 3× output correction predicts. Read it as **one point, not a
+range**: one question, one location, one run. The struck table above is left
+struck rather than rescaled around this, because one measurement does not
+reconstruct six.
+
+It is still an *estimate* in one specific sense worth keeping straight: the
+**token counts are real**, off the response's own `usage`, and the **prices are
+list**. That is what `est_cost_usd` is for and it is the same method as before —
+the only thing that changed is that the prices are now the ones `gpt-5.6-sol` is
+billed at. It is not an invoice.
+
+**The uncomfortable half of that run:** it took the full `NEWS_TIMEOUT_S`, and
+after `audit()` it kept **nothing** — 4 searches, 1 result dropped, 0 spoken. So
+23 cents bought a question RIO could not answer. The caps bound what a question
+may *spend*; nothing bounds what a question may spend **for no answer**. That is
+a real gap, not a rounding error, and it is worth a cap of its own.
+
+**Nothing overspent because of this.** `NEWS_MAX_SEARCHES_PER_DRIVE` has its
+teeth on the search count, not on the money, so the budget refused exactly when
+it always did. What the wrong rates reached is every surface that *quotes* a
+figure: `/news_spend`, `tools/news_selftest.py`, `tools/news_shapes.py`, and
+`LICENSING.md` §4, which published the range to counsel.
+
+One correction that survives the fix and matters for the caps: **the token half
+is the larger half of the bill**, not the smaller one. That is an argument for
+`NEWS_MAX_QUERIES_PER_QUESTION` and not only for the per-drive search cap.
 
 That is why the caps are not decoration:
 

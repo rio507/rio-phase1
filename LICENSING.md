@@ -405,7 +405,7 @@ vendor's exact wording so that one review can cover all of them:
 |---|---|
 | Vendor | OpenAI, already in use for conversation, visual Q&A and `deep_dive` |
 | New key / new account surface | **None.** Same `OPENAI_API_KEY` |
-| Cost | **$10.00 per 1,000 `web_search` calls**, plus search-result tokens billed as input at model rates. Measured: **$0.06–$0.15 per news question** |
+| Cost | **$10.00 per 1,000 `web_search` calls**, plus search-result tokens billed as input at model rates. **Corrected 2026-09-19:** the previously published "measured $0.06–$0.15 per question" was arithmetic at the wrong token price (gpt-5 tier against `gpt-5.6-sol`, understating input 4× and output 3×), and the probe it cited was never committed. One live question re-measured at the right rates cost **$0.2326** (4 searches, 60 s) — roughly **2× what was previously reported to this review**. Real token counts at list prices, not an invoice. See `config.py`'s money block and `docs/local_intelligence.md` §5 |
 | Storage / caching restrictions | **None stated** in the web search documentation. RIO caches answers 5 min (traffic) to 25 min (general), and background for a week, in memory only |
 | Attribution of the underlying publishers | Carried per result as `source`; spoken when the claim is contested or consequential |
 

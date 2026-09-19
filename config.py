@@ -1702,23 +1702,70 @@ NEWS_ENABLED = True
 NEWS_MODEL = OPENAI_REASONING_MODEL
 
 # --- the money, which is the reason half the settings below exist -----------
-# MEASURED, not estimated (tools/news_probe.py):
+# SEARCH COUNTS AND TIMES ARE OBSERVED. THE DOLLARS WERE NEVER MEASURED, and
+# this comment claimed otherwise for as long as the figures have been quoted:
 #
-#   local news question   3-6 searches   22-53 s   $0.06-$0.15
-#   traffic, narrow       3 searches     17 s      $0.06
-#   background            1 search        9 s      $0.014
+#   local news question   3-6 searches   22-53 s   $0.06-$0.15   <- WRONG
+#   traffic, narrow       3 searches     17 s      $0.06         <- WRONG
+#   background            1 search        9 s      $0.014        <- WRONG
 #
-# A weather refresh is $0.00045. One local news question is roughly 180 TIMES
-# that. It is the most expensive thing RIO does by a wide margin, and the cost
-# is dominated by the search calls themselves ($10.00 per 1000) plus the ~8-10k
-# input tokens each search stuffs into context.
+# The tool this block cited as its source -- tools/news_probe.py -- does not
+# exist and never has, in any commit. The dollar column is `est_cost_usd` from
+# localnews.retrieve(), which multiplies REAL token counts by the rates below;
+# so the token counts are honest and the money was arithmetic, done at the
+# wrong price. Two different claims got blurred into one word.
 #
-# Rates below are used to ESTIMATE spend per question so the budget can refuse
-# before the money is gone. They are list prices and will drift; they are here
-# to be right about the shape of the bill, not to be an invoice.
+# THE PRICE WAS THE WRONG MODEL'S. The rates said "gpt-5 standard tier"
+# ($1.25 / $10.00), and NEWS_MODEL is OPENAI_REASONING_MODEL, which is
+# gpt-5.6-sol: $5.00 / $30.00, per the bench table above (see
+# GPT_LIVE_BACKEND_MODEL, where the same three models were priced). Input was
+# understated 4x and output 3x.
+#
+# WHAT THAT DID AND DID NOT BREAK. The per-drive budget has teeth on the SEARCH
+# COUNT (NEWS_MAX_SEARCHES_PER_DRIVE, checked against searches actually
+# counted), so nothing was ever allowed to overspend because of this: the money
+# is reported, not enforced. What it did reach is every surface that quotes a
+# figure -- /news_spend, tools/news_selftest.py, tools/news_shapes.py, and
+# LICENSING.md section 4, which publishes "$0.06-$0.15 per news question" to
+# counsel as a measured fact.
+#
+# WHAT ONE REAL QUESTION COST, AT THE CORRECTED RATES. tools/news_selftest.py
+# run live (not --offline), Santa Monica, 2026-09-19:
+#
+#   local news question   4 searches   60.0 s   $0.2326
+#
+# Roughly double the $0.11 that used to be quoted for this shape, which is what
+# the 4x/3x price correction predicts. Read it as ONE POINT, not a range: one
+# question, one location, one run. The ranges above are left marked WRONG rather
+# than rescaled around it, because a corrected guess is still a guess and this
+# block has already been read once as a measurement.
+#
+# AND IT IS STILL AN ESTIMATE, in one specific sense worth keeping straight: the
+# TOKEN COUNTS are real, off the response's own usage, and the PRICES are list.
+# That is what est_cost_usd is for and it is the same method as before -- the
+# only thing that changed is that the prices are now the ones this model is
+# billed at. It is not an invoice and nothing here reconciles against one.
+#
+# THE UNCOMFORTABLE HALF OF THAT RUN: it took the full NEWS_TIMEOUT_S, and after
+# audit() it kept NOTHING -- 4 searches, 1 result dropped, 0 spoken. So 23 cents
+# bought a question RIO could not answer. The caps below bound what a question
+# may spend; nothing bounds what a question may spend for no answer, and that is
+# a real gap rather than a rounding error.
+#
+# A weather refresh is $0.00045. One local news question is the most expensive
+# thing RIO does by a wide margin, and the cost is dominated by the search
+# calls themselves ($10.00 per 1000) plus the ~8-10k input tokens each search
+# stuffs into context -- which is now the LARGER half of the bill, not the
+# smaller one, and is the reason the per-question query cap matters more than
+# it looked like it did.
+#
+# Rates below are used to ESTIMATE spend per question. They are list prices and
+# will drift; they are here to be right about the shape of the bill, not to be
+# an invoice. If NEWS_MODEL changes, THESE CHANGE WITH IT -- that coupling is
+# what failed here, so it is stated rather than implied.
 NEWS_SEARCH_COST_USD = 0.010            # $10.00 / 1000 web_search calls
-NEWS_IN_COST_USD = 1.25 / 1_000_000     # input tokens, gpt-5 standard tier
-NEWS_OUT_COST_USD = 10.0 / 1_000_000    # output tokens
+NEWS_IN_COST_USD = 5.0 / 1_000_000      # input tokens, gpt-5.6-sol
+NEWS_OUT_COST_USD = 30.0 / 1_000_000    # output tokens, gpt-5.6-sol
 
 # Per question. Every query is a search and a search is a cent plus the tokens,
 # so four is the difference between an 8 cent question and a 15 cent one. Four

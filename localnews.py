@@ -26,7 +26,12 @@ WHY THIS IS NOT deep_dive, HAVING MEASURED deep_dive
 -----------------------------------------------------
 It reaches the same model, through the same API, with the same key. It is not a
 second search stack and there is no new vendor here. But it is a different CALL,
-for two reasons that were measured rather than assumed (tools/news_probe.py):
+for two reasons that were observed rather than assumed. (Both were recorded
+against a probe that was never committed -- this file and config.py both cited
+`tools/news_probe.py`, which does not exist in any commit. The 1520-token /
+30.6-second failure below is specific enough to be a real run; it is simply not
+one anybody can re-run from this repo. See config.py's money block, where the
+same missing citation had carried a wrong number with it.)
 
   escalate() returns PROSE. Amendment A requires every result to carry a source
   and a timestamp and requires RIO's sentence to be supportable by them. You
@@ -46,12 +51,24 @@ timeframe, and prose is the right output. See `background()`.
 
 WHAT IT COSTS, WHICH IS WHY THE CAPS ARE NOT DECORATION
 --------------------------------------------------------
-Measured: a local news question is 3-6 web searches, 22-53 seconds, and
-$0.06-$0.15 — at $10.00 per 1000 search calls plus 8-10k input tokens stuffed
-into context per search. That is roughly 180x a weather refresh, for one
-question. So: a hard per-question search cap in the instruction, a hard
-per-drive cap enforced in Python that refuses rather than overspends, and a
-cache that makes the second question about the same cell free.
+Observed: a local news question is 3-6 web searches and 22-53 seconds — at
+$10.00 per 1000 search calls plus 8-10k input tokens stuffed into context per
+search. The searches and the seconds are counted from real responses.
+
+THE DOLLAR FIGURE THAT USED TO BE HERE ($0.06-$0.15) WAS ARITHMETIC AT THE
+WRONG PRICE and is withdrawn rather than restated. `est_cost_usd` below priced
+tokens at gpt-5's tier while NEWS_MODEL is gpt-5.6-sol -- input understated 4x,
+output 3x. Re-pricing the old numbers puts the same shape nearer $0.24-$0.31,
+which is an estimate and is not going in a header as a measurement. config.py's
+money block has the whole account. Nothing overspent: the per-drive cap has its
+teeth on the SEARCH COUNT, not on the money.
+
+Either way it is the most expensive thing RIO does by a wide margin -- hundreds
+of times a weather refresh, for one question. So: a hard per-question search cap
+in the instruction, a hard per-drive cap enforced in Python that refuses rather
+than overspends, and a cache that makes the second question about the same cell
+free. The token half of the bill is the LARGER half, which is an argument for
+the query cap and not only for the search cap.
 
 Nothing here runs per frame, and nothing here runs unasked. V1 answers when
 asked; the proactive path is deliberately absent (amendment E).
