@@ -36,6 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import assert_guard as _guard                              # noqa: E402
 from dotenv import load_dotenv                              # noqa: E402
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -55,39 +56,10 @@ def ok(name, cond, extra=""):
         print(f"  {BAD} {name}{('  ' + str(extra)) if extra else ''}")
 
 
-def ok_all(name, items, pred, extra=""):
-    """A claim about EVERY member, which empty must not satisfy.
-
-    `all([])` is True, and that is how this suite came to report a live news
-    question as fully audited when audit() had kept nothing. The run of
-    2026-09-19 spent 23 cents, dropped its one result, and printed three green
-    checks -- dated, sourced, geographically corroborated -- over an empty list.
-    The run that went wrong is exactly the run those checks called clean.
-
-    So empty FAILS here, and it fails saying that nothing was checked rather
-    than that something was wrong. That distinction matters because an empty
-    result set is a legitimate ANSWER for RIO -- localnews' own instruction says
-    an empty list is correct and better than a padded one -- but it is never a
-    legitimate TEST. A suite that spends real money to look at nothing should
-    say so in red, not in green.
-
-    The node suites have the same thing in tools/assert_guard.js, and
-    tools/suite_sweep.js is what finds the shape.
-    """
-    items = list(items or [])
-    if not items:
-        _fails.append(name)
-        print(f"  {BAD} {name}  — NOTHING TO ASSERT ON: the collection was "
-              f"empty, so this check proved nothing. Empty is not a pass for a "
-              f"claim about every member.")
-        return
-    bad = [x for x in items if not pred(x)]
-    if bad:
-        _fails.append(name)
-        print(f"  {BAD} {name}  ({len(items) - len(bad)}/{len(items)})"
-              f"{('  ' + str(extra)) if extra else ''}")
-    else:
-        print(f"  {OK} {name} ({len(items)}/{len(items)})")
+# The guarded assertions live in one place now: tools/assert_guard.py, shared
+# with the other suites that had the same shape. This file is where the failure
+# was first seen, which is why the account of it is in that module's docstring.
+ok_all, ok_none, non_empty = _guard.bind(ok, order="name_first")
 
 
 def section(t):

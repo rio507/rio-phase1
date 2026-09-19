@@ -46,7 +46,16 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# THE TOOLS DIRECTORY, because this suite is run BOTH ways: directly
+# (python tools/nav_server_selftest.py), where the script's own directory is
+# sys.path[0] for free, and as a module (python -m tools.nav_server_selftest),
+# where it is not and cwd is. tools/safety_speech_selftest.py runs it the
+# second way, so the guard import below failed there while passing every
+# direct run -- a suite reporting a ModuleNotFoundError as a failed check.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+import assert_guard as _guard                        # noqa: E402
 import config                                        # noqa: E402
 from navigation import anchors as anchors_mod        # noqa: E402
 from navigation import fixtures                      # noqa: E402
@@ -63,6 +72,14 @@ PASS, FAIL = [], []
 def ok(cond, what):
     (PASS if cond else FAIL).append(what)
     print(("  ok    " if cond else "  FAIL  ") + what)
+
+
+# A claim about every member of a collection must not pass when the collection is
+# empty -- `all([])` is True, and tools/news_selftest.py proved that is not
+# theoretical. See tools/assert_guard.py. The sites left using a bare all() below
+# iterate a literal tuple of key names, or sit under an explicit length
+# assertion; those cannot go vacuous and converting them would be noise.
+ok_all, ok_none, non_empty = _guard.bind(ok, order="cond_first")
 
 
 def section(name):
@@ -95,15 +112,15 @@ def run_provider():
 
     ok(route.provider == "fixture" and route.generation_id == 1,
        "a route arrives as a CanonicalRoute with a generation, from any provider")
-    ok(all(isinstance(m, M.CanonicalManeuver) for m in route.maneuvers),
-       "every maneuver is canonical — no provider dict survives the boundary")
+    ok_all("every maneuver is canonical — no provider dict survives the boundary",
+           route.maneuvers, lambda m: isinstance(m, M.CanonicalManeuver))
     ok([m.direction for m in route.maneuvers] == ["LEFT", "RIGHT", "RIGHT"],
        "direction is normalised out of the provider's own vocabulary")
     ok(route.arrival.side in (M.LEFT, M.RIGHT, M.UNKNOWN),
        "arrival side is provider-supplied, and UNKNOWN is a legal answer")
-    ok(all(m.route_distance_position >= 0 and m.polyline_index >= 0
-           for m in route.maneuvers),
-       "each maneuver is pinned to an exact vertex, not a nearest-point guess")
+    ok_all("each maneuver is pinned to an exact vertex, not a nearest-point guess",
+           route.maneuvers,
+           lambda m: m.route_distance_position >= 0 and m.polyline_index >= 0)
 
     wire = service.wire(route)
     for key in ("route_id", "generation_id", "geometry", "maneuvers", "timing",
@@ -114,9 +131,9 @@ def run_provider():
             "arrival_call_m", "units",
             "off_route_distance_m", "gps_stale_timeout_s")),
        "every threshold the browser times against ships WITH the route")
-    ok(all("tiers" in m["speech"] for m in wire["maneuvers"]),
-       "...and each maneuver carries its OWN ladder, so the browser reads a "
-       "distance rather than holding a policy")
+    ok_all("...and each maneuver carries its OWN ladder, so the browser reads a "
+           "distance rather than holding a policy",
+           wire["maneuvers"], lambda m: "tiers" in m["speech"])
     ok(wire.get("depart_speech"),
        "...and the route-start line rides on the route, not on a maneuver")
 
@@ -162,12 +179,13 @@ def run_provider():
     service.set_provider(Bare())
     service.reset()
     bare = service.build_route(34.043, -118.267, Bare().destination())
-    ok(bare.landmarks_state == "ready" and
-       all(not m.anchors for m in bare.maneuvers),
-       "a provider with no place data routes normally with no anchors at all")
-    ok(all(m.speech.get("near") or m.speech.get("arrival")
-           for m in bare.maneuvers),
-       "and every maneuver still has a complete spoken instruction")
+    ok(bare.landmarks_state == "ready",
+       "a provider with no place data still reports its landmark pass ready")
+    ok_all("a provider with no place data routes normally with no anchors at all",
+           bare.maneuvers, lambda m: not m.anchors)
+    ok_all("and every maneuver still has a complete spoken instruction",
+           bare.maneuvers,
+           lambda m: m.speech.get("near") or m.speech.get("arrival"))
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +337,8 @@ def run_candidates():
        "branded fuel and major chain signage are allowed anchors")
     ok(not any("Bob's" in l or "Dry Cleaning" in l for l in labels),
        "an unbranded local business is not — there is no reliable sign to see")
-    ok(all(a["speech"] for a in m0.anchors),
-       "every candidate arrives with its sentence already written")
+    ok_all("every candidate arrives with its sentence already written",
+           m0.anchors, lambda a: a["speech"])
     line = m0.anchors[0]["speech"]
     ok("left" in line.lower() and "the Shell station" in line
        and "Lincoln Boulevard" in line,
@@ -363,9 +381,9 @@ def run_candidates():
                                  route.destination)
         ok(provider.landmark_calls == 1 and r3.landmarks_state == "budget_exhausted",
            "the budget cap stops the pass and says so, rather than quietly spending")
-        ok(all(m.speech.get("near") or m.speech.get("arrival")
-               for m in r3.maneuvers),
-           "and the maneuvers it did not reach navigate normally")
+        ok_all("and the maneuvers it did not reach navigate normally",
+               r3.maneuvers,
+               lambda m: m.speech.get("near") or m.speech.get("arrival"))
     finally:
         config.NAV_LANDMARK_MAX_LOOKUPS_PER_ROUTE = old
 
@@ -730,8 +748,8 @@ def run_speech():
     ok(speech_mod.text_for(r, "m0", "primary") == m0.speech["near"],
        "...for all three of them")
 
-    ok(all(m.speech for m in r.maneuvers),
-       "every maneuver on the route has its lines before the drive starts")
+    ok_all("every maneuver on the route has its lines before the drive starts",
+           r.maneuvers, lambda m: m.speech)
 
     # The firewall, read out of the source: nothing on the navigation speech
     # path may reach a model. Same check headway/live_selftest.py runs against
@@ -823,8 +841,8 @@ def run_cadence():
     # half-mile call on a 400 m block. Session a2da65cd's replay produced two
     # of exactly those, at 414 m and 485 m against an 805 m tier.
     short = [m for m in rc.maneuvers if m.type == M.TURN]
-    ok(all("far" not in m.speech for m in short),
-       "no maneuver on a route of short blocks carries a far call at all")
+    ok_all("no maneuver on a route of short blocks carries a far call at all",
+           short, lambda m: "far" not in m.speech)
 
 
 def run_distance_phrasing():

@@ -53,6 +53,14 @@ import tempfile
 import time
 
 sys.path.insert(0, "/workspace/rio-phase1")
+# THE TOOLS DIRECTORY, because this suite is run BOTH ways: directly
+# (python tools/vehicle_health_selftest.py), where the script's own directory is
+# sys.path[0] for free, and as a module (python -m tools.vehicle_health_selftest),
+# where it is not and cwd is. tools/safety_speech_selftest.py runs it the
+# second way, so the guard import below failed there while passing every
+# direct run -- a suite reporting a ModuleNotFoundError as a failed check.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 
 from dotenv import load_dotenv                          # noqa: E402
 
@@ -87,6 +95,15 @@ def check(cond, label, detail=""):
     (PASS if cond else FAIL).append(label)
     print(f"  [{'PASS' if cond else 'FAIL'}] {label}" + (f"  -- {detail}" if detail else ""))
     return bool(cond)
+
+
+# `all([])` is True, so a claim about every member of a collection passes when
+# the collection is empty. Two sites here were exposed to that; the other two
+# sit directly under a length or set assertion that cannot be empty, and are
+# left alone. See tools/assert_guard.py.
+import assert_guard as _guard                                  # noqa: E402
+
+ok_all, ok_none, non_empty = _guard.bind(check, order="cond_first")
 
 
 def head(title):
@@ -434,9 +451,13 @@ def run_policy():
     said = (r.get("proposal") or {}).get("text", "")
     print(f"        RIO would have said: {said!r}")
     check("rear left" in said, "the proposal names the corner", said)
-    check(all(not i.get("announce_allowed") for i in issues
-              if i["domain"] == "tires"),
-          "and every tire issue is marked not-announceable")
+    # A FILTERED SUBSET IS THE EASIEST THING TO EMPTY BY ACCIDENT. If the domain
+    # label ever changes, this comprehension yields nothing, all() is True, and
+    # "every tire issue is marked not-announceable" passes over no tire issues at
+    # all -- in the section that exists to prove shadow mode keeps her quiet.
+    ok_all("and every tire issue is marked not-announceable",
+           [i for i in issues if i["domain"] == "tires"],
+           lambda i: not i.get("announce_allowed"))
 
     for i in range(5):
         r2 = pol.tick(vh.issues(), 33.0 + i * 3)
@@ -754,8 +775,12 @@ def run_priority():
     check(bool(fb), "the planner's fallback priority table is findable")
     if fb:
         fallback = {k: int(v) for k, v in re.findall(r"(\w+):\s*(\d+)", fb.group(1))}
-        check(all(order.get(k) == v for k, v in fallback.items()),
-              f"and it agrees with rio_speech.js ({fallback})")
+        # `bool(fb)` above proves the BLOCK was found, not that any k: v pair was
+        # parsed out of it. An empty `fallback` made this agree with rio_speech.js
+        # about nothing -- and what it is checking is the priority ladder, where a
+        # silent disagreement reorders which line cuts through which.
+        ok_all(f"and it agrees with rio_speech.js ({fallback})",
+               list(fallback.items()), lambda kv: order.get(kv[0]) == kv[1])
 
     health = open(os.path.join(ROOT, "static", "rio_health.js")).read()
     check("RIO.speech.say(" in health,

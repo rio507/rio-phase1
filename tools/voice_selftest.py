@@ -38,6 +38,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# THE TOOLS DIRECTORY, because this suite is run BOTH ways: directly
+# (python tools/voice_selftest.py), where the script's own directory is
+# sys.path[0] for free, and as a module (python -m tools.voice_selftest),
+# where it is not and cwd is. tools/safety_speech_selftest.py runs it the
+# second way, so the guard import below failed there while passing every
+# direct run -- a suite reporting a ModuleNotFoundError as a failed check.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 
 from dotenv import load_dotenv                              # noqa: E402
 
@@ -64,6 +72,14 @@ def ok(cond, what):
     (PASS if cond else FAIL).append(what)
     print(f"  {'ok  ' if cond else 'FAIL'}  {what}")
     return bool(cond)
+
+
+# See tools/assert_guard.py. The clip section below is the clearest case in the
+# repo after news_selftest: THREE checks in a row pass on an empty clip set, and
+# the comment above `expected` describes the day the clip set changed.
+import assert_guard as _guard                              # noqa: E402
+
+ok_all, ok_none, non_empty = _guard.bind(ok, order="cond_first")
 
 
 def section(name):
@@ -259,9 +275,12 @@ def run_tags():
     # ...and the model is told the same list the gate enforces.
     inst = realtime.instructions()
     if config.VOICE_BACKEND == "elevenlabs" and config.AUDIO_TAGS_ENABLED:
-        listed = all(f"[{t}]" in inst for t in voice_tags.allowed_tags())
-        ok(listed, "the live instructions name exactly the allowed tags, "
-                   "generated from the same config the validator reads")
+        # allowed_tags() is generated from config, so it can come back empty --
+        # and an empty list made "the instructions name exactly the allowed tags"
+        # true of instructions naming none of them.
+        ok_all("the live instructions name exactly the allowed tags, "
+               "generated from the same config the validator reads",
+               voice_tags.allowed_tags(), lambda t: f"[{t}]" in inst)
         ok("Most replies should carry no tag at all" in inst,
            "and say plainly that most replies carry none — the bible's "
            "silence discipline, applied to a mechanism that invites the "
@@ -523,6 +542,12 @@ def run_clips():
     # line was the one still insisting it had to be on disk.
     expected = set(ra.CLIP_LINES) | set(ra.TIRE_CLIPS)
     present = {p.stem for p in (REPO / "static/audio").glob("*.mp3")}
+    # THE PRECONDITION THE NEXT THREE CHECKS ALL REST ON. `expected <= present`,
+    # `not stale` and the model check below are ALL true of an empty `expected`,
+    # so an empty clip set would report the fast path perfectly healthy three
+    # times over. That is not hypothetical here: the comment above says this line
+    # once insisted on a clip that had left the set, so the set does change.
+    non_empty("there is a clip set to check at all", expected)
     ok(expected <= present,
        f"all {len(expected)} pre-rendered clips are on disk "
        f"({len(expected & present)}/{len(expected)})")
@@ -534,9 +559,9 @@ def run_clips():
     ok(not stale,
        f"and every one records the configured voice ({want['voice']})"
        + (f"; stale: {stale}" if stale else ""))
-    ok(all(doc.get(c, {}).get("model") == want["model"] for c in expected),
-       f"rendered on {want['model']} — the quality model, because nothing in a "
-       "car waits on a file that already exists")
+    ok_all(f"rendered on {want['model']} — the quality model, because nothing in "
+           "a car waits on a file that already exists",
+           sorted(expected), lambda c: doc.get(c, {}).get("model") == want["model"])
 
     # Runtime playback is untouched: still a local file, still no network.
     js = Path(REPO / "static/rio_speak.js").read_text()
