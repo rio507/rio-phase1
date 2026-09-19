@@ -262,7 +262,9 @@ section('C. a driver who cuts in on her opening word');
   ok(h.evTypes().indexOf('LIVE_BARGE_DEFERRED') >= 0,
      'the decision was held over her opening syllable, not taken');
   ok(h.counters().onset_deferred === 1,
-     'and then taken, once the guard expired and the speech was still going');
+     'and then taken, once the guard expired and the speech was still going'
+     + ' (onset_deferred=' + h.counters().onset_deferred
+     + ', mutes=' + h.audio.mutes + ')');
   ok(h.audio.mutes >= 1, 'she is muted — a driver at the start still stops her');
   h.stopped();
   await sleep(4);

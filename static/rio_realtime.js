@@ -1674,6 +1674,23 @@
     /* The decision held over her opening syllable, waiting to see whether the
        thing that fired the detector is still there when the guard expires. */
     var onsetHold = null;
+    /* WHICH RESPONSE HAS ALREADY SPENT ITS GUARD, and the race it closes.
+     *
+     * The guard holds a barge decision over her opening syllable and then takes
+     * it "from that moment" when the hold expires. Expiring re-enters bargeIn(),
+     * which re-asks onsetRemaining() -- and setTimeout and Date.now() are not
+     * the same clock. Measured under CPU load (tools/echo_barge_selftest.js
+     * section C, about 1 run in 15): a 38 ms hold came back with 1 ms still on
+     * the clock, so the guard armed a SECOND hold for that millisecond and the
+     * decision was deferred twice.
+     *
+     * The millisecond is harmless -- 39 ms of hold instead of 38, and at
+     * production scale 1 ms out of 400. What is not harmless is a guard that can
+     * re-arm itself from its own expiry: the count of holds is then a function
+     * of scheduler jitter rather than of anything the driver did, and the test
+     * that pinned it at one was right to. Spent once per response, so a NEW
+     * response still gets its own guard, which is the whole point of the thing. */
+    var onsetSpentFor = null;
     /* What the detector currently says: between speech_started and
        speech_stopped. The onset hold and the echo watch both need to know
        whether there is still something going on to decide about. */
@@ -2567,7 +2584,8 @@
          fired the detector is still going. A driver who talks over her first
          word still stops her; they stop her a fifth of a second later. */
       var onsetLeft = onsetRemaining();
-      if (onsetLeft > 0 && speaking && !pendingBarge) {
+      if (onsetLeft > 0 && speaking && !pendingBarge
+          && onsetSpentFor !== speaking.responseId) {
         if (!onsetHold) {
           var heldFor = speaking.responseId;
           emit('LIVE_BARGE_DEFERRED', { response_id: heldFor,
@@ -2577,6 +2595,11 @@
             onsetHold = null;
             if (stopped || !speechActive) return;
             if (!speaking || speaking.responseId !== heldFor) return;
+            /* SPENT BEFORE THE RE-ENTRY, not after. bargeIn() below re-asks
+               onsetRemaining(), which can still report a millisecond left --
+               see onsetSpentFor. Marking it here is what makes the hold happen
+               once per response instead of once per scheduler hiccup. */
+            onsetSpentFor = heldFor;
             counters.onset_deferred++;
             bargeIn();                   // past the guard: decide it properly
           }, onsetLeft);

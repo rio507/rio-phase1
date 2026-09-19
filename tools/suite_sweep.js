@@ -3,6 +3,7 @@
  *   node tools/suite_sweep.js            every browser/node suite
  *   node tools/suite_sweep.js --json     machine-readable, for a guard
  *   node tools/suite_sweep.js nav        only suites whose name matches
+ *   node tools/suite_sweep.js --repeat 5 each suite five times, to find flakes
  *
  * WHY THIS EXISTS, WHICH IS TWO SUITES FOUND BY ACCIDENT.
  *
@@ -42,6 +43,15 @@
  * source_selftest.js as running 10 assertions when it prints none at all. A
  * sweep that over-counts execution is the bug it was written to find, so the
  * over-count is described here rather than left for the next person.
+ *
+ * A FLAKY SUITE IS THE SAME SILENCE, WEARING A THIRD COSTUME. A suite that
+ * passes four times in five is a suite whose failure gets re-run rather than
+ * read, and one run of anything cannot tell a flake from a fact --
+ * echo_barge_selftest.js exited 1 once in five sweeps and cleanly in eight
+ * direct runs, which is exactly the shape that gets shrugged at. So --repeat N
+ * runs each suite N times and reports any suite whose VERDICT is not the same
+ * every time. Stability is a property of a suite, and an unstable one is not
+ * doing its job even when the majority of its runs are green.
  *
  * WHAT IT STILL CANNOT SEE, stated so nobody reads a green sweep as more than
  * it is. Coverage proves an assertion RAN. It cannot prove the assertion had
@@ -391,22 +401,44 @@ function verdict(r) {
 function main() {
   const args = process.argv.slice(2);
   const asJson = args.indexOf('--json') >= 0;
-  const filter = args.filter(a => !a.startsWith('--'))[0];
+  const ri = args.indexOf('--repeat');
+  const repeat = ri >= 0 ? Math.max(1, parseInt(args[ri + 1], 10) || 1) : 1;
+  const filter = args.filter(a => !a.startsWith('--')
+                                  && a !== String(repeat))[0];
 
   const list = suites(filter);
   if (!asJson) {
     console.log(`sweeping ${list.length} suites under NODE_V8_COVERAGE `
-                + `(node ${process.version})\n`);
+                + `(node ${process.version})`
+                + (repeat > 1 ? `, ${repeat} runs each` : '') + '\n');
   }
 
   const results = [];
   for (const file of list) {
-    const r = run(file);
-    r.verdict = verdict(r);
+    /* EVERY RUN, NOT JUST THE LAST. The reported result is the WORST verdict
+       seen, because a suite that is broken one run in five is broken -- taking
+       the last run would make the sweep itself the thing that re-runs until
+       green, which is the habit this whole file exists to interrupt. */
+    const runs = [];
+    for (let i = 0; i < repeat; i++) {
+      const one = run(file);
+      one.verdict = verdict(one);
+      runs.push(one);
+    }
+    const r = worst(runs);
+    r.runs = runs.length;
+    r.flaky = distinct(runs);
     results.push(r);
     if (asJson) continue;
     const name = file.replace(/\.js$/, '');
     console.log(`${pad(name, 30)} ${pad(r.verdict.tag, 18)} ${r.verdict.why}`);
+    if (r.flaky.length > 1) {
+      console.log(`${' '.repeat(31)}FLAKY across ${r.runs} runs: `
+                  + r.flaky.map(f => `${f.tag}x${f.n}`).join(', '));
+      r.exits = runs.map(x => x.code);
+      console.log(`${' '.repeat(31)}exit codes: ${r.exits.join(' ')}`
+                  + `   checks: ${runs.map(x => x.ran).join(' ')}`);
+    }
     if (r.vacuous.length) {
       console.log(`${' '.repeat(31)}asserted over an empty collection: `
                   + `${r.vacuous.length} site(s) `
@@ -424,7 +456,8 @@ function main() {
   const bad = results.filter(r => ['ASSERTS NOTHING', 'CRASHED PART-WAY',
                                    'EXITS EARLY', 'COLD SITES', 'NO COUNT',
                                    'SUMMARY WRONG', 'VACUOUS PASS']
-                                  .indexOf(r.verdict.tag) >= 0);
+                                  .indexOf(r.verdict.tag) >= 0
+                              || (r.flaky && r.flaky.length > 1));
   const totalSites = results.reduce((a, r) => a + r.sites, 0);
   const totalRan = results.reduce((a, r) => a + (r.ran || 0), 0);
   const totalCold = results.reduce((a, r) => a + r.cold.length, 0);
@@ -438,6 +471,24 @@ function main() {
   }
   console.log('every suite executes its assertions');
   return 0;
+}
+
+/* Severity order, worst first. Only used to pick which run to report. */
+const SEVERITY = ['ASSERTS NOTHING', 'CRASHED PART-WAY', 'EXITS EARLY',
+                  'VACUOUS PASS', 'COLD SITES', 'SUMMARY WRONG', 'NO COUNT',
+                  'FAILS HONESTLY', 'DECLARED SKIP', 'RUNS', 'NOT A SUITE'];
+
+function worst(runs) {
+  return runs.slice().sort(
+    (a, b) => SEVERITY.indexOf(a.verdict.tag) - SEVERITY.indexOf(b.verdict.tag))[0];
+}
+
+/* The distinct verdicts seen, with counts. Length > 1 means the suite does not
+   agree with itself. */
+function distinct(runs) {
+  const seen = new Map();
+  runs.forEach(r => seen.set(r.verdict.tag, (seen.get(r.verdict.tag) || 0) + 1));
+  return [...seen.entries()].map(([tag, n]) => ({ tag, n }));
 }
 
 function pad(s, n) { s = String(s); return s + ' '.repeat(Math.max(0, n - s.length)); }
