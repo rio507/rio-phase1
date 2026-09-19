@@ -46,6 +46,18 @@ def ok(cond, what):
     print(("  ok    " if cond else "  FAIL  ") + what)
 
 
+# See tools/assert_guard.py. Judged site by site, the five all() sites in this
+# file are all properly guarded -- `samples` has an explicit non-empty check with
+# an early return, and `restored`/`after` sit under a length assertion -- so none
+# was converted. What the sweep DID find here is below: a duplicate assertion, and
+# a whole section skipped in silence.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import assert_guard as _guard                                  # noqa: E402
+
+ok_all, ok_none, non_empty = _guard.bind(ok, order="cond_first")
+SKIPPED = _guard.Skips()
+
+
 def section(name):
     print(f"\n=== {name} ===")
 
@@ -687,10 +699,21 @@ def run_soak(page, clip, seconds):
     # AND THE CURE RAN, WITHOUT A GAP. A resync that never fires over ten
     # minutes proves nothing about a resync; one that fires and leaves the bus
     # uncovered for a sample would be worse than the drift.
+    #
+    # THIS USED TO BE A VERBATIM COPY of the coverage check above it -- the same
+    # `all(s["covered"] for s in samples)`, over the same list, a few lines
+    # later. It read as extra evidence and was none: whatever it reported, the
+    # line above had already reported. What its comment describes is narrower and
+    # is the interesting claim -- that coverage held ACROSS the rebuild -- so it
+    # now looks only at the samples that could show a gap, and refuses to pass
+    # when there are none of those (a resync after the last sample proves
+    # nothing about a resync either).
     if resyncs:
-        ok(all(s["covered"] for s in samples),
-           f"{len(resyncs)} resync(s) happened and not one of them left the "
-           f"bus uncovered — make before break")
+        first_resync = min(e["at"] for e in resyncs)
+        across = [s for s in samples if s["at"] >= first_resync]
+        ok_all(f"{len(resyncs)} resync(s) happened and not one of them left the "
+               f"bus uncovered — make before break",
+               across, lambda s: s["covered"])
 
 
 def main():
@@ -791,8 +814,19 @@ def main():
         run_unlock(page)
         run_bus_watch(page, errors)
         run_connect_cancel(page, errors)
+        # THE SOAK IS OPTIONAL AND USED TO BE SILENT. --soak-s defaults to 0, so
+        # by default this suite printed "49/49 checks passed" with the whole
+        # loopback section -- drift, jitter, concealment, coverage, the resync
+        # backoff -- never executed and nothing saying so. Same shape as
+        # nav_selftest's fixture section. Still optional, because it takes
+        # minutes of wall clock; no longer quiet.
         if args.soak_s > 0:
             run_soak(page, clip, args.soak_s)
+        else:
+            SKIPPED.skip("the loopback soak — drift, jitter, concealment, "
+                         "coverage and the resync backoff",
+                         "pass --soak-s 60 (or longer; the resync checks need "
+                         "a rebuild to actually happen)")
 
         ok(not errors, "no uncaught page errors" +
            ("" if not errors else ": " + "; ".join(errors[:3])))
@@ -800,7 +834,7 @@ def main():
 
     print("\n" + "=" * 72)
     total = len(PASS) + len(FAIL)
-    print(f"{len(PASS)}/{total} checks passed")
+    print(f"{len(PASS)}/{total} checks passed" + SKIPPED.summary())
     if FAIL:
         print("\nFAILED:")
         for f in FAIL:

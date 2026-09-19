@@ -38,6 +38,39 @@ neighbours.
 """
 
 
+class Skips:
+    """Skips that cannot hide.
+
+    An optional section that announces itself is information; one that goes quiet
+    is the bug. Both leave the same assertions dark, so the only way to tell them
+    apart is whether the suite said so.
+
+    Found twice by sweeping: nav_selftest's real-geometry section, gated on a
+    route fixture in argv[2], and output_bus_selftest's loopback soak, gated on
+    --soak-s which defaults to 0. The second printed "49/49 checks passed" with
+    three assertions about the loopback never executed and no mention of it.
+
+    The point is that "passed" must never be able to mean "passed, and also a
+    section you were not told about did not run".
+    """
+
+    def __init__(self):
+        self.declared = []
+
+    def skip(self, reason, how=""):
+        self.declared.append((reason, how))
+        print(f"  SKIP {reason}" + (f" — {how}" if how else ""))
+        return False
+
+    def summary(self):
+        """The fragment a summary line appends. Empty when nothing was skipped,
+        so the ordinary case reads exactly as it always has."""
+        if not self.declared:
+            return ""
+        return (f", {len(self.declared)} section(s) SKIPPED ("
+                + "; ".join(r for r, _ in self.declared) + ")")
+
+
 def bind(report, order="cond_first"):
     """Wrap a suite's reporter.
 
