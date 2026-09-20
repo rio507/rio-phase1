@@ -1469,46 +1469,24 @@ def session_config() -> dict:
     }
 
 
-def mint_client_secret() -> dict:
-    """An ephemeral key for the browser, and nothing else.
+def drive_policy(cfg: dict) -> dict:
+    """Everything the browser applies that has nothing to do with WHICH WIRE.
 
-    The browser needs credentials to open a WebRTC connection to the model, and
-    the account key is not a thing to hand it. This mints a short-lived secret
-    scoped to one session, which is the same discipline every other key on this
-    page follows: routing, geocoding and TTS all go through the server, and the
-    one key a browser is allowed to see is the Maps render key, which cannot do
-    anything but draw a map.
+    THERE ARE TWO MINTS NOW, and this is what they must not each hold a copy of.
+    Every field here is a number or a sentence decided in config.py, carried to
+    the page so the browser holds no second opinion -- and the failure mode of a
+    second copy is not a crash, it is a browser silently using its own DEFAULT:
+    the barge gate at whatever the code says instead of what was measured on the
+    iPhone, `newest wins` with no turn policy, the wrong voice's clips in the
+    three lines that cannot be re-rendered at the moment they fire.
+
+    27 of these were missing from the xAI mint when the second wire was first
+    connected, and not one of them would have raised an error.
+
+    `cfg` is the session configuration the vendor is actually opening, for the
+    one field that has to agree with it (output_modalities).
     """
-    cfg = session_config()
-    secret = client().realtime.client_secrets.create(session=cfg)
-    data = secret.model_dump()
     return {
-        "client_secret": data.get("value"),
-        "expires_at": data.get("expires_at"),
-        "model": config.OPENAI_REALTIME_MODEL,
-        "voice": config.OPENAI_REALTIME_VOICE,
-        "tool": TOOL_NAME,
-        "tools": [t["name"] for t in cfg["tools"]],
-        # The schemas themselves, because a session.update replaces the tool
-        # list whole: a browser that is going to add two tools has to be able
-        # to send back the seven that were already there. It holds them, it
-        # does not write them — every word still comes from here.
-        "tool_schemas": [dict(t) for t in cfg["tools"]],
-        # ...AND THE ONES THAT ARE NOT SENT YET.
-        #
-        # A tool schema is input on EVERY response for the whole drive, whether
-        # or not the driver ever needs it — and stop_navigation and reroute are
-        # unusable for most of a drive, because there is nothing to stop or to
-        # reroute until a route exists. Two tools nobody can call cost about
-        # 350 tokens a response, twice that on a tool turn, out of a minute
-        # that holds 40,000.
-        #
-        # So they are attached when their precondition holds and taken away
-        # when it stops holding, by a session.update the browser sends on the
-        # route attaching and on it ending. The condition is named rather than
-        # implied — `routing` — because this is the general shape and not a
-        # special case for navigation: a tool whose precondition is knowable
-        # rides with the precondition, not with the session.
         "conditional_tools": {
             name: [dict(t) for t in tools]
             for name, tools in CONDITIONAL_TOOLS.items()
@@ -1527,15 +1505,6 @@ def mint_client_secret() -> dict:
         # policies are: the browser holds no second copy of a decision made in
         # config.py, so there is nothing to drift.
         "voice_backend": config.VOICE_BACKEND,
-        # THE VOICE, BY VALUE. Named `live_voice` and not `cedar_voice`,
-        # because it stopped being cedar and a field whose NAME is a voice is a
-        # field that goes on saying the old one. The page reads this to build
-        # the tier-2 session.update, so a stale name here is a drive that
-        # changes speaker halfway through — which is the exact failure the
-        # whole one-voice argument exists to prevent.
-        "live_voice": config.OPENAI_REALTIME_VOICE,
-        # The old name, for one release. Nothing in this repo reads it.
-        "cedar_voice": config.OPENAI_REALTIME_VOICE,
         "voice_sample_rate": int(config.ELEVENLABS_SAMPLE_RATE),
         "output_modalities": cfg["output_modalities"],
         # ...and so does the resume policy, for the same reason: one place
@@ -1634,6 +1603,59 @@ def mint_client_secret() -> dict:
         # session. See config.REALTIME_PEER_DISCONNECT_GRACE_MS.
         "peer_disconnect_grace_ms":
             int(config.REALTIME_PEER_DISCONNECT_GRACE_MS),
+    }
+
+
+def mint_client_secret() -> dict:
+    """An ephemeral key for the browser, and nothing else.
+
+    The browser needs credentials to open a WebRTC connection to the model, and
+    the account key is not a thing to hand it. This mints a short-lived secret
+    scoped to one session, which is the same discipline every other key on this
+    page follows: routing, geocoding and TTS all go through the server, and the
+    one key a browser is allowed to see is the Maps render key, which cannot do
+    anything but draw a map.
+    """
+    cfg = session_config()
+    secret = client().realtime.client_secrets.create(session=cfg)
+    data = secret.model_dump()
+    return {
+        "client_secret": data.get("value"),
+        "expires_at": data.get("expires_at"),
+        "model": config.OPENAI_REALTIME_MODEL,
+        "voice": config.OPENAI_REALTIME_VOICE,
+        "tool": TOOL_NAME,
+        "tools": [t["name"] for t in cfg["tools"]],
+        # The schemas themselves, because a session.update replaces the tool
+        # list whole: a browser that is going to add two tools has to be able
+        # to send back the seven that were already there. It holds them, it
+        # does not write them — every word still comes from here.
+        "tool_schemas": [dict(t) for t in cfg["tools"]],
+        # ...AND THE ONES THAT ARE NOT SENT YET.
+        #
+        # A tool schema is input on EVERY response for the whole drive, whether
+        # or not the driver ever needs it — and stop_navigation and reroute are
+        # unusable for most of a drive, because there is nothing to stop or to
+        # reroute until a route exists. Two tools nobody can call cost about
+        # 350 tokens a response, twice that on a tool turn, out of a minute
+        # that holds 40,000.
+        #
+        # So they are attached when their precondition holds and taken away
+        # when it stops holding, by a session.update the browser sends on the
+        # route attaching and on it ending. The condition is named rather than
+        # implied — `routing` — because this is the general shape and not a
+        # special case for navigation: a tool whose precondition is knowable
+        # rides with the precondition, not with the session.
+        **drive_policy(cfg),
+        # THE VOICE, BY VALUE. Named `live_voice` and not `cedar_voice`,
+        # because it stopped being cedar and a field whose NAME is a voice is a
+        # field that goes on saying the old one. The page reads this to build
+        # the tier-2 session.update, so a stale name here is a drive that
+        # changes speaker halfway through — which is the exact failure the
+        # whole one-voice argument exists to prevent.
+        "live_voice": config.OPENAI_REALTIME_VOICE,
+        # The old name, for one release. Nothing in this repo reads it.
+        "cedar_voice": config.OPENAI_REALTIME_VOICE,
     }
 
 

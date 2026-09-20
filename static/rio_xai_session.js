@@ -673,6 +673,16 @@
     if (o.step) opening = o.step('socket', opening, o.progress);
 
     return opening.then(function () {
+      /* THE TWO TOOLS THAT ARRIVE WITH THEIR PRECONDITION. stop_navigation and
+         reroute are unusable until a route exists, so they ride with the route
+         rather than with the session -- attached and removed by a session.update
+         the controller sends. Without this call they would never be attached at
+         all on this wire, and two of the nine live tools would simply not exist
+         for the whole drive. Subscribed after the socket is open because that
+         update has to have somewhere to go; a route that was ALREADY live when
+         she was started mid-drive is picked up by the same call. */
+      controller.watchToolConditions(root.RIO && root.RIO.bus,
+                                     function (fn) { fn(); });
       return o.sessionHandle(session, {
         controller: controller,
         audioState: function () {

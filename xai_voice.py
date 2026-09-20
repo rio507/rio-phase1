@@ -284,7 +284,17 @@ def mint_client_secret() -> dict:
     """
     pol = session_policy()
     secret = _ephemeral(300)
+    import realtime
+
     return {
+        # THE DRIVE'S POLICY, FROM THE ONE PLACE THAT HOLDS IT. 27 fields -- the
+        # barge gate, the echo-text gate, the turn policy, the speak deadlines,
+        # the resume instruction, the clip prefix -- none of which have anything
+        # to do with which wire this is. They were missing here when this mint was
+        # first written, and a missing policy field is not an error: it is the
+        # browser quietly using its own default instead of the number that was
+        # measured. See realtime.drive_policy.
+        **realtime.drive_policy(pol),
         "client_secret": secret,
         "ws_url": f"{WS_URL}?model={config.XAI_VOICE_MODEL}",
         # The subprotocol the token rides in, because a browser cannot set an
@@ -292,6 +302,8 @@ def mint_client_secret() -> dict:
         "ws_subprotocol": f"xai-client-secret.{secret}",
         "model": config.XAI_VOICE_MODEL,
         "voice": config.XAI_VOICE,
+        # WHOSE VOICE, BY VALUE. The page reads this to build a session.update,
+        # so a stale name here is a drive that changes speaker halfway through.
         "live_voice": config.XAI_VOICE,
         "voice_backend": "xai_voice",
         "session": pol,

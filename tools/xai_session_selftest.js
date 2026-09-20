@@ -444,6 +444,9 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
   const panel = [];
   const mic = { getTracks: () => [{ muted: false, readyState: 'live',
                                     stop: () => {} }] };
+  /* The page's bus, which is how a route says it exists. */
+  const busSubs = [];
+  global.RIO.bus = { on: (t, fn) => busSubs.push(fn) };
   const minted = {
     ws_url: 'wss://example.test/v1/realtime?model=m',
     ws_subprotocol: 'xai-client-secret.tok',
@@ -454,6 +457,13 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
     speech_channels: { safety: true, chat: false },
     speak_timeout_ms: 1200,
     barge_sustain_ms: 260,
+    tool_schemas: [{ type: 'function', name: 'look', parameters: {} },
+                   { type: 'function', name: 'deep_dive', parameters: {} }],
+    /* The two that ride with the route rather than with the session. */
+    conditional_tools: {
+      routing: [{ type: 'function', name: 'stop_navigation', parameters: {} },
+                { type: 'function', name: 'reroute', parameters: {} }],
+    },
   };
 
   const handle = await session.attach({
@@ -489,6 +499,31 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
      '...and carries the queue and the degraded flag, which is where a session '
      + 'that went quiet becomes visible to the page');
 
+  ok(busNode !== null,
+     'and her voice is connected to RIO.output\'s node, not to ctx.destination '
+     + '— that node is inside the echo canceller, and on this wire there is no '
+     + 'remote track to be cancelled instead');
+
+  /* THE TWO TOOLS THAT RIDE WITH THE ROUTE. Nine live tools are required and
+     only seven are in the session; stop_navigation and reroute are attached when
+     there is something to stop. On this wire nothing was attaching them. */
+  ok(busSubs.length === 1,
+     'the controller is watching the page\'s bus for a route');
+  const before2 = WS.sent.length;
+  busSubs[0]({ type: 'NAV_ROUTE_ATTACHED' });
+  const updates = WS.sent.slice(before2)
+    .filter(e => e.type === 'session.update');
+  const names = updates.length
+    ? (updates[0].session.tools || []).map(t => t.name) : [];
+  ok(updates.length === 1 && names.indexOf('stop_navigation') >= 0
+     && names.indexOf('reroute') >= 0,
+     `a route attaching sends the two conditional tools (${names.join(', ')}) — `
+     + 'without this two of the nine live tools would not exist for the whole '
+     + 'drive, and nothing would have said so');
+  ok(names.indexOf('look') >= 0 && names.indexOf('deep_dive') >= 0,
+     '...and the session\'s own tools go back with them, because a session.update '
+     + 'replaces the tool list whole');
+
   /* THE MOUTH. On the other wire it is element.muted; here it is a gain, and it
      had better be between her voice and the bus rather than nowhere. */
   const gainNode = nodes[0];
@@ -502,11 +537,6 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
   ok(gainNode.gain._ramps.length > 0,
      '...by a ramp rather than a switch, because a gain that jumps to zero '
      + 'mid-word clicks and the sustain gate changes its mind often');
-
-  ok(busNode !== null,
-     'and her voice is connected to RIO.output\'s node, not to ctx.destination '
-     + '— that node is inside the echo canceller, and on this wire there is no '
-     + 'remote track to be cancelled instead');
 
   handle.stop();
   ok(true, 'stop() tears down the socket, the mouth and the microphone');
