@@ -235,6 +235,42 @@ section('THE GATE — a request waits for silence, a cancel does not');
 }
 
 // ---------------------------------------------------------------------------
+section('THE GATE HAS A CEILING — it must not be able to mute her for a drive');
+// ---------------------------------------------------------------------------
+{
+  /* The queue bounds the wait in every ordinary case. What it cannot bound is a
+     response that never CLOSES: no response.done, so generation is never done, so
+     idle() is false forever and every request for speech queues behind it. The
+     gate exists to stop two seconds of overlapping audio; holding forever costs
+     the rest of the drive, and that is the worse of the two. */
+  const h = harness({ gateMaxHoldMs: 1000 });
+  await h.s.connect();
+  h.s._onMessage(JSON.stringify({ type: 'response.created',
+                                  response: { id: 'r1' } }));
+  h.s._onMessage(JSON.stringify({ type: 'response.output_audio.delta',
+                                  delta: b64Audio(ONE_SECOND) }));
+  // ...and no response.done, ever. This is the anomaly.
+  h.s.send({ type: 'response.create' });
+  h.advance(0.5);
+  h.pump();
+  ok(!h.WS.sent.some(e => e.type === 'response.create'),
+     'still held half a second in — the ceiling is not a shortcut around the '
+     + 'gate');
+  ok(h.p.untilIdle() === Infinity,
+     'and the queue cannot say when this one ends, which is exactly the case '
+     + 'that used to wait forever');
+  h.advance(0.7);
+  h.pump();
+  ok(h.WS.sent.some(e => e.type === 'response.create'),
+     'past the ceiling it goes anyway: overlapping audio is two seconds of mess '
+     + 'and a mute car is the whole drive');
+  ok(h.events.some(e => e.type === 'XAI_GATE_TIMEOUT' && e.held_ms >= 1000),
+     '...and it is REPORTED, because a release this path takes is evidence that '
+     + 'a response never closed');
+  ok(h.s.health().gate_timeouts === 1, 'and counted in health');
+}
+
+// ---------------------------------------------------------------------------
 section('output_audio_buffer.clear is local, because the wire refuses it');
 // ---------------------------------------------------------------------------
 {

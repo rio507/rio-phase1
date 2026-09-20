@@ -224,7 +224,7 @@
     var stats = {
       audio_in_frames: 0, audio_out_bytes: 0, transcripts: 0,
       transcript_repeats_dropped: 0, local_flushes: 0, gated_requests: 0,
-      responses: 0, spoke: 0, silent_responses: 0,
+      responses: 0, spoke: 0, silent_responses: 0, gate_timeouts: 0,
     };
     /* SILENT-SESSION DETECTION. `expecting` is set when a response opens and
        cleared by its first audio; a response that closes with it still set is one
@@ -249,7 +249,7 @@
         var wait = playout.untilIdle();
         emit({ type: 'XAI_REQUEST_GATED',
                wait_s: wait === Infinity ? null : wait });
-        pending.push(out);
+        pending.push({ ev: out, at: now() });
         return;
       }
       try { ws.send(JSON.stringify(out)); } catch (e) {}
@@ -269,14 +269,32 @@
       }
     }
 
-    /* Anything held back by the gate, once there is silence to send it into. */
+    /* Anything held back by the gate, once there is silence to send it into --
+       AND A CEILING ON THE HOLD, because the gate must not be able to mute her
+       for the rest of the drive.
+       
+       The queue's own arithmetic bounds the wait in every ordinary case: once
+       generation is done it knows to the millisecond when the sound ends. What it
+       cannot bound is a response that never closes -- a response.done that does
+       not arrive, a cancel the server never confirms -- and then `idle()` is false
+       forever and every request for speech queues behind it. That is a mute car,
+       which is worse than the overlap the gate exists to prevent: overlapping
+       audio is two seconds of mess, and silence is the whole drive. So the hold
+       has a ceiling, and passing it is reported rather than quietly survived. */
     function flushPending() {
       if (!pending.length) return;
-      if (playout && !playout.idle()) return;
+      var overdue = pending[0] && (now() - pending[0].at) * 1000 > gateMaxHoldMs;
+      if (playout && !playout.idle() && !overdue) return;
+      if (overdue) {
+        stats.gate_timeouts++;
+        emit({ type: 'XAI_GATE_TIMEOUT',
+               held_ms: Math.round((now() - pending[0].at) * 1000),
+               playout: playout ? playout.state() : null });
+      }
       var go = pending.slice();
       pending.length = 0;
       go.forEach(function (o) {
-        try { ws.send(JSON.stringify(o)); } catch (e) {}
+        try { ws.send(JSON.stringify(o.ev)); } catch (e) {}
       });
     }
 
@@ -325,6 +343,12 @@
      * which was the tell, and is now asserted without it. */
     var ticker = null;
     var tickMs = opts.tickMs || 25;
+    /* How long a request for speech may wait for silence before it goes anyway.
+       Four seconds is longer than any answer's tail (a 30-second answer is 30
+       seconds of queue, but its END is known) and short enough that a driver
+       notices one pause rather than a drive of them. */
+    var gateMaxHoldMs = opts.gateMaxHoldMs === undefined ? 4000
+                                                         : opts.gateMaxHoldMs;
 
     function tick() {
       if (closed) return;
@@ -552,6 +576,7 @@
           degraded: silence.degraded,
           silent_responses: silence.responses,
           pending_requests: pending.length,
+          gate_timeouts: stats.gate_timeouts,
           queued_until: speaker ? speaker.queuedUntil() : 0,
           playout: playout ? playout.state() : null,
         };
