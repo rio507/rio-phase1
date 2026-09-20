@@ -42,7 +42,12 @@ function stubPage() {
     preview: { id: 'preview', src: '', paused: true,
                videoWidth: 1280, videoHeight: 720,
                play() { this.paused = false; return Promise.resolve(); },
-               pause() { this.paused = true; } },
+               pause() { this.paused = true; },
+               load() {} },
+    /* THE DRIVER'S OWN RECORD OF WHAT THEY PICKED. Set by the browser before
+       any of this page's JavaScript runs, which is why it is the evidence that
+       survives a handler that threw. */
+    upload: { id: 'upload', files: [], value: '' },
   };
   const asked = [];
   global.window = {
@@ -58,6 +63,8 @@ function stubPage() {
       },
     },
     RIO: {},
+    URL: { createObjectURL: (f) => 'blob:rebuilt-from-' + (f && f.name),
+           revokeObjectURL: () => {} },
   };
   global.document = global.window.document;
   /* NOT `global.navigator = ...`, AND THIS SUITE SPENT ITS WHOLE LIFE ON THAT
@@ -138,6 +145,129 @@ function stubPage() {
     ok(src.kind() === 'clip' && src.element() === els.preview,
        'stopping a feed does not silently drop the clip');
     ok(asked.length === 0, 'still no camera, after all of that');
+  }
+
+  // -------------------------------------------------------------------------
+  section('no device can be opened while a clip is loaded — the GUARD');
+  {
+    /* THE DRIVE OF 2026-09-20, 20:10:09, AND WHY RECONCILING WAS NOT ENOUGH.
+       DRIVE_SOURCE recorded `camera` with faults empty: reconcile() asked
+       #preview for a src, found none, and the camera opened. Reconciling is a
+       repair, and a repair only runs in the path that remembered to ask —
+       three places on this page ask for a camera and the history of this file
+       is callers who each decided for themselves. So the rule is enforced
+       where all of them go through. */
+    const { src, els, asked } = stubPage();
+    src.setClip('blob:abc', 'coastal.mp4');
+
+    let refused = null;
+    await navigator.mediaDevices.getUserMedia({ video: true })
+      .then(() => {}, (e) => { refused = e; });
+    ok(refused !== null && asked.length === 0,
+       'a RAW getUserMedia for video — the permission probe, the frame button, '
+       + 'anything written next — is refused before any device is touched');
+    ok(refused && refused.name === 'NotAllowedError'
+       && /clip is the source/.test(refused.message),
+       '...with a reason a caller can act on: ' + (refused && refused.message));
+    const f = src.faults().filter(x => x.code === 'CAMERA_REFUSED_CLIP_LOADED');
+    ok(f.length === 1 && f[0].detail.evidence === 'record',
+       '...and it FAILS LOUDLY, naming the evidence — ' + JSON.stringify(
+         f.length ? f[0].detail.evidence : null));
+
+    // The microphone is untouched. A guard that took it away would be worse
+    // than the bug: a clip drive still has a driver in it who talks.
+    refused = null;
+    await navigator.mediaDevices.getUserMedia({ audio: true })
+      .then(() => {}, (e) => { refused = e; });
+    ok(refused === null && asked.length === 1,
+       'audio-only passes straight through — a clip drive still has a driver '
+       + 'in it who talks');
+
+    // ...and with no clip, a camera opens exactly as it always did.
+    src.useCamera();
+    refused = null;
+    await navigator.mediaDevices.getUserMedia({ video: true })
+      .then(() => {}, (e) => { refused = e; });
+    ok(refused === null && asked.length === 2,
+       'and the guard refuses NOTHING once the clip is gone — it is a gate, '
+       + 'not a ban');
+  }
+
+  // -------------------------------------------------------------------------
+  section('the driver picked a file and nothing acted on it');
+  {
+    /* THE EVIDENCE THAT SURVIVES A HANDLER THAT DIED. #preview has a src only
+       because something put one there; `#upload`.files is the browser's record
+       of what the driver chose, set before any of this page's JavaScript runs.
+       At 20:10:09 the element was empty and that was the ONLY thing anybody
+       asked. */
+    const { src, els, asked } = stubPage();
+    els.upload.files = [{ name: 'RIO TEST HEADWAY_1.mp4', type: 'video/mp4' }];
+
+    ok(src.clipLoaded() === 'upload_input',
+       'a video in the upload input IS a clip being loaded, whatever else '
+       + 'failed to happen');
+
+    let refused = null;
+    await navigator.mediaDevices.getUserMedia({ video: true })
+      .then(() => {}, (e) => { refused = e; });
+    ok(refused !== null && asked.length === 0,
+       '...so no camera can be opened, before any repair has run');
+
+    const feed = await src.startFeed('drive');
+    ok(asked.length === 0, 'Start Drive opens no camera');
+    ok(feed.kind === 'clip' && feed.element === els.preview,
+       '...and drives the CLIP: the File is still in the input, so the source '
+       + 'is rebuilt rather than merely reported missing');
+    ok(els.preview.src === 'blob:rebuilt-from-RIO TEST HEADWAY_1.mp4',
+       '...from the driver\'s own file — ' + els.preview.src);
+    ok(src.name() === 'RIO TEST HEADWAY_1.mp4',
+       '...under its real name, so the badge and DRIVE_SOURCE say which clip');
+    const ad = src.faults().filter(x => x.code === 'ADOPTED_VISIBLE_CLIP');
+    ok(ad.length === 1 && ad[0].detail.evidence === 'upload_input',
+       '...and the recovery is a fault, because something should have said so '
+       + 'first');
+  }
+
+  // -------------------------------------------------------------------------
+  section('the REAL permission probe, against the guard');
+  {
+    /* THE SECOND CALLER, not a model of it. rio_permissions.js opens a camera
+       inside the Start Drive tap and decides whether to from a `skipCamera`
+       flag its caller computes — which is the convention that was in place on
+       2026-09-20 and was correct in exactly the one path that computed it.
+       Here the flag is deliberately wrong, the way a bug would make it wrong,
+       and the guard is what has to hold. */
+    const { src, els, asked } = stubPage();
+    src.setClip('blob:abc', 'coastal.mp4');
+
+    /* rio_permissions binds to `self`, so it is required for its EXPORT rather
+       than for a global — and required fresh, because the stub window is. */
+    delete require.cache[require.resolve(
+      path.join(__dirname, '..', 'static', 'rio_permissions.js'))];
+    const { makePermissions } = require(
+      path.join(__dirname, '..', 'static', 'rio_permissions.js'));
+    global.window.navigator.geolocation = {
+      getCurrentPosition: (okc) => okc({ coords: {
+        latitude: 34.02, longitude: -118.49, accuracy: 9 } }),
+    };
+    const perms = makePermissions(global.window.navigator,
+                                  { isSecureContext: true });
+
+    const snap = await perms.request({ skipCamera: false, video: true });
+    ok(asked.length === 1 && asked[0] && asked[0].audio,
+       'the probe asked for a camera and got nothing: the only request that '
+       + 'reached the device was the MICROPHONE ('
+       + JSON.stringify(asked) + ')');
+    ok(snap.camera === 'denied',
+       '...the probe is told no, in the vocabulary it already handles — '
+       + snap.camera);
+    ok(snap.mic === 'granted',
+       '...and the microphone is granted, because a clip drive still has a '
+       + 'driver in it');
+    ok(src.faults().some(f => f.code === 'CAMERA_REFUSED_CLIP_LOADED'),
+       '...and the violation is recorded against the module that owns the '
+       + 'decision, not lost in the caller that got it wrong');
   }
 
   // -------------------------------------------------------------------------
@@ -234,6 +364,15 @@ function stubPage() {
 
     ok(/RIO\.source\.setClip\(/.test(html),
        'an upload sets the clip as the source');
+    {
+      const mod = fs.readFileSync(path.join(__dirname, '..', 'static',
+                                            'rio_source.js'), 'utf8');
+      const tail = mod.slice(mod.indexOf('root.RIO.source = {'));
+      ok(/^\s*installGuard\(\);/m.test(tail),
+         'and the guard is armed by the module AT LOAD — a guard that arms when '
+         + 'the owner is first asked is absent for exactly the callers that '
+         + 'never ask it anything');
+    }
     ok(/id="camsource"/.test(html) && /id="usecamera"/.test(html),
        'the source is shown in the HUD and can be handed back to the camera');
 
@@ -259,6 +398,16 @@ function stubPage() {
     ok(recIdx >= 0 && recIdx < askIdx,
        'Start Drive reconciles what is on the screen BEFORE it asks for the '
        + 'camera permission, not after');
+    ok(/DRIVE_REFUSED_CLIP_UNOPENABLE/.test(drive)
+       && /will not fall back to the camera/.test(drive),
+       'and a clip that cannot be opened REFUSES the drive rather than falling '
+       + 'back to the camera — the fallback is the reported failure, with the '
+       + 'driver watching their clip and finding out from the log');
+    ok(/Starting drive on . \+ RIO\.source\.label\(\)/.test(drive)
+       || /Starting drive on ' \+ RIO\.source\.label\(\)/.test(drive),
+       'and the glass names the source at the TAP, not afterwards — '
+       + '"Starting drive..." was true of both a clip drive and a camera one, '
+       + 'and the difference between them was the fault');
     ok(/videoConstraints/.test(drive)
        && /videoConstraints: videoConstraints/.test(
             fs.readFileSync(path.join(__dirname, '..', 'static',

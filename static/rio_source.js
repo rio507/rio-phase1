@@ -189,6 +189,13 @@
         if (typeof p.load === 'function') p.load();
       } catch (e) {}
     }
+    /* ...AND THE DRIVER'S SELECTION, which is now evidence in its own right.
+       clipLoaded() reads the upload input, so leaving the file in it would make
+       the next acquisition adopt the clip again and the camera unopenable —
+       turning the one explicit choice in this module into one that cannot be
+       made. */
+    var up = byId('upload');
+    if (up) { try { up.value = ''; } catch (e) {} }
     state.kind = CAMERA;
     state.clipUrl = '';
     state.clipName = '';
@@ -328,19 +335,154 @@
    * something failed to say so, and that is worth a line -- and it happens
    * BEFORE any device is opened, which is what makes "the camera is never
    * opened over a clip" true rather than intended. */
+  /* WHAT THE DRIVER CHOSE, from the one place that cannot have been lost.
+   *
+   * `#upload`.files holds the File the driver picked in the dialog. It is the
+   * browser's own record of the choice, it is set before any of this page's
+   * JavaScript runs, and it survives every handler that was supposed to act on
+   * it failing -- which the element's `src` does not, because something has to
+   * put a src there.
+   *
+   * THE DRIVE OF 2026-09-20, 20:10:09: DRIVE_SOURCE recorded `camera`, faults
+   * empty, so reconcile() looked at #preview and found no src. Either no clip
+   * was re-selected after the hard reload twelve seconds earlier, or one was
+   * and nothing registered it. The element could not tell those apart. This
+   * can: if the input holds a video, the driver chose a clip, full stop. */
+  function chosenClipFile() {
+    var up = byId('upload');
+    var f = up && up.files && up.files.length ? up.files[0] : null;
+    if (!f) return null;
+    var type = String(f.type || '');
+    if (type.indexOf('video/') !== 0) return null;      // a still is not a source
+    return f;
+  }
+
+  /* IS A CLIP LOADED? Asked of every piece of evidence there is, because the
+     answer gates a device and a wrong `no` opens a camera over the driver's
+     picture. In order of directness: what this module recorded, what is in the
+     element, and what the driver actually picked. */
+  function clipLoaded() {
+    if (state.kind === CLIP && state.clipUrl) return 'record';
+    var clip = byId('preview');
+    var src = clip ? (clip.currentSrc || clip.src || '') : '';
+    if (src) return 'element';
+    if (chosenClipFile()) return 'upload_input';
+    return null;
+  }
+
   function reconcile() {
     if (kind() === CLIP) return;
+    var why = clipLoaded();
+    if (!why) return;
+
     var clip = byId('preview');
-    if (!clip) return;
-    var src = clip.currentSrc || clip.src || '';
-    if (!src) return;
+    var src = clip ? (clip.currentSrc || clip.src || '') : '';
+    var name_ = state.clipName || 'clip';
+
+    /* THE FILE IS STILL THERE, so the clip can be rebuilt rather than merely
+       reported. A File in the input is all URL.createObjectURL needs, so a
+       driver whose upload handler died still gets a drive on their clip
+       instead of a camera and an apology. */
+    if (!src) {
+      var f = chosenClipFile();
+      if (!f || !(root.URL && root.URL.createObjectURL)) return;
+      try { src = root.URL.createObjectURL(f); } catch (e) { return; }
+      name_ = f.name || name_;
+      if (clip) {
+        clip.src = src;
+        try { if (typeof clip.load === 'function') clip.load(); } catch (e) {}
+      }
+    }
+
     fault('ADOPTED_VISIBLE_CLIP', { src: String(src).slice(0, 80),
-                                    was: kind() });
+                                    was: kind(), evidence: why,
+                                    name: name_ });
     state.kind = CLIP;
     state.clipUrl = String(src);
-    state.clipName = state.clipName || 'clip';
+    state.clipName = name_;
     retarget();
     emit();
+  }
+
+  /* ---- THE GUARD -------------------------------------------------------
+   *
+   * "Assert that no getUserMedia call can happen while a clip is the adopted
+   * source, and make the violation fail loudly rather than reconcile after the
+   * fact."
+   *
+   * Reconciling is a repair, and a repair runs in the one path that remembered
+   * to ask. THREE places on this page request a camera -- this module, the
+   * permission probe in the Start Drive tap, and the manual frame button -- and
+   * the history of this file is callers who each independently decided they
+   * needed a picture. A fourth will be written.
+   *
+   * So the rule is enforced at the only place all of them go through: the
+   * browser's own getUserMedia. A request for VIDEO while a clip is loaded is
+   * refused here, before any device is touched, and the refusal is a fault with
+   * the caller's stack in it. Audio is untouched -- the microphone must work on
+   * a clip drive exactly as it does on a camera one, and a guard that took the
+   * microphone away would be a worse bug than the one it fixes.
+   *
+   * This is deliberately a patch on the platform call and not a convention. A
+   * convention is what was in place: `skipCamera: RIO.source.kind() === 'clip'`,
+   * correct, and evaluated by one caller out of three.
+   */
+  var originalGUM = null;
+
+  function wantsVideo(constraints) {
+    if (!constraints) return false;
+    var v = constraints.video;
+    return !!v;                    // true, or a constraints object
+  }
+
+  function installGuard() {
+    if (originalGUM) return true;
+    var md = root.navigator && root.navigator.mediaDevices;
+    if (!md || typeof md.getUserMedia !== 'function') return false;
+    originalGUM = md.getUserMedia.bind(md);
+    md.getUserMedia = function (constraints) {
+      if (wantsVideo(constraints)) {
+        var why = clipLoaded();
+        if (why) {
+          var detail = { evidence: why, constraints: describe(constraints),
+                         from: callerLine() };
+          fault('CAMERA_REFUSED_CLIP_LOADED', detail);
+          var err = new Error('RIO.source: a clip is the source (' + why
+                              + ') — no camera may be opened. '
+                              + 'See static/rio_source.js.');
+          err.name = 'NotAllowedError';
+          return Promise.reject(err);
+        }
+      }
+      return originalGUM(constraints);
+    };
+    return true;
+  }
+
+  function uninstallGuard() {
+    var md = root.navigator && root.navigator.mediaDevices;
+    if (originalGUM && md) md.getUserMedia = originalGUM;
+    originalGUM = null;
+  }
+
+  function describe(c) {
+    try { return JSON.stringify(c).slice(0, 120); } catch (e) { return '?'; }
+  }
+
+  /* WHO ASKED. A refusal that does not name the caller is a refusal somebody
+     has to go and find, and the whole point of the guard is that the caller is
+     something nobody has thought about yet. */
+  function callerLine() {
+    try {
+      var lines = String(new Error().stack || '').split('\n');
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i];
+        if (l.indexOf('rio_source.js') >= 0) continue;
+        if (/at (Object\.)?(installGuard|getUserMedia|callerLine)/.test(l)) continue;
+        if (/^\s*at /.test(l)) return l.trim().slice(0, 160);
+      }
+    } catch (e) {}
+    return null;
   }
 
   /* THE ONE ACQUISITION. Every start path calls this and none of them calls
@@ -419,7 +561,15 @@
       kind: liveFeed ? liveFeed.kind : null,
       source: kind(),
       holders: liveFeed ? liveFeed.holders.slice() : [],
-      faults: faults.slice(),
+      /* COMPACT ON PURPOSE. This goes into the DRIVE_SOURCE mark, whose note is
+         truncated at 700 characters — and a truncated JSON note is not a
+         shorter answer, it is an unparseable one. A code and the evidence
+         behind it is what the log needs; the full records, stack lines and all,
+         stay on RIO.source.faults() for the console and the suites. */
+      faults: faults.map(function (f) {
+        return { code: f.code, evidence: f.detail.evidence || null };
+      }),
+      fault_count: faults.length,
     };
   }
 
@@ -489,6 +639,11 @@
     kind: kind, name: name, label: label, element: element,
     isClip: isClip, facing: function () { return state.facing; },
     videoConstraints: videoConstraints,
+    /* IS A CLIP LOADED, on all the evidence — and it returns WHICH evidence,
+       because "the record says so" and "the driver picked a file nothing acted
+       on" are the same answer to the gate and different faults. */
+    clipLoaded: clipLoaded,
+    installGuard: installGuard, uninstallGuard: uninstallGuard,
     /* Called by a start path BEFORE it asks for permissions, because the
        permission probe opens a camera of its own and the decision about
        whether to ask for one at all depends on this. startFeed() calls it
@@ -506,6 +661,12 @@
       liveFeed = null; faults = [];
     },
   };
+
+  /* INSTALLED AT LOAD, not at the first acquisition. The call this guards is
+     reachable from anywhere in the page from the moment the page has a DOM,
+     and a guard that arms when the owner is first ASKED is a guard that is
+     absent for exactly the callers that never ask it anything. */
+  installGuard();
 
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = root.RIO.source;

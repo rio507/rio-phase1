@@ -4442,7 +4442,38 @@ document.addEventListener('DOMContentLoaded', () => {
     // static/rio_source.js.
     if (RIO.source.kind() === 'none') { say(RIO.mediaError()); return; }
 
-    say('Starting drive...');
+    /* A CLIP THE OWNER CANNOT OPEN IS A REFUSAL, NOT A CAMERA.
+     *
+     * reconcile() has already run and had every piece of evidence available to
+     * it — the record, the element, and the file the driver picked. If it still
+     * cannot make the clip the source while something says a clip is loaded,
+     * the honest answer is to stop and say which. The alternative is the
+     * failure being reported: a drive that quietly runs on the camera while the
+     * driver watches their clip, and finds out afterwards from the log.
+     *
+     * The guard in rio_source would refuse the device anyway — this is so the
+     * driver reads a sentence about their clip instead of a permission error
+     * about a camera they did not ask for. */
+    const pendingClip = RIO.source.clipLoaded && RIO.source.clipLoaded();
+    if (pendingClip && RIO.source.kind() !== 'clip') {
+      say('A clip is loaded (' + pendingClip + ') but it could not be opened, '
+          + 'and this drive will not fall back to the camera. Press play on '
+          + 'the clip, or pick the file again — or press "Use camera" to drive '
+          + 'on the camera deliberately.');
+      mark('DRIVE_REFUSED_CLIP_UNOPENABLE',
+           { evidence: pendingClip, source: RIO.source.kind(),
+             live: RIO.source.liveState ? RIO.source.liveState() : null });
+      return;
+    }
+
+    /* WHAT IT IS ABOUT TO LOOK THROUGH, SAID BEFORE IT OPENS ANYTHING.
+     *
+     * "Starting drive..." is true of both a clip drive and a camera drive, and
+     * on 2026-09-20 the difference between them was the fault — found
+     * afterwards, from the SHAPE of the frames in the log, because the only
+     * thing the glass said at the moment of the tap was "Starting drive...".
+     * The source is decided by now (reconcile above) and it is one word. */
+    say('Starting drive on ' + RIO.source.label() + '...');
     let feed;
     try {
       feed = await RIO.source.startFeed('drive');
