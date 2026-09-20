@@ -270,6 +270,45 @@
          * Binding on ordinal instead is the heuristic rio_realtime.js ~1002
          * rejects by name, and it is not shipping as a silent fallback. */
         transcriptionItemId: UNKNOWN,
+        /* STILL UNKNOWN AFTER PROBING, AND THE REASON IS NOT SHYNESS.
+         * tools/xai_transcription_probe.py opened a real session and could not
+         * answer it: this team has no access to grok-voice-latest,
+         * grok-voice-think-fast-2.0 or grok-transcribe. The REST /v1/stt
+         * endpoint works; the speech-to-speech models do not.
+         *
+         * The session ACCEPTED the connection, echoed
+         * transcription={"model":"grok-transcribe"} back in session.updated, ran
+         * VAD, fired speech_started / speech_stopped / committed -- and then
+         * emitted no transcript and no response at all, with no error event. A
+         * licensing gap that presents as a working session which never speaks is
+         * its own finding, and it is the shape a drive would hit.
+         *
+         * WHAT SUPERSEDE DEGRADES TO, stated rather than discovered later.
+         * `selfAnswered` at rio_realtime.js:2742 is
+         *     real && itemId && itemId === answeringItemId
+         * so an absent itemId makes it false on EVERY turn -- not sometimes.
+         * Every transcript then reaches supersedeGate as a possible new
+         * question, and on the turn where the model called a tool before the
+         * transcript arrived the gate passes it (it IS real driver speech, not
+         * an echo): supersedeTurn cancels the response, aborts the in-flight
+         * look(), discards the result, and the turn ends silent. That is commit
+         * ee0a909 exactly. It reproduced 3 of 3 on visual turns and never on
+         * deep_dive -- because deep_dive speaks a holding line first, and the
+         * barge gate protects what is already speaking.
+         *
+         * So the degraded mode is not "slightly worse supersede". It is "visual
+         * questions go silent", and it is not shippable.
+         *
+         * THE FIX THAT FOLLOWS FROM THE DIAGNOSIS rather than from cleverness:
+         * the bug is a long tool call with NOTHING SAID OVER IT. If identity is
+         * unavailable, remove the other half -- give `look` the holding line
+         * deep_dive already has, and the barge gate protects it the same way.
+         * The cost is real and is a product decision rather than a technical
+         * one: the visual fast path exists precisely so a scene question is
+         * answered with no model and no filler in front of it, and this puts one
+         * back. Ordinal binding is the obvious alternative and is the heuristic
+         * the comment at ~1002 rejects by name in favour of identity; it is not
+         * being smuggled in here. */
 
         // Documented as not emitted. The handler that files a barge-in as
         // transcription_failed goes dead; those turns fall through the
@@ -287,6 +326,11 @@
         // We read response.output_audio.delta and feed an AudioContext
         // ourselves. Everything in the two rows below follows from this one.
         clientOwnsPlayout: true,
+        /* ...and static/rio_playout.js is what owns it. The tail and the
+           response.create gate are one queue, because they are one fact: how
+           much sound is still to come. tools/playout_selftest.js holds it to an
+           inequality and proves the inequality has teeth by breaking it. */
+        playoutModule: "rio_playout",
         // Not the API's word for it any more — our own queue draining. The
         // tail is still held, on weaker evidence, and this is the field that
         // says so out loud. The a05d233 mute ledger now measures our

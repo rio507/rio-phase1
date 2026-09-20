@@ -175,6 +175,33 @@ def main():
     ok("the result names which model and vendor actually answered, so a drive "
        "log can say", '"vendor"' in esc and '"usd"' in esc)
 
+    section("a timeout means what it says")
+    import openai as _openai
+    sdk_default = _openai._constants.DEFAULT_MAX_RETRIES
+    ok(f"the SDK would retry {sdk_default}x by default, and its timeout is PER "
+       "ATTEMPT — which is why every timeout constant here was describing a "
+       f"{1 + sdk_default}th of the real ceiling", sdk_default > 0)
+    for role in ("reasoning", "news"):
+        ok(f"{role} retries 0 times, because a retry re-runs its searches — a "
+           "second bill for work the budget already paid for",
+           lp.max_retries_for(role) == 0, lp.max_retries_for(role))
+        ok(f"...and the client really carries it, not just the config",
+           lp.client(role).max_retries == 0, lp.client(role).max_retries)
+    ok("chat may retry once — it runs no tools, so its failure is a dropped "
+       "connection on a cheap call", lp.max_retries_for("chat") == 1)
+    ok(f"so a news question is bounded at {c.NEWS_TIMEOUT_S:.0f} s rather than "
+       f"{c.NEWS_TIMEOUT_S * (1 + sdk_default):.0f} s — the 95-second call that "
+       "found this was one attempt timing out and a retry succeeding",
+       c.NEWS_TIMEOUT_S * (1 + lp.max_retries_for("news")) == c.NEWS_TIMEOUT_S)
+    ok(f"and deep_dive at {c.DEEP_ANSWER_TIMEOUT_S:.0f} s rather than "
+       f"{c.DEEP_ANSWER_TIMEOUT_S * (1 + sdk_default):.0f} s",
+       c.DEEP_ANSWER_TIMEOUT_S * (1 + lp.max_retries_for("reasoning"))
+       == c.DEEP_ANSWER_TIMEOUT_S)
+    ok("two roles on one vendor with different retry policies are two clients, "
+       "not one shared pool with the wrong policy",
+       lp.client("news") is not lp.client("chat")
+       or lp.vendor_of("news") != lp.vendor_of("chat"))
+
     section("the length bound, which does not need the vendor's cooperation")
 
     import realtime

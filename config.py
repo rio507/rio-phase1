@@ -139,6 +139,31 @@ def chat_model() -> str:
     return XAI_CHAT_MODEL if CHAT_VENDOR == "xai" else OPENAI_CHAT_MODEL
 
 
+# HOW MANY TIMES A CALL MAY BE RETRIED, PER ROLE.
+#
+# The SDK's default is 2, and its `timeout` is per ATTEMPT -- so every timeout
+# constant in this file has been describing a third of the real ceiling.
+# NEWS_TIMEOUT_S 60 is really 180; DEEP_ANSWER_TIMEOUT_S 45 is really 135. A
+# 95-second news call on the current stack is what made this visible.
+#
+# ZERO for the two roles that run server-side searches, because a retry there
+# re-runs them: a second bill for work the budget already paid for, and a second
+# minute of a driver waiting on a question they asked once. Both are worse than
+# the failure, and both paths already have something honest to say instead.
+#
+# ONE for chat, which runs no tools: its failure mode is a dropped connection on
+# a cheap call, which is the case retries were invented for.
+MAX_RETRIES_BY_ROLE = {
+    "reasoning": int(os.getenv("REASONING_MAX_RETRIES", "0")),
+    "news": int(os.getenv("NEWS_MAX_RETRIES", "0")),
+    "chat": int(os.getenv("CHAT_MAX_RETRIES", "1")),
+}
+
+
+def max_retries_for_role(role: str) -> int:
+    return MAX_RETRIES_BY_ROLE.get(role, 0)
+
+
 def reasoning_effort_for(role: str):
     """The effort string for a role, or "" for none."""
     vendor = {"reasoning": REASONING_VENDOR, "news": NEWS_VENDOR,

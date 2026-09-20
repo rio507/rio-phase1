@@ -202,23 +202,58 @@ def label(role: str) -> str:
     return VENDORS[vendor_of(role)]["label"]
 
 
+def max_retries_for(role: str) -> int:
+    """How many times a failed call may be retried, for THIS role.
+
+    WHY THIS IS NOT THE SDK'S DEFAULT, AND WHY IT IS A LIVE BUG RATHER THAN A
+    MIGRATION ONE.
+
+    The SDK retries twice by default, and `timeout` is PER ATTEMPT. So
+    NEWS_TIMEOUT_S = 60 does not bound a news question at 60 seconds; it bounds
+    one attempt at 60 and the question at 180. Measured on the CURRENT stack,
+    before any of this migration: a local-news call returned successfully after
+    95 seconds -- one attempt timing out around 60, a retry succeeding in about
+    35. The 60 in config is read by everyone as the driver's wait, and was not.
+
+    AND THE SECOND HALF IS WORSE THAN THE WAIT. A retried search-backed call RUNS
+    THE SEARCHES AGAIN. The budget is debited from the successful response's own
+    count, so a four-search attempt that timed out followed by a four-search
+    attempt that worked spent eight searches of real money and charged the drive
+    for four. localnews._charge exists precisely so spend is debited from what was
+    spent rather than from what was asked for, and a silent retry defeats it one
+    level below where it can see.
+
+    So: zero for the roles whose calls run server-side tools. A retry there is not
+    a cheap second chance, it is a second bill and a second minute of a driver
+    waiting, and both are worse than the failure -- escalate() and localnews each
+    already have a "could not look it up" line they say out loud.
+    """
+    return int(config.max_retries_for_role(role))
+
+
 def client(role: str) -> OpenAI:
-    """The client for a role. Cached per vendor, because a client is a connection
-    pool and two of them for one vendor is two pools."""
+    """The client for a role.
+
+    Cached by (vendor, retries) rather than by vendor: a client is a connection
+    pool and two for one vendor is two pools, but two roles on one vendor with
+    different retry policies genuinely are two clients.
+    """
     if role in _override:
         return _override[role]
     name = vendor_of(role)
+    retries = max_retries_for(role)
+    ck = (name, retries)
     with _lock:
-        if name not in _clients:
+        if ck not in _clients:
             v = VENDORS[name]
-            kw = {}
+            kw = {"max_retries": retries}
             if v["base_url"]:
                 kw["base_url"] = v["base_url"]
             key = config.vendor_key(v["key_env"])
             if key:
                 kw["api_key"] = key
-            _clients[name] = OpenAI(**kw)
-        return _clients[name]
+            _clients[ck] = OpenAI(**kw)
+        return _clients[ck]
 
 
 def reasoning_effort(role: str) -> Optional[str]:
@@ -288,4 +323,5 @@ def describe(role: str) -> dict:
         "reasoning_effort": reasoning_effort(role),
         "enforces_token_cap": v["enforces_token_cap"],
         "reports_cost": bool(v["reports_cost"]),
+        "max_retries": max_retries_for(role),
     }
