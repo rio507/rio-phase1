@@ -54,9 +54,34 @@ def expected() -> dict:
     return out
 
 
-def verify(backend: str, only: str = None) -> int:
-    from openai import OpenAI
+def _hear(backend: str, path, text: str, vocab: str, cl) -> str:
+    """The clip, read back by a model that did not speak it.
 
+    TWO VENDORS, TWO TRANSCRIBERS, AND ONE DIFFERENCE THAT MATTERS TO THE SAFETY
+    ARGUMENT. The OpenAI path can pass a vocabulary hint, and the scoping of that
+    hint to short clips only is the whole reason this file is defensible on a long
+    line -- see the module docstring and render_alerts._library_vocabulary.
+
+    /v1/stt takes no prompt. So on xai_voice a short clip gets NO hint, which
+    makes the check strictly harder rather than easier: the transcriber is
+    answering "what are these sounds" with nothing to lean on. That is why an
+    empty or mistaken reading on a two-word clip is more likely here, and why
+    `unchecked` is reported separately rather than counted as wrong.
+    """
+    if backend == "xai_voice":
+        import xai_voice
+
+        return xai_voice.transcribe(path.read_bytes(), filename="clip.mp3")
+    buf = io.BytesIO(path.read_bytes())
+    buf.name = "clip.mp3"
+    kw = {}
+    if len(text.split()) <= ra.VOCAB_HINT_MAX_WORDS:
+        kw["prompt"] = vocab
+    return cl.audio.transcriptions.create(
+        model=config.OPENAI_STT_MODEL, file=buf, **kw).text
+
+
+def verify(backend: str, only: str = None) -> int:
     want = expected()
     audio = ra.audio_dir(backend)
     # The vocabulary hint, used on SHORT clips only -- see
@@ -64,7 +89,14 @@ def verify(backend: str, only: str = None) -> int:
     # safety argument. On a long line a hint papers over a local error, which
     # is exactly the case that matters.
     vocab = ra._library_vocabulary()
-    cl = OpenAI()
+    cl = None
+    if backend != "xai_voice":
+        from openai import OpenAI
+
+        cl = OpenAI()
+    sig = ra.voice_signature(backend)
+    print(f"  {sig['voice']} / {sig['model']}, read back by "
+          f"{config.XAI_STT_MODEL if backend == 'xai_voice' else config.OPENAI_STT_MODEL}")
     bad, missing, unchecked, ok = [], [], [], 0
     for clip, text in sorted(want.items()):
         if only and clip != only:
@@ -74,14 +106,8 @@ def verify(backend: str, only: str = None) -> int:
             missing.append(clip)
             print(f"  MISSING {clip}")
             continue
-        buf = io.BytesIO(path.read_bytes())
-        buf.name = "clip.mp3"
         try:
-            kw = {}
-            if len(text.split()) <= ra.VOCAB_HINT_MAX_WORDS:
-                kw["prompt"] = vocab
-            heard = cl.audio.transcriptions.create(
-                model=config.OPENAI_STT_MODEL, file=buf, **kw).text
+            heard = _hear(backend, path, text, vocab, cl)
         except Exception as e:
             print(f"  ERROR   {clip}: {type(e).__name__}: {e}")
             bad.append(clip)
@@ -118,7 +144,9 @@ def verify(backend: str, only: str = None) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backend", default=None)
+    ap.add_argument("--backend", default=None,
+                    choices=["openai_realtime", "gpt_live", "elevenlabs",
+                             "xai_voice", None])
     ap.add_argument("--clip", default=None)
     a = ap.parse_args()
     return verify(a.backend or config.VOICE_BACKEND, a.clip)

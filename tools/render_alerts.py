@@ -313,6 +313,21 @@ def _library_vocabulary() -> str:
     return " ".join(sorted(set(lines)))
 
 
+def _transcribe_xai(path: Path, expected: str = "") -> str:
+    """What the finished file says, according to a model that did not speak it.
+
+    /v1/stt with config.XAI_STT_MODEL against a clip spoken by
+    config.XAI_VOICE_MODEL: two different models, which is the whole value of the
+    check. The hint the OpenAI path passes is not available here -- /v1/stt takes
+    no prompt -- so a short clip gets no vocabulary nudge and the retry loop
+    carries more of the weight. That is a real difference and it is why the xAI
+    path gets the doubled attempt count rather than the single one.
+    """
+    import xai_voice
+
+    return xai_voice.transcribe(path.read_bytes(), filename="clip.mp3")
+
+
 def _transcribe(path: Path, expected: str = "") -> str:
     """What the finished file actually says, according to a different model.
 
@@ -408,6 +423,90 @@ def _norm(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]+", " ", t).split())
 
 
+def _render_xai_once(text: str, tmp: Path) -> int:
+    """One take in Eve: a grok-voice session, the line, the audio, then MP3."""
+    import subprocess
+
+    import xai_voice
+
+    got = xai_voice.render_speech(text)
+    if not got.get("ok"):
+        raise RuntimeError(f"the Eve voice returned no audio: {got.get('note')}")
+
+    # THE FIRST HALF OF THE CHECK, and on its own worth little: this is the
+    # model's own account of what it said. The clip that proved that is quoted in
+    # _render_live below -- a voice self-reporting "Pull over when it's safe" for
+    # audio that said "Hey, Ava, when it's safe". Kept because it catches the
+    # cheap failures early and costs nothing.
+    said = _norm(got.get("transcript", ""))
+    if said and said != _norm(text):
+        raise RuntimeError(
+            "the Eve voice did not read the line verbatim.\n"
+            f"  asked: {text!r}\n  said : {got.get('transcript')!r}")
+
+    wav = tmp.with_suffix(".wav.part")
+    wav.write_bytes(got["wav"])
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav),
+             "-codec:a", "libmp3lame", "-q:a", "4", "-f", "mp3", str(tmp)],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg could not transcode the clip (exit {proc.returncode}): "
+                f"{(proc.stderr or '').strip()[:300]}")
+    finally:
+        wav.unlink(missing_ok=True)
+    return tmp.stat().st_size
+
+
+def _render_xai(text: str, tmp: Path) -> int:
+    """One clip in Eve, verified by a model that did not speak it.
+
+    THE DOUBLED ATTEMPT COUNT, for the same reason the gpt_live path has it and
+    one more of its own: a render here is a whole websocket session, which can
+    fail to open, open and stay silent, or produce audio the verifier mishears --
+    and /v1/stt takes no vocabulary hint, so a two-word safety clip has nothing
+    helping the transcriber. Each of those is worth another go; none is worth
+    abandoning a twenty-two-clip run.
+
+    AN UNVERIFIED CLIP DOES NOT SHIP, and the reasoning is _render_live's,
+    unchanged: a missing clip falls through to dictation and then to the
+    synthesiser, which is a warning in a slightly different voice. A WRONG clip
+    is a warning that says the wrong thing, and there is no tier under that.
+    """
+    last = ""
+    for attempt in range(1, CLIP_RENDER_ATTEMPTS * 2 + 1):
+        try:
+            n = _render_xai_once(text, tmp)
+        except RuntimeError as e:
+            last = str(e)
+            print(f"      attempt {attempt}: {e}")
+            tmp.unlink(missing_ok=True)
+            continue
+        heard = _transcribe_xai(tmp, text)
+        if not heard:
+            # UNVERIFIABLE IS NOT VERIFIED. The OpenAI path treats an empty
+            # transcription as "downgrade the check and keep the clip", which is
+            # defensible when the transcriber is the same one the whole system
+            # trusts. Here it would mean shipping a safety line nobody read back,
+            # so it counts as a failed attempt instead.
+            last = "the verifier returned nothing"
+            print(f"      attempt {attempt}: could not verify, re-rendering")
+            tmp.unlink(missing_ok=True)
+            continue
+        if _norm(heard) == _norm(text):
+            return n
+        last = heard.strip()
+        print(f"      attempt {attempt}: not verbatim, re-rendering\n"
+              f"        wanted: {text!r}\n        heard : {heard.strip()!r}")
+        tmp.unlink(missing_ok=True)
+    tmp.unlink(missing_ok=True)
+    raise ClipUnverified(
+        f"not verbatim after {CLIP_RENDER_ATTEMPTS * 2} attempts; "
+        f"last heard {last!r}")
+
+
 def _render_elevenlabs(text: str, tmp: Path) -> int:
     """One clip in RIO's ElevenLabs voice, then checked like every other clip.
 
@@ -457,6 +556,10 @@ def voice_signature(backend: str = None) -> dict:
         return {"backend": "gpt_live",
                 "voice": config.GPT_LIVE_VOICE,
                 "model": config.GPT_LIVE_MODEL}
+    if backend == "xai_voice":
+        return {"backend": "xai_voice",
+                "voice": config.XAI_VOICE,
+                "model": config.XAI_VOICE_MODEL}
     if backend == "elevenlabs":
         return {"backend": "elevenlabs",
                 "voice": config.ELEVENLABS_VOICE_ID,
@@ -519,6 +622,8 @@ def render(force: bool = False, backend: str = None) -> list:
                 n = _render_realtime(text, tmp)
             elif backend == "gpt_live":
                 n = _render_live(text, tmp)
+            elif backend == "xai_voice":
+                n = _render_xai(text, tmp)
             else:
                 n = _render_elevenlabs(text, tmp)
         except ClipUnverified as e:
@@ -544,23 +649,41 @@ def main() -> int:
     ap.add_argument("--list", action="store_true", help="show state and exit")
     ap.add_argument("--backend", default=None,
                     choices=["openai_realtime", "realtime", "gpt_live",
-                             "elevenlabs"],
+                             "elevenlabs", "xai_voice"],
                     help="which voice to render in (default: config.VOICE_BACKEND)")
     args = ap.parse_args()
-
-    if args.list:
-        listing = [(k, live_policy.LINE_TEXT[k]) for k in CLIP_LINES]
-        listing += sorted(TIRE_CLIPS.items())
-        listing += sorted(IMMINENT_CLIPS.items())
-        for line, text in listing:
-            p = AUDIO_DIR / f"{line}.mp3"
-            size = p.stat().st_size if p.exists() else 0
-            print(f"  {line:18} {'OK ' if size else '-- '} {size:>7} B  {text!r}")
-        return 0
 
     backend = args.backend or config.VOICE_BACKEND
     if backend == "realtime":
         backend = "openai_realtime"
+
+    if args.list:
+        # PER BACKEND, WHICH IT WAS NOT. This read the module-level AUDIO_DIR and
+        # ignored --backend entirely, so `--list --backend gpt_live` printed the
+        # marin clips and called them Gleam's. In a library whose whole point is
+        # one directory per voice -- because clips cannot be re-made at the moment
+        # they are needed -- a listing that reports the wrong voice's files is the
+        # exact confusion the directories exist to prevent.
+        where = audio_dir(backend)
+        sig = voice_signature(backend)
+        print(f"  {sig['voice']} / {sig['model']}  in {where}")
+        listing = [(k, live_policy.LINE_TEXT[k]) for k in CLIP_LINES]
+        listing += sorted(TIRE_CLIPS.items())
+        listing += sorted(IMMINENT_CLIPS.items())
+        doc = manifest(backend).get("clips", {})
+        for line, text in listing:
+            p = where / f"{line}.mp3"
+            size = p.stat().st_size if p.exists() else 0
+            rec = doc.get(line) or {}
+            # The manifest is what says which voice a file on disk is IN. A clip
+            # present but unrecorded is a clip nobody can vouch for.
+            voice = rec.get("voice") or ("?" if size else "")
+            print(f"  {line:24} {'OK ' if size else '-- '} {size:>7} B  "
+                  f"{voice:<8} {text!r}")
+        return 0
+    if backend == "xai_voice" and not os.getenv("XAI_API_KEY"):
+        print("XAI_API_KEY is not set — cannot render in Eve")
+        return 2
     if backend in ("openai_realtime", "gpt_live") \
             and not os.getenv("OPENAI_API_KEY"):
         print("OPENAI_API_KEY not set (.env)", file=sys.stderr)

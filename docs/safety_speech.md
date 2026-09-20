@@ -155,3 +155,68 @@ to run its own tests untouched. Both still pass — 273 and 133 checks.
 `SAFETY_PHRASE_ENABLED=0` and every non-critical line is the deterministic
 sentence it was before. The critical tier is not affected by that switch or by
 any other: it is four files on disk.
+
+---
+
+## Stage 4 — Eve, rendered and read back (2026-09-20)
+
+Every pre-rendered line re-rendered in **Eve** on `grok-voice-think-fast-2.0`,
+into `static/audio/eve/`, and **verified by a model that did not speak it** —
+`grok-voice-transcribe-2.0` over `/v1/stt`. Rendered, not auditioned: nobody
+listened to a single one of these and decided it sounded right.
+
+**16 correct, 0 wrong, 0 unchecked, 0 missing.** Every line passed on the first
+take, which is a better result than the Gleam render got and is worth recording
+as a property of the voice rather than of the harness.
+
+### The hazard that prompted the requirement
+
+One voice previously failed on **"Pull over" sentence-initially** — and worse,
+self-reported the failure as correct: it rendered *"Hey, Ava, when it's safe…"*
+for *"Pull over when it's safe…"*, replacing the entire instruction with a
+greeting. That is why the render-time check is the voice's own transcript **and**
+an independent transcriber, and why an unverified clip does not ship.
+
+Tested directly on Eve, three takes each:
+
+| line | takes verbatim |
+|---|---|
+| `Pull over now.` | **3 / 3** |
+| `Pull over when you can.` | **3 / 3** |
+| `Pull over when it is safe — one of your tires is dangerously low and still going down.` | 2 / 3 |
+
+**Sentence-initial "Pull over" is not a hazard for Eve.** The historical failure
+does not reproduce: the two short imperatives are perfect, and the long line's one
+miss was *not* the instruction — it came back *"one of **her** tires"* for *"one
+of **your** tires"*. A pronoun substitution in the middle of a long sentence, not
+a dropped action.
+
+That is a milder failure than the original but the same lesson, and it lands on a
+line that is **already not in the shipped set**: the long form was rewritten to
+`tire_critical` — *"Tire's going down fast — pull over when you can."* — which
+verifies clean. This retroactively justifies that rewrite on a second voice, and
+it is an argument against ever putting a fifteen-word safety line back.
+
+### No line needed rewriting
+
+The requirement was that any line Eve cannot deliver gets rewritten and
+re-verified. None of the sixteen failed, so nothing was rewritten. The only shape
+that misbehaved is one the library had already moved away from.
+
+### One difference in the verifier, stated because it makes the check harder
+
+`/v1/stt` takes **no vocabulary prompt**. The OpenAI path supplies the whole clip
+library as a hint on clips of four words or fewer — deliberately scoped, because a
+hint on a long line talks the transcriber round exactly where a local error hides.
+Eve's clips got no hint at all, so a two-word clip was transcribed cold. That
+makes 16/16 a stronger result than the same number on the OpenAI path, and it is
+why `_render_xai` treats an empty transcription as a failed attempt rather than as
+"could not check": there is no hint to fall back on, so an unreadable clip is
+re-rendered instead of shipped unverified.
+
+### What is NOT done
+
+`xai_voice` is a **render target only**. `config.VOICE_BACKENDS` deliberately does
+not include it, so `VOICE_BACKEND=xai_voice` is still refused — the browser
+controller for that transport does not exist (stage 3 built the playout queue, not
+the session). These clips are ready for the day it does.

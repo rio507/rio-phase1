@@ -543,6 +543,51 @@ def run_clips():
     # line was the one still insisting it had to be on disk.
     expected = set(ra.CLIP_LINES) | set(ra.TIRE_CLIPS)
     present = {p.stem for p in (REPO / "static/audio").glob("*.mp3")}
+    # ---- the Eve set, if it has been rendered -------------------------------
+    #
+    # A RENDER TARGET, NOT A LIVE BACKEND. config.VOICE_BACKENDS deliberately
+    # excludes xai_voice, so VOICE_BACKEND=xai_voice is refused and these clips
+    # cannot be played yet. What is asserted here is that IF they are on disk they
+    # are coherent -- the right voice, the right model, all of them, and nothing
+    # from another voice mixed in. A per-voice clip library whose directory
+    # contains two voices is the failure the directories exist to prevent.
+    eve_dir = ra.audio_dir("xai_voice")
+    eve_sig = ra.voice_signature("xai_voice")
+    ok(eve_sig["voice"] == config.XAI_VOICE
+       and eve_sig["model"] == config.XAI_VOICE_MODEL,
+       f"the xai_voice render target is {eve_sig['voice']} on "
+       f"{eve_sig['model']} — a pinned version, not an alias")
+    ok("latest" not in eve_sig["model"],
+       "...and not an alias: the version came from the session's own "
+       "session.updated payload, which is the only record of what answered")
+    ok("xai_voice" not in config.VOICE_BACKENDS,
+       "and it is NOT a live backend — VOICE_BACKEND=xai_voice is still refused, "
+       "because the controller for that transport does not exist yet")
+    ok(eve_dir != ra.audio_dir("openai_realtime"),
+       f"its clips live apart from the shipped set ({eve_dir.name}/), so a "
+       "backend switch cannot leave one voice's files to be played by another")
+
+    eve_present = {q.stem for q in eve_dir.glob("*.mp3")} if eve_dir.exists() else set()
+    if eve_present:
+        eve_doc = ra.manifest("xai_voice").get("clips", {})
+        non_empty("the Eve set has clips to check", eve_present)
+        ok_all("every Eve clip is recorded as Eve on the pinned model",
+               sorted(eve_present),
+               lambda c: (eve_doc.get(c, {}).get("voice") == config.XAI_VOICE
+                          and eve_doc.get(c, {}).get("model") == config.XAI_VOICE_MODEL))
+        wanted = set(ra.CLIP_LINES) | set(ra.TIRE_CLIPS) | set(ra.IMMINENT_CLIPS)
+        ok(wanted <= eve_present,
+           f"and every line the renderer knows about is there "
+           f"({len(wanted & eve_present)}/{len(wanted)})"
+           + (f" — missing {sorted(wanted - eve_present)}"
+              if wanted - eve_present else ""))
+        ok_none("no clip from another voice is mixed into the directory",
+                sorted(eve_present),
+                lambda c: eve_doc.get(c, {}).get("voice") not in (config.XAI_VOICE,))
+    else:
+        SKIPPED.skip("the Eve clip set — not rendered on this machine",
+                     "python -m tools.render_alerts --backend xai_voice")
+
     # THE PRECONDITION THE NEXT THREE CHECKS ALL REST ON. `expected <= present`,
     # `not stale` and the model check below are ALL true of an empty `expected`,
     # so an empty clip set would report the fast path perfectly healthy three

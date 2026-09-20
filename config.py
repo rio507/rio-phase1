@@ -68,6 +68,36 @@ CHAT_VENDOR = os.getenv("CHAT_VENDOR", "openai")
 XAI_REASONING_MODEL = os.getenv("XAI_REASONING_MODEL", "grok-4.6")
 XAI_CHAT_MODEL = os.getenv("XAI_CHAT_MODEL", "grok-4.3")
 
+# --- her voice under xAI ----------------------------------------------------
+# PINNED TO THE VERSIONED NAME, not the alias, exactly as the realtime model is:
+# an alias moving under a running drive is a change nobody made. The name here
+# is not from the documentation -- it is what the session's own session.updated
+# payload reported when asked for `grok-voice-latest`, which is the only honest
+# record of what answered. (The ?model= query parameter is IGNORED by that
+# endpoint: an invalid name connects and behaves identically, so it proves
+# nothing.)
+XAI_VOICE_MODEL = os.getenv("XAI_VOICE_MODEL", "grok-voice-think-fast-2.0")
+
+# EVE. Chosen, not defaulted -- there are 26 built-in voices and none of them is
+# marin or cedar, so this is a fresh selection rather than a mapping. It is the
+# single most noticeable thing about RIO, which is why it is one constant that
+# everything speaking reads, the same discipline OPENAI_REALTIME_VOICE follows.
+XAI_VOICE = os.getenv("XAI_VOICE", "Eve")
+
+# The transcriber, and it does TWO jobs that must not be confused.
+#
+# In a live session it is `grok-transcribe`, set on
+# session.audio.input.transcription.model, and that is the string the session
+# echoes back. Over REST at /v1/stt it is the versioned name below. Two names for
+# one job is exactly the sort of thing OPENAI_STT_MODEL's comment warns about --
+# "two transcribers would make two records that disagree" -- so it is written
+# down here rather than discovered twice.
+#
+# It is also the VERIFIER for rendered clips, and there its whole value is being
+# a different model from the one that spoke. See xai_voice.transcribe.
+XAI_STT_MODEL = os.getenv("XAI_STT_MODEL", "grok-voice-transcribe-2.0")
+XAI_STT_SESSION_MODEL = os.getenv("XAI_STT_SESSION_MODEL", "grok-transcribe")
+
 # HOW HARD THE REASONING MODEL THINKS, and this is a latency decision.
 #
 # grok-4.6 reasons by default, and on RIO's own deep_dive questions that is most
@@ -1587,6 +1617,17 @@ CLIP_DIRS = {
     # ElevenLabs renders its own; it has always shared the default directory
     # and nothing here changes that.
     "elevenlabs": "/static/audio/",
+    # Eve, rendered off a grok-voice session. Its own directory for the reason
+    # every voice has one: clips cannot be re-made at the moment they are needed,
+    # so a backend switch must not leave the previous voice's files in place to be
+    # played by the next one.
+    #
+    # NOTE that having an entry here does NOT make xai_voice a live backend --
+    # VOICE_BACKENDS below is the allowlist for that and deliberately does not
+    # include it, because the browser controller for it does not exist yet. This
+    # is a RENDER target: `python -m tools.render_alerts --backend xai_voice`
+    # works, and setting VOICE_BACKEND=xai_voice is still refused.
+    "xai_voice": "/static/audio/eve/",
 }
 
 

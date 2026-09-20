@@ -1,0 +1,137 @@
+{
+  "clips": {
+    "back_off": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 10461,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "2bd06463b7e0",
+      "voice": "Eve"
+    },
+    "keep_left": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 7701,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "31a3b7c9ff9f",
+      "voice": "Eve"
+    },
+    "keep_right": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 7005,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "82363ffd9ee1",
+      "voice": "Eve"
+    },
+    "left_at_the_roundabout": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 12573,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "e2b2bb3bd0bb",
+      "voice": "Eve"
+    },
+    "make_a_u_turn": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 9429,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "ceb6577df20d",
+      "voice": "Eve"
+    },
+    "merge": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 5709,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "c166c6c8de86",
+      "voice": "Eve"
+    },
+    "merge_left": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 9501,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "406819ef6a8a",
+      "voice": "Eve"
+    },
+    "merge_right": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 8277,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "4a9aa21cedd0",
+      "voice": "Eve"
+    },
+    "right_at_the_roundabout": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 11973,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "fd36b95e3cff",
+      "voice": "Eve"
+    },
+    "take_the_exit": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 8877,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "0e635f1b8d6b",
+      "voice": "Eve"
+    },
+    "this_one": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 6405,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "8e60534acda4",
+      "voice": "Eve"
+    },
+    "tire_critical": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 22317,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "a8f3caeaffa6",
+      "voice": "Eve"
+    },
+    "too_close": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 13341,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "00ab504ae404",
+      "voice": "Eve"
+    },
+    "turn_left": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 7269,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "f1b1b0aa7e3f",
+      "voice": "Eve"
+    },
+    "turn_right": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 7029,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "f4bdb418a092",
+      "voice": "Eve"
+    },
+    "watch_distance": {
+      "at": 1789865464.8,
+      "backend": "xai_voice",
+      "bytes": 13245,
+      "model": "grok-voice-think-fast-2.0",
+      "sha1": "ca6b716665c5",
+      "voice": "Eve"
+    }
+  },
+  "voice": {
+    "backend": "xai_voice",
+    "model": "grok-voice-think-fast-2.0",
+    "voice": "Eve"
+  }
+}
