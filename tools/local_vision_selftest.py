@@ -207,6 +207,37 @@ def main() -> int:
        'return ""' in (REPO / "vision.py").read_text().split(
            "_flags[\"think_unterminated\"] += 1")[1][:400])
 
+    # -- the frame gate, which is the one that had to be ADDED -------------
+    # Cosmos-Reason2-2B answered a featureless grey frame AND a frame of pixel
+    # noise with the same confident sentence about a single-lane asphalt road.
+    # Measured, both fabrications, neither caught by any guard that looks at the
+    # WORDS: they are not the prompt's examples, they carry no memorised
+    # whitespace, and teachers.canned needs three identical readings in a row.
+    # So the question is asked of the picture instead, before any model sees it.
+    from PIL import Image as _Image
+    blank = _Image.new("RGB", (640, 360), (128, 128, 128))
+    ok("a featureless frame measures as having nothing in it",
+       vis.frame_structure(blank) < 8.0, f"{vis.frame_structure(blank):.2f}")
+    import random as _random
+    _random.seed(7)
+    noisy = _Image.new("RGB", (640, 360))
+    noisy.putdata([(_random.randrange(256),) * 3 for _ in range(640 * 360)])
+    # Pixel noise survives neither the JPEG nor the downscale: it averages to
+    # near-uniform grey, which is why the same number catches it.
+    ok("...and so does pixel noise once it is downscaled",
+       vis.frame_structure(noisy) < 30.0, f"{vis.frame_structure(noisy):.2f}")
+    grad = _Image.new("RGB", (640, 360))
+    grad.putdata([(x % 256, (x // 3) % 256, 200) for x in range(640 * 360)])
+    ok("...while a frame with structure in it does not",
+       vis.frame_structure(grad) > 8.0, f"{vis.frame_structure(grad):.2f}")
+    _vsrc = (REPO / "vision.py").read_text()
+    ok("the gate runs BEFORE the forward pass, not after the answer",
+       _vsrc.index("structure < config.LOCAL_VISION_BLANK_STD")
+       < _vsrc.index("_model.generate"))
+    ok("...and is counted as its own flag",
+       '"blank_frame": 0' in _vsrc
+       and "blank_frame" in vis.flag_rate())
+
     from teachers import canned
     recited = "A vehicle controls loss. The vehicle driver is in distracted driving."
     ok("the canned guard still catches memorised label text",

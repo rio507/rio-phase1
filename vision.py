@@ -222,6 +222,20 @@ def _downscale(pil, max_side: int):
                       Image.BILINEAR)
 
 
+def frame_structure(pil) -> float:
+    """How much is IN this picture. -> standard deviation of its luminance.
+
+    Asked of the frame, not of a model, because it is a property of the frame.
+    128x72 is small enough to cost 2.5 ms and large enough that a lane marking
+    still registers; the number it produces is two orders of magnitude apart
+    between a covered lens and a road (see config.LOCAL_VISION_BLANK_STD).
+    """
+    import numpy as np
+
+    small = pil.convert("L").resize((128, 72), Image.BILINEAR)
+    return float(np.asarray(small, dtype=np.float32).std())
+
+
 def _strip_think(text: str):
     """Remove a reasoning trace. -> (answer, had_trace, unterminated)
 
@@ -265,6 +279,8 @@ _flags = {
     "think_unterminated": 0,
     # the instrument gave the driver an instruction (rio_prompts.sensor_faults)
     "advisory": 0,
+    # the frame had nothing in it to read, and no model was asked
+    "blank_frame": 0,
     "total": 0,
 }
 _repeats = canned.RepeatTracker()
@@ -312,6 +328,30 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         _ensure_loaded()
         pil = _downscale(Image.open(io.BytesIO(image_bytes)).convert("RGB"),
                          max_side)
+        # NOTHING IN THE FRAME MEANS NOTHING TO SAY ABOUT IT, and the model is
+        # not asked. Before the forward pass, because the cheapest way to not
+        # fabricate a road is to not ask a model about a picture that has no
+        # road in it -- and because the pass itself is 300-1500 ms that buys
+        # nothing on a blank frame.
+        #
+        # Cosmos-Reason2-2B answered a featureless grey frame and a frame of
+        # pixel noise with the SAME confident sentence about a single-lane
+        # asphalt road. See config.LOCAL_VISION_BLANK_STD for the numbers.
+        try:
+            structure = frame_structure(pil)
+        except Exception:
+            structure = None          # never fail a reading on the guard
+        if structure is not None and structure < config.LOCAL_VISION_BLANK_STD:
+            _flags["total"] += 1
+            _flags["blank_frame"] += 1
+            if _flags["blank_frame"] in (1, 10, 100):
+                print(f"[vision] no reading -- the frame has nothing in it "
+                      f"(structure {structure:.2f} < "
+                      f"{config.LOCAL_VISION_BLANK_STD}): a covered lens, a "
+                      f"dead camera or a black frame, not a road "
+                      f"({_flags['blank_frame']} so far)", flush=True)
+            clear_holder()
+            return ""
         msgs = [{"role": "user", "content": [
             {"type": "image", "image": pil},
             {"type": "text", "text": TEACHER_PROMPT},

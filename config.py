@@ -2253,6 +2253,40 @@ LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "60"))
 # that has failed, and failing fast is what keeps the observer at ~1 Hz.
 LOCAL_VISION_THINK_BUDGET = int(os.getenv("LOCAL_VISION_THINK_BUDGET", "220"))
 
+# IS THERE ANYTHING IN THIS FRAME TO READ? Asked of the PICTURE, before any
+# model sees it, because it is a property of the picture and does not need one.
+#
+# THE MEASUREMENT THAT PUT THIS HERE. Cosmos-Reason2-2B, on the adversarial
+# probes in tools/vision_ab.py:
+#
+#   a featureless grey frame  -> "ROAD: asphalt, single-laned, forward
+#                                 direction | TRAFFIC: none | RISK: none seen"
+#   random pixel noise        -> the same sentence, byte for byte
+#
+# Both confident, both well-formed, both about a road that is not there. Neither
+# guard caught them: they are not the prompt's examples, they carry no memorised
+# whitespace, and teachers.canned needs THREE identical readings in a row before
+# repetition counts (REPEAT_FLOOR) -- these were a run of two.
+#
+# So the question is asked of the frame instead. Standard deviation of the
+# luminance at 128x72, measured on the same probes and on twenty real road
+# frames:
+#
+#   black frame      0.00      real road frames   40.0 - 45.2
+#   grey frame       0.00      a sign filling it  88.5
+#   pixel noise      4.04
+#
+# Two orders of magnitude apart, so the floor is not a tuned number -- anything
+# between 5 and 30 separates them. 8.0 keeps a wide margin under the darkest
+# real frame measured, because a night road still has headlights, lane markings
+# and edges in it, and a frame with none of those is a covered lens or a dead
+# camera rather than a dark road.
+#
+# It also saves the forward pass: a blank frame cost Qwen ~300 ms and Cosmos
+# ~600 ms to say nothing useful about. The check is 2.5 ms on the image
+# vision.observe has already decoded.
+LOCAL_VISION_BLANK_STD = float(os.getenv("LOCAL_VISION_BLANK_STD", "8.0"))
+
 # ---------------------------------------------------------------------------
 # Place search (places.py) — what is actually around the car
 # ---------------------------------------------------------------------------
