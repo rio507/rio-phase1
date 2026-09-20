@@ -202,6 +202,26 @@ XAI_VOICE_EFFORT = os.getenv("XAI_VOICE_EFFORT", "none")
 # A thirty-minute drive is therefore about $2.40 in audio before a single tool
 # call. The text-input component is quoted as "$0.004 / text input" with no unit
 # given, so it is deliberately not multiplied out here.
+#
+# WHAT THE OLD STACK COSTS ON THE SAME DRIVE, measured rather than quoted
+# (tools/live_cost.py --arms openai_realtime, the seven-question scripted drive):
+#
+#   gpt-realtime-2.1   80 s of wall clock, $0.0937  =  $0.0706/min
+#                      tokens: 912 audio in, 463 audio out, 46,754 text in
+#                      (39,616 of them cached), 543 text out
+#
+# So on this drive shape xAI is about 13% dearer per minute -- and the comparison
+# does not hold still, because the two are priced on different things. The token
+# bill above is dominated by CONVERSATION HISTORY re-sent as input on every turn
+# (46.7k text-in tokens for seven questions), which grows with the drive; a flat
+# per-minute rate does not.
+#
+# THE ONE UNKNOWN WITH REAL MONEY IN IT: whether the $0.08 is billed per minute of
+# SESSION or per minute of AUDIO. A car is long and mostly quiet -- sparse speech,
+# minutes of nothing -- so the two readings differ by a lot over half an hour, and
+# the realtime session reports no numeric usage at all (checked, every field of
+# every response.done across 72 turns). Only the invoice can answer it. Read it
+# after the first real drive and correct this block.
 XAI_VOICE_USD_PER_MIN = float(os.getenv("XAI_VOICE_USD_PER_MIN", "0.08"))
 
 # HOW MUCH SILENCE TO KEEP SENDING AFTER THE DRIVER STOPS TALKING.

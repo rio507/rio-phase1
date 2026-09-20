@@ -272,6 +272,8 @@ async def drive(prepared, turns, verbose):
                         except asyncio.TimeoutError:
                             break
                         t = ev.get("type", "")
+                        if verbose:
+                            print(f"        <- {t}")
                         if t == "response.output_audio.delta":
                             play2.push(len(base64.b64decode(ev.get("delta") or b"")))
                             if not got_audio:
@@ -279,6 +281,13 @@ async def drive(prepared, turns, verbose):
                                 got_audio = True
                         elif t == "response.output_audio_transcript.done":
                             print(f"      she said: {str(ev.get('transcript'))[:90]!r}")
+                        elif t == "error":
+                            # NEVER SWALLOWED. A turn that produced no answer while
+                            # an error event went unprinted is how a wrong item
+                            # shape reads as "the model chose not to speak" -- and
+                            # the answer-after-a-tool-call is the one sequence in
+                            # the drive where that mistake is invisible.
+                            print(f"      WIRE ERROR: {str(ev)[:300]}")
                         elif t == "response.done":
                             play2.done_generating()
                             break
