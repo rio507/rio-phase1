@@ -155,30 +155,40 @@ XAI_VOICE = os.getenv("XAI_VOICE", "Eve")
 # on this endpoint that resolves to none, because low does not exist.
 #
 # MEASURED (tools/xai_voice_bench, RIO's nine real tool schemas and her real
-# session instructions, 18 utterances x 2 trials at each effort):
+# session instructions, 18 utterances per trial), in two runs:
 #
 #   effort   routed    first audio           to the TOOL CALL
 #                      p50    p95            p50    p95     max
-#   none     32/36     647    842 ms         349    521     756 ms
+#   none     32/36     647    842 ms         349    521     756 ms   (2 trials)
 #   high     32/36     733    920 ms         368   2270    3302 ms
+#   none     48/54     712    834 ms         386    676     785 ms   (3 trials)
+#   high     48/54     664    837 ms         374    439    3562 ms
 #
-# THE MEDIANS ARE A WASH AND THE TAIL IS NOT. Same routing, 19 ms apart on the
-# median time to a tool call -- and 2,270 ms against 521 at p95, 3,302 against 756
-# at worst. At high this model sometimes spends three and a third seconds deciding
-# before it starts fetching, and the tool's own latency is still to come after
-# that. A driver asks a question and hears nothing for three seconds.
+# TIME TO FIRST AUDIO IS A WASH, in both directions: high was 86 ms slower in the
+# first run and 48 ms faster in the second, on p50s of 650-730 ms. Nothing to
+# choose there, and the first run's ordering should not have been read as one.
 #
-# p95 is the number this file cares about and has said so since the
-# REALTIME_SPEAK_TIMEOUT_MS block was written against exactly this kind of trade.
-# The median said "no difference"; the tail said "four times worse"; the tail wins.
+# WHAT SEPARATES THEM IS THE WORST TOOL CALL. Over 90 measured calls at each
+# effort, none never took longer than 785 ms to reach a tool. High produced a
+# 3,302 ms and a 3,562 ms one. The p95 figures disagree between runs (2,270 then
+# 439) because at n=36 one or two slow calls move in and out of p95 -- so the
+# claim is NOT "four times worse at p95", which is what the first run alone looked
+# like. It is that high occasionally spends three and a half seconds deciding
+# before it starts fetching, with the tool's own latency still to come, and none
+# has not done that once. A driver asks a question and hears nothing for three
+# seconds.
 #
-# ROUTING WAS 32/36 AT BOTH, and the four that missed are the same two utterances
-# in both trials of both efforts: "This traffic is unbelievable." reached
+# p95 is the number this file usually cares about; here it is the MAXIMUM, because
+# the failure being avoided is the one drive in twenty where she seems to have
+# stopped listening, and the medians are identical.
+#
+# ROUTING WAS THE SAME AT BOTH, in every run: the misses are the same two
+# utterances every time -- "This traffic is unbelievable." reached
 # search_local_news and "Tell me something interesting." reached deep_dive, where
-# the bench wanted no tool at all. Both are defensible readings -- the router's own
-# rules send traffic words to local news -- so this is a bench label being strict
+# the bench wanted no tool at all. Both are defensible readings (the router's own
+# rules send traffic words to local news), so this is a bench label being strict
 # rather than a model being wrong, and it is written down that way instead of being
-# quoted as 89%.
+# quoted as 89%. Effort buys no routing accuracy on RIO's tools.
 XAI_VOICE_EFFORT = os.getenv("XAI_VOICE_EFFORT", "none")
 
 # WHAT A DRIVE MINUTE COSTS, and it cannot be read back. The Responses API returns
@@ -1323,7 +1333,22 @@ OPENAI_REASONING_EFFORT = "none"
 #                      model" is two models, and the split is the point --
 #                      turn-taking and prosody belong to the voice layer, tool
 #                      discipline and brevity to the backend. See live.py.
-VOICE_BACKEND = os.getenv("VOICE_BACKEND", "openai_realtime")
+#   "xai_voice"        RIO's voice is Eve, on a grok-voice session over a
+#                      WebSocket. Speech to speech like openai_realtime, and the
+#                      same one-voice mechanism -- deterministic lines are
+#                      dictated into the same session -- with one structural
+#                      difference: THE PAGE OWNS THE PLAYOUT. There is no remote
+#                      track, so the browser renders her audio itself, which
+#                      means the end of her voice is computed from the bytes
+#                      (static/rio_playout.js) rather than announced by the
+#                      transport, and the next request is gated on the same
+#                      queue. See static/rio_xai_session.js.
+#
+#                      THIS IS THE SHIPPED PATH AS OF 2026-09-20.
+#                      openai_realtime is intact and one env var away --
+#                      VOICE_BACKEND=openai_realtime and a restart -- and stays
+#                      that way.
+VOICE_BACKEND = os.getenv("VOICE_BACKEND", "xai_voice")
 
 
 # ---------------------------------------------------------------------------
@@ -1412,16 +1437,30 @@ if VOICE_BACKEND == "realtime":
 if VOICE_BACKEND in ("gpt-live", "gptlive", "live"):
     VOICE_BACKEND = "gpt_live"
 
-# A BACKEND NAME THAT IS NOT ONE OF THE THREE IS A MUTE CAR, and it fails here
+# A BACKEND NAME THAT IS NOT ONE OF THE FOUR IS A MUTE CAR, and it fails here
 # rather than at the first warning. The old code accepted anything and let the
 # page discover it had no mouth; a typo in an .env is worth a line on stderr at
 # boot and the shipped default, not a silent drive.
-# xai_voice IS SELECTABLE NOW and is not yet the default. The brief's order is
-# "make it the default once it passes its own tests", and the browser controller
-# is the piece still missing -- what exists is the server mint, the session policy,
-# the playout queue, the event seam in both directions, and a live harness that
-# drives a whole turn through them. VOICE_BACKEND=xai_voice therefore starts a
-# session the page cannot yet render, which is why openai_realtime stays default.
+#
+# xai_voice IS THE DEFAULT AS OF 2026-09-20, on the brief's own condition: "make
+# it the default once it passes its own tests." What passes, exactly:
+#
+#   the mint and the session policy      tools/voice_backend_parity_selftest.py
+#   the event seam, both directions      tools/provider_adapter_selftest.py
+#   the reconstructed end of her audio   tools/playout_selftest.js — section Z
+#                                        breaks the queue on purpose and 4 of 6
+#                                        assertions fail against the break
+#   the browser transport and the gate   tools/xai_session_selftest.js
+#   a whole turn, live, with tools       tools/xai_drive_harness.py
+#   every safety line in Eve's voice     tools/clip_verify.py, 16/16 verified
+#
+# WHAT NO TEST COVERS, said plainly: a car. The microphone pump and actual
+# playback have no meaningful fake -- ScriptProcessor and getUserMedia are the two
+# things a browser has and node does not -- so the first drive on this backend is
+# the first time her voice leaves a speaker on this wire. What to watch for is her
+# cutting herself off mid-sentence, which is the failure the playout queue exists
+# to prevent and which took two drives to find last time. The way back is
+# VOICE_BACKEND=openai_realtime and a restart.
 VOICE_BACKENDS = ("openai_realtime", "gpt_live", "elevenlabs", "xai_voice")
 if VOICE_BACKEND not in VOICE_BACKENDS:
     print(f"[config] VOICE_BACKEND={VOICE_BACKEND!r} is not one of "

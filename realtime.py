@@ -2668,7 +2668,7 @@ def _observer_status() -> dict:
         return {"error": f"{type(e).__name__}"}
 
 
-def _backend_model() -> str:
+def backend_model() -> str:
     """The model the configured voice backend will actually open."""
     if config.VOICE_BACKEND == "gpt_live":
         return config.GPT_LIVE_MODEL
@@ -2677,7 +2677,7 @@ def _backend_model() -> str:
     return config.OPENAI_REALTIME_MODEL
 
 
-def _backend_voice() -> str:
+def backend_voice() -> str:
     """...and the voice it will speak in."""
     if config.VOICE_BACKEND == "gpt_live":
         return config.GPT_LIVE_VOICE
@@ -2699,9 +2699,9 @@ def status() -> dict:
         # and each names its own model and voice: a /health that reports the
         # OpenAI model while the browser is talking to another vendor is worse
         # than one that omits the field, because it is read as evidence.
-        "model": _backend_model(),
+        "model": backend_model(),
         "realtime_model": config.OPENAI_REALTIME_MODEL,
-        "voice": _backend_voice(),
+        "voice": backend_voice(),
         # Through the role, so this reports whoever deep_dive actually reaches.
         "reasoning_model": (config.GPT_LIVE_BACKEND_MODEL
                             if config.VOICE_BACKEND == "gpt_live"

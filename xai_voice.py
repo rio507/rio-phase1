@@ -263,8 +263,10 @@ def session_policy() -> dict:
     }
     if config.XAI_VOICE_EFFORT:
         # 3. 'none' or 'high' ONLY on this endpoint -- 'low' is a validation
-        #    error. Measured: effort high has a tool-call p95 of 2,270 ms against
-        #    521, so the drive session takes none. See config.XAI_VOICE_EFFORT.
+        #    error. Measured over 180 tool calls: same routing, same time to first
+        #    audio, and high occasionally takes three and a half seconds to decide
+        #    to call a tool where none has never exceeded 785 ms. The drive session
+        #    takes none. See config.XAI_VOICE_EFFORT for both runs.
         pol["reasoning"] = {"effort": config.XAI_VOICE_EFFORT}
     return pol
 

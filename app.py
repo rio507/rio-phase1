@@ -421,11 +421,20 @@ def health():
                 "visual": llm_provider.model_of("visual"),
                 "reasoning": llm_provider.model_of("reasoning"),
                 "news": llm_provider.model_of("news"),
-                "realtime": config.OPENAI_REALTIME_MODEL,
+                # THE WIRE THE NEXT DRIVE WILL ACTUALLY OPEN, asked of the
+                # backend for the same reason the roles above are asked of the
+                # role: a third voice backend arrived and these two named
+                # OpenAI's model whatever was configured, which is the first
+                # thing anybody checks after a switch.
+                "realtime": realtime.backend_model(),
                 "stt": config.OPENAI_STT_MODEL,
-                "dialogue": (config.OPENAI_REALTIME_MODEL
-                             if config.VOICE_BACKEND == "openai_realtime"
-                             else llm_provider.model_of("chat")),
+                # Who answers a whole turn of conversation. Under a
+                # speech-to-speech backend that is the voice model itself;
+                # under elevenlabs the session is in text mode and the chat
+                # role writes the words.
+                "dialogue": (llm_provider.model_of("chat")
+                             if config.VOICE_BACKEND == "elevenlabs"
+                             else realtime.backend_model()),
             },
             # AND WHO IS ANSWERING EACH ROLE, which is the question the block
             # above cannot answer on its own: two roles can share a model name

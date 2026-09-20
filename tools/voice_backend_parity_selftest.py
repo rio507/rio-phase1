@@ -149,16 +149,16 @@ def main() -> int:
 
     section("/health reports the wire it is actually on")
     ok("the model /health names is the configured backend's",
-       realtime._backend_model() == (
+       realtime.backend_model() == (
            config.XAI_VOICE_MODEL if config.VOICE_BACKEND == "xai_voice"
            else config.GPT_LIVE_MODEL if config.VOICE_BACKEND == "gpt_live"
            else config.OPENAI_REALTIME_MODEL),
-       realtime._backend_model())
-    ok("...and so is the voice", realtime._backend_voice() == (
+       realtime.backend_model())
+    ok("...and so is the voice", realtime.backend_voice() == (
            config.XAI_VOICE if config.VOICE_BACKEND == "xai_voice"
            else config.GPT_LIVE_VOICE if config.VOICE_BACKEND == "gpt_live"
            else config.OPENAI_REALTIME_VOICE),
-       realtime._backend_voice())
+       realtime.backend_voice())
     ok("xai_voice is selectable at all", "xai_voice" in config.VOICE_BACKENDS,
        config.VOICE_BACKENDS)
 
