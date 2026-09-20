@@ -71,11 +71,40 @@ def _record(text, frame, key=None):
     # A line that fails is still kept. It is a perfectly good description and
     # the composed path still works from it; what it may not do is go straight
     # to a speaker as something RIO said.
+    #
+    # AND UNDER A SENSOR MODEL THE ANSWER IS ALWAYS NO, whatever the words look
+    # like. Cosmos-Reason2 is asked for a reading (rio_prompts.SENSOR_PROMPT),
+    # not for her sentence: it is an instrument, its output is evidence, and a
+    # reading that happened to pass a persona lint would still be an instrument
+    # speaking in her voice. So the gate is the MODEL's role, asked first, and
+    # the lint only decides anything for the model that was asked to write a
+    # line for her. See config.local_vision_speaks_directly().
+    #
+    # This is what makes "the local model never speaks as her" a property of the
+    # code rather than a property of how the prompt happens to read today.
+    import config as _config
+    if not _config.local_vision_speaks_directly():
+        return {
+            "text": text,
+            "speakable": False,
+            "faults": ["sensor_model"],
+            # THE NAME OF THE INSTRUMENT, beside its reading. A reading shown
+            # without the model that produced it is a reading nobody can weigh,
+            # and this is the field the glass renders.
+            "model": _config.local_vision_label(),
+            "at": time.time(),
+            "frame_wall_t": getattr(frame, "wall_t", None),
+            "frame_id": getattr(frame, "frame_id", None),
+            "frame_age_s": round(getattr(frame, "age_s", 0.0) or 0.0, 2),
+            "origin": getattr(frame, "origin", None),
+            "session_key": str(key) if key else None,
+        }
     faults = persona.lint(text)
     return {
         "text": text,
         "speakable": not faults,
         "faults": faults,
+        "model": _config.local_vision_label(),
         "at": time.time(),
         # The frame's OWN clock, not the observation's: the difference between
         # them is how long Qwen took, and a driver asking "what do you see"
@@ -191,10 +220,21 @@ def _tick(key, state):
             # complaint somebody will make after a prompt change, and the
             # answer wants to be a number with reasons attached rather than a
             # shrug. Printed rarely, for the same reason errors are.
-            state["unspeakable"] = state.get("unspeakable", 0) + 1
-            if state["unspeakable"] in (1, 10, 100):
-                print(f"[observer] {key}: not in her voice ({rec['faults']}): "
-                      f"{text!r}", flush=True)
+            #
+            # A SENSOR MODEL IS NOT A REGRESSION, AND MUST NOT READ AS ONE. Under
+            # cosmos every record is unspeakable BY DESIGN -- it is an
+            # instrument's reading, not her line -- so counting it in the same
+            # tally as "Qwen wrote something that failed the persona lint" would
+            # make a healthy drive report 100% unspeakable and train whoever
+            # reads that number to ignore it. Two counters, because they are two
+            # facts: one is the design, the other is a fault.
+            if rec["faults"] == ["sensor_model"]:
+                state["readings"] = state.get("readings", 0) + 1
+            else:
+                state["unspeakable"] = state.get("unspeakable", 0) + 1
+                if state["unspeakable"] in (1, 10, 100):
+                    print(f"[observer] {key}: not in her voice "
+                          f"({rec['faults']}): {text!r}", flush=True)
     return True
 
 

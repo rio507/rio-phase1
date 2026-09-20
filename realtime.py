@@ -2463,9 +2463,22 @@ def look(question: str, session_key: str = "default",
                 base["lint"] = hit.get("faults") or []
                 if tctx:
                     base["teachers"] = tctx
+                # WHICH INSTRUMENT PRODUCED THIS READING, handed over with it.
+                # Under a sensor model this branch is the ONLY one -- there is no
+                # direct path for a reading (config.local_vision_speaks_directly)
+                # -- so the words she is about to compose from are a camera-side
+                # model's output, and she should know whose.
+                base["reading_from"] = (hit.get("model")
+                                        or config.local_vision_label())
+                sensor = not config.local_vision_speaks_directly()
                 base["rules"] = (
                     "This is what the camera is seeing right now — "
-                    f"{hit['age_s']:.0f} second(s) ago. Say it in your own "
+                    f"{hit['age_s']:.0f} second(s) ago"
+                    + (f", read by {base['reading_from']}, a camera-side model. "
+                       "It is an instrument's reading, not a sentence to repeat: "
+                       "it is evidence about the road and the words are not "
+                       "yours. " if sensor else ". ")
+                    + "Say it in your own "
                     "words, in ONE short sentence, as the road in front of "
                     "you. Do not read it out as a caption and do not add "
                     "anything it does not contain. If the driver wants "

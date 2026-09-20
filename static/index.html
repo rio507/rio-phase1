@@ -7179,7 +7179,14 @@ document.addEventListener('DOMContentLoaded', () => {
     .then(r => r.json())
     .then(h => {
       const m = h.models || {};
-      set('subperception', short(m.vision) + ' · seeing');
+      /* WHAT IS SEEING, AND WHAT ITS WORDS ARE. A sensor model's reading is
+         evidence shown raw; the 8B observer wrote a line that could be spoken
+         as hers. The card says which, because a driver reading a raw
+         instrument reading has to know that is what it is — and because a
+         label that names a model without naming its role is how "Seeing"
+         survived two model generations out of date. */
+      set('subperception', short(m.vision)
+          + (m.vision_speaks_directly === false ? ' · reading' : ' · seeing'));
       set('subdialogue', short(m.dialogue) + ' · speaking');
       /* A degraded pod is a fact about what the driver is looking at: with no
          detector there are no candidate boxes and headway reports UNKNOWN for

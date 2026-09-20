@@ -1,0 +1,260 @@
+"""local_vision_selftest.py — the resident eye is a sensor, and cannot speak.
+
+    python -m tools.local_vision_selftest
+
+WHAT THIS DEFENDS, AND WHY IT IS NOT tools/visual_selftest.py's JOB.
+
+visual_selftest runs the real pipeline against real frames on a GPU and asks
+whether the ANSWERS are good. This asks the structural questions that a swap
+gets wrong silently and that no amount of good answers would reveal:
+
+  1  THE ROLE RESOLVES BOTH WAYS. config.LOCAL_VISION_MODEL=cosmos|qwen selects
+     the weights, the prompt AND whether the output may be spoken. A rollback
+     that moved the weights and left the prompt behind would ask an instrument
+     to have a voice, or waste the one thing the 8B is kept for.
+
+  2  A SENSOR CANNOT SPEAK AS HER. Under cosmos, observer._record must return
+     speakable=False for EVERY reading, whatever the words are -- including a
+     reading that would sail through persona.lint(). The gate is the model's
+     role, asked first, not the shape of the sentence. look()'s
+     `observer_direct` branch is reached only on `speakable`, so this one
+     assertion is what makes "grok says it, not the camera" true.
+
+  3  THE PROMPTS ARE FOR THE MODELS THEY ARE GIVEN TO. The sensor prompt must
+     not carry her register, her rhythm or the four paired examples; the
+     observer prompt must keep all three. The examples are a Qwen-specific cure
+     (rio_prompts.OBSERVER_EXAMPLES) and carrying them into a different model's
+     prompt untested is how a fix becomes a superstition -- see
+     tools/vision_ab.py --prompt-ab, which measures it.
+
+  4  THE GUARDS ARE REAL. A reasoning trace is stripped and an UNTERMINATED one
+     is refused rather than published as perception. Recited label text and
+     decoding loops are refused (teachers.canned, written because Alpamayo 1.5
+     answered eight of ten keyframes with a training label, and a 2B is more
+     prone to that, not less). An advisory reading is refused, because a warning
+     on this car comes from measured geometry and never from a caption.
+
+  5  NOTHING NAMES A MODEL IN A LITERAL. /health, the page and the drive log ask
+     the role. This project has already shipped a card that said "ElevenLabs"
+     for every backend that was not OpenAI's, and a perception card that says
+     "Seeing" was two model generations out of date.
+
+No GPU and no network: every check here is a decision, a string or a source
+file. The model's actual readings are tools/vision_ab.py's job.
+"""
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+REPO = Path(__file__).resolve().parent.parent
+
+_checks = []
+_fails = []
+
+
+def ok(name, cond, extra=""):
+    _checks.append(name)
+    if cond:
+        print(f"  ok   {name}" + (f" — {extra}" if extra else ""))
+    else:
+        _fails.append(name)
+        print(f"  FAIL {name}" + (f" — {extra}" if extra else ""))
+
+
+def section(t):
+    print(f"\n== {t}")
+
+
+def fresh(role: str):
+    """config + rio_prompts + vision as they are under this role."""
+    os.environ["LOCAL_VISION_MODEL"] = role
+    for m in ("config", "rio_prompts", "vision", "observer", "persona"):
+        sys.modules.pop(m, None)
+    import config
+    import rio_prompts
+    return config, rio_prompts
+
+
+class FakeFrame:
+    frame_id = "f000001"
+    wall_t = 1789900000.0
+    age_s = 0.2
+    origin = "s1:camera"
+    jpeg = b"\xff\xd8ffff"
+
+
+def main() -> int:
+    # -----------------------------------------------------------------------
+    section("1. the role selects the weights, the prompt and the voice")
+    cfg, rp = fresh("cosmos")
+    ok("cosmos resolves to the 2B",
+       cfg.local_vision_model_id() == "nvidia/Cosmos-Reason2-2B",
+       cfg.local_vision_model_id())
+    ok("...labelled without the org prefix, for the glass",
+       cfg.local_vision_label() == "Cosmos-Reason2-2B", cfg.local_vision_label())
+    ok("...and it may NOT speak as her",
+       cfg.local_vision_speaks_directly() is False)
+
+    cfg_q, rp_q = fresh("qwen")
+    ok("qwen is one env var away, and is the 8B",
+       cfg_q.local_vision_model_id() == "Qwen/Qwen3-VL-8B-Instruct",
+       cfg_q.local_vision_model_id())
+    ok("...and IS allowed to speak, which is what it is kept for",
+       cfg_q.local_vision_speaks_directly() is True)
+
+    # The rollback has to be one variable, not two. A deployment that moved the
+    # weights and forgot the prompt is the failure this check exists for.
+    import vision as v_q
+    ok("the prompt follows the weights: qwen gets the observer prompt",
+       v_q.TEACHER_PROMPT == rp_q.OBSERVER_PROMPT)
+    fresh("cosmos")
+    import vision as v_c
+    ok("...and cosmos gets the sensor prompt",
+       v_c.TEACHER_PROMPT == __import__("rio_prompts").SENSOR_PROMPT)
+    ok("...so one env var moves both", v_q.TEACHER_PROMPT != v_c.TEACHER_PROMPT)
+
+    # -----------------------------------------------------------------------
+    section("2. a sensor cannot speak as her — whatever the words are")
+    fresh("cosmos")
+    import observer as obs_c
+    # A line written to PASS the persona lint. Under a sensor model it must
+    # still be refused, because the gate is the model's role and not the
+    # sentence: this is the assertion that keeps grok in front of her mouth.
+    flattering = "Open freeway, light traffic — dry hills both sides"
+    import persona
+    ok("the test line really would pass the persona lint",
+       not persona.lint(flattering), repr(persona.lint(flattering)))
+    rec = obs_c._record(flattering, FakeFrame(), "s1")
+    ok("...and the sensor model's record is STILL not speakable",
+       rec["speakable"] is False, repr(rec["faults"]))
+    ok("...refused for being a sensor, not for its prose",
+       rec["faults"] == ["sensor_model"], repr(rec["faults"]))
+    ok("...and the reading carries the instrument's name",
+       rec.get("model") == "Cosmos-Reason2-2B", repr(rec.get("model")))
+    ok("...with the frame's own clock, so age can be judged",
+       rec["frame_id"] == "f000001" and rec["frame_wall_t"] == FakeFrame.wall_t)
+
+    fresh("qwen")
+    import observer as obs_q
+    rec_q = obs_q._record(flattering, FakeFrame(), "s1")
+    ok("under qwen the same line IS speakable — the rollback is intact",
+       rec_q["speakable"] is True, repr(rec_q["faults"]))
+
+    # look()'s direct branch is gated on exactly this field.
+    rt = (REPO / "realtime.py").read_text()
+    ok("look() reaches the direct path only on `speakable`",
+       'if hit.get("speakable"):' in rt
+       and 'base["speak_directly"] = True' in rt)
+    ok("...and hands the composed path the instrument's name as evidence",
+       'base["reading_from"]' in rt and "an instrument's reading" in rt)
+
+    # -----------------------------------------------------------------------
+    section("3. the prompts are written for the models they are given to")
+    fresh("cosmos")
+    import rio_prompts as rp2
+    sp = rp2.SENSOR_PROMPT
+    ok("the sensor prompt asks for a reading, not a sentence she would say",
+       "ROAD:" in sp and "TRAFFIC:" in sp and "RISK:" in sp)
+    ok("...it does not put her in it",
+       "RIO" not in sp and "her own words" not in sp)
+    ok("...it allows 'unreadable' as a real answer",
+       "unreadable" in sp.lower())
+    ok("...it forbids inventing a speed or a distance",
+       "Never estimate a speed" in sp)
+    ok("...and it asks for no reasoning trace, which the code also enforces",
+       "No reasoning trace" in sp)
+    for ex in rp2.OBSERVER_EXAMPLES:
+        ok(f"...and carries none of Qwen's paired examples ({ex[:24]}…)",
+           ex not in sp)
+    ok("the A/B variant exists so the question is measured, not assumed",
+       rp2.OBSERVER_EXAMPLES[0] not in sp
+       and len(rp2.SENSOR_PROMPT_WITH_EXAMPLES) > len(sp))
+    ab = (REPO / "tools" / "vision_ab.py").read_text()
+    ok("...by a harness that runs both over the same frames",
+       "SENSOR_PROMPT_WITH_EXAMPLES" in ab and "--prompt-ab" in ab)
+
+    ok("the observer prompt KEEPS its examples — they are Qwen's cure",
+       all(e in rp2.OBSERVER_PROMPT for e in rp2.OBSERVER_EXAMPLES))
+
+    # -----------------------------------------------------------------------
+    section("4. an instrument reports, and does not advise")
+    ok("a clean reading has no faults",
+       rp2.sensor_faults("ROAD: two lanes, wet | TRAFFIC: none | RISK: none seen")
+       == [])
+    for bad in ("RISK: slow down, stopped traffic ahead",
+                "you should brake now",
+                "be careful of the cyclist"):
+        ok(f"...and an advisory one does ({bad[:28]}…)",
+           rp2.sensor_faults(bad) != [], repr(rp2.sensor_faults(bad)))
+
+    # -----------------------------------------------------------------------
+    section("5. the guards")
+    import vision as vis
+    vis.reset_flags()
+    answer, had, unterm = vis._strip_think(
+        "<think>the road looks wet, but that could be glare</think>"
+        "ROAD: two lanes, wet | TRAFFIC: none | RISK: none seen")
+    ok("a closed reasoning trace is stripped and the reading kept",
+       had and not unterm and answer.startswith("ROAD:"), repr(answer[:40]))
+    answer2, had2, unterm2 = vis._strip_think(
+        "<think>let me consider the lane markings and the")
+    ok("an UNTERMINATED trace leaves nothing to publish",
+       had2 and unterm2 and answer2 == "", repr(answer2))
+    ok("...which the caller turns into a refusal, not a caption",
+       'return ""' in (REPO / "vision.py").read_text().split(
+           "_flags[\"think_unterminated\"] += 1")[1][:400])
+
+    from teachers import canned
+    recited = "A vehicle controls loss. The vehicle driver is in distracted driving."
+    ok("the canned guard still catches memorised label text",
+       bool(canned.describe(recited, 0).get("markers")),
+       str(canned.describe(recited, 0).get("markers")))
+    loop = " ".join(["The sedan is also further away from the ego vehicle."] * 5)
+    ok("...and a decoding loop",
+       canned.describe(loop, 0).get("loop", 0) >= canned.LOOP_FLOOR)
+    ok("...and repetition is a HINT, reported apart from proof",
+       canned.describe("ROAD: clear", 4).get("strength") == "weak")
+
+    vsrc = (REPO / "vision.py").read_text()
+    ok("the canned guard runs on EVERY reading, not just teacher rows",
+       "canned.describe(text, repeats)" in vsrc)
+    ok("...and its refusals are counted as a rate",
+       "def flag_rate" in vsrc and '"canned": 0' in vsrc)
+    fr = vis.flag_rate()
+    for k in ("prompt_example", "canned", "repeated", "think_trace",
+              "think_unterminated", "advisory"):
+        ok(f"...{k} is reported", k in fr and k in (fr["rate"] or {}))
+
+    # -----------------------------------------------------------------------
+    section("6. nothing names a model in a literal")
+    app = (REPO / "app.py").read_text()
+    ok("/health asks the role for the eye",
+       '"vision_role": config.LOCAL_VISION_MODEL' in app
+       and '"vision": vision.MODEL_ID' in app)
+    ok("...and reports whether it may speak, which a model id cannot say",
+       '"vision_speaks_directly"' in app)
+    page = (REPO / "static" / "index.html").read_text()
+    ok("the perception card renders what /health says, not a constant",
+       "m.vision_speaks_directly === false" in page
+       and "short(m.vision)" in page)
+    ok("...and says 'reading' for a sensor rather than 'seeing'",
+       "· reading" in page)
+    ok("vision.model_label() asks config rather than holding a name",
+       "def model_label" in vsrc and "config.local_vision_label()" in vsrc)
+    hard = re.findall(r'"(?:Qwen|nvidia)/[A-Za-z0-9.\-]+"', vsrc)
+    ok("vision.py hard-codes no checkpoint path at all",
+       not hard, f"found {hard}" if hard else "")
+
+    print("\n" + "-" * 62)
+    print(f"  {'PASS' if not _fails else 'FAIL'}: {len(_fails)} failure(s) "
+          f"of {len(_checks)} checks")
+    for f in _fails:
+        print(f"    - {f}")
+    return 1 if _fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

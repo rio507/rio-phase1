@@ -2141,6 +2141,119 @@ SYSTEM_PROMPT = RIO_SYSTEM_PROMPT
 VISION_ENABLED = True
 
 # ---------------------------------------------------------------------------
+# THE LOCAL EYE — which model is resident on this card, and what it is FOR
+# ---------------------------------------------------------------------------
+# A ROLE, not a model name, for exactly the reasons the four vendor roles above
+# are roles: two models can do this job, the choice is a measurement rather than
+# a preference, and the losing one has to stay one env var away or the decision
+# cannot be revisited.
+#
+#   LOCAL_VISION_MODEL=cosmos   nvidia/Cosmos-Reason2-2B   (the default)
+#   LOCAL_VISION_MODEL=qwen     Qwen/Qwen3-VL-8B-Instruct  (the rollback)
+#
+# WHAT CHANGED, AND WHY IT IS NOT A LIKE-FOR-LIKE SWAP. Qwen3-VL-8B was doing
+# two jobs at once: it was RIO's eyes AND, on the observer path, her voice --
+# OBSERVER_PROMPT asked it to write the sentence she would say, and a line that
+# passed persona.lint() was spoken to the driver verbatim (look()'s
+# `observer_direct` branch). That was a good trade when the local model was an
+# 8B general VLM and the remote hop cost 2.8 s.
+#
+# It is the wrong trade now, for two independent reasons:
+#
+#   THE JOB NARROWED. Specificity moved to the cloud: visual_qa sends the frame
+#   to grok-4.3 and answers in ~1200 ms (see XAI_VISUAL_MODEL's measurements).
+#   What is left for a resident model is the part that cannot go to the cloud at
+#   all -- watching every frame for risk and for the edge case, continuously,
+#   with no round trip. That is a different job and it wants a different model.
+#
+#   A SENSOR MUST NOT HAVE A VOICE. The local model's output is EVIDENCE. Shown
+#   raw on the glass, labelled with the model that produced it, and handed to
+#   grok as input when RIO speaks. It is not paraphrased into her register and
+#   it is never spoken verbatim as hers -- see LOCAL_VISION_SPEAKS_DIRECTLY,
+#   which is a property of the model's prompt and not a preference.
+#
+# WHAT COSMOS-REASON2-2B IS. A 2B post-train of Qwen3-VL-2B-Instruct by NVIDIA,
+# aimed at physical-AI reasoning: space, time, physics, "what happens next".
+# Same `qwen3_vl` architecture, so it loads through the same transformers class
+# with no vendor package -- which is why this swap is a model id and a prompt
+# rather than a second code path.
+#
+# NVIDIA'S OWN NUMBERS (model card, 2026-04-28 — THEIR measurement, not ours,
+# and reported here because it is what motivated trying it):
+#
+#                          Cosmos-Reason2-2B   Qwen3-VL-8B-Instruct
+#   Self-Driving overall         57.37                46.38
+#     AV Collision               74.33                34.00
+#     AV Stop                    38.78                36.73
+#     LingoQA                    59.00                68.40
+#   General overall              62.21                71.98
+#
+# Read that honestly: the 2B is far better at the collision and stop questions
+# -- which IS the narrowed job -- and WORSE at LingoQA and at general
+# understanding, which is description. A model that sees risk better and
+# describes worse is the correct trade only because description now happens
+# somewhere else. If it ever stops happening there, this decision changes with
+# it.
+LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "cosmos")
+
+COSMOS_VISION_MODEL_ID = os.getenv("COSMOS_VISION_MODEL_ID",
+                                   "nvidia/Cosmos-Reason2-2B")
+QWEN_VISION_MODEL_ID = os.getenv("QWEN_VISION_MODEL_ID",
+                                 "Qwen/Qwen3-VL-8B-Instruct")
+
+
+def local_vision_model_id() -> str:
+    """The weights this process loads for the resident eye."""
+    return (COSMOS_VISION_MODEL_ID if LOCAL_VISION_MODEL == "cosmos"
+            else QWEN_VISION_MODEL_ID)
+
+
+def local_vision_label() -> str:
+    """The name shown beside the reading on the glass and in the drive log.
+
+    ASKED, NEVER STATED. The same rule the voice label learned the hard way on
+    2026-09-20, when every backend that was not OpenAI's rendered as
+    "ElevenLabs": a card that names a model from a literal is a card that lies
+    the first time the model changes.
+    """
+    return local_vision_model_id().split("/")[-1]
+
+
+def local_vision_speaks_directly() -> bool:
+    """May this model's sentence go to the speaker as RIO's own words?
+
+    TRUE ONLY FOR QWEN, and it is a property of the PROMPT rather than of the
+    model's quality. OBSERVER_PROMPT asks for the sentence she would say, in her
+    register, and persona.lint() then checks it -- so there is something to
+    speak. SENSOR_PROMPT asks Cosmos for a reading: a flat factual line, no
+    persona, no rhythm, and speaking it verbatim would put a sensor's register
+    in her mouth.
+
+    So under cosmos the observer's fast path composes instead (look()'s
+    `observer_composed` branch): grok gets the reading as evidence and says it
+    in her words. That costs the remote hop the direct path existed to avoid --
+    measured in the swap commit -- and it is the price of the local model being
+    a sensor.
+    """
+    return LOCAL_VISION_MODEL == "qwen"
+
+
+# HOW MANY TOKENS A READING MAY BE.
+#
+# Cosmos-Reason2 is a REASONING model: it thinks inside <think>...</think>
+# before answering, and the teacher service keeps that trace because for a
+# teacher the trace is the interesting part. Here it is pure latency on a call
+# that runs about once a second, so the prompt asks for no trace and the budget
+# is sized for the answer alone -- with the parser stripping a trace anyway if
+# one appears, because a prompt is a request and a guard is a rule.
+LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "60"))
+
+# The ceiling that catches a runaway trace rather than truncating a reading. A
+# <think> block that opens and never closes inside this many tokens is a reading
+# that has failed, and failing fast is what keeps the observer at ~1 Hz.
+LOCAL_VISION_THINK_BUDGET = int(os.getenv("LOCAL_VISION_THINK_BUDGET", "220"))
+
+# ---------------------------------------------------------------------------
 # Place search (places.py) — what is actually around the car
 # ---------------------------------------------------------------------------
 # RIO answers "what's good round here" from Google Places, never from the

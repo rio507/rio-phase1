@@ -84,6 +84,90 @@ If the frame is too dark, too blurred or too close to make out, say that plainly
 No greeting, no offer, no question, no commentary. One sentence only."""
 
 
+# ---------------------------------------------------------------------------
+# SENSOR_PROMPT — the resident model as an instrument, not a voice.
+# ---------------------------------------------------------------------------
+# WHY THERE ARE NOW TWO OBSERVER PROMPTS.
+#
+# OBSERVER_PROMPT above asks for the sentence RIO would say. That was right
+# while the local model was an 8B general VLM and the remote hop cost 2.8 s: her
+# line came out of the card in 400 ms and was spoken as it stood.
+#
+# The local model's job has narrowed to risk and the edge case, and specificity
+# now happens in the cloud (config.XAI_VISUAL_MODEL, ~1200 ms). So the resident
+# model is an INSTRUMENT. Its output is a reading: shown raw on the glass beside
+# the name of the model that produced it, and handed to grok as evidence when
+# RIO speaks. It is never spoken verbatim as her, so it is not written in her
+# voice — see config.local_vision_speaks_directly().
+#
+# WHAT THAT CHANGES IN THE WORDS. Everything the observer prompt spends
+# instructions on — her rhythm, the dash, the banned "I see", the twelve-word
+# ceiling, the four paired examples — exists to make a sentence SPEAKABLE. None
+# of it belongs here. What belongs here is the opposite: say what is there, say
+# what is closing, say when you cannot tell.
+#
+# THE EXAMPLES ARE DELIBERATELY ABSENT, and that is a measurement rather than a
+# preference — see tools/vision_ab.py, which runs this prompt with and without
+# them on the same frames and counts what comes back. The paired examples in
+# OBSERVER_PROMPT exist because Qwen3-VL pattern-completed a bare example list;
+# carrying them into a prompt for a different model, on the assumption that the
+# same fix is needed, would be carrying a cure for a disease nobody has tested
+# for. The variants below are what the test compares.
+SENSOR_PROMPT = """Report what is in this frame. You are a camera-side model in a car; what you write is a sensor reading that another system reads, not something said to a person.
+
+Answer in this shape, one line, no preamble:
+
+ROAD: the road and lane layout, surface, light
+TRAFFIC: vehicles that matter and roughly where — ahead, left, right, closing
+RISK: anything that could become a problem in the next few seconds, or "none seen"
+
+Rules:
+- Only what is in this frame. If it is not visible, it is not in the answer.
+- If the frame is too dark, blurred, or close to read, write "unreadable" and the reason. That is a valid reading.
+- If this is not a road scene, say what it actually is. Do not describe a road.
+- No advice, no instruction to the driver, no speculation about intent.
+- Numbers only if you can see them. Never estimate a speed or a distance in metres.
+- No reasoning trace. The answer only."""
+
+# The same prompt with the paired examples appended, for the A/B. Kept as a
+# separate constant rather than a flag so that what was measured is readable.
+SENSOR_PROMPT_WITH_EXAMPLES = SENSOR_PROMPT + """
+
+Three frames and the reading for each:
+
+  frame: three lanes, hills either side, few cars -> ROAD: three-lane highway, dry, bright overcast | TRAFFIC: two cars ahead in the right lane, well spaced | RISK: none seen
+  frame: town street in rain, queue of cars -> ROAD: two-lane street, wet, low light | TRAFFIC: queue of cars ahead, brake lights on the nearest | RISK: stopped traffic closing ahead
+  frame: a hand held over the lens -> ROAD: unreadable — lens blocked | TRAFFIC: unreadable | RISK: no view of the road
+
+Those are other frames. They are not the answer to this one."""
+
+# WHAT A SENSOR READING MAY NOT CONTAIN. The persona lint is the wrong check for
+# this prompt — it exists to catch a line that does not sound like her, and this
+# one is not supposed to — so a reading gets its own, smaller rule: it must not
+# address the driver or give an instruction. A sensor that says "slow down" has
+# written a warning, and warnings on this car come from measured geometry with a
+# band and a lead behind them (headway/), never from a caption.
+SENSOR_BANNED = (
+    "you should", "you need to", "slow down", "speed up", "brake now",
+    "be careful", "watch out", "i recommend", "i suggest", "let's ",
+    "we should", "keep in mind", "make sure",
+)
+
+
+def sensor_faults(text: str) -> list:
+    """-> reasons this reading may not be published as a reading. [] is clean.
+
+    Deliberately NOT persona.lint(): that asks "does this sound like RIO", and a
+    sensor reading is not supposed to. This asks the two questions that actually
+    matter for an instrument — is it addressing the driver, and is it issuing an
+    instruction — because either one means the model has stopped reporting and
+    started advising.
+    """
+    t = (text or "").lower()
+    found = [w.strip() for w in SENSOR_BANNED if w in t]
+    return found
+
+
 def _normalise(text: str) -> str:
     """Down to letters and single spaces, for comparing a line to an example."""
     out = []

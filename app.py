@@ -416,7 +416,14 @@ def health():
             # a health endpoint that lies about that is worse than one that omits
             # it, because it is the first thing anybody checks after a switch.
             "models": {
+                # THE RESIDENT EYE, and whether it is allowed to speak. A model
+                # id alone stopped being the whole answer when the local model
+                # became a sensor: "which weights" and "may its words reach the
+                # driver as hers" are different questions, and the second one is
+                # the one a swap can get wrong silently.
                 "vision": vision.MODEL_ID,
+                "vision_role": config.LOCAL_VISION_MODEL,
+                "vision_speaks_directly": config.local_vision_speaks_directly(),
                 "chat": llm_provider.model_of("chat"),
                 "visual": llm_provider.model_of("visual"),
                 "reasoning": llm_provider.model_of("reasoning"),

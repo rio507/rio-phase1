@@ -1,25 +1,69 @@
-"""Qwen3-VL-8B vision module for RIO.
-Loads the model once at first use, caches the most recent observation
-so llm_interface.get_observation() can pull it cheaply per user turn.
+"""The resident eye. One model on this card, loaded once, read by everything.
 
-Upgraded from Qwen2.5-VL-3B. Qwen3-VL needs transformers >= 4.57.0 and a
-different model class; torch stays at 2.4.1+cu124 (4.57 only wants >= 2.2).
+WHICH MODEL, AND WHY IT IS A ROLE. config.LOCAL_VISION_MODEL selects it:
+`cosmos` (nvidia/Cosmos-Reason2-2B, the default) or `qwen`
+(Qwen/Qwen3-VL-8B-Instruct, the rollback, one env var away). Both are the
+`qwen3_vl` architecture -- Cosmos-Reason2 is a post-train of Qwen3-VL-2B -- so
+there is one loader, one processor and one generate here, not two code paths.
+See config.LOCAL_VISION_MODEL for what was measured and what the swap costs.
+
+THE TWO MODELS ARE ASKED DIFFERENT QUESTIONS, and that is the substance of the
+change rather than a detail of it:
+
+  qwen    OBSERVER_PROMPT. The sentence RIO would say, in her register, checked
+          by persona.lint() and -- if it passes -- spoken to the driver word for
+          word. The local model was her voice as well as her eyes.
+  cosmos  SENSOR_PROMPT. A reading: road, traffic, risk. Shown raw on the glass
+          under the model's own name, handed to grok as evidence when she
+          speaks, and never spoken verbatim. An instrument does not have a
+          register.
+
+WHAT RUNS ON EVERY OUTPUT, WHICHEVER MODEL IT IS
+------------------------------------------------
+Two guards, and they catch different lies:
+
+  is_prompt_example   the reading came back as one of the prompt's own examples.
+                      Qwen3-VL did this with a bare example list -- a hand, a
+                      black frame and random noise all returned the first
+                      example verbatim -- and the sentence reads perfectly.
+  canned.describe     the reading is memorised label text or a decoding loop.
+                      Written for the teachers, because Alpamayo 1.5 answered
+                      eight of ten keyframes with a scenario label out of its
+                      training taxonomy, and a 2B is MORE prone to that, not
+                      less. It runs here now, on every frame, and what it flags
+                      is counted and reported (`flag_rate()`).
+
+Both are refusals of a sentence, never of the frame: an empty reading is a state
+every caller already handles, and the honest slow path picks it up.
 """
 import io
 import os
+import re
 import threading
 import time
 import torch
 from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
-from rio_prompts import OBSERVER_PROMPT, is_prompt_example
+from rio_prompts import (OBSERVER_PROMPT, SENSOR_PROMPT, is_prompt_example,
+                         sensor_faults)
+from teachers import canned
 
-MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+MODEL_ID = config.local_vision_model_id()
 
-# Sourced from rio_prompts.py (compiled from behavior bible v1).
-# The observer is NOT RIO. It produces a short factual note that RIO reads.
-TEACHER_PROMPT = OBSERVER_PROMPT
+# WHICH QUESTION THIS MODEL IS ASKED. Resolved through the role, so a rollback
+# moves the prompt with the weights -- a sensor prompt on Qwen would waste the
+# one thing Qwen is here for, and OBSERVER_PROMPT on Cosmos would ask an
+# instrument to have a voice.
+TEACHER_PROMPT = (OBSERVER_PROMPT if config.local_vision_speaks_directly()
+                  else SENSOR_PROMPT)
+
+# The reasoning trace, if one comes back anyway. Cosmos-Reason2 thinks inside
+# these before answering; SENSOR_PROMPT asks it not to, and this is what makes
+# that a rule rather than a request. An unterminated <think> is handled too --
+# see _strip_think, and the note there about what an unclosed one means.
+_THINK = re.compile(r"<think>.*?</think>", re.S)
+_THINK_OPEN = re.compile(r"<think>.*$", re.S)
 
 
 _processor = None
@@ -96,13 +140,64 @@ DEVICE_MAP = os.environ.get("RIO_QWEN_DEVICE",
 def _ensure_loaded():
     global _processor, _model
     if _model is None:
-        print(f"[vision] Loading Qwen3-VL-8B onto {DEVICE_MAP}...", flush=True)
-        _processor = AutoProcessor.from_pretrained(MODEL_ID)
-        # `dtype` replaces the deprecated `torch_dtype` kwarg in transformers 4.57.
-        _model = Qwen3VLForConditionalGeneration.from_pretrained(
-            MODEL_ID, dtype=torch.bfloat16, device_map=DEVICE_MAP
-        )
-        print("[vision] Loaded.", flush=True)
+        print(f"[vision] loading {MODEL_ID} ({config.LOCAL_VISION_MODEL}) "
+              f"onto {DEVICE_MAP}...", flush=True)
+        t0 = time.time()
+        try:
+            _processor = AutoProcessor.from_pretrained(MODEL_ID)
+            # `dtype` replaces the deprecated `torch_dtype` kwarg in
+            # transformers 4.57.
+            _model = Qwen3VLForConditionalGeneration.from_pretrained(
+                MODEL_ID, dtype=torch.bfloat16, device_map=DEVICE_MAP
+            )
+        except Exception as e:
+            # THE WEIGHTS ARE NOT HERE, AND THE MESSAGE HAS TO SAY WHAT TO DO.
+            #
+            # This is a role now, so "the model failed to load" has a new and
+            # very likely cause that a transformers traceback does not name: the
+            # role points at weights this pod has never had. Cosmos-Reason2-2B
+            # is a GATED repo -- a valid HF token is not enough, the account has
+            # to have accepted NVIDIA's licence on that repo specifically, and
+            # the failure for a token that has accepted the 8B and not the 2B is
+            # a 403 forty frames deep in a stack trace.
+            #
+            # Named, with the rollback beside it, because the pod is still
+            # useful without the local eye (the remote visual path is
+            # untouched) and the person reading this log needs one line, not an
+            # investigation.
+            _processor = None
+            print(f"[vision] CANNOT LOAD {MODEL_ID} "
+                  f"(LOCAL_VISION_MODEL={config.LOCAL_VISION_MODEL}): "
+                  f"{type(e).__name__}: {e}", flush=True)
+            if "gated" in str(e).lower() or "403" in str(e):
+                print(f"[vision] that repo is GATED: the HF account behind "
+                      f"HF_TOKEN has to accept its licence at "
+                      f"https://huggingface.co/{MODEL_ID} — a token that works "
+                      f"for another Cosmos size does not cover this one.",
+                      flush=True)
+            print("[vision] the local eye is DOWN. The remote visual path is "
+                  "unaffected; roll back with LOCAL_VISION_MODEL=qwen.",
+                  flush=True)
+            try:
+                import gpu_health
+                gpu_health.note("vision", e)
+            except Exception:
+                pass
+            raise
+        # WHAT IT COST TO LOAD AND WHAT IT IS HOLDING. Both printed because the
+        # swap that brought this comment was justified partly on VRAM, and a
+        # claim about VRAM that is not printed at startup is a claim nobody can
+        # check on the machine it matters on. The 4090 in this pod has 24 GB and
+        # the detector, the depth model and the lane model want their share.
+        held = None
+        try:
+            if torch.cuda.is_available():
+                held = round(torch.cuda.memory_allocated() / 1048576.0)
+        except Exception:
+            pass
+        print(f"[vision] loaded in {time.time() - t0:.1f}s"
+              + (f", {held} MiB allocated" if held is not None else ""),
+              flush=True)
 
 
 def _downscale(pil, max_side: int):
@@ -125,6 +220,74 @@ def _downscale(pil, max_side: int):
     scale = max_side / float(longest)
     return pil.resize((max(1, int(w * scale)), max(1, int(h * scale))),
                       Image.BILINEAR)
+
+
+def _strip_think(text: str):
+    """Remove a reasoning trace. -> (answer, had_trace, unterminated)
+
+    SENSOR_PROMPT asks for no trace. This is what makes that a rule: a prompt is
+    a request, and the model that ignores it would otherwise put four hundred
+    words of deliberation on the glass where a reading goes.
+
+    An UNTERMINATED <think> is its own case and not an answer. It means the
+    token budget ran out mid-thought, so there is no answer after it to keep --
+    returning the trace would publish deliberation as perception. The caller
+    treats an empty string the way it treats every other refusal.
+    """
+    t = text or ""
+    if "<think>" not in t:
+        return t, False, False
+    closed = _THINK.sub("", t).strip()
+    if "<think>" not in closed:
+        return closed, True, False
+    # Opened and never closed: nothing after it to trust.
+    return _THINK_OPEN.sub("", t).strip(), True, True
+
+
+# WHAT THE GUARDS HAVE CAUGHT, so the claim "it reports honestly" is a number
+# rather than an impression. Every one of these is a reading that was REFUSED --
+# the frame is still there and the slow path still answers, which is why
+# refusing is cheap and publishing a fabrication is not.
+_flags = {
+    # the reading was one of the prompt's own examples
+    "prompt_example": 0,
+    # memorised label text, exotic whitespace, or a sentence repeating inside
+    # one answer (teachers.canned). The fault Alpamayo had and a 2B is more
+    # prone to.
+    "canned": 0,
+    # identical to the previous N readings, byte for byte. A HINT, not proof:
+    # on an unchanging road the same reading may simply be right again, which is
+    # why it is counted apart from `canned`.
+    "repeated": 0,
+    # a reasoning trace came back despite the prompt
+    "think_trace": 0,
+    # ...and one that never closed, which is a reading that failed
+    "think_unterminated": 0,
+    # the instrument gave the driver an instruction (rio_prompts.sensor_faults)
+    "advisory": 0,
+    "total": 0,
+}
+_repeats = canned.RepeatTracker()
+
+
+def flag_rate() -> dict:
+    """-> the flag counts with a rate per reading. `total` is readings ATTEMPTED.
+
+    Read this next to `parroted()`: that counter predates the swap and counts
+    one of these flags. This dict is the whole set.
+    """
+    total = _flags["total"] or 0
+    out = dict(_flags)
+    out["model"] = config.local_vision_label()
+    out["rate"] = {k: (round(v / total, 4) if total else None)
+                   for k, v in _flags.items() if k != "total"}
+    return out
+
+
+def reset_flags() -> None:
+    for k in _flags:
+        _flags[k] = 0
+    _repeats.reset()
 
 
 # How long the last observe() waited for the lock before it could start.
@@ -157,10 +320,31 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
         ).to(_model.device)
-        out = _model.generate(**inputs, max_new_tokens=60, do_sample=False)
-        text = _processor.batch_decode(
+        # THE BUDGET IS THE ROLE'S, not a literal. A reading is one line; a
+        # reasoning model that ignores "no trace" needs a ceiling that stops it
+        # rather than one that truncates the answer it was going to give after
+        # the trace. See config.LOCAL_VISION_THINK_BUDGET.
+        budget = int(config.LOCAL_VISION_MAX_TOKENS)
+        if not config.local_vision_speaks_directly():
+            budget = max(budget, int(config.LOCAL_VISION_THINK_BUDGET))
+        out = _model.generate(**inputs, max_new_tokens=budget, do_sample=False)
+        raw = _processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
+        _flags["total"] += 1
+        # A REASONING TRACE IS NOT A READING. Stripped, counted, and if it never
+        # closed there is nothing after it to publish.
+        text, had_trace, unterminated = _strip_think(raw)
+        if had_trace:
+            _flags["think_trace"] += 1
+        if unterminated:
+            _flags["think_unterminated"] += 1
+            if _flags["think_unterminated"] in (1, 10, 100):
+                print(f"[vision] reading refused -- reasoning trace filled the "
+                      f"budget ({_flags['think_unterminated']} so far)",
+                      flush=True)
+            clear_holder()
+            return ""
         # THE MODEL DID NOT LOOK. It completed the prompt's example list
         # instead, which is a sentence about a road that is not there and which
         # reads as a perfectly good answer -- it was written to. Refused here,
@@ -171,11 +355,47 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         if is_prompt_example(text):
             global _parroted
             _parroted += 1
+            _flags["prompt_example"] += 1
             if _parroted in (1, 10, 100):
                 print(f"[vision] observation refused -- prompt example verbatim "
                       f"({_parroted} so far): {text!r}", flush=True)
             clear_holder()
             return ""
+        # IS THIS A READING OR A RECITATION? The guard written for the teachers,
+        # run here on every frame, because the fault it was written for --
+        # Alpamayo answering eight of ten keyframes with a training label -- is
+        # one a 2B is more prone to rather than less. Repetition is tracked
+        # across frames, which is the only way the byte-identical case is
+        # visible at all.
+        repeats = _repeats.note(config.LOCAL_VISION_MODEL, "reading", text)
+        verdict = canned.describe(text, repeats)
+        if verdict:
+            if verdict.get("markers") or verdict.get("loop"):
+                _flags["canned"] += 1
+                if _flags["canned"] in (1, 10, 100):
+                    print(f"[vision] reading refused -- {verdict.get('why')}: "
+                          f"{text[:120]!r}", flush=True)
+                clear_holder()
+                return ""
+            # Repetition alone is a hint and is NOT a refusal: on an unchanging
+            # road the same reading may simply be right again. Counted so the
+            # rate can be read, and left to be published.
+            _flags["repeated"] += 1
+            if _flags["repeated"] in (1, 10, 100):
+                print(f"[vision] reading repeated x{repeats} (not refused): "
+                      f"{text[:80]!r}", flush=True)
+        # AN INSTRUMENT DOES NOT ADVISE. A reading that tells the driver to slow
+        # down has written a warning, and warnings on this car come from measured
+        # geometry with a band and a lead behind them, never from a caption.
+        if not config.local_vision_speaks_directly():
+            advisory = sensor_faults(text)
+            if advisory:
+                _flags["advisory"] += 1
+                if _flags["advisory"] in (1, 10, 100):
+                    print(f"[vision] reading refused -- advisory "
+                          f"({advisory}): {text[:120]!r}", flush=True)
+                clear_holder()
+                return ""
         _last_observation = text
         _last_observed_at = time.time()
         _last_observed_frame = frame_id
@@ -255,13 +475,41 @@ def set_observation(text: str) -> None:
         _last_observed_at = time.time()
 
 
+def model_label() -> str:
+    """Which model this process actually has resident.
+
+    ASKED, NEVER STATED, and for the reason the voice label learned on
+    2026-09-20: a card that names a model from a literal is a card that lies the
+    first time the model changes. /health, the perception card and the drive log
+    all read this.
+    """
+    return config.local_vision_label()
+
+
+def model_info() -> dict:
+    """What is loaded, what it is being asked, and whether it may speak."""
+    return {
+        "role": config.LOCAL_VISION_MODEL,
+        "model_id": MODEL_ID,
+        "label": config.local_vision_label(),
+        "loaded": _model is not None,
+        "prompt": ("observer" if config.local_vision_speaks_directly()
+                   else "sensor"),
+        # WHETHER ITS WORDS MAY REACH A SPEAKER AS HERS. The one field that
+        # says, in a form a test can assert, that the local model is a sensor.
+        "speaks_directly": config.local_vision_speaks_directly(),
+        "max_new_tokens": int(config.LOCAL_VISION_MAX_TOKENS),
+        "flags": flag_rate(),
+    }
+
+
 def get_handles():
-    """(processor, model, lock) for the one loaded Qwen3-VL instance.
+    """(processor, model, lock) for the one loaded local VLM.
 
     Lets headway.anchor ground boxes on the model the app already has resident
-    instead of pulling a second ~17 GB copy. The load happens under `_lock` and
-    the lock is then released before returning: callers take it themselves
-    around generate(), and threading.Lock is not reentrant.
+    instead of pulling a second copy. The load happens under `_lock` and the
+    lock is then released before returning: callers take it themselves around
+    generate(), and threading.Lock is not reentrant.
     """
     with _lock:
         _ensure_loaded()
