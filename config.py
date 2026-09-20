@@ -113,6 +113,59 @@ XAI_VOICE_MODEL = os.getenv("XAI_VOICE_MODEL", "grok-voice-think-fast-2.0")
 # everything speaking reads, the same discipline OPENAI_REALTIME_VOICE follows.
 XAI_VOICE = os.getenv("XAI_VOICE", "Eve")
 
+# HOW HARD THE DRIVE SESSION THINKS, and "none" is decided on the TAIL.
+#
+# THE SCALE HERE IS NOT THE OTHER TWO. session.reasoning.effort on the realtime
+# endpoint takes 'none' or 'high' and REFUSES 'low' outright:
+#
+#     session.reasoning.effort
+#       Input should be 'none' or 'high'  [input_value='low']
+#
+# That is the third effort scale on one vendor -- /v1/responses takes low and high
+# and refuses medium, /v1/chat/completions takes none through high, and this takes
+# two values. The migration brief asked for "low or none" for the drive session;
+# on this endpoint that resolves to none, because low does not exist.
+#
+# MEASURED (tools/xai_voice_bench, RIO's nine real tool schemas and her real
+# session instructions, 18 utterances x 2 trials at each effort):
+#
+#   effort   routed    first audio           to the TOOL CALL
+#                      p50    p95            p50    p95     max
+#   none     32/36     647    842 ms         349    521     756 ms
+#   high     32/36     733    920 ms         368   2270    3302 ms
+#
+# THE MEDIANS ARE A WASH AND THE TAIL IS NOT. Same routing, 19 ms apart on the
+# median time to a tool call -- and 2,270 ms against 521 at p95, 3,302 against 756
+# at worst. At high this model sometimes spends three and a third seconds deciding
+# before it starts fetching, and the tool's own latency is still to come after
+# that. A driver asks a question and hears nothing for three seconds.
+#
+# p95 is the number this file cares about and has said so since the
+# REALTIME_SPEAK_TIMEOUT_MS block was written against exactly this kind of trade.
+# The median said "no difference"; the tail said "four times worse"; the tail wins.
+#
+# ROUTING WAS 32/36 AT BOTH, and the four that missed are the same two utterances
+# in both trials of both efforts: "This traffic is unbelievable." reached
+# search_local_news and "Tell me something interesting." reached deep_dive, where
+# the bench wanted no tool at all. Both are defensible readings -- the router's own
+# rules send traffic words to local news -- so this is a bench label being strict
+# rather than a model being wrong, and it is written down that way instead of being
+# quoted as 89%.
+XAI_VOICE_EFFORT = os.getenv("XAI_VOICE_EFFORT", "none")
+
+# WHAT A DRIVE MINUTE COSTS, and it cannot be read back. The Responses API returns
+# usage.cost_in_usd_ticks and the realtime session returns no numeric usage at all
+# -- checked, every field of every response.done across 72 turns. So this is the
+# published rate rather than a measurement, and it is the one figure in the
+# migration that stays an estimate:
+#
+#   $0.08 per minute of audio  ($4.80/hour), plus text input
+#
+# A thirty-minute drive is therefore about $2.40 in audio before a single tool
+# call. The text-input component is quoted as "$0.004 / text input" with no unit
+# given, so it is deliberately not multiplied out here.
+XAI_VOICE_USD_PER_MIN = float(os.getenv("XAI_VOICE_USD_PER_MIN", "0.08"))
+
 # The transcriber, and it does TWO jobs that must not be confused.
 #
 # In a live session it is `grok-transcribe`, set on
