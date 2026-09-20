@@ -52,6 +52,7 @@ from openai import OpenAI
 
 import config
 import llm_provider
+import persona
 import rio_prompts
 import voice_tags
 # Place search lives in its own module for the same reason visual_qa does: it is
@@ -1842,7 +1843,14 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
               f"{type(e).__name__}: {e}", flush=True)
         return {"ok": False, "note": f"{type(e).__name__}", "took_ms": took}
 
-    text = (getattr(resp, "output_text", "") or "").strip()
+    # CITATION MARKUP OUT BEFORE ANYTHING ELSE LOOKS AT IT. A model asked for
+    # prose with no markdown and no URLs sometimes supplies both -- measured,
+    # intermittently, on the same question with the same instructions -- and this
+    # text is going to a voice. See persona.strip_citation_markup for what a
+    # driver would otherwise hear. Done before the length bound so the bound
+    # measures the words rather than the markup.
+    text = persona.strip_citation_markup(
+        (getattr(resp, "output_text", "") or "").strip())
     took = round((time.time() - t0) * 1000, 1)
 
     # WHAT THE MODEL ACTUALLY DID, pulled out whether or not it worked. An
@@ -2637,9 +2645,11 @@ def status() -> dict:
         "realtime_model": config.OPENAI_REALTIME_MODEL,
         "voice": (config.GPT_LIVE_VOICE if config.VOICE_BACKEND == "gpt_live"
                   else config.OPENAI_REALTIME_VOICE),
+        # Through the role, so this reports whoever deep_dive actually reaches.
         "reasoning_model": (config.GPT_LIVE_BACKEND_MODEL
                             if config.VOICE_BACKEND == "gpt_live"
-                            else config.OPENAI_REASONING_MODEL),
+                            else llm_provider.model_of("reasoning")),
+        "reasoning_vendor": llm_provider.vendor_of("reasoning"),
         "guards": config.guards(),
         "tools": [TOOL_NAME, LOOK_TOOL_NAME, NAV_TOOL_NAME,
                   NAV_DIRECTIONS_TOOL_NAME, PLACES_TOOL_NAME,

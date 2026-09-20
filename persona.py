@@ -106,6 +106,62 @@ def lint(text: str) -> list:
     return out
 
 
+# ---------------------------------------------------------------------------
+# CITATION MARKUP IN PROSE THAT IS ABOUT TO BE SPOKEN
+# ---------------------------------------------------------------------------
+# Every path that asks a model for prose tells it, in words: no markdown, no
+# URLs, no citations. That instruction is obeyed most of the time and it is not a
+# guarantee. Measured on grok-4.6 with web_search, same question and same
+# instructions on two runs minutes apart:
+#
+#   run A   "[[1]](https://en.wikipedia.org/wiki/Pacific_Ocean_Park)[[2]](https://
+#            www.islands.com/1850660/los-angeles-area-ocean-park-...)Ocean Park..."
+#   run B   "Ocean Park in Santa Monica is known as a historic beach neighborhood"
+#
+# Four variants were tried to turn it off -- default, include=[], an exclude in
+# extra_body, and the old search_parameters (which answers 410, live search being
+# deprecated in favour of the Agent Tools API). None of them is the difference.
+# The contamination is NON-DETERMINISTIC, which is the worst case available: it
+# cannot be configured away and it cannot be tested away, because a run that comes
+# back clean proves nothing about the next one.
+#
+# WHAT IT WOULD SOUND LIKE, which is why this is not a formatting concern. This
+# text goes to a voice. A driver would hear "bracket bracket one bracket bracket
+# open paren h t t p s colon slash slash e n dot wikipedia dot org slash wiki
+# slash Pacific underscore Ocean underscore Park" before the answer, at the moment
+# they asked a question with their eyes on the road.
+#
+# SO IT IS STRIPPED HERE, UNCONDITIONALLY, rather than asked for politely
+# upstream. The citation URLs are not lost: they come off the response's
+# `annotations` and go to the Sources card, which is where LICENSING.md section 4
+# says a citation belongs. What is removed is only the markup that leaked into the
+# words.
+_CITE_MD = re.compile(r"\[+\s*\d+\s*\]+\s*\((?:https?://)[^)\s]*\)")
+_CITE_BARE = re.compile(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]")
+_BARE_URL = re.compile(r"https?://\S+")
+
+
+def strip_citation_markup(text: str) -> str:
+    """Prose with any citation markup removed, for something about to say it.
+
+    Ordered deliberately: the markdown form `[[1]](url)` is removed whole first,
+    because stripping bare `[1]` or the URL first would leave the other half
+    behind as `(https://...)` or `[[1]]()`. Then bare markers, then any raw URL
+    that survived on its own.
+    """
+    if not text:
+        return text
+    out = _CITE_MD.sub("", text)
+    out = _CITE_BARE.sub("", out)
+    out = _BARE_URL.sub("", out)
+    # Collapse the gaps the removals leave, and the space before punctuation that
+    # a stripped marker mid-sentence produces ("the pier [1], which" -> "the pier
+    # , which").
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"\(\s*\)", "", out)
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
 def speakable(text: str) -> bool:
     """May this be spoken as RIO, with no model between it and the driver?"""
     return not lint(text)

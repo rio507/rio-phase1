@@ -1,13 +1,23 @@
 import json
 
-from openai import OpenAI
-
 import config
+import llm_provider
 import router as request_router
 import vehicle_health
 from vision import get_observation
 
-client = OpenAI()
+# THROUGH THE ADAPTER, NOT A CLIENT OF ITS OWN.
+#
+# This module used to hold `client = OpenAI()` at import and read
+# config.OPENAI_CHAT_MODEL at the call. That made CHAT_VENDOR decorative: flipping
+# it changed what /health reported and not one thing about who answered a driver.
+# A switch that moves the label and not the traffic is worse than no switch, so
+# the client and the model both come from the role now.
+#
+# Resolved per call rather than cached at import, because config reads the
+# environment AT import and a module-level client would pin the vendor to
+# whatever was set when this file was first imported -- which is exactly the
+# staleness the role indirection exists to remove.
 
 history = [
     {
@@ -126,13 +136,22 @@ def generate_stream(user_text: str, route: dict = None):
 
     messages = history + [{"role": "user", "content": composed}]
 
-    stream = client.chat.completions.create(
-        model=config.OPENAI_CHAT_MODEL,
+    kw = {}
+    effort = llm_provider.reasoning_effort("chat")
+    if effort:
+        kw["reasoning_effort"] = effort
+    elif config.OPENAI_REASONING_EFFORT:
+        # The shipped behaviour, kept for the vendor that has always had it: this
+        # path has sent an effort since it was written. Only bypassed when the
+        # role's own effort is set, which is the newer and more specific answer.
+        kw["reasoning_effort"] = config.OPENAI_REASONING_EFFORT
+    stream = llm_provider.client("chat").chat.completions.create(
+        model=llm_provider.model_of("chat"),
         messages=messages,
         temperature=config.OPENAI_TEMPERATURE,
         max_completion_tokens=config.OPENAI_MAX_TOKENS,
-        reasoning_effort=config.OPENAI_REASONING_EFFORT,
         stream=True,
+        **kw,
     )
 
     full_reply = []

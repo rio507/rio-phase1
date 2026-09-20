@@ -78,32 +78,53 @@ def fresh(**env):
 
 
 def main():
-    section("the default is the stack that is running")
+    section("the default is xAI, and OpenAI is one env var away per role")
     c, lp = fresh(REASONING_VENDOR=None, NEWS_VENDOR=None, CHAT_VENDOR=None)
-    for role, want in (("reasoning", c.OPENAI_REASONING_MODEL),
-                       ("news", c.OPENAI_REASONING_MODEL),
-                       ("chat", c.OPENAI_CHAT_MODEL)):
-        ok(f"{role} still answers as {want}",
-           lp.vendor_of(role) == "openai" and lp.model_of(role) == want,
+    for role, want in (("reasoning", c.XAI_REASONING_MODEL),
+                       ("news", c.XAI_REASONING_MODEL),
+                       ("chat", c.XAI_CHAT_MODEL)):
+        ok(f"{role} answers as {want}",
+           lp.vendor_of(role) == "xai" and lp.model_of(role) == want,
            f"{lp.vendor_of(role)}/{lp.model_of(role)}")
-    ok("and no effort is sent, which is what this stack has always sent",
-       lp.reasoning_effort("reasoning") is None,
-       lp.reasoning_effort("reasoning"))
-    ok("OpenAI is recorded as enforcing max_output_tokens",
-       lp.capability("reasoning", "enforces_token_cap") is True)
-    ok("...and as not reporting its own cost, so the estimate is still needed",
-       lp.cost_usd("reasoning", None) is None
-       and lp.capability("reasoning", "reports_cost") is None)
+    ok("...and every one of them is a pinned version, not an alias",
+       all("latest" not in lp.model_of(r)
+           for r in ("reasoning", "news", "chat")))
 
-    section("one role moves without the others")
-    c, lp = fresh(REASONING_VENDOR="xai", NEWS_VENDOR=None, CHAT_VENDOR=None)
-    ok("reasoning is on xAI", lp.vendor_of("reasoning") == "xai")
-    ok(f"...as {c.XAI_REASONING_MODEL}, a pinned version and not an alias",
-       lp.model_of("reasoning") == c.XAI_REASONING_MODEL
-       and "latest" not in lp.model_of("reasoning"))
-    ok("news has NOT moved with it — that is stage 2, and it is measured "
-       "separately", lp.vendor_of("news") == "openai")
-    ok("nor has chat", lp.vendor_of("chat") == "openai")
+    # The effort per role, which is deliberately not one value.
+    ok(f"the reasoning roles think at {c.XAI_REASONING_EFFORT!r} — 17.8 s median "
+       "through the real path, against 31.7 s at the vendor default",
+       lp.reasoning_effort("reasoning") == c.XAI_REASONING_EFFORT
+       and lp.reasoning_effort("news") == c.XAI_REASONING_EFFORT)
+    ok(f"and chat at {c.XAI_CHAT_EFFORT!r}, because it runs BEFORE the answer: "
+       "585 ms against 3,179 for one more correct classification in fourteen",
+       lp.reasoning_effort("chat") == c.XAI_CHAT_EFFORT)
+    ok("...which is also what this path has always sent, so the flip changed the "
+       "vendor and not the behaviour",
+       c.XAI_CHAT_EFFORT == c.OPENAI_REASONING_EFFORT)
+
+    section("the rollback, which is the point of the switch being per role")
+    for role, env in (("reasoning", "REASONING_VENDOR"),
+                      ("news", "NEWS_VENDOR"), ("chat", "CHAT_VENDOR")):
+        _c, _lp = fresh(**{env: "openai"})
+        want = (_c.OPENAI_CHAT_MODEL if role == "chat"
+                else _c.OPENAI_REASONING_MODEL)
+        ok(f"{env}=openai puts {role} back on {want}",
+           _lp.vendor_of(role) == "openai" and _lp.model_of(role) == want,
+           f"{_lp.vendor_of(role)}/{_lp.model_of(role)}")
+        others = [r for r in ("reasoning", "news", "chat") if r != role]
+        ok(f"...and leaves {' and '.join(others)} on xAI — one role at a time is "
+           "the whole reason these are three switches and not one",
+           all(_lp.vendor_of(o) == "xai" for o in others))
+
+    _c, _lp = fresh(REASONING_VENDOR="openai")
+    ok("a rolled-back reasoning role gets no effort sent, which is what the "
+       "OpenAI path has always had",
+       _lp.reasoning_effort("reasoning") is None)
+    ok("and OpenAI is still recorded as enforcing max_output_tokens, so the "
+       "length bound is belt and braces there rather than the only belt",
+       _lp.capability("reasoning", "enforces_token_cap") is True)
+    ok("...and as not reporting its own cost, so the rate-table estimate is "
+       "still needed on that path", _lp.capability("reasoning", "reports_cost") is None)
 
     section("what the record says about xAI, measured rather than assumed")
     ok("max_output_tokens is recorded as NOT enforced (asked 200, got 849)",
@@ -133,9 +154,19 @@ def main():
     ok("a value this vendor does not take is dropped rather than sent — "
        "'medium' is on the text scale for OpenAI and not for xAI",
        lp2.reasoning_effort("reasoning") is None)
-    ok("...and the voice model's scale is NOT this scale: high|none there, "
-       "low|high here, which is why the check is against the vendor",
-       set(lp2.VENDORS["xai"]["reasoning_efforts"]) == {"low", "high"})
+    # THREE SCALES ON ONE VENDOR, which is why the check is against the endpoint
+    # and not merely against the vendor name. Measured: /v1/responses refuses
+    # "medium"; /v1/chat/completions accepts it; and the VOICE model's scale is
+    # high|none only (see static/rio_provider.js). A single per-vendor tuple --
+    # which is what this file asserted first -- would have dropped the router's
+    # "none" on the floor.
+    ok(set(lp2.VENDORS["xai"]["reasoning_efforts"]["responses"]) == {"low", "high"},
+       "the Responses API takes low|high")
+    ok("none" in lp2.VENDORS["xai"]["reasoning_efforts"]["chat"],
+       "chat/completions takes 'none' too — which the router depends on")
+    ok(lp2.ROLE_API["chat"] == "chat"
+       and lp2.ROLE_API["reasoning"] == "responses",
+       "...and each role is checked against the endpoint it actually speaks")
 
     section("a question nobody has answered raises")
     for bad in ("realtime", "voice", ""):

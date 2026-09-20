@@ -58,9 +58,38 @@ from rio_prompts import RIO_SYSTEM_PROMPT
 #
 # llm_provider.py is the only file that knows what these names mean. Nothing else
 # should read them; ask it for a client, a model or a capability instead.
-REASONING_VENDOR = os.getenv("REASONING_VENDOR", "openai")
-NEWS_VENDOR = os.getenv("NEWS_VENDOR", "openai")
-CHAT_VENDOR = os.getenv("CHAT_VENDOR", "openai")
+# FLIPPED TO xAI, 2026-09-20, on measurement rather than on preference. The
+# OpenAI paths are intact and one env var away each; they are simply not what
+# runs any more.
+#
+# WHAT WAS MEASURED BEFORE EACH FLIP, so a rollback is a decision and not a
+# retreat:
+#
+#   reasoning  grok-4.6 effort=low, through realtime.escalate with web_search:
+#              17.8 s median against gpt-5.6-sol's 4.8 s. 3.7x SLOWER, and the
+#              reason is not speed -- grok ran 2-4 searches where gpt ran 0-1.
+#              Still inside the "ten to twenty-five seconds" the session
+#              instructions put in her mouth, with seconds to spare rather than
+#              room. This is the role where the flip costs something real.
+#   news       $0.141 for a local-news question against $0.252 estimated on the
+#              old stack -- but an earlier run of the same shape cost $0.512, so
+#              the spread WITHIN the vendor is larger than the gap between
+#              vendors and no saving is claimed. NEWS_MAX_SEARCHES_PER_QUESTION
+#              bounds the runaway that made the difference.
+#   chat       grok-4.3 effort=none on the router's own classifier prompt, 14
+#              utterances: 13/14 correct at 585 ms p50, against gpt-5.5's 13/14
+#              at 913 ms. Same accuracy on this corpus, different single
+#              mistakes, 36% faster. n=14 is too small to separate them on
+#              accuracy and is quite large enough to separate them on latency.
+#
+# AND WHAT HAD TO BE FIXED FIRST, because the switch would otherwise have been
+# decorative: llm_interface.py and router.py each built their own OpenAI client
+# and read config.OPENAI_CHAT_MODEL, so CHAT_VENDOR moved a label and no traffic.
+# /health, the realtime session status and /news_spend all reported the OpenAI
+# constants regardless of who was answering. All five now go through the role.
+REASONING_VENDOR = os.getenv("REASONING_VENDOR", "xai")
+NEWS_VENDOR = os.getenv("NEWS_VENDOR", "xai")
+CHAT_VENDOR = os.getenv("CHAT_VENDOR", "xai")
 
 # --- xAI's side of each role ------------------------------------------------
 # Pinned versioned names, not aliases, for the same reason the realtime model is
@@ -141,6 +170,25 @@ XAI_STT_SESSION_MODEL = os.getenv("XAI_STT_SESSION_MODEL", "grok-transcribe")
 # llm_provider.reasoning_effort checks the value against the vendor before
 # sending it rather than trusting this constant.
 XAI_REASONING_EFFORT = os.getenv("XAI_REASONING_EFFORT", "low")
+
+# ...AND THE CHAT ROLE GETS ITS OWN, WHICH IS "none".
+#
+# Not a tidiness split. The conversation and router paths have sent
+# OPENAI_REASONING_EFFORT = "none" since they were written, and folding them onto
+# the reasoning role's "low" was a silent behaviour change caught only by printing
+# what the flip resolved to: /talk and the classifier would both have started
+# thinking harder than they were asked to.
+#
+# The number says the same thing. grok-4.3 on the router's own prompt:
+#
+#   effort none    585 ms p50   13/14 correct
+#   effort low   3,179 ms p50   14/14 correct
+#
+# One more correct answer out of fourteen for five and a half times the wait, on a
+# classifier that runs BEFORE the answer and therefore adds its latency to every
+# routed turn. The router already hardcodes "none" for exactly this reason; this is
+# the conversation path agreeing with it.
+XAI_CHAT_EFFORT = os.getenv("XAI_CHAT_EFFORT", "none")
 # Left empty for OpenAI: the shipped path sends no effort at all and its latency
 # was measured at 8.2 s, so there is nothing to fix and no reason to start
 # sending a parameter this stack has never sent.
@@ -199,7 +247,10 @@ def reasoning_effort_for(role: str):
     vendor = {"reasoning": REASONING_VENDOR, "news": NEWS_VENDOR,
               "chat": CHAT_VENDOR}.get(role, "openai")
     if vendor == "xai":
-        return XAI_REASONING_EFFORT
+        return XAI_CHAT_EFFORT if role == "chat" else XAI_REASONING_EFFORT
+    if role == "chat":
+        # What this path has always sent.
+        return OPENAI_REASONING_EFFORT
     return OPENAI_REASONING_EFFORT_DEEP if role == "reasoning" else ""
 
 

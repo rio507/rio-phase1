@@ -486,14 +486,22 @@ Reply with ONLY this JSON:
 def _classify_with_model(question: str, has_referent: bool):
     """One small call, only when the rules were not sure. None on any failure."""
     try:
-        from openai import OpenAI
+        import llm_provider
 
-        client = OpenAI()
         prompt = _CLASSIFIER_PROMPT.format(
             referent_state=("exists (they may be continuing about it)"
                             if has_referent else "does not exist"))
-        r = client.chat.completions.create(
-            model=config.OPENAI_CHAT_MODEL,
+        # THE CHAT ROLE, through the adapter. This classifier runs BEFORE the
+        # answer, so its latency is on every routed turn -- which is why it sends
+        # effort "none" and why that value being accepted was checked per endpoint
+        # rather than assumed (see llm_provider.ROLE_API: one vendor refuses
+        # "medium" on /v1/responses and accepts it on /v1/chat/completions).
+        #
+        # Measured head to head on this prompt, 14 utterances: gpt-5.5 13/14 at
+        # 913 ms p50, grok-4.3 13/14 at 585 ms p50, both at effort "none". Same
+        # accuracy on this corpus, different single mistakes, and 36% faster.
+        r = llm_provider.client("chat").chat.completions.create(
+            model=llm_provider.model_of("chat"),
             messages=[{"role": "system", "content": prompt},
                       {"role": "user", "content": question}],
             max_completion_tokens=80,

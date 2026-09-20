@@ -811,6 +811,14 @@ class _Result:
                               else output_tokens),
             "output_tokens_details": type("O", (), {
                 "reasoning_tokens": reasoning_tokens})(),
+            # BOTH VENDORS' WAY OF REPORTING A SEARCH, because this fake stands in
+            # for whichever one is configured and the code asks the provider which
+            # to read. One vendor counts web_search_call items in `output`; the
+            # other puts the number here. A fake that modelled only the first
+            # reported zero searches the moment the default moved, and the
+            # assertions that check the log line went red for a reason that had
+            # nothing to do with the log line.
+            "num_server_side_tools_used": searches,
         })()
         self.output = [type("I", (), {"type": "web_search_call"})()
                        for _ in range(searches)]
@@ -848,10 +856,18 @@ def run_failure():
         r = realtime.escalate("why", context="driver asked about the route")
         ok(r["ok"] and r["answer"] == "Because the map says so.",
            "a good answer comes back as text for RIO to speak")
-        ok(r["model"] == config.OPENAI_REASONING_MODEL,
-           "recorded against the model that produced it")
+        # THE ROLE, NOT A VENDOR'S CONSTANT. These named
+        # config.OPENAI_REASONING_MODEL, which pinned the test to one vendor and
+        # went red the moment the default moved -- while the thing being checked
+        # (the result records what answered, and what was asked is what was
+        # configured) is true on either.
+        want_model = llm_provider.model_of("reasoning")
+        ok(r["model"] == want_model,
+           f"recorded against the model that produced it ({want_model})")
+        ok(r.get("vendor") == llm_provider.vendor_of("reasoning"),
+           "...and against the vendor, so a drive log says who answered")
         sent = fake.responses.calls[-1]
-        ok(sent["model"] == config.OPENAI_REASONING_MODEL,
+        ok(sent["model"] == want_model,
            "the reasoning model is the one asked")
         ok("driver asked about the route" in sent["input"],
            "and the conversation context goes with the question")
@@ -1037,6 +1053,15 @@ def run_firewall():
     # sort of thing that should have to justify itself here.
     ok(live_imports <= {"json", "os", "re", "threading", "time", "typing",
                         "openai", "config", "llm_provider", "visual_qa", "router",
+                        # `persona` is a lint and two regexes over strings. It
+                        # holds no state, reaches no policy and cannot make a
+                        # sound. It is imported for strip_citation_markup, which
+                        # removes citation markup from prose that is ABOUT TO BE
+                        # SPOKEN -- measured leaking out of a model that had been
+                        # told not to produce it, intermittently, on the same
+                        # question. A driver would otherwise hear a URL read out
+                        # character by character.
+                        "persona",
                         "vehicle_health", "places", "observer",
                         # Both are read-side context sources reached only by a
                         # tool call, exactly as `places` is.
@@ -1150,8 +1175,14 @@ def run_endpoints():
 
     st = realtime.status()
     ok(st["model"] == config.OPENAI_REALTIME_MODEL and
-       st["reasoning_model"] == config.OPENAI_REASONING_MODEL,
-       "status() reports both model ids without calling anything")
+       st["reasoning_model"] == llm_provider.model_of("reasoning"),
+       "status() reports both model ids without calling anything — the realtime "
+       "one from config (that backend has not moved) and the reasoning one from "
+       "the role, which is the only way it can be right after a vendor switch")
+    ok(st.get("reasoning_vendor") == llm_provider.vendor_of("reasoning"),
+       f"...and says WHOSE it is ({st.get('reasoning_vendor')}), because two "
+       "vendors can offer a model with a similar name and a drive log cannot "
+       "guess")
 
 
 # ---------------------------------------------------------------------------

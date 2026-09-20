@@ -1307,7 +1307,15 @@ def _background(loc, cls, place_name, session_key) -> dict:
     searches = llm_provider.searches_of("news", r)
     cost, basis = _spend_of(r, searches)
     _charge(session_key, searches, cost)
-    text = (getattr(r, "output_text", "") or "").strip()
+    # Same sanitiser as deep_dive's prose, and for the same measured reason: this
+    # is the one path here that answers in prose rather than in fields, so it is
+    # the one that can carry citation markup into something that will be spoken.
+    # The URLs are not lost -- citations_of_response reads them off the
+    # annotations, which is where the Sources card gets them.
+    import persona
+
+    text = persona.strip_citation_markup(
+        (getattr(r, "output_text", "") or "").strip())
     if not text:
         return {"ok": False, "note": "empty_background", "classified": cls,
                 "rules": ("You could not look that up. Say so plainly and do "
@@ -1404,6 +1412,13 @@ def citations_of_response(resp) -> list:
                     title = ""
                 elif title.startswith(("http://", "https://")):
                     title = ""
+                elif title.strip().strip("[]").isdigit():
+                    # A MARKER INDEX IS NOT A HEADLINE EITHER. Measured on
+                    # grok-4.6: `title` came back as "1" and "2" -- the inline
+                    # citation's own numbering. Rendering that as a headline would
+                    # put "1" above a link in the Sources card, which is worse
+                    # than blank because it looks like content.
+                    title = ""
                 out.append({
                     "source": _host_of(url), "headline": title, "url": url,
                     "published": None, "age_h": None, "where": None,
@@ -1448,7 +1463,11 @@ def status() -> dict:
         spend = {k: dict(v) for k, v in _spend.items()}
     return {
         "enabled": bool(config.NEWS_ENABLED),
-        "model": config.NEWS_MODEL,
+        # config.NEWS_MODEL is the OpenAI constant and is no longer what this
+        # module calls; _model() resolves the role. Reporting the constant after
+        # a vendor switch would have made /news_spend name a model nobody asked.
+        "model": _model(),
+        "vendor": __import__("llm_provider").vendor_of("news"),
         "max_queries_per_question": config.NEWS_MAX_QUERIES_PER_QUESTION,
         "max_searches_per_drive": config.NEWS_MAX_SEARCHES_PER_DRIVE,
         "min_geo_match": config.NEWS_MIN_GEO_MATCH,

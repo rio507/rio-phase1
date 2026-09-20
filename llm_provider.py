@@ -126,7 +126,10 @@ VENDORS = {
         # static/rio_provider.js. Two different scales on one vendor is exactly
         # the sort of thing a capability record exists to stop being folded into
         # one constant.
-        "reasoning_efforts": ("none", "low", "medium", "high", "xhigh"),
+        "reasoning_efforts": {
+            "responses": ("none", "low", "medium", "high", "xhigh"),
+            "chat": ("none", "low", "medium", "high", "xhigh"),
+        },
         # How a server-side search shows up in the response.
         "search_count": "output_items",     # count web_search_call items
     },
@@ -138,7 +141,11 @@ VENDORS = {
         "enforces_token_cap": False,
         # usage.cost_in_usd_ticks, at this many USD per tick.
         "reports_cost": ("cost_in_usd_ticks", 1e-10),
-        "reasoning_efforts": ("low", "high"),
+        # MEASURED PER ENDPOINT, because they disagree. See ROLE_API.
+        "reasoning_efforts": {
+            "responses": ("low", "high"),
+            "chat": ("none", "low", "medium", "high"),
+        },
         # usage.num_server_side_tools_used.
         #
         # NOT because the output items are missing -- and a commit message of
@@ -163,6 +170,22 @@ ROLE_VENDOR = {
     "reasoning": config.REASONING_VENDOR,
     "news": config.NEWS_VENDOR,
     "chat": config.CHAT_VENDOR,
+}
+
+# WHICH API EACH ROLE SPEAKS, and it matters for exactly one thing: the set of
+# reasoning-effort values that will not 400. Measured, same vendor, same day:
+#
+#   /v1/responses         "medium" is REFUSED  (low, high accepted)
+#   /v1/chat/completions  "none", "low", "medium", "high" ALL accepted
+#
+# One vendor, two endpoints, two answers. The first version of this file recorded
+# `reasoning_efforts: ("low", "high")` from the Responses observation alone, which
+# would have silently dropped the router's `effort=none` -- the value it has always
+# sent and the one worth 585 ms against 3,179.
+ROLE_API = {
+    "reasoning": "responses",
+    "news": "responses",
+    "chat": "chat",
 }
 
 ROLE_MODEL = {
@@ -266,7 +289,7 @@ def reasoning_effort(role: str) -> Optional[str]:
     want = config.reasoning_effort_for(role)
     if not want:
         return None
-    allowed = VENDORS[vendor_of(role)]["reasoning_efforts"]
+    allowed = VENDORS[vendor_of(role)]["reasoning_efforts"][ROLE_API[role]]
     if want not in allowed:
         print(f"[llm] {vendor_of(role)} does not take reasoning effort "
               f"{want!r} (has {allowed}); sending none", flush=True)

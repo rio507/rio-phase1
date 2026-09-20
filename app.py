@@ -30,6 +30,7 @@ import contextvars
 
 import gpu_health
 import config
+import llm_provider
 import voice
 import llm_interface
 import vision
@@ -409,19 +410,27 @@ def health():
             #
             # Cheap for the same reason the checks above are: every value is
             # a module constant or a config attribute already in memory.
+            # ASKED OF THE ROLE, NOT READ OFF A VENDOR'S CONSTANT. These used to
+            # name config.OPENAI_* directly, which meant /health reported OpenAI
+            # for every role no matter which vendor was actually answering -- and
+            # a health endpoint that lies about that is worse than one that omits
+            # it, because it is the first thing anybody checks after a switch.
             "models": {
                 "vision": vision.MODEL_ID,
-                "chat": config.OPENAI_CHAT_MODEL,
-                "reasoning": config.OPENAI_REASONING_MODEL,
+                "chat": llm_provider.model_of("chat"),
+                "reasoning": llm_provider.model_of("reasoning"),
+                "news": llm_provider.model_of("news"),
                 "realtime": config.OPENAI_REALTIME_MODEL,
                 "stt": config.OPENAI_STT_MODEL,
-                # Which of the two above is answering the driver right now
-                # depends on the voice backend, and the panel should not have
-                # to work that out from a string comparison of its own.
                 "dialogue": (config.OPENAI_REALTIME_MODEL
                              if config.VOICE_BACKEND == "openai_realtime"
-                             else config.OPENAI_CHAT_MODEL),
+                             else llm_provider.model_of("chat")),
             },
+            # AND WHO IS ANSWERING EACH ROLE, which is the question the block
+            # above cannot answer on its own: two roles can share a model name
+            # and sit on different vendors, and a drive log needs to know.
+            "vendors": {r: llm_provider.describe(r)
+                        for r in ("reasoning", "news", "chat")},
             # WHICH DETECTOR THIS PROCESS IS ACTUALLY RUNNING. Not a health
             # question -- eager is a perfectly good answer and is the one the
             # car has been driven on -- but it IS the first thing to ask when a
