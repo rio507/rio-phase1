@@ -508,6 +508,28 @@
       return out;
     }
 
+    /* MUST `look` BE PRECEDED BY A SPOKEN LINE ON THIS PROVIDER?
+     *
+     * Derived from transcriptionItemId rather than listed, because it is the
+     * same fact wearing different clothes. Two things independently stop a late
+     * transcript superseding the turn it belongs to, and only one needs to hold:
+     * the transcript carries the id of the utterance it is for (free, silent),
+     * or she is already audible when it lands (costs a filler line in front of a
+     * four-millisecond answer).
+     *
+     * UNKNOWN COUNTS AS NEEDED. `=== true` and not truthiness: UNKNOWN is a
+     * non-empty string and would pass a loose test, which is the exact way this
+     * record was built not to be read. A backend nobody has measured gets the
+     * line, because a filler line is forgiven and a silent visual turn is the
+     * fault that took two drives to find.
+     *
+     * config.look_holding_line_required() is the server's copy -- it composes
+     * the instruction, so it has to know -- and tools/realtime_selftest.py reads
+     * THIS file to assert the two agree. */
+    function needsLookHoldingLine() {
+      return caps.transcriptionItemId !== true;
+    }
+
     /* MAY THE MOUTH WAIT FOR THE SOUND TO STOP?
      *
      * The question the controller used to answer with a hardcoded `true` and a
@@ -570,6 +592,7 @@
         return out;
       },
       holdTail: holdTail,
+      needsLookHoldingLine: needsLookHoldingLine,
       probes: probes,
       blockedPaths: blockedPaths,
       unknown: function (key) { return isUnknown(caps[key]); },

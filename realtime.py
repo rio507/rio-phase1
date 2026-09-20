@@ -589,6 +589,37 @@ REROUTE_SCHEMA = {
 #   it. The rare slow look — cropping the frame for one particular thing —
 #   takes a couple of seconds, and that silence is what a passenger does when
 #   they turn their head to look. Silence is a tone here, not a gap to fill.
+# --- the one paragraph that depends on the backend ---------------------------
+# Whether `look` is called in silence or with a line in front of it is not a
+# style choice; it is what stands in for an item_id when the transcript cannot
+# be bound to the turn it belongs to. config.look_holding_line_required() owns
+# the decision and says why at length. Both texts live here, next to each other,
+# so the difference is a thing you can read rather than a diff you have to
+# reconstruct.
+
+LOOK_ONSET_SILENT = """CALL IT FIRST AND SAY NOTHING IN FRONT OF IT. Not "let me look", not "one
+second" — call look, wait, then answer. Every word in front of the call is a
+word the driver waits through."""
+
+LOOK_ONSET_SPOKEN = """SAY ONE SHORT THING, THEN CALL IT — in that order, in the same breath. Four
+or five words that are TRUE about looking: "let me have a look", "hang on,
+looking". Never "one second", because it is not one second, and never anything
+about tools or cameras or systems.
+
+THE ORDER IS THE WHOLE POINT. The words come first and the call comes after
+them, in the same reply. A line that arrives after the call is worse than no
+line at all.
+
+Then answer in one or two sentences as you always would. Do not announce that
+you looked, do not narrate the wait, and do not apologise for it."""
+
+
+def look_onset(backend: str = None) -> str:
+    """The `look` paragraph for this backend."""
+    return (LOOK_ONSET_SPOKEN if config.look_holding_line_required(backend)
+            else LOOK_ONSET_SILENT)
+
+
 LIVE_ADDENDUM = """
 YOU ARE LIVE, IN A MOVING CAR.
 
@@ -667,9 +698,7 @@ TWO TIERS, AND THE FIRST ONE IS ALWAYS SHORT.
 The first answer to anything you can see is the camera's, in one or two
 sentences. "What's that building?" — say what it is. That is the whole answer.
 
-CALL IT FIRST AND SAY NOTHING IN FRONT OF IT. Not "let me look", not "one
-second" — call look, wait, then answer. Every word in front of the call is a
-word the driver waits through.
+%LOOK_ONSET%
 
 THEN OFFER, DON'T DELIVER. When the thing is worth more — a landmark, a named
 building, something unusual — add one short clause: "want to know more about
@@ -1253,7 +1282,8 @@ def instructions() -> str:
     instruction and the enforcement being two expressions of one list is what
     stops them drifting.
     """
-    parts = [rio_prompts.live_prompt(), LIVE_ADDENDUM.strip(),
+    parts = [rio_prompts.live_prompt(),
+             LIVE_ADDENDUM.strip().replace("%LOOK_ONSET%", look_onset()),
              TEACHER_ADDENDUM.strip()]
     if config.VOICE_BACKEND == "elevenlabs":
         tags = voice_tags.instruction()

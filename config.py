@@ -1138,6 +1138,74 @@ OPENAI_REASONING_EFFORT = "none"
 #                      turn-taking and prosody belong to the voice layer, tool
 #                      discipline and brevity to the backend. See live.py.
 VOICE_BACKEND = os.getenv("VOICE_BACKEND", "openai_realtime")
+
+
+# ---------------------------------------------------------------------------
+# DOES `look` NEED A HOLDING LINE IN FRONT OF IT?
+# ---------------------------------------------------------------------------
+# It does NOT, on a backend where the driver's transcript can be bound to the
+# response already answering it -- which is what item_id is for, and what the
+# whole of commit ee0a909 is about. It DOES on a backend where it cannot.
+#
+# WHY THE TWO ARE THE SAME QUESTION. The bug is a long tool call with NOTHING
+# SAID OVER IT: the transcription loses its race with the model, arrives ~86 ms
+# after the tool call looking like a brand new question, and supersedes the turn
+# it belongs to -- cancelling the look(), discarding the result, leaving the
+# driver in silence. It reproduced 3 of 3 on visual turns and never on deep_dive.
+#
+# Two things independently prevent it, and only one of them needs to be true:
+#
+#   IDENTITY   the transcript carries the item_id its utterance was committed
+#              under, so `selfAnswered` recognises it as the question already
+#              being answered. Free, silent, and what the shipped stack has.
+#   A VOICE    she is already audible when the transcript lands, so
+#              supersedeGate's `silentSoFar` is false and a supersede needs a
+#              CONFIRMED BARGE, which a question that finished speaking a moment
+#              ago cannot produce. This is why deep_dive was never affected: its
+#              holding line is spoken in the same response, BEFORE the function
+#              call goes out, so audio is already flowing when the tool is asked
+#              for. A line started after the call would be far too late -- first
+#              audio on a dictated line was measured at 418-1277 ms against an
+#              86 ms race.
+#
+# WHAT IT COSTS, WHICH IS WHY IT IS NOT SIMPLY ALWAYS ON. Most looks are
+# answered from an observation written a moment ago, in about FOUR MILLISECONDS.
+# A holding line in front of that is a sentence the driver waits through to be
+# told something that was already known before she started talking -- and the
+# line above this one in realtime.py's instructions says exactly that, at
+# length, as a deliberate design decision. Turning it on everywhere would undo
+# it everywhere to fix a turn shape that only some backends have.
+#
+# UNKNOWN COUNTS AS "NEEDED". A filler line is a thing a driver notices and
+# forgives; a visual question that goes silent is the fault that took two drives
+# to find. So a backend nobody has measured gets the line.
+#
+# The browser holds the same fact in static/rio_provider.js, derived from its
+# capability record, and tools/realtime_selftest.py asserts the two agree by
+# reading that file -- one source of truth, checked rather than trusted.
+LOOK_HOLDING_LINE_BY_BACKEND = {
+    # gpt-realtime: .completed carries item_id and the binding is in service.
+    "openai_realtime": False,
+    # Same event stream, text mode. Same answer.
+    "elevenlabs": False,
+    # gpt-live-1 has no supersede at all -- rio_live.js drops it, because there
+    # is no response to supersede on a full-duplex model. Nothing to protect.
+    "gpt_live": False,
+    # xAI: UNKNOWN. tools/xai_transcription_probe.py could not answer it (the
+    # voice models are not licensed to this team), so this is the fail-closed
+    # answer and not a finding. The probe flips it the day voice is licensed.
+    "xai_voice": True,
+}
+
+
+def look_holding_line_required(backend: str = None) -> bool:
+    """True when `look` must be preceded by a spoken line.
+
+    Unknown backends get True: see the block above. A backend this file has
+    never heard of is precisely the case where nobody has measured the binding.
+    """
+    b = VOICE_BACKEND if backend is None else backend
+    return bool(LOOK_HOLDING_LINE_BY_BACKEND.get(b, True))
 # "realtime" was what this setting called the live voice before ElevenLabs came
 # back. Old .env files and old shell exports still say it, and a car that comes
 # up mute because a value was renamed is a bad trade for a tidier vocabulary.

@@ -298,8 +298,17 @@ def run_text_session():
     flat = re.sub(r"\s+", " ", instr)
     ok(rio_prompts.live_prompt() in instr,
        "the bible is carried as the live session's assembly of it, whole")
-    ok(realtime.LIVE_ADDENDUM.strip() in instr,
-       "and the live addendum whole after it")
+    # WHOLE, WITH ONE PARAGRAPH SUBSTITUTED RATHER THAN APPENDED. The `look`
+    # onset paragraph depends on the backend (see look_onset), so the addendum
+    # carries a placeholder and instructions() fills it. Asserted as "the
+    # addendum with its placeholder resolved", which is the same claim this check
+    # has always made -- that nothing is truncated on the way through -- and not
+    # a weakening of it: a missing substitution or a lost half would still fail.
+    ok(realtime.LIVE_ADDENDUM.strip().replace(
+           "%LOOK_ONSET%", realtime.look_onset()) in instr,
+       "and the live addendum whole after it, with the look paragraph resolved")
+    ok("%LOOK_ONSET%" not in instr,
+       "...and no placeholder reaches the model")
 
     # WHAT THE LIVE ASSEMBLY DROPS, AND WHY IT IS NOT A SUMMARY.
     #
@@ -660,6 +669,58 @@ def run_config():
     src = inspect.getsource(realtime)
     ok("gpt-realtime" not in src and "gpt-5" not in src,
        "and no model id is hardcoded in realtime.py")
+
+    # ---- the holding line in front of `look`, and the two files that decide it
+    #
+    # It exists to stand in for an item_id. The transcription races the model and
+    # loses on a tool turn; if the transcript cannot be recognised as the
+    # question already being answered, the only other thing that stops it
+    # superseding the turn is her being audible when it lands. That is why
+    # deep_dive was never affected and every visual turn was.
+    #
+    # The cost is a filler line in front of an answer that is usually ready in
+    # four milliseconds, so it is ON only where it is needed -- and "needed" is
+    # read off the capability record rather than decided twice.
+    ok(config.look_holding_line_required("openai_realtime") is False,
+       "the shipped backend calls look in silence — its transcripts carry the "
+       "item_id, so the binding does the job for free")
+    ok(config.look_holding_line_required("xai_voice") is True,
+       "a backend whose transcript binding is UNKNOWN gets the line: a filler "
+       "line is forgiven, a silent visual turn took two drives to find")
+    ok(config.look_holding_line_required("a_backend_from_the_future") is True,
+       "...and so does one nobody has heard of — unknown counts as needed")
+
+    silent = realtime.look_onset("openai_realtime")
+    spoken = realtime.look_onset("xai_voice")
+    ok("SAY NOTHING IN FRONT OF IT" in silent and "SAY ONE SHORT THING" not in silent,
+       "the silent variant is what the shipped stack is told")
+    ok("SAY ONE SHORT THING" in spoken and "THE ORDER IS THE WHOLE POINT" in spoken,
+       "and the spoken variant insists the words come BEFORE the call — a line "
+       "after it is too late by 300-1200 ms against an 86 ms race")
+    ok("one second" in spoken.lower(),
+       "...and still forbids 'one second', which deep_dive learned the hard way")
+    ok("%LOOK_ONSET%" not in realtime.instructions(),
+       "the placeholder is substituted, not shipped to the model")
+
+    # ONE SOURCE OF TRUTH, CHECKED. The browser derives the same fact from its
+    # capability record; this reads that file rather than trusting it to agree.
+    js = open(os.path.join(REPO, "static", "rio_provider.js")).read()
+    ok("function needsLookHoldingLine()" in js
+       and "caps.transcriptionItemId !== true" in js,
+       "the browser derives it from transcriptionItemId rather than keeping a "
+       "second list to drift from")
+    ok("!== true" in js and "!= true" not in js.replace("!== true", ""),
+       "...with an identity test, because UNKNOWN is a non-empty string and "
+       "would pass a truthy one — which is the way this record was built not "
+       "to be read")
+    for backend, want in (("openai_realtime", False), ("xai_voice", True)):
+        prof = "openai_realtime" if backend == "openai_realtime" else "xai_voice"
+        i = js.index('"%s": {' % prof) if ('"%s": {' % prof) in js else js.index("%s: {" % prof)
+        blob = js[i:i + 6000]
+        unknown_here = "transcriptionItemId: UNKNOWN" in blob
+        ok(unknown_here == want,
+           f"config and the browser agree about {backend}: "
+           f"{'the id is unmeasured, so the line is on' if want else 'the id is known, so it is off'}")
 
 
 # ---------------------------------------------------------------------------
