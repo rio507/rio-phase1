@@ -269,6 +269,21 @@ def _loop(key, state):
                 state["errors"] += 1
                 if state["errors"] in (1, 10, 100):
                     print(f"[observer] {key}: {type(e).__name__}: {e}", flush=True)
+                    # ...AND THE TRACEBACK, ON THE FIRST ONE.
+                    #
+                    # "AssertionError: " is a real line this printed, with an
+                    # empty message, from inside a compiled generate several
+                    # layers below anything in this file. One line of type and
+                    # message is enough to know the observer is failing and
+                    # useless for knowing why -- which is the same lesson
+                    # app.py's warm handler already carries, for the same
+                    # reason. Once, not every second: a GPU that is out of
+                    # memory would otherwise fill the log with identical stacks.
+                    if state["errors"] == 1:
+                        import traceback
+                        traceback.print_exc()
+                        import sys as _sys
+                        _sys.stdout.flush()
         # Idle: nobody has asked to see anything for a while. Stop rather than
         # hold the GPU for a conversation that has moved on to the route.
         if (time.time() - state["last_used"]) > config.OBSERVER_IDLE_S:

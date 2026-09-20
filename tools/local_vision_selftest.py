@@ -112,8 +112,13 @@ def main() -> int:
        v_q.TEACHER_PROMPT == rp_q.OBSERVER_PROMPT)
     fresh("cosmos")
     import vision as v_c
-    ok("...and cosmos gets the sensor prompt",
-       v_c.TEACHER_PROMPT == __import__("rio_prompts").SENSOR_PROMPT)
+    _rp = __import__("rio_prompts")
+    # EITHER sensor variant is correct here; which one is a latency decision
+    # (config.LOCAL_VISION_SENSOR_PROMPT, asserted in its own section below).
+    # What this check is about is that the ROLE picks a sensor prompt at all.
+    ok("...and cosmos gets a sensor prompt, not hers",
+       v_c.TEACHER_PROMPT in (_rp.SENSOR_PROMPT, _rp.SENSOR_PROMPT_TERSE),
+       "terse" if v_c.TEACHER_PROMPT == _rp.SENSOR_PROMPT_TERSE else "full")
     ok("...so one env var moves both", v_q.TEACHER_PROMPT != v_c.TEACHER_PROMPT)
 
     # -----------------------------------------------------------------------
@@ -230,6 +235,28 @@ def main() -> int:
     grad.putdata([(x % 256, (x // 3) % 256, 200) for x in range(640 * 360)])
     ok("...while a frame with structure in it does not",
        vis.frame_structure(grad) > 8.0, f"{vis.frame_structure(grad):.2f}")
+    # -- the generation policy, which is what made the cadence -------------
+    fresh("cosmos")
+    import vision as vis2
+    kw = vis2._generate_kwargs()
+    ok("the reading is capped at the measured budget, not at a trace's",
+       kw["max_new_tokens"] == 48, str(kw["max_new_tokens"]))
+    ok("...with the repetition penalty that removed the decoding loop",
+       kw.get("repetition_penalty") == 1.05, str(kw.get("repetition_penalty")))
+    ok("...and NOT the compiled static cache, which broke the live observer",
+       "cache_implementation" not in kw, str(kw))
+    ok("warm() makes the same call the observer will, so no compile or "
+       "allocation lands on a drive's first frame",
+       "_generate_kwargs()" in (REPO / "vision.py").read_text()
+       .split("def warm(")[1][:2000])
+    import rio_prompts as rp3
+    ok("the sensor prompt is the terse one by default",
+       vis2.TEACHER_PROMPT == rp3.SENSOR_PROMPT_TERSE)
+    ok("...which names all three fields and carries no example reading",
+       all(f in rp3.SENSOR_PROMPT_TERSE for f in ("ROAD:", "TRAFFIC:", "RISK:")))
+    ok("...and no angle-bracket placeholder, which the model copied verbatim",
+       "<" not in rp3.SENSOR_PROMPT_TERSE.replace("<br>", ""))
+
     _vsrc = (REPO / "vision.py").read_text()
     ok("the gate runs BEFORE the forward pass, not after the answer",
        _vsrc.index("structure < config.LOCAL_VISION_BLANK_STD")
@@ -246,6 +273,27 @@ def main() -> int:
     loop = " ".join(["The sedan is also further away from the ego vehicle."] * 5)
     ok("...and a decoding loop",
        canned.describe(loop, 0).get("loop", 0) >= canned.LOOP_FLOOR)
+    # THE TWO LOOPS THAT GOT THROUGH, both measured on real readings.
+    #
+    # A repeated WORD: loop_run splits on sentence boundaries, so 203 consecutive
+    # "interstate" with no full stop was one sentence and scored clean. It was
+    # also the worst reading of the run at 5721 ms.
+    interstate = "ROAD: three lanes, asphalt, " + "interstate " * 203
+    ok("...a word repeated to the token ceiling (the 5721 ms reading)",
+       canned.describe(interstate, 0).get("word_loop", 0)
+       >= canned.WORD_LOOP_FLOOR,
+       f"run={canned.word_loop_run(interstate)}")
+    # ...and a repeated piece with NO WHITESPACE, which str.split() sees as one
+    # word. The terse sensor format's own separator is a bar, so the bar became
+    # the loop's unit.
+    bars = "ROAD: two|three|curb|curb|curb|curb|curb|curb|curb|"
+    ok("...and a loop on the format's own separator, with no spaces in it",
+       canned.describe(bars, 0).get("word_loop", 0) >= canned.WORD_LOOP_FLOOR,
+       f"run={canned.word_loop_run(bars)}")
+    for good in ("ROAD: five, two-way, asphalt | TRAFFIC: none | RISK: none",
+                 "the the road ahead", "very very very good"):
+        ok(f"...while real text is left alone ({good[:34]}…)",
+           not canned.describe(good, 0))
     ok("...and repetition is a HINT, reported apart from proof",
        canned.describe("ROAD: clear", 4).get("strength") == "weak")
 

@@ -129,6 +129,79 @@ Rules:
 - Numbers only if you can see them. Never estimate a speed or a distance in metres.
 - No reasoning trace. The answer only."""
 
+# THE SAME READING, SHORTER, BECAUSE LENGTH IS THE LATENCY.
+#
+# A reading is ~97% decode and decode is ~24 ms a token on this card, so the only
+# lever that moves the observer's cadence without changing the model is how much
+# it is asked to WRITE. SENSOR_PROMPT above produces 50 output tokens at p50 --
+# three fields of comfortable English -- which is 1.2 s of decode before anything
+# else, against a 1 Hz loop.
+#
+# This asks for the same three facts under a hard word budget. Nothing is dropped:
+# ROAD, TRAFFIC and RISK all survive, because RISK is the field the whole narrowed
+# job is about and a faster observer that stopped reporting risk would be a
+# regression dressed as a fix.
+#
+# What it gives up is the prose. "five lanes all going forward, asphalt, dashed
+# white lines dividing lanes, solid yellow line dividing opposite traffic" becomes
+# "5 lanes, asphalt, dry". The reading is evidence handed to grok, not a sentence
+# anybody hears, so the register costs nothing here -- which is exactly why this
+# trade is available on a sensor and was NOT available when the local model was
+# also the voice.
+# THE SHAPE IS THE BUDGET, AND IT MUST NOT BE COMPLETABLE.
+#
+# Two things were measured here and they pull against each other.
+#
+# A COMPACT ONE-LINE TEMPLATE is what makes the reading short: 30 output tokens
+# against 46 for the same three fields described in prose, which is 850 ms against
+# 1230 ms on this card. The model matches the shape it is shown.
+#
+# ...BUT A TEMPLATE WITH PLACEHOLDERS IN IT GETS COPIED. The first version used
+# `ROAD: <lanes, surface, light> | ...` and the live server produced:
+#
+#     ROAD: <four, asphalt, moderate>
+#     TRAFFIC: <white sedan ahead>
+#
+# angle brackets and all. A placeholder is the most completable thing in a prompt.
+#
+# So: the compact one-line shape is kept, and the slots are written as bare nouns
+# with no bracket, quote or capital-letter marker around them. Nothing in the
+# template looks like a blank to fill in, and there is no example reading anywhere
+# in it -- see the A/B in tools/vision_ab.py for what example readings do to this
+# model (a black frame came back as example one, verbatim).
+#
+# AND NOT ONE WORD OF EXAMPLE IN THE RULES EITHER, which cost a measurement to
+# learn. The terse fields first came back as "ROAD: five, four, asphalt" -- the
+# slot names answered positionally with numbers -- so a rule was added:
+#
+#     Answer each part in words, not as a bare number: "five lanes, asphalt,
+#     bright" and not "five, four, asphalt".
+#
+# The quoted good example had no field NAMES in it. The model copied it exactly:
+# field names disappeared from every reading (all-three-fields went 20/20 -> 0/20),
+# it started SHOUTING IN CAPS, p90 went 989 ms -> 2547 ms, and on two frames it
+# invented a list of car models ("VW Beetle, Hyundai Sonata, Toyota Camry, Honda
+# Accord, Kia Forte, Mazda MX-5 Miata") that is not in any frame.
+#
+# Three times in one afternoon, on two different models: an example in a prompt is
+# a thing that gets copied, whether it is four paired sentences, an angle-bracket
+# placeholder, or one quoted phrase inside a rule. "ROAD: five, four, asphalt" is
+# terse and a bit thin; it is also honest, and it keeps its field names.
+SENSOR_PROMPT_TERSE = """Report this frame as a sensor reading for another system. Not a sentence to a person.
+
+Exactly three fields, one line, separated by a vertical bar, at most six words each, in this order and with these names:
+
+ROAD: lanes, surface, light | TRAFFIC: vehicles that matter and where | RISK: what could bite in the next few seconds, or none seen
+
+Rules:
+- Replace each field's description with what you actually see. Keep the field names.
+- Write no angle brackets, no square brackets, no quotes around a field.
+- Only what is visible in this frame. No guessing.
+- If the frame cannot be read, write unreadable in each field. That is a valid reading.
+- If this is not a road, say what it actually is. Do not describe a road.
+- No advice, no instruction to a driver, no speed or distance in numbers unless you can read them in the frame.
+- No reasoning, no preamble. The three fields only."""
+
 # The same prompt with the paired examples appended, for the A/B. Kept as a
 # separate constant rather than a flag so that what was measured is readable.
 SENSOR_PROMPT_WITH_EXAMPLES = SENSOR_PROMPT + """

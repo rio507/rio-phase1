@@ -45,7 +45,8 @@ import torch
 from PIL import Image
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
-from rio_prompts import (OBSERVER_PROMPT, SENSOR_PROMPT, is_prompt_example,
+from rio_prompts import (OBSERVER_PROMPT, SENSOR_PROMPT,
+                         SENSOR_PROMPT_TERSE, is_prompt_example,
                          sensor_faults)
 from teachers import canned
 
@@ -55,8 +56,18 @@ MODEL_ID = config.local_vision_model_id()
 # moves the prompt with the weights -- a sensor prompt on Qwen would waste the
 # one thing Qwen is here for, and OBSERVER_PROMPT on Cosmos would ask an
 # instrument to have a voice.
+def _sensor_prompt():
+    """The reading's shape, which is also its latency. See
+    config.LOCAL_VISION_SENSOR_PROMPT: `terse` halves the output tokens and is
+    what holds the observer at 1 Hz; `full` is the comfortable-English version
+    and is 1.8x slower for the same three fields."""
+    if str(getattr(config, "LOCAL_VISION_SENSOR_PROMPT", "terse")) == "full":
+        return SENSOR_PROMPT
+    return SENSOR_PROMPT_TERSE
+
+
 TEACHER_PROMPT = (OBSERVER_PROMPT if config.local_vision_speaks_directly()
-                  else SENSOR_PROMPT)
+                  else _sensor_prompt())
 
 # The reasoning trace, if one comes back anyway. Cosmos-Reason2 thinks inside
 # these before answering; SENSOR_PROMPT asks it not to, and this is what makes
@@ -222,6 +233,31 @@ def _downscale(pil, max_side: int):
                       Image.BILINEAR)
 
 
+def _generate_kwargs() -> dict:
+    """Every argument the decode is run with, in ONE place.
+
+    HERE BECAUSE THE NUMBERS WERE MEASURED AND THE MEASUREMENT HAS TO BE THE
+    THING THAT SHIPS. warm() and observe() have to agree exactly: the static
+    cache pays a one-off compile on its first call at a given shape, and a warm
+    that used different arguments would move that cost onto the first frame of a
+    drive. See config.LOCAL_VISION_CACHE for what was measured and what it cost.
+    """
+    budget = int(config.LOCAL_VISION_MAX_TOKENS)
+    think = int(getattr(config, "LOCAL_VISION_THINK_BUDGET", 0) or 0)
+    if think > 0 and not config.local_vision_speaks_directly():
+        budget = max(budget, think)
+    kw = {"max_new_tokens": budget, "do_sample": False}
+    cache = str(getattr(config, "LOCAL_VISION_CACHE", "") or "").strip()
+    if cache and cache != "dynamic":
+        # 25.8 -> 8.1 ms/token, which is 97% of a reading. The whole fix.
+        kw["cache_implementation"] = cache
+    pen = float(getattr(config, "LOCAL_VISION_REPETITION_PENALTY", 1.0) or 1.0)
+    if pen and pen != 1.0:
+        # 1 decoding loop in 20 readings -> 0. See the config note.
+        kw["repetition_penalty"] = pen
+    return kw
+
+
 def frame_structure(pil) -> float:
     """How much is IN this picture. -> standard deviation of its luminance.
 
@@ -360,14 +396,7 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
         ).to(_model.device)
-        # THE BUDGET IS THE ROLE'S, not a literal. A reading is one line; a
-        # reasoning model that ignores "no trace" needs a ceiling that stops it
-        # rather than one that truncates the answer it was going to give after
-        # the trace. See config.LOCAL_VISION_THINK_BUDGET.
-        budget = int(config.LOCAL_VISION_MAX_TOKENS)
-        if not config.local_vision_speaks_directly():
-            budget = max(budget, int(config.LOCAL_VISION_THINK_BUDGET))
-        out = _model.generate(**inputs, max_new_tokens=budget, do_sample=False)
+        out = _model.generate(**inputs, **_generate_kwargs())
         raw = _processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
@@ -468,7 +497,21 @@ def warm() -> None:
                 msgs, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt",
             ).to(_model.device)
-            _model.generate(**inputs, max_new_tokens=1, do_sample=False)
+            # THE FULL BUDGET, WITH THE REAL ARGUMENTS, and not max_new_tokens=1.
+            #
+            # Whatever the observer's first call would pay, this pays instead.
+            # That mattered most while the static KV cache was on: it compiles
+            # for the shape it is first used at, MEASURED AT 36.8 s cold and
+            # 16.1 s warm, and a one-token warm-up left all of it on the first
+            # frame of a drive -- the one place in this system where 37 seconds
+            # is unsurvivable. The static cache is off now (see
+            # config.LOCAL_VISION_CACHE) and this is still the right shape: the
+            # warm-up makes the same call the observer will make, whatever that
+            # turns out to cost, which is why _generate_kwargs() exists.
+            t_gen = time.time()
+            _model.generate(**inputs, **_generate_kwargs())
+            print(f"[vision] warm generate {(time.time() - t_gen):.1f}s "
+                  f"({_generate_kwargs()})", flush=True)
         except Exception as e:
             print("[vision] warm inference skipped:", e)
 

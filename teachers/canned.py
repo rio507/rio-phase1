@@ -112,6 +112,51 @@ def loop_run(text: str) -> int:
     return best
 
 
+# A WORD repeated this many times in a row is a decoding loop too, and this is
+# the check that was missing. loop_run above splits on sentence boundaries, so it
+# scored the worst reading of the 2026-09-20 measurement as CLEAN:
+#
+#     "ROAD: three lanes in one direction, asphalt, solid yellow line dividing
+#      opposite lanes, interstate interstate interstate interstate ..."
+#
+# 216 words, 14 distinct, "interstate" x203, no full stop anywhere in it -- one
+# sentence as far as loop_run was concerned, and 5721 ms of a 1 Hz observer's
+# budget. Five is chosen well above anything English does on purpose; "very very
+# very" is three.
+WORD_LOOP_FLOOR = 5
+
+
+# What separates one piece of a reading from the next. Whitespace is not enough,
+# and that cost a second measurement: a reading in the terse sensor format came
+# back as
+#
+#     ROAD: two|three|curb|curb|curb|curb|curb|curb|curb|
+#
+# which `str.split()` sees as TWO words -- "ROAD:" and one 48-character word --
+# because the loop has no spaces in it. A model in a loop repeats whatever unit it
+# is emitting, and the unit is not always space-delimited; on a format whose own
+# separator is a bar, the bar is the unit. So the split is on the separators a
+# reading can actually contain.
+_PIECES = re.compile(r"[\s|,;:/]+")
+
+
+def word_loop_run(text: str) -> int:
+    """Longest run of one repeated piece. -> count (1 when nothing repeats).
+
+    The cheap half of loop detection and the half that catches a model that has
+    stopped producing sentences altogether. Deliberately case-sensitive: "the
+    the" from a real stutter is two, and a decoder in a loop emits the identical
+    unit tens or hundreds of times.
+    """
+    ws = [p for p in _PIECES.split(text or "") if p]
+    best = run = 1 if ws else 0
+    for i in range(1, len(ws)):
+        run = run + 1 if ws[i] == ws[i - 1] else 1
+        if run > best:
+            best = run
+    return best
+
+
 def looks_canned(text: str) -> bool:
     return bool(markers(text))
 
@@ -127,6 +172,12 @@ def describe(text: str, repeats: int = 0) -> dict:
     loop = loop_run(text)
     if loop >= LOOP_FLOOR:
         out["loop"] = loop
+    # ...and the same fault one level down, where a model has stopped emitting
+    # sentences at all. Reported under its own key so a corpus row says WHICH
+    # kind of loop it was.
+    wloop = word_loop_run(text)
+    if wloop >= WORD_LOOP_FLOOR:
+        out["word_loop"] = wloop
     if not out:
         return out
     # TWO STRENGTHS, AND THEY ARE NOT THE SAME CLAIM.
@@ -141,7 +192,12 @@ def describe(text: str, repeats: int = 0) -> dict:
     # small vocabulary of exactly that kind. Calling that "recited" would train
     # whoever reads this card to ignore the flag, which is the only way a flag
     # can fail.
-    out["strength"] = "strong" if (m or out.get("loop")) else "weak"
+    out["strength"] = ("strong" if (m or out.get("loop") or out.get("word_loop"))
+                       else "weak")
+    if out.get("word_loop") and not m and not out.get("loop"):
+        out["why"] = (f"one word repeats {out['word_loop']} times in a row — a "
+                      f"decoding loop, not a reading")
+        return out
     if out.get("loop") and not m:
         out["why"] = (f"one sentence repeats {out['loop']} times in a row "
                       f"inside this answer — a decoding loop, not analysis")

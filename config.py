@@ -2238,20 +2238,123 @@ def local_vision_speaks_directly() -> bool:
     return LOCAL_VISION_MODEL == "qwen"
 
 
-# HOW MANY TOKENS A READING MAY BE.
+# HOW MANY TOKENS A READING MAY BE — AND THE TAIL THIS NUMBER USED TO BE.
 #
-# Cosmos-Reason2 is a REASONING model: it thinks inside <think>...</think>
-# before answering, and the teacher service keeps that trace because for a
-# teacher the trace is the interesting part. Here it is pure latency on a call
-# that runs about once a second, so the prompt asks for no trace and the budget
-# is sized for the answer alone -- with the parser stripping a trace anyway if
-# one appears, because a prompt is a request and a guard is a rule.
-LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "60"))
+# Cosmos-Reason2 is a REASONING model: it thinks inside <think>...</think> before
+# answering, and the teacher service keeps that trace because for a teacher the
+# trace is the interesting part. Here it is pure latency on a call that runs
+# about once a second, so the prompt asks for no trace.
+#
+# MEASURED: IT DOES NOT PRODUCE ONE. Zero reasoning traces in 45 readings. So the
+# 220-token ceiling this used to carry -- room reserved for a trace that never
+# came -- bought nothing and cost the worst reading of the drive: a decoding loop
+# ("interstate" x203, 216 words, 14 distinct) ran to that ceiling and took
+# 5721 ms. The budget was the tail.
+#
+# 96 is sized on the answer: three fields, 50 output tokens at p50, and 1 of 20
+# frames truncated at 96 against 4 of 20 at 64. Below ~64 the RISK field starts
+# being cut off, which is the one field the narrowed job is about.
+LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "48"))
 
-# The ceiling that catches a runaway trace rather than truncating a reading. A
-# <think> block that opens and never closes inside this many tokens is a reading
-# that has failed, and failing fast is what keeps the observer at ~1 Hz.
-LOCAL_VISION_THINK_BUDGET = int(os.getenv("LOCAL_VISION_THINK_BUDGET", "220"))
+# WHICH SENSOR PROMPT, and this is the lever that actually made the cadence.
+#
+# "terse" asks for the same three fields under a six-word-per-field budget;
+# "full" is the comfortable-English version that shipped first. Measured on the
+# same twenty road frames, dynamic cache, rep 1.05:
+#
+#                    out tokens   p50       p90       max     all 3 fields
+#   full                     55   1549 ms   2039 ms   2727 ms      19/20
+#   terse                    30    862 ms    937 ms    940 ms      20/20
+#
+# Half the tokens, 2.9x off the tail, and field completeness went UP -- a short
+# reading finishes all three fields where a long one runs out of budget in the
+# middle of the third. Nothing was dropped to get it: ROAD, TRAFFIC and RISK are
+# all still there, because RISK is what the narrowed job is about.
+#
+# What it gives up is prose. "five lanes all going forward, asphalt, dashed white
+# lines dividing lanes" becomes "5 lanes, asphalt, dry". That is free HERE and
+# would not have been free before the swap: the reading is evidence handed to
+# grok, and nobody hears these words.
+LOCAL_VISION_SENSOR_PROMPT = os.getenv("LOCAL_VISION_SENSOR_PROMPT", "terse")
+
+# Extra room, ONLY if a reasoning trace ever starts appearing. 0 disables it and
+# is the measured default: an unterminated <think> inside the budget above is
+# refused as a failed reading (vision._strip_think), which is the honest outcome
+# and a fast one. Raise this if a future checkpoint starts thinking out loud.
+LOCAL_VISION_THINK_BUDGET = int(os.getenv("LOCAL_VISION_THINK_BUDGET", "0"))
+
+# --- THE DECODE LEVER, which is where the milliseconds actually were ---------
+#
+# Measured on a 4090, Cosmos-Reason2-2B, 2.13 B parameters in bf16:
+#
+#   prefill (369 input tokens, 512 px)        ~48 ms
+#   decode, dynamic KV cache             25.8 ms/token   ->  39 tok/s
+#   decode, STATIC KV cache               8.1 ms/token   -> 124 tok/s
+#   memory-bandwidth floor for 4.3 GB      ~4.3 ms/token
+#
+# A reading is ~97% decode, so prefill and the image size are irrelevant here
+# (512 px to 384 px moved the total by 5%). The dynamic cache was running SIX
+# times off the hardware's floor: that is per-token Python and kernel-launch
+# overhead, not arithmetic. Which is also why QUANTIZATION WAS NOT THE ANSWER and
+# was not done -- FP8 halves the bytes moved per token, and bytes moved was never
+# the binding constraint. The same measurement explains why the 2B was barely
+# faster than the 8B per token (25.8 against ~32 ms): both were paying overhead,
+# not weights.
+#
+# STATIC IS NOT A FREE SPEEDUP, and this is the part that needs saying out loud.
+# A preallocated, padded cache changes the reduction order in attention, and in
+# bf16 that is enough to land on different tokens: static and dynamic agreed on
+# only 5 of 15 frames. Each is deterministic on its own (5 of 5 identical reads),
+# so this is a different computation and not a noisy one.
+#
+# What the difference COSTS, measured on the probe set: static fabricates a road
+# on three blank frames where dynamic fabricates on two -- and all three are
+# frames LOCAL_VISION_BLANK_STD refuses before any model sees them (measured
+# structure 0.00, 0.00, 4.04 against a floor of 8.0). On the twenty real road
+# frames: same field completeness (18/20), fewer truncations (1 against 4), no
+# loops.
+#
+# SO THE STATIC CACHE IS SAFE HERE BECAUSE THE BLANK-FRAME GATE RUNS FIRST. That
+# is a real dependency between two settings and not a coincidence: turning the
+# gate off would re-expose the one case where this cache is worse.
+#
+# ...AND IT IS OFF ANYWAY, BECAUSE IT DOES NOT SURVIVE THIS SERVER. Measured on
+# the running process, not in a harness: with cache_implementation="static" the
+# observer produced ZERO readings and 31 errors in one look_latency run, every
+# one an `AssertionError` with an empty message from
+# torch/_functorch/_aot_autograd/runtime_wrappers.py:580 -- AOTAutograd's runtime
+# wrapper being handed an input signature its compiled graph was not traced for.
+# The scene fast path fell back to full_visual (1513 ms p50, 6408 ms max) and the
+# card's own perception went quiet.
+#
+# WHERE THE SPEEDUP ACTUALLY CAME FROM, which matters for anyone tempted to try
+# this again: the COMPILE, not the cache. Measured for 48 tokens --
+#
+#   dynamic                     24.2 ms/token
+#   static, auto-compiled        8.0 ms/token   <- 3x, and it is the compile
+#   static + disable_compile    28.7 ms/token   <- no better than dynamic
+#
+# So there is no version of this that is both fast and compile-free, and the
+# compiled one breaks in a process where four callers (the observer, enrich.py,
+# visual_qa and headway/anchor) generate on one model at shapes that vary per
+# frame. It reproduced in NEITHER a background thread, NOR concurrent CUDA work,
+# NOR interleaved static/dynamic calls -- only in the server -- which is a good
+# reason to leave it off rather than a good reason to keep hunting.
+#
+# "static" remains one env var away for a pod that wants to retry it with a
+# fixed input shape, which is the untested idea that might make it stable.
+LOCAL_VISION_CACHE = os.getenv("LOCAL_VISION_CACHE", "dynamic")
+
+# Repetition penalty. NVIDIA ships 1.0 and teachers/canned.py notes that this
+# "invites" the decoding loop it documents -- which is exactly what was then
+# measured here: 1 of 20 road readings was one word repeated to the ceiling.
+#
+# 1.05 removed it: 1 loop of 20 -> 0 of 20, with field completeness unchanged
+# (17-18 of 20) and the same probe behaviour. A deliberate departure from the
+# card's sampling, made on this measurement, and the reason it is a named
+# constant rather than a literal.
+LOCAL_VISION_REPETITION_PENALTY = float(
+    os.getenv("LOCAL_VISION_REPETITION_PENALTY", "1.05"))
 
 # IS THERE ANYTHING IN THIS FRAME TO READ? Asked of the PICTURE, before any
 # model sees it, because it is a property of the picture and does not need one.
