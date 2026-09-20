@@ -220,3 +220,93 @@ def transcribe(audio_bytes: bytes, filename: str = "clip.mp3") -> str:
     except Exception as e:
         print(f"      (could not verify: {type(e).__name__}) ", end="")
         return ""
+
+
+# ---------------------------------------------------------------------------
+# THE BROWSER'S CREDENTIAL, AND THE SESSION POLICY THAT TRAVELS WITH IT
+# ---------------------------------------------------------------------------
+
+def session_policy() -> dict:
+    """The drive session's configuration, assembled server-side.
+
+    THE SAME DISCIPLINE realtime.mint_client_secret FOLLOWS, and for the same
+    reason: every number the browser applies is decided in config.py and carried
+    here, so the page holds no second copy of a policy to drift from the one the
+    tests check. The browser builds no session config of its own.
+
+    THE FOUR FIELDS WHOSE ABSENCE IS SILENT are all present and all commented,
+    because omitting any of them produces a session that accepts everything, runs
+    VAD, and never speaks -- with no error event to notice.
+    """
+    import realtime
+
+    cfg = realtime.session_config()
+    pol = {
+        "type": "realtime",
+        # 1. WITHOUT THIS THE SESSION PRODUCES NOTHING AT ALL.
+        "output_modalities": ["audio"],
+        "instructions": cfg["instructions"],
+        "tools": [dict(t) for t in cfg["tools"]],
+        "tool_choice": "auto",
+        "audio": {
+            "input": {
+                "format": {"type": "audio/pcm", "rate": RATE},
+                "transcription": {"model": config.XAI_STT_SESSION_MODEL},
+                "turn_detection": {"type": "server_vad"},
+            },
+            "output": {
+                # 2. ...NOR WITHOUT THIS ONE.
+                "voice": config.XAI_VOICE,
+                "format": {"type": "audio/pcm", "rate": RATE},
+            },
+        },
+    }
+    if config.XAI_VOICE_EFFORT:
+        # 3. 'none' or 'high' ONLY on this endpoint -- 'low' is a validation
+        #    error. Measured: effort high has a tool-call p95 of 2,270 ms against
+        #    521, so the drive session takes none. See config.XAI_VOICE_EFFORT.
+        pol["reasoning"] = {"effort": config.XAI_VOICE_EFFORT}
+    return pol
+
+
+def mint_client_secret() -> dict:
+    """An ephemeral secret for the browser, plus everything it needs to connect.
+
+    Deliberately the same shape realtime.mint_client_secret returns, so
+    /realtime/session can dispatch on the backend and the page's connect path does
+    not branch on a vendor name.
+
+    4. THE EXPLICIT COMMIT AND THE SILENCE TAIL are the browser's job and are
+       carried as policy rather than left to it: server_vad owns the end of an
+       utterance, so the page must NOT send input_audio_buffer.commit (the
+       provider's outbound map drops it) and MUST keep feeding frames through the
+       gap after speech, or the turn never closes. silence_tail_ms is how much.
+    """
+    pol = session_policy()
+    secret = _ephemeral(300)
+    return {
+        "client_secret": secret,
+        "ws_url": f"{WS_URL}?model={config.XAI_VOICE_MODEL}",
+        # The subprotocol the token rides in, because a browser cannot set an
+        # Authorization header on a WebSocket.
+        "ws_subprotocol": f"xai-client-secret.{secret}",
+        "model": config.XAI_VOICE_MODEL,
+        "voice": config.XAI_VOICE,
+        "live_voice": config.XAI_VOICE,
+        "voice_backend": "xai_voice",
+        "session": pol,
+        "tool": "deep_dive",
+        "tools": [t["name"] for t in pol["tools"]],
+        "tool_schemas": [dict(t) for t in pol["tools"]],
+        "sample_rate": RATE,
+        # How long a tail of silence to keep sending after the driver stops, so
+        # server_vad can hear the end of the utterance. 400 ms is ten 40 ms
+        # frames; measured, audio that stops dead on the last syllable leaves the
+        # turn open and no transcript ever follows.
+        "silence_tail_ms": int(config.XAI_SILENCE_TAIL_MS),
+        # .completed arrives three times per utterance with one id. The page
+        # deduplicates BY ID rather than counting, and is told the number so a
+        # drive log can notice if it ever changes.
+        "transcript_repeats": 3,
+        "expires_at": None,
+    }

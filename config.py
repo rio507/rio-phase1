@@ -166,6 +166,20 @@ XAI_VOICE_EFFORT = os.getenv("XAI_VOICE_EFFORT", "none")
 # given, so it is deliberately not multiplied out here.
 XAI_VOICE_USD_PER_MIN = float(os.getenv("XAI_VOICE_USD_PER_MIN", "0.08"))
 
+# HOW MUCH SILENCE TO KEEP SENDING AFTER THE DRIVER STOPS TALKING.
+#
+# server_vad decides where an utterance ENDS, and it has to hear the end. Audio
+# that stops dead on the last syllable leaves the turn open: speech_started fires,
+# speech_stopped fires, the buffer commits -- and no transcript ever arrives. That
+# was one of the two configuration mistakes that had me report the voice models as
+# unlicensed, so it is a number here rather than a hope in the browser.
+#
+# 400 ms is ten 40 ms frames, which is what the probe used and what worked. It is
+# not free: a driver who stops mid-sentence to think waits this long before the
+# turn closes, on top of the detector's own window. If that reads long on a drive
+# it is the first thing to tune, and it must not go to zero.
+XAI_SILENCE_TAIL_MS = int(os.getenv("XAI_SILENCE_TAIL_MS", "400"))
+
 # The transcriber, and it does TWO jobs that must not be confused.
 #
 # In a live session it is `grok-transcribe`, set on
@@ -1364,7 +1378,13 @@ if VOICE_BACKEND in ("gpt-live", "gptlive", "live"):
 # rather than at the first warning. The old code accepted anything and let the
 # page discover it had no mouth; a typo in an .env is worth a line on stderr at
 # boot and the shipped default, not a silent drive.
-VOICE_BACKENDS = ("openai_realtime", "gpt_live", "elevenlabs")
+# xai_voice IS SELECTABLE NOW and is not yet the default. The brief's order is
+# "make it the default once it passes its own tests", and the browser controller
+# is the piece still missing -- what exists is the server mint, the session policy,
+# the playout queue, the event seam in both directions, and a live harness that
+# drives a whole turn through them. VOICE_BACKEND=xai_voice therefore starts a
+# session the page cannot yet render, which is why openai_realtime stays default.
+VOICE_BACKENDS = ("openai_realtime", "gpt_live", "elevenlabs", "xai_voice")
 if VOICE_BACKEND not in VOICE_BACKENDS:
     print(f"[config] VOICE_BACKEND={VOICE_BACKEND!r} is not one of "
           f"{VOICE_BACKENDS}; falling back to openai_realtime", flush=True)
