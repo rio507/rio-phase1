@@ -119,7 +119,18 @@ class Drive:
             jpeg = self.frames[self.i]
             self.last = self.session.process(jpeg, self.v_host, 0.1,
                                              frame_t=self.i * self.dt)
-            self.ring.push(jpeg, self.last)
+            # STAMPED AS THIS SESSION'S OWN FRAMES, which is what the page
+            # does ("<session key>:<source>") and what framebuf.owns() requires.
+            #
+            # This was a bare push, so every frame landed as "api:unknown" --
+            # and owns() refuses an api: origin for a NAMED session, by design,
+            # because that is how a phone came to be answered from a desktop's
+            # clip on 2026-09-16. So this suite has been exercising the REFUSAL
+            # path since that rule landed: every acceptance test that needs a
+            # picture got "No camera view available right now" and failed for a
+            # reason that had nothing to do with what it was testing (36 failures
+            # measured at HEAD before this line changed).
+            self.ring.push(jpeg, self.last, origin=f"{SESSION}:camera")
             self.i += 1
             fed += 1
         if not quiet:
