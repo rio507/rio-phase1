@@ -4548,10 +4548,41 @@
             throw new Error('mint: session asks for xai_voice and '
                             + 'rio_xai_session.js is not loaded');
           }
+          /* THE ECHO METER, WHICH THIS WIRE CAN HAVE AFTER ALL.
+           *
+           * attach() was written with `levels: null` on the reasoning that
+           * makeMeter needs a remote MediaStream and this transport has none.
+           * Half right: it needs a MIC stream, which we have, and its `out`
+           * reading falls back to RIO.output.level() -- which measures the BUS,
+           * and her voice on this wire is connected into that bus. So the
+           * measurement was available the whole time.
+           *
+           * The cost of having got that wrong is in the drive of 2026-09-20:
+           * eleven barge detections in ninety seconds, three answers cut off as
+           * false_barge_in with "no transcript followed", and echo_suppressed at
+           * ZERO -- because with no meter the level test has no evidence and
+           * every one of them reached the gate. Her own voice out of the phone
+           * speaker was being heard as the driver. */
+          var xmeter = null;
+          try {
+            var xo = root.RIO && root.RIO.output;
+            var xctx = (xo && xo.context) ? xo.context() : null;
+            xmeter = makeMeter(xctx, mic, null);
+          } catch (e) { xmeter = null; }
+          if (opts.onEvent) {
+            try {
+              opts.onEvent({ type: 'LIVE_ECHO_METER', ok: !!xmeter,
+                             device: touch ? 'touch' : 'desktop',
+                             margin_db: barge.echo_margin_db,
+                             onset_guard_ms: barge.onset_guard_ms,
+                             sustain_ms: barge.sustain_ms,
+                             source: 'output_bus' });
+            } catch (e) {}
+          }
           return xs.attach({
             session: session, mic: mic, url: url, progress: progress,
             onEvent: opts.onEvent, arbiter: arbiter, touch: touch, barge: barge,
-            step: step,
+            step: step, levels: xmeter,
             createController: createController,
             controllerConfig: controllerConfig,
             sessionHandle: sessionHandle,

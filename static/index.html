@@ -1105,6 +1105,14 @@
     color: var(--t4);
   }
   .spoken.has-line { color: var(--t2); }
+  /* The session's own status line. Deliberately quiet: it is read between
+     glances at the road, like the stat chips, and it must not compete with the
+     spoken line above it. */
+  .voice-status {
+    min-height: 1.4em; padding: 0 4px 10px;
+    font-size: var(--fs-sub); line-height: 1.4; text-align: center;
+    color: var(--t4);
+  }
 
   .chips { display: flex; gap: var(--gap-xs); margin-bottom: 12px; }
   .chip { flex: 1 1 0; min-width: 0; padding: 10px 12px; background: var(--inset); border-radius: var(--r-inset); }
@@ -2179,6 +2187,9 @@
         <span><i>Frames</i><b id="statframes">0</b></span>
         <span><i>Last</i><b id="statlast">--:--:--</b></span>
         <span><i>Session</i><b id="statsession">&mdash;</b></span>
+        <!-- WHICH LOOP IS FEEDING, because "Frames 0" and "Frames 268 from a
+             conversation on a clip" were indistinguishable before this. -->
+        <span><i>Feed</i><b id="statfeed">&mdash;</b></span>
       </div>
       <div id="drivestatus"></div>
     </div>
@@ -2296,6 +2307,16 @@ acted on, never consulted by the arbiter.">Shadow</div>
       </div>
 
       <div class="spoken" id="spokenline"></div>
+
+      <!-- WHAT THE SESSION IS DOING, in the card that is about the session.
+           Nine of these messages -- "Looking that up...", "Live session lost",
+           "Picking up where she left off", "she is listening but not answering"
+           -- were written into #observation, which is the PERCEPTION card's
+           line, because the voice session had no line of its own. On the drive
+           of 2026-09-20 the Perception card read "She is listening but not
+           answering - session degraded. Tap to reconnect." while the camera
+           column had nothing to do with it. -->
+      <div class="voice-status" id="voicestatus"></div>
 
       <div class="chips">
         <div class="chip"><i>Round trip</i><b id="statrtt">&mdash;</b></div>
@@ -2645,6 +2666,13 @@ RIO.ui = (function () {
       const f = $('statframes'), l = $('statlast');
       if (f) f.textContent = n;
       if (l) l.textContent = stamp();
+    },
+    /* WHOSE FRAMES THOSE ARE: the drive loop, or the conversation's own feed.
+       Both push into the same ring on the server and only one of them used to
+       be counted here. */
+    feedLabel(text) {
+      const el = $('statfeed');
+      if (el) el.textContent = text || '—';
     },
 
     // ----- column 2: perception -----
@@ -3077,6 +3105,21 @@ if (window.RIO && RIO.ui) RIO.ui.talkState = setMicState;
 const frameBtn = document.getElementById('frame');
 const player = document.getElementById('player');
 const obs = document.getElementById('observation');
+/* WHAT THE VOICE SESSION IS DOING, said in the voice card.
+ *
+ * Every line below used to go into `obs` -- the PERCEPTION card's observation
+ * slot -- because the session had nowhere of its own to write. That is how a
+ * live drive on 2026-09-20 showed "She is listening but not answering — session
+ * degraded" in the column that describes what the camera can see. The perception
+ * line is for perception; this is for the session.
+ *
+ * Falls back to `obs` only if the element is missing, so an older cached page
+ * still says something rather than nothing. */
+function voiceStatus(text) {
+  const el = document.getElementById('voicestatus');
+  if (el) { el.textContent = text || ''; return; }
+  if (obs) obs.textContent = text || '';
+}
 let recorder, chunks;
 
 async function startRec() {
@@ -3139,7 +3182,7 @@ async function startRec() {
         RIO.ui.turnToHistory(j.transcript || transcript, j.reply);
       });
     } catch (e) {
-      obs.textContent = 'Talk failed: ' + e;
+      voiceStatus('Talk failed: ' + e);
       RIO.ui.clearExpect();
       RIO.ui.voice('idle');
     } finally {
@@ -3247,12 +3290,27 @@ async function startLiveFrames() {
     return false;
   }
   liveFrames.feed = feed;
+  liveFrames.sent = 0;
   const tick = async () => {
     if (!liveFrames.timer) return;
     // A drive starting mid-conversation takes over: it feeds the same ring
     // faster, and two feeds would be two uploads of the same road.
     if (!RIO.driving) {
-      try { await RIO.headway.captureFromVideo(feed.element); } catch (e) {}
+      try {
+        await RIO.headway.captureFromVideo(feed.element);
+        /* AND IT SAYS SO ON THE CARD. This loop fed the ring for a whole live
+           conversation and incremented nothing, so the camera card read
+           "Frames 0 · Session —" while 268 frames reached the server. On the
+           drive of 2026-09-20 that was read, reasonably, as frames never
+           arriving at all — the counter it was read from belongs to the DRIVE
+           loop, which was correctly not running.
+           
+           The count and the source, because "0" and "268 from a clip" are
+           different answers to the one question this card exists to answer. */
+        liveFrames.sent++;
+        RIO.ui.frameSent(liveFrames.sent);
+        RIO.ui.feedLabel('conversation · ' + (RIO.source.kind() || 'feed'));
+      } catch (e) {}
     }
     if (liveFrames.timer) liveFrames.timer = setTimeout(tick, LIVE_FRAME_MS);
   };
@@ -3262,6 +3320,9 @@ async function startLiveFrames() {
 
 function stopLiveFrames() {
   if (liveFrames.timer) { clearTimeout(liveFrames.timer); liveFrames.timer = null; }
+  // The card stops claiming a feed that has stopped. A drive underneath keeps
+  // its own, and its next frame relabels this within half a second.
+  if (!RIO.driving) { try { RIO.ui.feedLabel(null); } catch (e) {} }
   // Releases a camera if this feed opened one; a clip feed owns nothing, so
   // the clip is still loaded and still the source when the conversation ends.
   // A drive running underneath keeps its own feed either way.
@@ -3849,7 +3910,7 @@ async function toggleLive() {
         // the ring in column 4 is showing, the button in the corner shows too.
         else if (mine && ev.type === 'LIVE_RESPONSE_START') { RIO.ui.voice('speaking'); setMicState('speaking'); }
         else if (mine && ev.type === 'LIVE_RESPONSE_END') { RIO.ui.voice('listening'); setMicState('listening'); }
-        else if (mine && ev.type === 'LIVE_TOOL_CALL') obs.textContent = 'Looking that up…';
+        else if (mine && ev.type === 'LIVE_TOOL_CALL') voiceStatus('Looking that up…');
         // The citation card. Rendered whatever the screen is otherwise doing
         // and NOT gated on `mine`: a superseded turn whose search already ran
         // still showed the driver information drawn from those pages, and the
@@ -3876,7 +3937,7 @@ async function toggleLive() {
             stopBusWatch();
             setMicState('failed');
             RIO.ui.voice('idle');
-            obs.textContent = 'Live session lost (' + why + ') — tap to reconnect.';
+            voiceStatus('Live session lost (' + why + ') — tap to reconnect.');
           }, 0);
         }
         /* SHE CONNECTED AND SAID NOTHING. Not a lull: the transport expected
@@ -3887,16 +3948,16 @@ async function toggleLive() {
            through reportLive below, in the drive's own record. */
         else if (mine && ev.type === 'XAI_SESSION_SILENT') {
           RIO.ui.voice('listening');
-          obs.textContent = 'She is listening but not answering — session '
-            + 'degraded. Tap to reconnect.';
+          voiceStatus('She is listening but not answering — session '
+            + 'degraded. Tap to reconnect.');
         }
         else if (mine && ev.type === 'XAI_SESSION_RECOVERED') {
-          obs.textContent = 'Live — just talk. She will stop when you do.';
+          voiceStatus('Live — just talk. She will stop when you do.');
         }
         else if (mine && ev.type === 'LIVE_RESUME') {
           // Say so on screen. An answer that finishes itself after a warning is
           // a good thing that looks like a glitch if it is never explained.
-          obs.textContent = 'Picking up where she left off…';
+          voiceStatus('Picking up where she left off…');
         }
         reportLive(ev);
       },
@@ -3925,8 +3986,8 @@ async function toggleLive() {
     // Ended while the feed was opening. The branch above has already stopped
     // the session and the frames; all that is left is not to narrate it.
     if (gen !== liveGen) return;
-    obs.textContent = 'Live — just talk. She will stop when you do.'
-      + (eyes || RIO.driving ? '' : ' (no camera — she cannot see)');
+    voiceStatus('Live — just talk. She will stop when you do.'
+      + (eyes || RIO.driving ? '' : ' (no camera — she cannot see)'));
   } catch (e) {
     /* Cancelled, and then it failed anyway. The failure is moot and must not
        be acted on: liveMode = false would take live conversation away for the
@@ -3945,8 +4006,8 @@ async function toggleLive() {
        because the failure the driver actually met was a button that said
        "Connecting…" forever and told them nothing. */
     setMicState('failed');
-    obs.textContent = 'Live conversation unavailable — ' + why
-      + '. Hold the button to talk instead.';
+    voiceStatus('Live conversation unavailable — ' + why
+      + '. Hold the button to talk instead.');
     /* AND IT GOES IN THE DRIVE'S LOG. The night this broke, the only record
        was the absence of a session_started -- which says a session did not
        start and nothing at all about why. reportLive lands in the session
@@ -4195,6 +4256,7 @@ document.addEventListener('DOMContentLoaded', () => {
       frames++;
       RIO.ui.observation(j.observation);
       RIO.ui.frameSent(frames);
+      RIO.ui.feedLabel('drive · ' + (RIO.source.kind() || 'feed'));
       say('Drive active - ' + frames + ' frames - session ' + RIO.sessionId.slice(0, 8));
     } catch (e) {
       // Never let one bad frame kill the drive loop.
@@ -7023,13 +7085,19 @@ document.addEventListener('DOMContentLoaded', () => {
   fetch('/voice/status', { cache: 'no-store' })
     .then(r => r.json())
     .then(v => {
-      /* Two backends with two different things worth naming: the realtime
-         session speaks with a named voice, ElevenLabs with a voice id under a
-         named model. Whichever is live is what the card should say. */
-      const line = v.backend === 'openai_realtime'
-        ? 'OpenAI Realtime · ' + (v.live_voice || 'voice')
-        : 'ElevenLabs · ' + (v.configured ? (v.voice_id || 'narrator') : 'not configured');
-      set('subvoice', line);
+      /* WHO SPEAKS, NAMED BY THE SERVER. This was a two-way branch on
+         `backend === 'openai_realtime'`, which meant every backend that was not
+         OpenAI's fell into the ElevenLabs arm -- so a drive on grok-voice showed
+         "ElevenLabs · weA4Q36twV5kwSaTEL0Q", an ElevenLabs voice id, for a voice
+         layer that has no ElevenLabs in it at all. Nothing was resolving to
+         ElevenLabs; the label was a literal with an else on it.
+
+         Same class as the four selftests that named a vendor where they could
+         have asked, and the same fix: the backend is decided in config.py, so
+         config.py's process is what names it (see _voice_label in app.py). The
+         fallback keeps a card rather than a blank if an older server answers. */
+      set('subvoice', v.voice_label
+        || ((v.backend || 'voice') + ' · ' + (v.live_voice || '')).trim());
     })
     .catch(() => {});
 });

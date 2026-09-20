@@ -360,6 +360,30 @@ section('SILENCE WHERE AUDIO WAS EXPECTED IS A FAULT, NOT A LULL');
      + 'failure has never done is look like one');
   ok(h.s.health().silent_responses === 1, 'and counts them');
 
+  /* AND THE THREE SHAPES THAT ARE *SUPPOSED* TO BE SILENT ARE NOT COUNTED.
+     The drive of 2026-09-20 reported four degraded sessions while she was
+     answering normally: three noise replies cancelled on sight and one response
+     killed by a barge-in. The detector was reading "no audio" where it had to
+     read "no audio on a response the server called COMPLETED". */
+  const q = harness();
+  await q.s.connect();
+  ['cancelled', 'failed', 'incomplete'].forEach((st, i) => {
+    q.s._onMessage(JSON.stringify({ type: 'response.created',
+                                    response: { id: 'c' + i } }));
+    q.s._onMessage(JSON.stringify({ type: 'response.done',
+                                    response: { id: 'c' + i, status: st } }));
+  });
+  ok(q.s.health().degraded === false,
+     'a cancelled, a failed and an incomplete response make no sound and do NOT '
+     + 'read as a degraded session — a noise reply cancelled on sight is the '
+     + 'noise gate working, not the wire failing');
+  ok(q.s.health().silent_responses === 0
+     && q.s.health().silent_by_design === 3,
+     'they are counted apart, because a drive log that cannot tell the two apart '
+     + 'is what produced a false "she is listening but not answering"');
+  ok(!q.events.some(e => e.type === 'XAI_SESSION_SILENT'),
+     '...and nothing was reported to the panel');
+
   h.s._onMessage(JSON.stringify({ type: 'response.created',
                                   response: { id: 'r2' } }));
   h.s._onMessage(JSON.stringify({ type: 'response.output_audio.delta',
@@ -504,7 +528,11 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
 
   const handle = await session.attach({
     session: minted, mic, arbiter: speech.makeArbiter(),
-    barge: {}, onEvent: (e) => panel.push(e),
+    barge: { echo_margin_db: 6, sustain_ms: 600, onset_guard_ms: 400 },
+    // What connect() hands over: a meter built on the microphone and the output
+    // bus. Its readings are what the echo gate tests a detector firing against.
+    levels: () => ({ mic: -22, out: -44 }),
+    onEvent: (e) => panel.push(e),
     url: (u) => u,
     createController: rt.createController,
     controllerConfig: rt._controllerConfig,
@@ -526,6 +554,13 @@ section('ATTACH — the second wire on the FIRST wire\'s policy and handle');
   ok(handle.voiceBackend() === 'xai_voice',
      'and the controller reports WHICH WIRE it is on from the provider record — '
      + 'a literal here would have logged the wrong vendor for every drive');
+
+  /* THE METER. Passed in by connect() and reaching the controller, because the
+     alternative -- `levels: null` -- is what the first drive ran on: eleven barge
+     detections in ninety seconds and echo_suppressed at zero. */
+  ok(handle.controller.state().policy.echo_meter === true,
+     'the controller has a level meter on this wire, so the echo gate has '
+     + 'evidence rather than a desk default');
 
   const st = handle.audioState();
   ok(st.channel === 'open' && st.peer === null && st.element_paused === null,

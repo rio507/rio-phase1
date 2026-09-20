@@ -595,6 +595,42 @@ def run_clips():
        f"the page loads what the DEFAULT backend needs to make a sound "
        f"({config.VOICE_BACKEND}: {', '.join(want_js)})"
        + (f" — MISSING: {absent}" if absent else ""))
+
+    # ---- WHO THE PANEL SAYS IS SPEAKING -----------------------------------
+    #
+    # The Voice layer card read `backend === 'openai_realtime' ? 'OpenAI
+    # Realtime · ...' : 'ElevenLabs · ...'`, so every backend that was not
+    # OpenAI's rendered as ElevenLabs -- and a live drive on grok-voice showed
+    # "ElevenLabs · weA4Q36twV5kwSaTEL0Q", a voice id for a vendor that is not in
+    # the path at all. Nothing was resolving to ElevenLabs; the label was a
+    # literal with an else on it. Same class as the suites that named a vendor
+    # where they could have asked.
+    import app as _app
+
+    ok("voice_label" in index and "v.voice_label" in index,
+       "the panel reads the voice label from the server rather than deciding it "
+       "from the backend name")
+    ok("'ElevenLabs · '" not in index and '"ElevenLabs · "' not in index,
+       "...and holds no vendor label of its own to fall through to")
+    label = _app._voice_label()
+    ok(config.VOICE_BACKEND == "elevenlabs" or "ElevenLabs" not in label,
+       f"the label names the running backend and not another vendor ({label!r})")
+    # EVERY backend, not just the configured one: a fifth arriving must not be
+    # able to fall through to whatever the last branch happens to say.
+    unnamed = []
+    for b in config.VOICE_BACKENDS:
+        original = config.VOICE_BACKEND
+        try:
+            config.VOICE_BACKEND = b
+            lab = _app._voice_label()
+        finally:
+            config.VOICE_BACKEND = original
+        if lab == b or not lab:
+            unnamed.append(b)
+    ok(not unnamed,
+       "and every selectable backend has a label of its own, so a new one cannot "
+       "silently borrow the previous vendor's name"
+       + (f" — UNNAMED: {unnamed}" if unnamed else ""))
     ok(eve_dir != ra.audio_dir("openai_realtime"),
        f"its clips live apart from the shipped set ({eve_dir.name}/), so a "
        "backend switch cannot leave one voice's files to be played by another")

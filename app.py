@@ -1071,6 +1071,28 @@ async def voice_dialogue_socket(ws: WebSocket, session_id: str = Query(default=N
         sessions.log_live(session_id, "voice_dialogue_close", session.status())
 
 
+def _voice_label() -> str:
+    """One line naming who speaks, for a panel that should not hold a table.
+
+    The page used to decide this with `backend === 'openai_realtime' ? ... : ...`,
+    so every backend that was not OpenAI's rendered as ElevenLabs. A two-way
+    branch on a vendor name is the same bug as the four suites that named a
+    vendor where they could have asked, and the fix is the same: the server names
+    the vendor, because the server is where the backend is decided.
+    """
+    b = config.VOICE_BACKEND
+    if b == "xai_voice":
+        return f"xAI grok-voice · {config.XAI_VOICE}"
+    if b == "openai_realtime":
+        return f"OpenAI Realtime · {config.OPENAI_REALTIME_VOICE}"
+    if b == "gpt_live":
+        return f"OpenAI {config.GPT_LIVE_MODEL} · {config.GPT_LIVE_VOICE}"
+    if b == "elevenlabs":
+        vid = voice_dialogue.voice_id() if voice_dialogue.configured() else None
+        return f"ElevenLabs · {vid or 'not configured'}"
+    return b
+
+
 @app.get("/voice/status")
 def voice_status_endpoint():
     """Which voice RIO is using, and what it has cost her.
@@ -1088,7 +1110,15 @@ def voice_status_endpoint():
         "configured": voice_dialogue.configured(),
         "conversation_model": config.ELEVENLABS_CONVERSATION_MODEL,
         "deterministic_model": config.ELEVENLABS_DETERMINISTIC_MODEL,
-        "live_voice": config.OPENAI_REALTIME_VOICE,
+        # THE VOICE THIS DRIVE ACTUALLY SPEAKS IN, asked of the backend. This
+        # read OPENAI_REALTIME_VOICE unconditionally, so under xai_voice it
+        # answered "marin" while the car was speaking as Eve -- and the panel's
+        # Voice layer card renders this field, which is how a drive on grok came
+        # to have "ElevenLabs · <Ava's voice id>" on the screen.
+        "live_voice": realtime.backend_voice(),
+        # ...and which of them is live, so a reader does not have to infer it
+        # from which of the other fields look relevant.
+        "voice_label": _voice_label(),
         "first_byte_budget_ms": config.ELEVENLABS_FIRST_BYTE_BUDGET_MS,
         "chunk": {"min_tokens": config.ELEVENLABS_CHUNK_MIN_TOKENS,
                   "max_wait_ms": config.ELEVENLABS_CHUNK_MAX_WAIT_MS},

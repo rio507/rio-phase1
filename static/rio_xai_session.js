@@ -225,6 +225,11 @@
       audio_in_frames: 0, audio_out_bytes: 0, transcripts: 0,
       transcript_repeats_dropped: 0, local_flushes: 0, gated_requests: 0,
       responses: 0, spoke: 0, silent_responses: 0, gate_timeouts: 0,
+      /* Cancelled, failed or incomplete responses that made no sound. Counted
+         apart from silent_responses because they are not a fault -- a noise reply
+         cancelled on sight is the noise gate working -- and because a drive log
+         that cannot tell the two apart is what produced a false "degraded". */
+      silent_by_design: 0,
     };
     /* SILENT-SESSION DETECTION. `expecting` is set when a response opens and
        cleared by its first audio; a response that closes with it still set is one
@@ -431,10 +436,25 @@
         /* GENERATION IS OVER; THE SOUND MAY NOT BE. The queue is told, and the
            controller's holdTail is what waits. */
         if (playout) playout.generationDone(expecting);
-        if (stats.spoke_this_response !== true) {
+        /* A RESPONSE THAT WAS CANCELLED IS *SUPPOSED* TO BE SILENT, and the
+           first version of this counted those too. On the drive of 2026-09-20 it
+           reported four degraded sessions and put "she is listening but not
+           answering" on the screen while she was answering normally: three of the
+           four were noise replies cancelled on sight (turn_kind "noise",
+           generated_chars 0 -- the controller's own noise gate working exactly as
+           designed) and the fourth was a response cancelled by a barge-in. She
+           spoke three times in the same ninety seconds.
+           
+           So the shape this detector exists for is narrower than "no audio": it
+           is a response the server said it COMPLETED that nonetheless made no
+           sound. A cancelled one is not evidence of anything. */
+        var status = (ev.response && ev.response.status) || null;
+        if (stats.spoke_this_response !== true && status === 'completed') {
           stats.silent_responses++;
           silence.responses++;
-          noteSilence('a response closed without making a sound');
+          noteSilence('a response the server called completed made no sound');
+        } else if (stats.spoke_this_response !== true) {
+          stats.silent_by_design++;
         }
         stats.spoke_this_response = false;
         startedSent = false;
@@ -575,6 +595,7 @@
           conversation_id: conversationId,
           degraded: silence.degraded,
           silent_responses: silence.responses,
+          silent_by_design: stats.silent_by_design,
           pending_requests: pending.length,
           gate_timeouts: stats.gate_timeouts,
           queued_until: speaker ? speaker.queuedUntil() : 0,
@@ -699,14 +720,15 @@
     controller = o.createController(o.controllerConfig(session, {
       arbiter: o.arbiter,
       barge: o.barge || {},
-      /* NO ECHO METER ON THIS WIRE YET, and that is a real difference rather
-         than an oversight: makeMeter measures the microphone against a remote
-         MediaStream, and there is no remote stream here -- her voice is a graph.
-         Without one the barge gate behaves as it does on a desk, which is the
-         behaviour every session had before the meter existed. It is the one
-         thing this backend gives up on a phone, and it is written down here
-         because a silent `null` would read as "no echo problem". */
-      levels: function () { return null; },
+      /* THE ECHO METER, PASSED IN. There is no remote MediaStream on this wire,
+         and for a while this said `null` for that reason -- wrongly. The meter
+         needs the MICROPHONE, which exists, and its output reading falls back to
+         RIO.output.level(), which measures the bus her voice is connected into.
+         connect() builds it and hands it here; without it the level test has no
+         evidence and every detector firing reaches the barge gate, which is
+         measured: eleven barge detections and three cut-off answers in the first
+         ninety seconds of the first drive. */
+      levels: o.levels || function () { return null; },
       provider: prov,
       send: function (obj) { sess.send(obj); },
       url: o.url || function (p) { return p; },
