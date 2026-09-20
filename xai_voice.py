@@ -310,3 +310,55 @@ def mint_client_secret() -> dict:
         "transcript_repeats": 3,
         "expires_at": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# A DETERMINISTIC LINE, WITHOUT ASKING A MODEL TO SAY IT
+# ---------------------------------------------------------------------------
+# force_message is xAI's own extension: a conversation.item.create whose item
+# type synthesises the words with no model in the path. Measured, and the
+# measurement matters more than the feature:
+#
+#   item = {"type": "force_message",
+#           "content": [{"type": "input_text", "text": LINE}]}
+#       -> 1.43 s of audio, transcript "Back off — now." EXACT, and no
+#          response.create needed. This is the form to use.
+#
+#   item = {"type": "force_message", "text": LINE}  + response.create
+#       -> 1.43 s of audio saying "Hey. What's up."
+#
+# READ THE SECOND ONE AGAIN. It produces AUDIO, of a plausible length, with no
+# error -- and the words are a greeting instead of a warning. A caller that
+# checked "did it make a sound" would ship it. That is the same failure as the
+# clip quoted above ClipUnverified in tools/render_alerts.py, where "Pull over
+# when it's safe" came out as "Hey, Ava, when it's safe" and the voice's own
+# transcript said it was fine. Same shape, different mechanism, and this time the
+# cause is one wrong field name.
+#
+#   item = {"type": "force_message", "role": "assistant", "text": LINE}
+#       -> nothing at all. No audio, no error.
+#
+# So: the content-array form, and the transcript checked against the words even
+# here. "Exact by construction" is a property of ONE spelling of this event.
+#
+# NOT YET MEASURED: interruptible:false. The field is documented to drop caller
+# audio during playback, which is a policy change rather than a mechanism one --
+# commit 0bdec46 ("Eleven refused barge-ins were eleven questions being
+# answered") is the argument for using it only on the red tier and the imminent
+# turn call. Testing it needs a barge-in to refuse, which needs two speakers.
+
+def force_message_item(line: str, interruptible: bool = True) -> dict:
+    """The conversation.item.create item that says `line` verbatim.
+
+    The content-array form, because the `text` form produces a greeting -- see
+    above. Callers should still verify the transcript: one wrong field name is
+    the difference between a warning and "Hey. What's up."
+    """
+    item = {"type": "force_message",
+            "content": [{"type": "input_text", "text": line}]}
+    if not interruptible:
+        # Documented to DROP caller audio while it plays, so a driver speaking
+        # over it is not heard at all rather than merely ignored. Red tier and the
+        # imminent turn call only.
+        item["interruptible"] = False
+    return item

@@ -560,9 +560,14 @@ def run_clips():
     ok("latest" not in eve_sig["model"],
        "...and not an alias: the version came from the session's own "
        "session.updated payload, which is the only record of what answered")
-    ok("xai_voice" not in config.VOICE_BACKENDS,
-       "and it is NOT a live backend — VOICE_BACKEND=xai_voice is still refused, "
-       "because the controller for that transport does not exist yet")
+    ok("xai_voice" in config.VOICE_BACKENDS,
+       "it is SELECTABLE now — the server mint, the session policy, the playout "
+       "queue and the event seam in both directions all exist, and a live harness "
+       "drives a whole turn through them")
+    ok(config.VOICE_BACKEND != "xai_voice",
+       f"...and not the DEFAULT ({config.VOICE_BACKEND}), because the browser "
+       "controller does not exist yet: selecting it would start a session the "
+       "page cannot render, which is a worse failure than not offering it")
     ok(eve_dir != ra.audio_dir("openai_realtime"),
        f"its clips live apart from the shipped set ({eve_dir.name}/), so a "
        "backend switch cannot leave one voice's files to be played by another")
