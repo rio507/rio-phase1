@@ -25,18 +25,21 @@
  *                 driven the old way reach the same state on the same events.
  *                 This is the check that makes the refactor a refactor.
  *
- *   HONESTY       what nobody has measured reads as unmeasured. The xAI
- *                 profile has an UNKNOWN in it -- whether
- *                 ...transcription.completed carries an item_id -- and a
- *                 boolean cannot hold that. Asserted here is that it CANNOT be
- *                 read as a boolean at all, so no `if` downstream can quietly
- *                 take the degraded path.
+ *   HONESTY       what nobody has measured reads as unmeasured, and cannot be
+ *                 read as a boolean at all -- so no `if` downstream quietly
+ *                 takes a degraded path. The example this section was written
+ *                 around, transcriptionItemId, has since been MEASURED (see
+ *                 below); it is re-aimed at webrtcEndpoint rather than deleted,
+ *                 because a test that dies when its example resolves was only
+ *                 ever guarding one value.
  *
- * WHAT THIS FILE CANNOT DO, and says so rather than pretending: it does not
- * verify a single claim about xAI's wire. The account this repo holds a key for
- * is credit-blocked, so the xai_voice profile is documentation shaped like
- * code. Every check below tests that the RECORD is internally consistent and
- * that the seam honours it -- never that the record is true.
+ * WHAT THIS FILE DOES AND DOES NOT VERIFY. It tests that the RECORD is
+ * internally consistent and that the seam honours it. Whether the record is TRUE
+ * is settled elsewhere, by probes against the live API -- and the history of this
+ * file is an argument for keeping those separate. When it was written the account
+ * was credit-blocked and every xai_voice value was documentation shaped like
+ * code; two of those values have since been measured and one of them came back
+ * the opposite of what a careful reading of the docs had predicted.
  */
 'use strict';
 
@@ -290,27 +293,36 @@ section('honesty — an unmeasured fact cannot be read as a boolean');
 // ---------------------------------------------------------------------------
 {
   const p = provider.create('xai_voice');
-  const v = p.capability('transcriptionItemId');
 
-  ok(v === provider.UNKNOWN, 'transcriptionItemId is UNKNOWN, not a guess');
-  ok(v !== true && v !== false && typeof v !== 'boolean',
-     'and it is not a boolean, so `=== true` and `=== false` both fail closed '
-     + '— there is no comparison that quietly takes the wrong branch');
-  ok(p.unknown('transcriptionItemId') === true,
-     'unknown() is the only correct way to read it');
+  /* THIS SECTION USED TO ASSERT transcriptionItemId WAS UNKNOWN, and it is not
+     any more: tools/xai_transcription_probe.py measured it, committed, .updated
+     and .completed all carrying one item_id. The section is re-aimed rather than
+     deleted, because what it was really testing is the MECHANISM -- that a fact
+     nobody has measured cannot be misread as "no" -- and that mechanism still
+     has a live subject in webrtcEndpoint. A test deleted the moment its example
+     resolves is a test that only ever guarded one value. */
+  ok(p.capability('transcriptionItemId') === true,
+     'transcriptionItemId is now a measured true, not an UNKNOWN and not a guess');
+  ok(p.unknown('transcriptionItemId') === false,
+     '...so unknown() says so, and the supersede binding needs nothing');
+  ok(p.capability('transcriptionCompletedRepeats') === 3,
+     'and the difference the probe DID find is recorded: .completed arrives 3x '
+     + 'per utterance where OpenAI sends it once');
 
+  /* The mechanism itself, on the fact that is still open. */
+  ok(provider.UNKNOWN !== true && provider.UNKNOWN !== false
+     && typeof provider.UNKNOWN !== 'boolean',
+     'UNKNOWN is still not a boolean, so `=== true` and `=== false` both fail '
+     + 'closed on whatever is unmeasured next');
   const probes = p.probes();
-  ok(probes.length === 2,
-     `probes() names what is outstanding (${probes.length}): `
-     + probes.map(x => x.capability).join(', '));
-  const item = probes.find(x => x.capability === 'transcriptionItemId');
-  ok(item && /item_id/.test(item.settle) && /grok-transcribe/.test(item.settle),
-     'and each one carries the procedure that settles it, in enough detail to '
-     + 'write the probe from');
-  ok(p.blockedPaths().indexOf('supersede') >= 0,
-     'the supersede path is named as blocked — the binding at '
-     + 'rio_realtime.js:2742 is what the unknown gates, and commit ee0a909 is '
-     + 'what it costs when it is wrong');
+  ok(probes.length === 1 && probes[0].capability === 'webrtcEndpoint',
+     `probes() names what is still outstanding (${probes.map(x => x.capability).join(', ')})`);
+  ok(probes[0].settle && probes[0].settle.length > 20,
+     'and carries the procedure that settles it, in enough detail to write the '
+     + 'probe from');
+  ok(p.blockedPaths().length === 0,
+     'no path is blocked any more — supersede was the only one, and the '
+     + 'measurement unblocked it');
 
   const settled = provider.create('openai_realtime');
   ok(settled.probes().length === 0 && settled.blockedPaths().length === 0,

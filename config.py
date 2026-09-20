@@ -1191,10 +1191,21 @@ LOOK_HOLDING_LINE_BY_BACKEND = {
     # gpt-live-1 has no supersede at all -- rio_live.js drops it, because there
     # is no response to supersede on a full-duplex model. Nothing to protect.
     "gpt_live": False,
-    # xAI: UNKNOWN. tools/xai_transcription_probe.py could not answer it (the
-    # voice models are not licensed to this team), so this is the fail-closed
-    # answer and not a finding. The probe flips it the day voice is licensed.
-    "xai_voice": True,
+    # xAI: MEASURED, and the answer is no line needed.
+    # tools/xai_transcription_probe.py, 2026-09-20: input_audio_buffer.committed,
+    # ...transcription.updated and ...transcription.completed all carry the SAME
+    # item_id. The binding does the job, silently and for free, exactly as it
+    # does on gpt-realtime -- so the visual fast path keeps its four-millisecond
+    # answer with nothing in front of it.
+    #
+    # THIS ENTRY WAS True FOR ONE COMMIT, on a fail-closed default, because the
+    # probe had twice failed for reasons that were mine and not the vendor's: a
+    # session.update with no output_modalities and no voice (which produces
+    # silence rather than an error), and an explicit commit alongside server_vad
+    # with no tail of silence for the detector to end the turn on. Left in the
+    # history rather than tidied away: the fail-closed default did its job, and
+    # what flipped it was a measurement rather than an argument.
+    "xai_voice": False,
 }
 
 

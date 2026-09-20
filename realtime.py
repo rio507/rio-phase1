@@ -613,6 +613,39 @@ line at all.
 Then answer in one or two sentences as you always would. Do not announce that
 you looked, do not narrate the wait, and do not apologise for it."""
 
+# WHY THIS IS AN INSTRUCTION AND NOT A DICTATED LINE, MEASURED.
+#
+# The obvious alternative to asking the model for a line is for the code to
+# dictate a fixed one the moment `look` is called: guaranteed wording, no
+# reliance on the model obeying an order about sequence. It cannot work, and a
+# number says so rather than an argument.
+#
+# grok-voice-think-fast-2.0, voice Eve, "Back off - now." by response.create
+# carrying the words, n=5 (2026-09-20):
+#
+#     639  645  660  665  795 ms to FIRST AUDIO       p50 660, max 795
+#
+# Against the shipped backend's own dictation table (config.py's
+# REALTIME_SPEAK_TIMEOUT_MS block: 418-1277 ms, p50 ~700, max 1277) that is
+# slightly better at the median and much better at the tail -- a useful fact in
+# its own right for the deterministic-speech budgets, and the first real number
+# anyone has for dictation on this vendor.
+#
+# (Named by constant rather than by model id on purpose: this file is asserted to
+# contain no model ids at all, prose included, and tools/realtime_selftest.py
+# checks the raw source. That invariant has been kept here since long before this
+# migration and is not worth spending on a comment.)
+#
+# But the race this line exists to win is 86 MILLISECONDS: that is how long after
+# the tool call the transcript arrives. A dictated line fired at the call makes
+# its first sound at 660 ms, by which time the transcript has been and gone and
+# the turn has already superseded itself. Seven times too slow to matter.
+#
+# The model-spoken line works for the one reason a dictated one cannot: it is
+# part of the SAME response, emitted before the function call, so audio is
+# already flowing when the tool is asked for. There is nothing for it to be late
+# for. That is also precisely why deep_dive was never affected by this bug.
+
 
 def look_onset(backend: str = None) -> str:
     """The `look` paragraph for this backend."""

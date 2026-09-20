@@ -684,19 +684,24 @@ def run_config():
     ok(config.look_holding_line_required("openai_realtime") is False,
        "the shipped backend calls look in silence — its transcripts carry the "
        "item_id, so the binding does the job for free")
-    ok(config.look_holding_line_required("xai_voice") is True,
-       "a backend whose transcript binding is UNKNOWN gets the line: a filler "
-       "line is forgiven, a silent visual turn took two drives to find")
+    ok(config.look_holding_line_required("xai_voice") is False,
+       "and so does xai_voice, now that the probe has MEASURED its transcripts "
+       "carrying the committed item_id — the binding does the job for free, so "
+       "the fast path keeps its four-millisecond answer")
     ok(config.look_holding_line_required("a_backend_from_the_future") is True,
        "...and so does one nobody has heard of — unknown counts as needed")
 
     silent = realtime.look_onset("openai_realtime")
-    spoken = realtime.look_onset("xai_voice")
+    # From an UNMEASURED backend, because both real ones now bind by item_id and
+    # get the silent variant. The spoken text still has to be correct for the day
+    # a backend arrives that cannot bind.
+    spoken = realtime.look_onset("a_backend_from_the_future")
     ok("SAY NOTHING IN FRONT OF IT" in silent and "SAY ONE SHORT THING" not in silent,
        "the silent variant is what the shipped stack is told")
     ok("SAY ONE SHORT THING" in spoken and "THE ORDER IS THE WHOLE POINT" in spoken,
-       "and the spoken variant insists the words come BEFORE the call — a line "
-       "after it is too late by 300-1200 ms against an 86 ms race")
+       "and the spoken variant insists the words come BEFORE the call — a "
+       "dictated line's first audio was MEASURED at 639-795 ms (p50 660) "
+       "against an 86 ms race, so a line started after the call cannot help")
     ok("one second" in spoken.lower(),
        "...and still forbids 'one second', which deep_dive learned the hard way")
     ok("%LOOK_ONSET%" not in realtime.instructions(),
@@ -713,14 +718,24 @@ def run_config():
        "...with an identity test, because UNKNOWN is a non-empty string and "
        "would pass a truthy one — which is the way this record was built not "
        "to be read")
-    for backend, want in (("openai_realtime", False), ("xai_voice", True)):
-        prof = "openai_realtime" if backend == "openai_realtime" else "xai_voice"
-        i = js.index('"%s": {' % prof) if ('"%s": {' % prof) in js else js.index("%s: {" % prof)
-        blob = js[i:i + 6000]
-        unknown_here = "transcriptionItemId: UNKNOWN" in blob
-        ok(unknown_here == want,
-           f"config and the browser agree about {backend}: "
-           f"{'the id is unmeasured, so the line is on' if want else 'the id is known, so it is off'}")
+    # THE TWO FILES MUST AGREE, PER BACKEND, and the check reads the JS rather
+    # than trusting it. `transcriptionItemId: UNKNOWN` in a profile is the browser
+    # saying the line is needed; config's table has to say the same.
+    for prof in ("openai_realtime", "xai_voice"):
+        i = js.index("%s: {" % prof)
+        blob = js[i:i + 9000]
+        js_needs = "transcriptionItemId: UNKNOWN" in blob
+        py_needs = config.look_holding_line_required(prof)
+        ok(js_needs == py_needs,
+           f"config and the browser agree about {prof}: the line is "
+           f"{'ON' if py_needs else 'OFF'} in both")
+    ok("transcriptionItemId: true" in js,
+       "and xai_voice's id is recorded as MEASURED true rather than assumed — "
+       "committed, .updated and .completed all carried the same item_id")
+    ok("transcriptionCompletedRepeats: 3" in js,
+       "...alongside the real difference the probe did find: .completed arrives "
+       "three times per utterance where OpenAI sends it once, so anything "
+       "acting on it must be idempotent")
 
 
 # ---------------------------------------------------------------------------

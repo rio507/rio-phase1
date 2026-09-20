@@ -89,7 +89,8 @@ def mint() -> str:
     return r.json()["value"]
 
 
-async def probe(audio: bytes, model: str, stt: str, keep_open: float) -> dict:
+async def probe(audio: bytes, model: str, stt: str, keep_open: float,
+                voice: str = "Eve", commit: bool = False) -> dict:
     import websockets
 
     token = mint()
@@ -105,17 +106,27 @@ async def probe(audio: bytes, model: str, stt: str, keep_open: float) -> dict:
         async def send(obj):
             await ws.send(json.dumps(obj))
 
+        # OUTPUT MODALITIES AND A VOICE, BOTH OF WHICH THE FIRST VERSION OMITTED.
+        # Without them this session accepted every field, echoed the transcription
+        # config back, ran VAD, committed the audio -- and produced nothing at
+        # all, which I read as the voice models being unlicensed. They are not:
+        # with these two lines the same endpoint returns audio and a transcript.
+        # The session does not complain about a half-configured output; it just
+        # goes quiet, which is the same silent-failure shape this repo keeps
+        # finding and is worth more than the config fix.
         await send({"type": "session.update", "session": {
             "type": "realtime",
+            "output_modalities": ["audio"],
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": RATE},
                     "transcription": {"model": stt},
                     "turn_detection": {"type": "server_vad"},
                 },
-                "output": {"format": {"type": "audio/pcm", "rate": RATE}},
+                "output": {"voice": voice,
+                           "format": {"type": "audio/pcm", "rate": RATE}},
             },
-            "instructions": "Say only: heard you.",
+            "instructions": "Reply with one short sentence.",
         }})
 
         # In 40 ms frames, the way a browser would, rather than one giant append:
@@ -124,8 +135,22 @@ async def probe(audio: bytes, model: str, stt: str, keep_open: float) -> dict:
         for i in range(0, len(audio), frame):
             await send({"type": "input_audio_buffer.append",
                         "audio": base64.b64encode(audio[i:i + frame]).decode()})
-        await send({"type": "input_audio_buffer.commit"})
-        await send({"type": "response.create"})
+            await asyncio.sleep(0.005)
+
+        # A TAIL OF SILENCE, AND NO EXPLICIT COMMIT. This is the second thing the
+        # first version got wrong, and between them they cost a wrong conclusion.
+        # With server_vad the SERVER decides where the utterance ends, and it
+        # needs to hear the end: audio that stops dead at the last syllable
+        # leaves the turn open, so speech_stopped fires and no transcript ever
+        # follows. Sending input_audio_buffer.commit as well does not help and is
+        # the client arguing with the detector it just asked for.
+        #
+        # With the tail and without the commit, the same session returns
+        # .updated and .completed, both carrying the committed item_id.
+        await send({"type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(b"\x00" * frame * 20).decode()})
+        if commit:
+            await send({"type": "input_audio_buffer.commit"})
 
         deadline = time.time() + keep_open
         while time.time() < deadline:
@@ -161,13 +186,18 @@ def main() -> int:
                                                  "grok-voice-latest"))
     ap.add_argument("--stt", default="grok-transcribe")
     ap.add_argument("--keep-open", type=float, default=20.0)
+    ap.add_argument("--voice", default="Eve")
+    ap.add_argument("--commit", action="store_true",
+                    help="also send input_audio_buffer.commit — which suppresses "
+                         "the transcript when server_vad is on")
     a = ap.parse_args()
 
     audio = pcm16(Path(a.audio))
     print(f"probe: {a.model} / {a.stt}, {len(audio)/2/RATE:.2f} s of audio "
           f"from {Path(a.audio).name}\n")
 
-    res = asyncio.run(probe(audio, a.model, a.stt, a.keep_open))
+    res = asyncio.run(probe(audio, a.model, a.stt, a.keep_open, a.voice,
+                            a.commit))
     evs = res["events"]
     print(f"  {len(evs)} events\n")
 
@@ -217,6 +247,10 @@ def main() -> int:
         print("  the three answers: the binding would never match and every turn")
         print("  would look like a new question.")
         return 4
+    if len(completed) > 1:
+        print(f"  NOTE: .completed arrived {len(completed)}x for one utterance, "
+              f"all with the same id. OpenAI sends it once; anything that acts on "
+              f"it must be idempotent.")
     print(f"  ALL THREE AGREE on {completed[0]!r}.")
     print("  The binding ports unchanged; transcriptionItemId is True.")
     return 0

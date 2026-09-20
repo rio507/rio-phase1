@@ -269,47 +269,47 @@
          *
          * Binding on ordinal instead is the heuristic rio_realtime.js ~1002
          * rejects by name, and it is not shipping as a silent fallback. */
-        transcriptionItemId: UNKNOWN,
-        /* STILL UNKNOWN AFTER PROBING, AND THE REASON IS NOT SHYNESS.
-         * tools/xai_transcription_probe.py opened a real session and could not
-         * answer it: this team has no access to grok-voice-latest,
-         * grok-voice-think-fast-2.0 or grok-transcribe. The REST /v1/stt
-         * endpoint works; the speech-to-speech models do not.
+        /* MEASURED TRUE, 2026-09-20, and it replaces an UNKNOWN that had been
+         * carried on two wrong readings of my own -- both recorded here because
+         * the record is worth more than my dignity.
          *
-         * The session ACCEPTED the connection, echoed
-         * transcription={"model":"grok-transcribe"} back in session.updated, ran
-         * VAD, fired speech_started / speech_stopped / committed -- and then
-         * emitted no transcript and no response at all, with no error event. A
-         * licensing gap that presents as a working session which never speaks is
-         * its own finding, and it is the shape a drive would hit.
+         * tools/xai_transcription_probe.py: input_audio_buffer.committed,
+         * ...transcription.updated and ...transcription.completed all carried
+         * the SAME item_id ('d75146cc-...', then reproduced), with transcript
+         * "Back off. Now." So the self-supersede binding at
+         * rio_realtime.js:2742 ports unchanged and needs nothing.
          *
-         * WHAT SUPERSEDE DEGRADES TO, stated rather than discovered later.
-         * `selfAnswered` at rio_realtime.js:2742 is
-         *     real && itemId && itemId === answeringItemId
-         * so an absent itemId makes it false on EVERY turn -- not sometimes.
-         * Every transcript then reaches supersedeGate as a possible new
-         * question, and on the turn where the model called a tool before the
-         * transcript arrived the gate passes it (it IS real driver speech, not
-         * an echo): supersedeTurn cancels the response, aborts the in-flight
-         * look(), discards the result, and the turn ends silent. That is commit
-         * ee0a909 exactly. It reproduced 3 of 3 on visual turns and never on
-         * deep_dive -- because deep_dive speaks a holding line first, and the
-         * barge gate protects what is already speaking.
+         * WHAT I GOT WRONG TWICE, because both mistakes looked like a licensing
+         * wall and neither was:
          *
-         * So the degraded mode is not "slightly worse supersede". It is "visual
-         * questions go silent", and it is not shippable.
+         *   1. No output_modalities and no output voice in session.update. The
+         *      session accepted every field, echoed the transcription config
+         *      back, ran VAD, committed the audio -- and produced NOTHING. Not
+         *      an error; silence. I read that as the voice models being
+         *      unlicensed and said so.
+         *   2. An explicit input_audio_buffer.commit alongside server_vad, and
+         *      audio that stopped dead at the last syllable. server_vad decides
+         *      where an utterance ENDS and has to hear the end; without a tail of
+         *      silence the turn stays open and no transcript ever follows.
          *
-         * THE FIX THAT FOLLOWS FROM THE DIAGNOSIS rather than from cleverness:
-         * the bug is a long tool call with NOTHING SAID OVER IT. If identity is
-         * unavailable, remove the other half -- give `look` the holding line
-         * deep_dive already has, and the barge gate protects it the same way.
-         * The cost is real and is a product decision rather than a technical
-         * one: the visual fast path exists precisely so a scene question is
-         * answered with no model and no filler in front of it, and this puts one
-         * back. Ordinal binding is the obvious alternative and is the heuristic
-         * the comment at ~1002 rejects by name in favour of identity; it is not
-         * being smuggled in here. */
-
+         * The models were always there: the session resolves grok-voice-latest
+         * to "grok-voice-think-fast-2.0" in its own session.updated payload and
+         * accepts voice "Eve". The 403s I quoted are real but belong to OTHER
+         * endpoints -- /v1/audio/speech and /v1/realtime/models -- and say
+         * nothing about the realtime websocket, which works. A "not-found" for
+         * grok-voice-latest on /v1/chat/completions is a voice model being asked
+         * to do chat, which was never a valid test.
+         *
+         * ONE REAL DIFFERENCE TO CARRY FORWARD: .completed arrives THREE TIMES
+         * for one utterance, every one with the same id and text, where OpenAI
+         * sends it once. transcriptArrived is reached three times; the second
+         * and third are selfAnswered by the binding above and suppressed, which
+         * is luck rather than design. See transcriptionCompletedRepeats. */
+        transcriptionItemId: true,
+        /* How many times .completed arrives per utterance. Measured 3 on xAI, 1
+           on OpenAI. Anything that acts on it has to be idempotent, and the only
+           reason ours is, is that the item_id binding recognises the repeats. */
+        transcriptionCompletedRepeats: 3,
         // Documented as not emitted. The handler that files a barge-in as
         // transcription_failed goes dead; those turns fall through the
         // bargeConfirmMs timer and land as false_barge_in instead. Same
