@@ -169,6 +169,45 @@ after `audit()` it kept **nothing** — 4 searches, 1 result dropped, 0 spoken. 
 may *spend*; nothing bounds what a question may spend **for no answer**. That is
 a real gap, not a rounding error, and it is worth a cap of its own.
 
+### Stage 2 measured, and the variance is larger than the vendor difference
+
+Through `search_local_news` itself, one question each, 2026-09-19:
+
+| vendor | shape | time | searches | cost |
+|---|---|---:|---:|---:|
+| gpt-5.6-sol | local news | 95 s | 4 | $0.252 *(estimated)* |
+| gpt-5.6-sol | background | 6 s | 1 | $0.059 *(estimated)* |
+| grok-4.6 | local news | 30 s | 8 | **$0.141** *(reported)* |
+| grok-4.6 | background | 19 s | 2 | **$0.035** *(reported)* |
+
+And an earlier probe of the same local-news shape on grok-4.6: **84 s, 15
+searches, $0.512.** Same question, same instructions, 3.6× the cost of the run
+above it.
+
+**So the honest reading is that per-question cost is not a property of the
+vendor.** It is a property of how many searches the model decides to run, and
+that varied 8→15 *within* grok-4.6. n=1 per cell here; the spread between two
+runs of one vendor is bigger than the gap between vendors, so nothing in this
+table supports "xAI is cheaper" or "xAI is dearer" and it is not written as if
+it does.
+
+What *is* solid:
+
+- **The corrected estimate was right.** gpt-5.6-sol's local-news question came in
+  at $0.252 against the $0.24–$0.31 predicted by re-pricing. The old published
+  $0.11 was wrong by about 2.3×.
+- **grok-4.6's figures are reported, not estimated** — `usage.cost_in_usd_ticks`,
+  no rate table involved. That is why the `(reported)` / `(estimated)` column
+  exists and why `spend_basis` is now carried through every return.
+- **Both vendors ignore the query cap.** `NEWS_MAX_QUERIES_PER_QUESTION` asks for
+  4; observed 4 (OpenAI), 8 and 15 (xAI). `NEWS_MAX_SEARCHES_PER_QUESTION = 8`
+  now bounds it client-side: charged in full, then refused, so a runaway happens
+  once and is visible instead of quietly eating a drive's budget.
+- **95 seconds on the OpenAI path** is worth its own line. The historical figure
+  in the struck table above is 34–46 s. Either that was optimistic or this
+  question was unusually hard; either way the 60 s `NEWS_TIMEOUT_S` did not stop
+  it, which wants looking at separately from the migration.
+
 **Nothing overspent because of this.** `NEWS_MAX_SEARCHES_PER_DRIVE` has its
 teeth on the search count, not on the money, so the budget refused exactly when
 it always did. What the wrong rates reached is every surface that *quotes* a

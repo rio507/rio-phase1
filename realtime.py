@@ -1796,11 +1796,10 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
     reasoning_tokens = getattr(
         getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
     out_tokens = getattr(usage, "output_tokens", None)
-    # ASKED, NOT COUNTED IN ONE VENDOR'S SHAPE. This used to count output items
-    # of type web_search_call, which is how OpenAI reports a search and not how
-    # xAI does -- xAI puts the number in usage.num_server_side_tools_used, so the
-    # old line would have reported zero searches on a call that ran five. That
-    # matters where it is debited from a budget (localnews._charge).
+    # ASKED RATHER THAN COUNTED. Through the provider, so the count comes from
+    # wherever this vendor reports it -- see llm_provider, which also records
+    # that my first reason for this change was wrong: xAI does emit
+    # web_search_call items, and the two sources agree exactly.
     searches = llm_provider.searches_of("reasoning", resp)
     # WHAT IT ACTUALLY COST, when the vendor says. None means it did not, which
     # is the OpenAI path and is why the news constants exist to estimate with.
@@ -1834,6 +1833,34 @@ def escalate(question: str, context: str = "", timeout_s: Optional[float] = None
         return {"ok": False, "note": note, "took_ms": took,
                 "status": status, "reason": why,
                 "reasoning_tokens": reasoning_tokens, "searches": searches}
+    # THE BOUND THAT DOES NOT NEED THE VENDOR'S COOPERATION.
+    #
+    # max_output_tokens above is advisory on at least one vendor -- measured:
+    # asked 200, got 849; asked 3,000, got 5,041 -- and the `incomplete` branch
+    # below keys on a status that vendor never sets, so it can no longer fire.
+    # That leaves nothing between a model in a talkative mood and a driver
+    # listening to a paragraph they cannot politely interrupt, which is the exact
+    # thing DEEP_ANSWER_MAX_TOKENS was written to prevent.
+    #
+    # REFUSED RATHER THAN TRUNCATED, and that is the whole decision. Cutting the
+    # text at the limit would hand the live model half a sentence to read out,
+    # and half a sentence is a different claim from the sentence -- on a path
+    # whose entire job is answering questions about the world, a clause lopped
+    # off "...which the council has NOT approved" is worse than no answer. A
+    # refusal is something the session instructions already tell her how to
+    # absorb: answer from what she knows, or say she could not look it up.
+    #
+    # Checked BEFORE the incomplete branch, because a long answer that also
+    # reports incomplete should be refused on its length and not merely noted.
+    if len(text) > int(config.DEEP_ANSWER_MAX_CHARS):
+        print(f"[realtime] deep_dive refused its own answer after {took} ms: "
+              f"{len(text)} chars against a {config.DEEP_ANSWER_MAX_CHARS} "
+              f"ceiling — {shape}", flush=True)
+        return {"ok": False, "note": "answer too long to speak", "took_ms": took,
+                "status": status, "reason": "over_length",
+                "chars": len(text), "limit": int(config.DEEP_ANSWER_MAX_CHARS),
+                "reasoning_tokens": reasoning_tokens, "searches": searches,
+                "usd": spent}
     if status == "incomplete":
         # There ARE words, so the driver gets an answer; it is just one that
         # stopped early, which is worth a line rather than a shrug.

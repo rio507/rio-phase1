@@ -389,6 +389,50 @@ DEEP_ANSWER_MAX_TOKENS = 320
 # keeps an answer short is the one above it.
 DEEP_REASONING_MAX_TOKENS = 1200
 
+# ---------------------------------------------------------------------------
+# AND A BOUND THAT DOES NOT DEPEND ON THE VENDOR HONOURING ONE
+# ---------------------------------------------------------------------------
+# Everything above assumes max_output_tokens stops generation. On xAI it does
+# not: asked for 200, grok-4.6 returned 849 output tokens, status "completed",
+# incomplete_details None. Asked for 3,000 on a news retrieval it returned
+# 5,041. So the argument that produced the two numbers above -- that the answer
+# and the thinking each get a ceiling and the API is handed the sum -- is an
+# argument about a cap that is now ADVISORY.
+#
+# Two things followed from that cap being real, and both are gone:
+#
+#   the SPEND was bounded. A tool call could cost at most its budget. Now the
+#   only bound is DEEP_ANSWER_TIMEOUT_S, and a timeout is not a budget: a
+#   45-second window at grok-4.6's search rate bought a $0.51 news question.
+#   the LENGTH was bounded, and length is what a driver actually experiences.
+#   An essay read aloud in a car is a monologue nobody can interrupt politely,
+#   which is the whole reason DEEP_ANSWER_MAX_TOKENS exists.
+#
+# This is the length half, enforced HERE rather than asked for. Characters and
+# not tokens, deliberately: what reaches the driver is speech, the thing being
+# bounded is how long she talks, and characters are what the clip and dictation
+# paths already measure (see REALTIME_SPEAK_* and voice_dialogue's chunker).
+# 320 tokens of English prose is roughly 1,300 characters; 1,600 leaves room for
+# a long final sentence rather than guillotining one.
+#
+# IT FAILS CLOSED, and that is the point of it. An answer over the bound is not
+# truncated mid-word and spoken anyway -- truncation is how a sentence becomes a
+# different sentence, and this path feeds a model that will read whatever it is
+# handed. It is REFUSED, the same way a timeout or an empty answer is refused,
+# and RIO carries on in her own words. A refusal she can absorb beats a
+# paragraph she cannot stop.
+DEEP_ANSWER_MAX_CHARS = int(os.getenv("DEEP_ANSWER_MAX_CHARS", "1600"))
+
+# Where the same question is asked of the SEARCH count rather than the length.
+# The instruction asks for at most NEWS_MAX_QUERIES_PER_QUESTION searches and
+# xAI ran fifteen against a request for four, so the instruction is a request on
+# this vendor in a way it was not before. A single question that spends most of
+# a drive's budget is the failure this bounds: it is checked against the count
+# the response actually reports, and a question over it is charged in full and
+# then refused, so the overspend happens once rather than every question.
+NEWS_MAX_SEARCHES_PER_QUESTION = int(
+    os.getenv("NEWS_MAX_SEARCHES_PER_QUESTION", "8"))
+
 # ...AND HOW LONG THE DRIVER WAITS FOR IT. Measured against the live API on
 # news questions, which are the slow ones because each search is a round trip
 # the model then reasons about:

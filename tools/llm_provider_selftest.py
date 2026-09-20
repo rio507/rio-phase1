@@ -175,6 +175,60 @@ def main():
     ok("the result names which model and vendor actually answered, so a drive "
        "log can say", '"vendor"' in esc and '"usd"' in esc)
 
+    section("the length bound, which does not need the vendor's cooperation")
+
+    import realtime
+
+    class _Resp:
+        def __init__(self, text):
+            self.output_text = text
+            self.status = "completed"
+            self.incomplete_details = None
+            self.output = []
+            class U:
+                output_tokens = 4000
+                class output_tokens_details:
+                    reasoning_tokens = 3000
+            self.usage = U()
+
+    class _Fake:
+        text = ""
+        class responses:
+            @staticmethod
+            def create(**kw):
+                return _Resp(_Fake.text)
+        def with_options(self, **kw):
+            return self
+
+    import llm_provider as _lp
+    _lp.override("reasoning", _Fake())
+    try:
+        _Fake.text = "A short honest answer."
+        r = realtime.escalate("why")
+        ok("an answer inside the bound is returned", r.get("ok") is True)
+
+        _Fake.text = "y" * int(c.DEEP_ANSWER_MAX_CHARS)
+        r = realtime.escalate("why")
+        ok(f"exactly {c.DEEP_ANSWER_MAX_CHARS} characters is allowed — the "
+           "boundary is inclusive", r.get("ok") is True)
+
+        _Fake.text = "x" * (int(c.DEEP_ANSWER_MAX_CHARS) + 1)
+        r = realtime.escalate("why")
+        ok("one character over is REFUSED, not truncated",
+           r.get("ok") is False and r.get("reason") == "over_length",
+           r.get("note"))
+        ok("...and it fails CLOSED: no text comes back at all, so nothing can "
+           "hand the live model half a sentence to read out",
+           "answer" not in r, sorted(r))
+        ok("...saying how long it was and what the ceiling is",
+           r.get("chars") == int(c.DEEP_ANSWER_MAX_CHARS) + 1
+           and r.get("limit") == int(c.DEEP_ANSWER_MAX_CHARS))
+        ok("the bound exists because max_output_tokens is advisory on at least "
+           "one vendor — asked 200, got 849; asked 3,000, got 5,041",
+           _lp.VENDORS["xai"]["enforces_token_cap"] is False)
+    finally:
+        _lp.clear_overrides()
+
     print("\n" + "-" * 58)
     print(f'  {"PASS" if not _fails else "FAIL"}: {len(_fails)} failure(s)'
           f' of {len(_checks)} checks')

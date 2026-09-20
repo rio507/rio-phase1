@@ -426,11 +426,75 @@ def t_live():
     print(f"     drive spend so far: {spend}")
 
 
+def t_vendor_seam():
+    """Stage 2's seam: the news role routes through the provider, the budget is
+    debited from what the vendor reports, and a runaway question is refused."""
+    section("G. the vendor seam, and the bounds that do not depend on it")
+    import llm_provider
+
+    ok("the news role resolves a vendor, a model and a client",
+       llm_provider.vendor_of("news") in ("openai", "xai")
+       and bool(llm_provider.model_of("news")),
+       f"{llm_provider.vendor_of('news')}/{llm_provider.model_of('news')}")
+    ok("...and this file names no vendor of its own",
+       not any(w in open(ln.__file__).read().lower().split("# ")[0]
+               for w in ("grok", "api.x.ai")))
+
+    # The search count comes from wherever this vendor reports it. Both shapes,
+    # because the point is that the CALLER does not know which it is talking to.
+    class _U:
+        num_server_side_tools_used = 9
+    class _RUsage:
+        usage = _U(); output = []
+    class _I:
+        type = "web_search_call"
+    class _ROut:
+        usage = None; output = [_I(), _I(), _I()]
+    got = {llm_provider.searches_of("news", _RUsage()),
+           llm_provider.searches_of("news", _ROut())}
+    ok("the search count is read from the vendor's own shape",
+       got & {9, 3}, got)
+
+    # A URL is not a headline.
+    class _A:
+        type = "url_citation"
+        def __init__(self, u, t): self.url, self.title = u, t
+    class _C:
+        def __init__(self, a): self.annotations = a
+    class _M:
+        type = "message"
+        def __init__(self, c): self.content = c
+    class _R:
+        def __init__(self, a): self.output = [_M([_C(a)])]
+    u = "https://pacpark.com/pacific-ocean-park/"
+    cites = ln.citations_of_response(_R([_A(u, u)]))
+    ok("a citation whose title IS its url gets no headline rather than a "
+       "headline that is the link again", cites and cites[0]["headline"] == "",
+       cites)
+    cites2 = ln.citations_of_response(_R([_A("https://smdp.com/x", "Pier plan approved")]))
+    ok("...and a real title survives untouched",
+       cites2 and cites2[0]["headline"] == "Pier plan approved", cites2)
+
+    ok(f"a per-question search ceiling exists "
+       f"({config.NEWS_MAX_SEARCHES_PER_QUESTION}) and is below the per-drive "
+       f"cap ({config.NEWS_MAX_SEARCHES_PER_DRIVE})",
+       0 < config.NEWS_MAX_SEARCHES_PER_QUESTION
+       < config.NEWS_MAX_SEARCHES_PER_DRIVE)
+    ok("...and it is low enough that a drive affords more than two questions",
+       config.NEWS_MAX_SEARCHES_PER_DRIVE
+       / config.NEWS_MAX_SEARCHES_PER_QUESTION >= 3,
+       f"{config.NEWS_MAX_SEARCHES_PER_DRIVE / config.NEWS_MAX_SEARCHES_PER_QUESTION:.1f} questions")
+
+    ok("a spend figure says whether the vendor reported it or a rate table "
+       "guessed", "spend_basis" in open(ln.__file__).read())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--offline", action="store_true")
     a = ap.parse_args()
     t_honesty()
+    t_vendor_seam()
     t_entity()
     t_routing()
     t_budget()

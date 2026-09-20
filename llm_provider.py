@@ -139,7 +139,19 @@ VENDORS = {
         # usage.cost_in_usd_ticks, at this many USD per tick.
         "reports_cost": ("cost_in_usd_ticks", 1e-10),
         "reasoning_efforts": ("low", "high"),
-        # usage.num_server_side_tools_used, rather than counting output items.
+        # usage.num_server_side_tools_used.
+        #
+        # NOT because the output items are missing -- and a commit message of
+        # mine said they were, wrongly. Measured on three real news calls, xAI
+        # emits web_search_call items too and the two agree exactly: 15 and 15,
+        # 8 and 8, 2 and 2. The old counting method would have worked.
+        #
+        # The usage field is still the right source, for a smaller reason than
+        # the one I claimed: it is one integer the vendor computed rather than a
+        # scan of an output list whose item taxonomy is theirs to change, and on
+        # a 32-item response most of those items are `reasoning`. But nothing was
+        # broken here, and a justification that overstates itself is how a
+        # capability record stops being trustworthy.
         "search_count": "usage_field",
     },
 }

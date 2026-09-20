@@ -558,9 +558,56 @@ RETRIEVE_INSTRUCTIONS = (
 
 
 def _client():
-    from openai import OpenAI
+    """The client for the NEWS role.
 
-    return OpenAI(timeout=float(config.NEWS_TIMEOUT_S))
+    Through llm_provider rather than constructed here, so this file names no
+    vendor -- and so the news role can move to another one without the reasoning
+    role moving with it. That separation is the point of staging the migration:
+    deep_dive was measured on its own before this was touched.
+    """
+    import llm_provider
+
+    return llm_provider.client("news").with_options(
+        timeout=float(config.NEWS_TIMEOUT_S))
+
+
+def _model() -> str:
+    import llm_provider
+
+    return llm_provider.model_of("news")
+
+
+def _effort_kw() -> dict:
+    """`reasoning={"effort": ...}` when the vendor takes one, else nothing."""
+    import llm_provider
+
+    effort = llm_provider.reasoning_effort("news")
+    return {"reasoning": {"effort": effort}} if effort else {}
+
+
+def _spend_of(resp, searches: int):
+    """What this call cost: the vendor's own figure where there is one.
+
+    THE DIFFERENCE MATTERS AND IT IS WHY THIS FUNCTION EXISTS. The estimate below
+    multiplies token counts by rates in config.py, and those rates were wrong for
+    as long as they have been quoted -- gpt-5's tier against a gpt-5.6-sol model,
+    understating input 4x and output 3x, published to counsel in LICENSING.md as
+    a measured fact. A rate table is a thing that goes stale silently. A number
+    the vendor returns cannot.
+
+    So: ask, and estimate only when the answer is None.
+    """
+    import llm_provider
+
+    reported = llm_provider.cost_usd("news", getattr(resp, "usage", None))
+    if reported is not None:
+        return reported, "reported"
+    usage = getattr(resp, "usage", None)
+    est = round(searches * config.NEWS_SEARCH_COST_USD
+                + (getattr(usage, "input_tokens", 0) or 0) * config.NEWS_IN_COST_USD
+                + (getattr(usage, "output_tokens", 0) or 0) * config.NEWS_OUT_COST_USD,
+                4)
+    return est, "estimated"
 
 
 def retrieve(queries: list, cls: dict, loc: dict, place_name: str = "") -> dict:
@@ -594,22 +641,27 @@ def retrieve(queries: list, cls: dict, loc: dict, place_name: str = "") -> dict:
 
     try:
         r = _client().responses.create(
-            model=config.NEWS_MODEL,
+            model=_model(),
             instructions=RETRIEVE_INSTRUCTIONS,
             input="\n".join(ask),
             tools=[{"type": "web_search"}],
             text={"format": {"type": "json_schema", "name": "news_results",
                              "schema": RESULT_SCHEMA, "strict": True}},
             max_output_tokens=int(config.NEWS_MAX_TOKENS),
+            **_effort_kw(),
         )
     except Exception as e:
         print(f"[news] retrieve failed: {type(e).__name__}: {e}", flush=True)
         return {"ok": False, "note": f"{type(e).__name__}",
                 "took_ms": round((time.time() - t0) * 1000, 1), "searches": 0}
 
-    searches = sum(1 for i in (getattr(r, "output", None) or [])
-                   if getattr(i, "type", "") == "web_search_call")
+    import llm_provider
+    # ASKED OF THE VENDOR rather than counted out of the output list. The budget
+    # below is debited from this number, and a budget debited from the wrong one
+    # is not a budget.
+    searches = llm_provider.searches_of("news", r)
     usage = getattr(r, "usage", None)
+    spent, spend_basis = _spend_of(r, searches)
     raw = (getattr(r, "output_text", "") or "").strip()
     try:
         results = (json.loads(raw) or {}).get("results") or []
@@ -617,6 +669,7 @@ def retrieve(queries: list, cls: dict, loc: dict, place_name: str = "") -> dict:
         print(f"[news] unparseable retrieval payload ({len(raw)} chars)",
               flush=True)
         return {"ok": False, "note": "unreadable_results", "searches": searches,
+                "est_cost_usd": spent, "spend_basis": spend_basis,
                 "took_ms": round((time.time() - t0) * 1000, 1)}
 
     return {
@@ -624,11 +677,12 @@ def retrieve(queries: list, cls: dict, loc: dict, place_name: str = "") -> dict:
         "took_ms": round((time.time() - t0) * 1000, 1),
         "input_tokens": getattr(usage, "input_tokens", None),
         "output_tokens": getattr(usage, "output_tokens", None),
-        "est_cost_usd": round(
-            searches * config.NEWS_SEARCH_COST_USD
-            + (getattr(usage, "input_tokens", 0) or 0) * config.NEWS_IN_COST_USD
-            + (getattr(usage, "output_tokens", 0) or 0) * config.NEWS_OUT_COST_USD,
-            4),
+        "est_cost_usd": spent,
+        # "reported" means the vendor returned it and no rate table was involved;
+        # "estimated" means config's rates were. Carried so /news_spend and the
+        # drive log can say which, because the two have very different standing
+        # and the old code presented an estimate as a measurement.
+        "spend_basis": spend_basis,
     }
 
 
@@ -1134,7 +1188,36 @@ def _news(loc, cls, place_name, session_key, route_ahead=None) -> dict:
                 "rules": RULES_NEWS}
 
     got = retrieve(queries, cls, loc, place_name)
+    # CHARGED FIRST, ALWAYS. The money is spent by the time this returns, whether
+    # or not the answer is usable, and a budget that only debits successful calls
+    # is a budget that a failing vendor can drain for free.
     _charge(session_key, got.get("searches", 0), got.get("est_cost_usd", 0.0))
+
+    # AND A CEILING ON ONE QUESTION, because the instruction stopped being
+    # sufficient. NEWS_MAX_QUERIES_PER_QUESTION asks for at most four searches.
+    # Measured on grok-4.6: fifteen on a local-news question, eight on a narrow
+    # traffic one. At fifteen, the per-drive cap of twenty-four is 1.6 questions,
+    # so the SECOND question of a drive finds the budget gone -- and the driver
+    # hears "I can't look anything else up" having asked twice.
+    #
+    # The overspend cannot be prevented from here: there is no server-side
+    # parameter to cap searches (only allowed_domains / excluded_domains), so by
+    # the time the count is known the searches have run. What can be prevented is
+    # its becoming the NORM. This refuses the answer to a question that ran away,
+    # after charging for it in full, so the runaway happens once and is visible
+    # rather than quietly eating the drive.
+    over = int(got.get("searches") or 0) > int(config.NEWS_MAX_SEARCHES_PER_QUESTION)
+    if over:
+        print(f"[news] one question ran {got.get('searches')} searches against a "
+              f"ceiling of {config.NEWS_MAX_SEARCHES_PER_QUESTION} "
+              f"(${got.get('est_cost_usd')} {got.get('spend_basis')}); charged "
+              f"and refused", flush=True)
+        return {"ok": False, "note": "search_runaway", "classified": cls,
+                "queries": queries, "searches": got.get("searches", 0),
+                "est_cost_usd": got.get("est_cost_usd"),
+                "spend_basis": got.get("spend_basis"),
+                "rules": ("You could not look that up this time. Say so plainly, "
+                          "in your own words, and do NOT answer from memory.")}
     if not got.get("ok"):
         return {"ok": False, "note": got.get("note"), "classified": cls,
                 "queries": queries, "searches": got.get("searches", 0),
@@ -1167,6 +1250,10 @@ def _news(loc, cls, place_name, session_key, route_ahead=None) -> dict:
         "offer_other": cls.get("offer_other"),
         "searches": got.get("searches"),
         "est_cost_usd": got.get("est_cost_usd"),
+        # Carried up from retrieve(), which is where it is known. Without this the
+        # main news path reported a figure with no provenance -- the exact
+        # ambiguity `spend_basis` was added to remove, reintroduced one level up.
+        "spend_basis": got.get("spend_basis"),
         "retrieve_ms": got.get("took_ms"),
         "rules": RULES_NEWS,
     }
@@ -1192,7 +1279,7 @@ def _background(loc, cls, place_name, session_key) -> dict:
     t0 = time.time()
     try:
         r = _client().responses.create(
-            model=config.NEWS_MODEL,
+            model=_model(),
             instructions=(
                 "You are the background step behind a car assistant's spoken "
                 "answer. Say what this place is and why it is interesting, in "
@@ -1208,6 +1295,7 @@ def _background(loc, cls, place_name, session_key) -> dict:
             tools=([{"type": "web_search"}]
                    if config.NEWS_BACKGROUND_SEARCH else []),
             max_output_tokens=int(config.NEWS_BACKGROUND_MAX_TOKENS),
+            **_effort_kw(),
         )
     except Exception as e:
         print(f"[news] background failed: {type(e).__name__}: {e}", flush=True)
@@ -1215,12 +1303,9 @@ def _background(loc, cls, place_name, session_key) -> dict:
                 "rules": ("You could not look that up. Say so plainly and do "
                           "not invent a history for the place.")}
 
-    searches = sum(1 for i in (getattr(r, "output", None) or [])
-                   if getattr(i, "type", "") == "web_search_call")
-    usage = getattr(r, "usage", None)
-    cost = round(searches * config.NEWS_SEARCH_COST_USD
-                 + (getattr(usage, "input_tokens", 0) or 0) * config.NEWS_IN_COST_USD
-                 + (getattr(usage, "output_tokens", 0) or 0) * config.NEWS_OUT_COST_USD, 4)
+    import llm_provider
+    searches = llm_provider.searches_of("news", r)
+    cost, basis = _spend_of(r, searches)
     _charge(session_key, searches, cost)
     text = (getattr(r, "output_text", "") or "").strip()
     if not text:
@@ -1232,6 +1317,7 @@ def _background(loc, cls, place_name, session_key) -> dict:
         "subject": subject, "background": text,
         "citations": citations_of_response(r),
         "searches": searches, "est_cost_usd": cost,
+        "spend_basis": basis,
         "offer_other": cls.get("offer_other"),
         "retrieve_ms": round((time.time() - t0) * 1000, 1),
         "rules": RULES_BACKGROUND,
@@ -1296,6 +1382,28 @@ def citations_of_response(resp) -> list:
                     continue
                 seen.add(url)
                 title = (getattr(a, "title", "") or "").strip()
+                # A URL IS NOT A HEADLINE, and one vendor hands one over as if it
+                # were. Measured on grok-4.6's url_citation annotations: `title`
+                # came back as the URL itself for all fifteen citations on a
+                # background answer, so the Sources card would have rendered
+                # "https://pacpark.com/pacific-ocean-park/" as the headline of a
+                # row whose link is that same URL -- the same string twice, once
+                # pretending to be a title.
+                #
+                # It matters because of what the card is FOR. LICENSING.md section
+                # 4 commits to citations a person can read and click, and the
+                # renderer drops a row with nothing to click precisely so nothing
+                # dead is displayed. A row whose headline is its own href is not
+                # dead, it is uninformative, which is the failure mode that passes
+                # every test and helps nobody.
+                #
+                # Empty rather than the URL: the renderer already shows the source
+                # name and the link, so a blank headline degrades to a citation
+                # that says less, not to one that says something useless.
+                if title and title.split("?")[0].rstrip("/") == url.split("?")[0].rstrip("/"):
+                    title = ""
+                elif title.startswith(("http://", "https://")):
+                    title = ""
                 out.append({
                     "source": _host_of(url), "headline": title, "url": url,
                     "published": None, "age_h": None, "where": None,
