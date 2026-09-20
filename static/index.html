@@ -3323,6 +3323,12 @@ const LIVE_REPORTED = {
      every one of them a new question. */
   LIVE_TURN_PHANTOM: 'turn_phantom',
   LIVE_BUS_HEALTH: 'bus_health',
+  /* A RESPONSE THAT MADE NO SOUND, counted where a drive's silence is already
+     accounted for (/realtime/cutoffs). It is deliberately NOT a cut-off: no
+     answer was interrupted, because none was ever heard -- and the browser is
+     the only thing that can tell the difference, because it is the only thing
+     that knows audio was expected. */
+  XAI_SESSION_SILENT: 'session_silent',
   LIVE_TURN_COALESCED: 'turn_coalesced',
   /* ROAD NOISE, in the drive's own record.
      "she answered nothing four times in ten milliseconds" is a sentence about
@@ -3830,7 +3836,7 @@ async function toggleLive() {
         const hint = document.getElementById('michint');
         if (hint) {
           hint.textContent = name === 'mic' ? 'allow the microphone'
-            : name === 'negotiate' ? 'opening the line'
+            : name === 'negotiate' || name === 'socket' ? 'opening the line'
             : name === 'mint' ? 'starting the session'
             : 'stand by';
         }
@@ -3872,6 +3878,20 @@ async function toggleLive() {
             RIO.ui.voice('idle');
             obs.textContent = 'Live session lost (' + why + ') — tap to reconnect.';
           }, 0);
+        }
+        /* SHE CONNECTED AND SAID NOTHING. Not a lull: the transport expected
+           audio for a response and none came, which on this wire is a real and
+           already-seen failure -- a socket that runs VAD, commits the driver's
+           words and produces no sound. Three wrong conclusions were drawn from
+           that shape while nothing said it out loud, so it is on the screen and,
+           through reportLive below, in the drive's own record. */
+        else if (mine && ev.type === 'XAI_SESSION_SILENT') {
+          RIO.ui.voice('listening');
+          obs.textContent = 'She is listening but not answering — session '
+            + 'degraded. Tap to reconnect.';
+        }
+        else if (mine && ev.type === 'XAI_SESSION_RECOVERED') {
+          obs.textContent = 'Live — just talk. She will stop when you do.';
         }
         else if (mine && ev.type === 'LIVE_RESUME') {
           // Say so on screen. An answer that finishes itself after a warning is
@@ -6848,8 +6868,20 @@ document.addEventListener('DOMContentLoaded', () => {
                         connect — a controller built before this exists gets no
                         provider and falls back to its cfg flags, which is the
                         node suite's path and not a browser's
+       rio_playout.js   the audio queue that knows when her voice actually ends,
+                        for the backends where the page renders it. Before
+                        rio_xai_session.js, which builds one per session
+       rio_xai_session.js  the WebSocket transport for VOICE_BACKEND=xai_voice:
+                        the socket, the PCM in both directions and the audio
+                        queue. It holds the vendor's wire and none of the drive's
+                        policy — rio_realtime.js hands it the controller config
+                        and the session handle, so both backends answer
+                        "how long may this line wait for the mouth" the same way
        rio_realtime.js  RIO's live session — no DOM in the half that decides
-                        anything, so node can test it
+                        anything, so node can test it. connect() mints, opens the
+                        microphone, and then either negotiates a peer connection
+                        or hands the session to rio_xai_session.js, depending on
+                        which backend the mint says
        rio_speak.js     one voice for deterministic lines: dictate, else
                         synthesise, else play the clip
        rio_navcore.js   the route tracker — no DOM, node-testable
@@ -6873,6 +6905,10 @@ document.addEventListener('DOMContentLoaded', () => {
 <script src="/static/rio_permissions.js"></script>
 <script src="/static/rio_playout.js"></script>
 <script src="/static/rio_provider.js"></script>
+<!-- The WebSocket voice transport. Loaded alongside the others for the same
+     reason rio_live.js is: VOICE_BACKEND decides which wire connects, and a
+     backend that is one env var away has to be one restart away too. -->
+<script src="/static/rio_xai_session.js"></script>
 <script src="/static/rio_realtime.js"></script>
 <!-- The gpt-live-1 controller. Loaded alongside rather than instead of the
      realtime one: VOICE_BACKEND decides which connects (see voiceConnect

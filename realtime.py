@@ -1050,6 +1050,15 @@ _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
                   # facts: an absorbed blip fired the gate and stopped short of
                   # cancelling, and one of these never got that far.
                   "echo_suppressed": 0,
+                  # A SESSION THAT CONNECTED AND NEVER SPOKE. Not a cut-off: no
+                  # answer was interrupted, because none was ever heard. Three
+                  # wrong conclusions were drawn from this shape while it had no
+                  # counter -- a socket that opens, runs VAD, commits audio and
+                  # produces nothing looks identical from here to a quiet
+                  # driver. The browser is the only thing that can tell the
+                  # difference (it knows what it expected) and this is where it
+                  # says so.
+                  "session_silent": 0,
                   # NEWEST WINS (item 4). Not part of the cut-off tally: a
                   # superseded turn is not a failure of an answer, it is an
                   # answer correctly thrown away, and counting it as a cut-off
@@ -1105,7 +1114,7 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
             c = cause if cause in _CUTOFF_CAUSES else "other"
             _cutoffs["tally"][c] += 1
         elif kind in ("resumed", "resume_skipped", "blips_absorbed",
-                      "echo_suppressed"):
+                      "echo_suppressed", "session_silent"):
             _cutoffs[kind] += 1
         elif kind in _TURN_KINDS:
             # Counted rather than tallied as a cut-off: a supersede is not a
@@ -1129,6 +1138,9 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              "why", "text", "speaking", "since_audio_ms",
                              "covered", "context", "to_destination",
                              "bus_failures", "fallbacks",
+                             # How many responses had gone silent when the
+                             # browser said so.
+                             "responses",
                              # ...and road noise: how many fragments one window
                              # swallowed, how long it spanned, and how long
                              # since the last "Didn't catch that".
@@ -1205,6 +1217,10 @@ def cutoff_tally() -> dict:
             # ...and the ones that never reached the gate, because the level
             # test said the microphone was hearing the loudspeaker.
             "echo_suppressed": _cutoffs["echo_suppressed"],
+            # Responses that made no sound at all. A non-zero number here means
+            # the driver was talking to something that was not answering, which
+            # is a different fault from every other number in this dict.
+            "session_silent": _cutoffs["session_silent"],
             "resumed": _cutoffs["resumed"],
             "resume_skipped": _cutoffs["resume_skipped"],
             "recent": list(_cutoffs["recent"]),
@@ -2630,6 +2646,24 @@ def _observer_status() -> dict:
         return {"error": f"{type(e).__name__}"}
 
 
+def _backend_model() -> str:
+    """The model the configured voice backend will actually open."""
+    if config.VOICE_BACKEND == "gpt_live":
+        return config.GPT_LIVE_MODEL
+    if config.VOICE_BACKEND == "xai_voice":
+        return config.XAI_VOICE_MODEL
+    return config.OPENAI_REALTIME_MODEL
+
+
+def _backend_voice() -> str:
+    """...and the voice it will speak in."""
+    if config.VOICE_BACKEND == "gpt_live":
+        return config.GPT_LIVE_VOICE
+    if config.VOICE_BACKEND == "xai_voice":
+        return config.XAI_VOICE
+    return config.OPENAI_REALTIME_VOICE
+
+
 def status() -> dict:
     """What the panel and /health need to know, without calling anything."""
     return {
@@ -2639,12 +2673,13 @@ def status() -> dict:
         # the browser has to know before it starts rather than discover it from
         # a failure. Decided in config.py, read here, chosen once per drive.
         "voice_backend": config.VOICE_BACKEND,
-        "model": (config.GPT_LIVE_MODEL
-                  if config.VOICE_BACKEND == "gpt_live"
-                  else config.OPENAI_REALTIME_MODEL),
+        # WHO IS ACTUALLY SPEAKING THIS DRIVE, per backend. Three of them now,
+        # and each names its own model and voice: a /health that reports the
+        # OpenAI model while the browser is talking to another vendor is worse
+        # than one that omits the field, because it is read as evidence.
+        "model": _backend_model(),
         "realtime_model": config.OPENAI_REALTIME_MODEL,
-        "voice": (config.GPT_LIVE_VOICE if config.VOICE_BACKEND == "gpt_live"
-                  else config.OPENAI_REALTIME_VOICE),
+        "voice": _backend_voice(),
         # Through the role, so this reports whoever deep_dive actually reaches.
         "reasoning_model": (config.GPT_LIVE_BACKEND_MODEL
                             if config.VOICE_BACKEND == "gpt_live"

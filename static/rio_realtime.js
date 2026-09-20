@@ -4070,7 +4070,14 @@
           speaking: !!speaking,
           dictating: !!dictation,
           // Which mouth this session is using, and what the sink is doing.
-          voice_backend: sink ? 'elevenlabs' : 'openai_realtime',
+          /* WHICH MOUTH AND WHICH WIRE. The sink answers first because it IS
+             the mouth when it exists; otherwise the provider record says whose
+             wire this is, and it says so because the server told it (see
+             forVoiceBackend). A literal here was right while there was one
+             wire, and would have quietly reported the wrong vendor in every
+             drive log the moment there were two. */
+          voice_backend: sink ? 'elevenlabs'
+                              : ((provider && provider.name) || 'openai_realtime'),
           speaking_directly: !!(speaking && speaking.direct),
           voice: sink && sink.state ? sink.state() : null,
           generated: generated,
@@ -4270,6 +4277,195 @@
     };
   }
 
+  /* ------------------------------------------------------------------------
+   * THE CONTROLLER'S POLICY, IN ONE PLACE, BECAUSE THERE ARE NOW TWO WIRES.
+   *
+   * Every field below is a decision made in config.py and carried here with the
+   * session. It used to sit inside connect(), which was fine while connect() was
+   * the only way a session came into being -- and stopped being fine the moment
+   * the xAI backend arrived with a WebSocket instead of a peer connection.
+   *
+   * The alternative was a second call site with its own copy of this list, and
+   * that is the failure this project has already had: a policy field added to one
+   * path and not the other drifts silently, because a missing field is a default,
+   * not an error. Two transports, one policy.
+   *
+   * `w` is the WIRE: the handful of things that genuinely differ between them --
+   * how an event is sent, what the mouth is, whether there is a level meter, and
+   * which provider record describes the far end.
+   * --------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------
+   * THE HANDLE THE PANEL HOLDS, and the second thing that had to stop living
+   * inside connect() when a second transport arrived.
+   *
+   * Everything here except the four members in `parts` is a READ of the session
+   * payload -- which channels may speak, how long a line has to start, which
+   * voice ended up being used. None of it depends on the wire, and a copy of it
+   * per transport is the same drift controllerConfig() exists to prevent.
+   *
+   * parts: { controller, audioState(), resumeAudio(why), stop() }
+   * --------------------------------------------------------------------- */
+  function sessionHandle(session, parts) {
+    var controller = parts.controller;
+    var handle = {
+      controller: controller,
+      session: session,
+      /* Dictate a deterministic line in RIO's voice. Warnings,
+         turns and health announcements come through here; each of
+         them already holds the mouth at its own priority. */
+      speak: function (text, o) { return controller.speak(text, o); },
+      /* ...and give it back. The arbiter takes the mouth away from a
+         line by calling `stop()` on the item that owns it, and until
+         this was reachable from there the line went on holding the
+         session's single dictation slot to the end of its own budget
+         -- so the line that replaced it was refused `busy` and, with
+         no clip of its own, went silent. */
+      cancelSpeak: function (token, reason) {
+        return controller.cancelSpeak(token, reason);
+      },
+      speechEnabled: function (channel) {
+        if (session.speech_enabled === false) return false;
+        var chans = session.speech_channels || {};
+        return chans[channel] !== false;
+      },
+      /* How long THIS line may take to start speaking before it is
+         synthesised instead. Per channel, and for navigation per call
+         type, because a backup call at the junction and one issued
+         seconds out have different deadlines. The table is decided in
+         config.py and travels with the session; this only reads it. */
+      speakTimeout: function (channel, callType) {
+        var table = session.speak_timeout_ms_by_channel || {};
+        var byCall = table[channel];
+        if (!byCall) return session.speak_timeout_ms;
+        return byCall[callType] || byCall._default
+               || session.speak_timeout_ms;
+      },
+      /* Which voice this drive is actually using, for the panel and
+         for the tests. Read from the controller rather than from the
+         session payload: the payload says what was INTENDED, and after
+         a tier-2 fallback those are two different answers. */
+      voiceBackend: function () {
+        return controller.state().voice_backend;
+      },
+      audioState: parts.audioState,
+      resumeAudio: parts.resumeAudio,
+      stop: function () {
+        try { parts.stop(); } catch (e) {}
+        if (active === handle) active = null;
+      },
+    };
+    active = handle;
+    return handle;
+  }
+
+  function controllerConfig(session, w) {
+    return {
+          arbiter: w.arbiter,
+          // Dictation policy comes from the server with the session, so the
+          // browser holds no second copy of the verbatim instruction to drift
+          // from the one the tests check.
+          verbatimInstruction: session.verbatim_instruction,
+          speakTimeoutMs: session.speak_timeout_ms,
+          directSpeechTimeoutMs: session.direct_speech_timeout_ms,
+          lookAnswerMaxTokens: session.look_answer_max_tokens,
+          // Interruption policy, decided in config.py and carried here with
+          // the session exactly as the dictation policy is. The browser holds
+          // no numbers of its own to drift from the ones the tests check.
+          resumeInstruction: session.resume_instruction,
+          bargeConfirmMs: session.barge_confirm_ms,
+          /* THE VENDOR, AS A RECORD RATHER THAN AS KNOWLEDGE.
+             This used to be `holdTail: true` under a comment reading "WebRTC
+             sends output_audio_buffer.stopped: the mouth waits for it" — true,
+             and the only written record of the dependency. The provider now
+             answers it, along with every other capability question, so the
+             controller holds no vendor names and this call site holds no
+             transport assumptions. See static/rio_provider.js.
+
+             The backend travels with the session (config.VOICE_BACKEND, sent
+             by mint_client_secret), and `elevenlabs` resolves to the same
+             OpenAI event stream it has always been — it changes the mouth, not
+             the wire. */
+          provider: w.provider,
+          /* THE PHONE COLUMN OR THE DESK COLUMN. Both travel with the session
+             (config.py decides them, realtime.mint_client_secret sends them)
+             and the machine picks its own — see isTouchDevice. The fallback to
+             the flat barge_sustain_ms is what an older server sends, and it is
+             the desktop behaviour, unchanged. */
+          bargeSustainMs: w.barge.sustain_ms || session.barge_sustain_ms,
+          bargeOnsetGuardMs: w.barge.onset_guard_ms || 0,
+          bargeEchoMarginDb: w.barge.echo_margin_db || 0,
+          bargeEchoFloorDb: session.barge_echo_floor_db,
+          /* The meter is installed later, when there is a remote track to
+             measure; until then the level test has no evidence and the gate
+             behaves as it does on a desk. */
+          levels: w.levels || function () { return null; },
+          maxResumes: session.max_resumes,
+          /* How long her own voice may still be in the room after she stops,
+             and what counts as hearing herself. config.py decides both; see
+             REALTIME_ECHO_* and the iPhone test that produced them. */
+          /* The floor under semantic_vad's tail. 0 is off. */
+          turnBackstopMs: session.turn_backstop_ms,
+          turnBackstopMicDb: session.turn_backstop_mic_db,
+          echoTailMs: session.echo_tail_ms,
+          echoTextWindowS: session.echo_text_window_s,
+          echoTextOverlap: session.echo_text_overlap,
+          echoTextMinWords: session.echo_text_min_words,
+          /* NEWEST WINS. The commands that preempt, how long two fragments may
+             be apart and still be one question, and what a continuation looks
+             like — all decided in config.py and carried here with the session,
+             exactly as the barge and dictation policies are. */
+          turnPolicy: session.turn_policy,
+          send: w.send,
+          tool: function (name, args, controller) {
+            // Answered in the page when the page is the source of truth;
+            // everything else goes to the server, which holds the camera, the
+            // vehicle context and the reasoning model.
+            if (LOCAL_TOOLS[name]) {
+              try { return Promise.resolve(LOCAL_TOOLS[name](args)); }
+              catch (e) { return Promise.resolve({ ok: false, note: 'panel error' }); }
+            }
+            return fetch(w.url('/realtime/tool'), {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              /* THE HANDLE THAT STOPS IT. One controller per tool call, held by
+                 the turn that asked for it; a new driver utterance aborts every
+                 controller belonging to an older turn. Aborting the fetch also
+                 drops the TCP connection, which is how the server finds out --
+                 /realtime/tool watches for it and stops waiting on work nobody
+                 is going to hear.
+
+                 On the first real drive these calls ran 40.1, 12.9, 48.5 and
+                 27.1 seconds. Nothing could stop one. */
+              signal: w.controller() ? w.controller().signal : undefined,
+              // `where` is the car's own fix. Only find_places reads it, but it
+              // is attached to every call rather than to one, so a tool that
+              // needs it later does not have to re-plumb this.
+              //
+              // `spoken` is the DRIVER'S OWN LAST WORDS, and it is here for a
+              // measured reason. The model paraphrases what it was asked --
+              // "what's around us right now" reaches the tool as "describe the
+              // current scene" -- and the camera's fast path is a judgement
+              // about the question, so it has to be able to see the question
+              // rather than the relay. This page is where Whisper's transcript
+              // lands, so this is the only place that can send it.
+              body: JSON.stringify({ name: name, arguments: args,
+                                     where: currentFix(),
+                                     spoken: w.transcript() }),
+            }).then(function (r) { return r.json(); });
+          },
+          // Muting rather than pausing: a track is live and a paused element
+          // resumes into stale audio, and the sink's fade is undoable for the
+          // same reason -- the sustain gate has to be able to change its mind.
+          audio: w.audio,
+          voice: w.voice,
+          liveVoice: session.live_voice || session.voice,
+          // The tool list, and the part of it that waits for a precondition.
+          // Both come from the server; see mint_client_secret.
+          toolSchemas: session.tool_schemas,
+          conditionalTools: session.conditional_tools,
+          onEvent: w.onEvent,
+        };
+  }
+
   function connect(opts) {
     opts = opts || {};
     // The shared watch, subscribed to rather than started: rio_nav.js reads the
@@ -4329,6 +4525,39 @@
             } catch (e) {}
           }
         }
+        /* ---- A DIFFERENT WIRE ENTIRELY -------------------------------------
+         *
+         * The xAI backend is a WebSocket: no peer connection, no SDP, no remote
+         * track, and the audio is rendered in the page instead of by the WebRTC
+         * stack. Everything below this point is about the connection that
+         * backend does not have, so the branch is here -- before any of it --
+         * rather than threaded through it.
+         *
+         * WHAT IS SHARED IS THE PART THAT MATTERS: the same createController,
+         * the same controllerConfig, the same sessionHandle. This file hands
+         * those three to the transport and the transport hands back the four
+         * members that genuinely differ. Nothing about a vendor's events or its
+         * audio format is decided here, and nothing about the drive's policy is
+         * decided there.
+         *
+         * The mic is already open and is passed on: getUserMedia waits on a
+         * human and there is no reason for a second prompt. */
+        if (session.voice_backend === 'xai_voice') {
+          var xs = root.RIO && root.RIO.xaiSession;
+          if (!xs || !xs.attach) {
+            throw new Error('mint: session asks for xai_voice and '
+                            + 'rio_xai_session.js is not loaded');
+          }
+          return xs.attach({
+            session: session, mic: mic, url: url, progress: progress,
+            onEvent: opts.onEvent, arbiter: arbiter, touch: touch, barge: barge,
+            step: step,
+            createController: createController,
+            controllerConfig: controllerConfig,
+            sessionHandle: sessionHandle,
+          });
+        }
+
         var pc = new RTCPeerConnection();
         var channel = pc.createDataChannel('oai-events');
         mic.getTracks().forEach(function (t) { pc.addTrack(t, mic); });
@@ -4477,20 +4706,10 @@
           catch (e) { return ''; }
         }
 
-        var controller = createController({
+        var controller = createController(controllerConfig(session, {
           arbiter: arbiter,
-          // Dictation policy comes from the server with the session, so the
-          // browser holds no second copy of the verbatim instruction to drift
-          // from the one the tests check.
-          verbatimInstruction: session.verbatim_instruction,
-          speakTimeoutMs: session.speak_timeout_ms,
-          directSpeechTimeoutMs: session.direct_speech_timeout_ms,
-          lookAnswerMaxTokens: session.look_answer_max_tokens,
-          // Interruption policy, decided in config.py and carried here with
-          // the session exactly as the dictation policy is. The browser holds
-          // no numbers of its own to drift from the ones the tests check.
-          resumeInstruction: session.resume_instruction,
-          bargeConfirmMs: session.barge_confirm_ms,
+          barge: barge,
+          levels: function () { return meter ? meter() : null; },
           /* THE VENDOR, AS A RECORD RATHER THAN AS KNOWLEDGE.
              This used to be `holdTail: true` under a comment reading "WebRTC
              sends output_audio_buffer.stopped: the mouth waits for it" — true,
@@ -4507,86 +4726,16 @@
             ? root.RIO.provider.forVoiceBackend(session.voice_backend
                                                 || 'openai_realtime')
             : null,
-          /* THE PHONE COLUMN OR THE DESK COLUMN. Both travel with the session
-             (config.py decides them, realtime.mint_client_secret sends them)
-             and the machine picks its own — see isTouchDevice. The fallback to
-             the flat barge_sustain_ms is what an older server sends, and it is
-             the desktop behaviour, unchanged. */
-          bargeSustainMs: barge.sustain_ms || session.barge_sustain_ms,
-          bargeOnsetGuardMs: barge.onset_guard_ms || 0,
-          bargeEchoMarginDb: barge.echo_margin_db || 0,
-          bargeEchoFloorDb: session.barge_echo_floor_db,
-          /* The meter is installed later, when there is a remote track to
-             measure; until then the level test has no evidence and the gate
-             behaves as it does on a desk. */
-          levels: function () { return meter ? meter() : null; },
-          maxResumes: session.max_resumes,
-          /* How long her own voice may still be in the room after she stops,
-             and what counts as hearing herself. config.py decides both; see
-             REALTIME_ECHO_* and the iPhone test that produced them. */
-          /* The floor under semantic_vad's tail. 0 is off. */
-          turnBackstopMs: session.turn_backstop_ms,
-          turnBackstopMicDb: session.turn_backstop_mic_db,
-          echoTailMs: session.echo_tail_ms,
-          echoTextWindowS: session.echo_text_window_s,
-          echoTextOverlap: session.echo_text_overlap,
-          echoTextMinWords: session.echo_text_min_words,
-          /* NEWEST WINS. The commands that preempt, how long two fragments may
-             be apart and still be one question, and what a continuation looks
-             like — all decided in config.py and carried here with the session,
-             exactly as the barge and dictation policies are. */
-          turnPolicy: session.turn_policy,
           send: function (obj) {
             if (channel.readyState === 'open') channel.send(JSON.stringify(obj));
           },
-          tool: function (name, args, controller) {
-            // Answered in the page when the page is the source of truth;
-            // everything else goes to the server, which holds the camera, the
-            // vehicle context and the reasoning model.
-            if (LOCAL_TOOLS[name]) {
-              try { return Promise.resolve(LOCAL_TOOLS[name](args)); }
-              catch (e) { return Promise.resolve({ ok: false, note: 'panel error' }); }
-            }
-            return fetch(url('/realtime/tool'), {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              /* THE HANDLE THAT STOPS IT. One controller per tool call, held by
-                 the turn that asked for it; a new driver utterance aborts every
-                 controller belonging to an older turn. Aborting the fetch also
-                 drops the TCP connection, which is how the server finds out --
-                 /realtime/tool watches for it and stops waiting on work nobody
-                 is going to hear.
-
-                 On the first real drive these calls ran 40.1, 12.9, 48.5 and
-                 27.1 seconds. Nothing could stop one. */
-              signal: controller ? controller.signal : undefined,
-              // `where` is the car's own fix. Only find_places reads it, but it
-              // is attached to every call rather than to one, so a tool that
-              // needs it later does not have to re-plumb this.
-              //
-              // `spoken` is the DRIVER'S OWN LAST WORDS, and it is here for a
-              // measured reason. The model paraphrases what it was asked --
-              // "what's around us right now" reaches the tool as "describe the
-              // current scene" -- and the camera's fast path is a judgement
-              // about the question, so it has to be able to see the question
-              // rather than the relay. This page is where Whisper's transcript
-              // lands, so this is the only place that can send it.
-              body: JSON.stringify({ name: name, arguments: args,
-                                     where: currentFix(),
-                                     spoken: controllerTranscript() }),
-            }).then(function (r) { return r.json(); });
-          },
-          // Muting rather than pausing: a track is live and a paused element
-          // resumes into stale audio, and the sink's fade is undoable for the
-          // same reason -- the sustain gate has to be able to change its mind.
+          url: url,
+          transcript: controllerTranscript,
+          controller: function () { return controller; },
           audio: audioFacade,
           voice: sink,
-          liveVoice: session.live_voice || session.voice,
-          // The tool list, and the part of it that waits for a precondition.
-          // Both come from the server; see mint_client_secret.
-          toolSchemas: session.tool_schemas,
-          conditionalTools: session.conditional_tools,
           onEvent: opts.onEvent,
-        });
+        }));
 
         channel.onmessage = function (e) {
           var ev;
@@ -4718,46 +4867,8 @@
                         progress);
           })
           .then(function () {
-            var handle = {
-              session: session,
+            return sessionHandle(session, {
               controller: controller,
-              /* Dictate a deterministic line in RIO's voice. Warnings,
-                 turns and health announcements come through here; each of
-                 them already holds the mouth at its own priority. */
-              speak: function (text, o) { return controller.speak(text, o); },
-              /* ...and give it back. The arbiter takes the mouth away from a
-                 line by calling `stop()` on the item that owns it, and until
-                 this was reachable from there the line went on holding the
-                 session's single dictation slot to the end of its own budget
-                 -- so the line that replaced it was refused `busy` and, with
-                 no clip of its own, went silent. */
-              cancelSpeak: function (token, reason) {
-                return controller.cancelSpeak(token, reason);
-              },
-              speechEnabled: function (channel) {
-                if (session.speech_enabled === false) return false;
-                var chans = session.speech_channels || {};
-                return chans[channel] !== false;
-              },
-              /* How long THIS line may take to start speaking before it is
-                 synthesised instead. Per channel, and for navigation per call
-                 type, because a backup call at the junction and one issued
-                 seconds out have different deadlines. The table is decided in
-                 config.py and travels with the session; this only reads it. */
-              speakTimeout: function (channel, callType) {
-                var table = session.speak_timeout_ms_by_channel || {};
-                var byCall = table[channel];
-                if (!byCall) return session.speak_timeout_ms;
-                return byCall[callType] || byCall._default
-                       || session.speak_timeout_ms;
-              },
-              /* Which voice this drive is actually using, for the panel and
-                 for the tests. Read from the controller rather than from the
-                 session payload: the payload says what was INTENDED, and after
-                 a tier-2 fallback those are two different answers. */
-              voiceBackend: function () {
-                return controller.state().voice_backend;
-              },
               /* WHAT THE AUDIO SESSION LOOKS LIKE RIGHT NOW. Read by the
                  page on every visibility change, so the drive log carries
                  the state of the mouth and the microphone at the moment the
@@ -4801,11 +4912,8 @@
                 try { pc.close(); } catch (e) {}
                 mic.getTracks().forEach(function (t) { t.stop(); });
                 element.srcObject = null;
-                if (active === handle) active = null;
               },
-            };
-            active = handle;
-            return handle;
+            });
           });
       });
   }
@@ -4854,6 +4962,12 @@
                        // The connect deadlines, for tools/realtime_selftest.js.
                        // See the export block above for why these are seams.
                        _connectBudgets: _connectBudgets, _step: step,
+                       /* The two pieces both transports share. Exported so
+                          tools/xai_session_selftest.js can attach the second
+                          wire to the REAL policy and the REAL handle rather than
+                          to a pair of fakes that would agree with anything. */
+                       _controllerConfig: controllerConfig,
+                       _sessionHandle: sessionHandle,
                        navDirections: navDirections,
                        noteFix: noteFix, currentFix: currentFix,
                        startNavigation: startNavigation,

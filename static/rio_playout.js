@@ -82,6 +82,22 @@
      * whole design and the selftest pins it in both directions. */
     var tailGraceS = opts.tailGraceS === undefined ? 0.06 : opts.tailGraceS;
 
+    /* WHO IS TOLD WHEN THE SOUND ENDS, and there is more than one of them.
+     *
+     * The constructor option is kept -- tools/playout_selftest.js and the drive
+     * harness both use it -- but the transport needs the same fact to synthesise
+     * output_audio_buffer.stopped for the controller, and a single callback slot
+     * would have meant one of the two silently not being told. That is the shape
+     * of every bug in this file's history, so it is a list. */
+    var endListeners = [];
+    if (typeof opts.onAudioEnd === 'function') endListeners.push(opts.onAudioEnd);
+
+    function fireEnd(rid, detail) {
+      for (var li = 0; li < endListeners.length; li++) {
+        try { endListeners[li](rid, detail); } catch (e) {}
+      }
+    }
+
     /* Per response: when its audio is scheduled to finish, whether generation is
        over, and whether we have already declared it ended. */
     var live = {};          /* responseId -> row */
@@ -165,13 +181,8 @@
         r.endedBy = 'drained';
         r.endedAt = t;
         ended++;
-        if (opts.onAudioEnd) {
-          try {
-            opts.onAudioEnd(rid, { reason: 'drained', at: t,
-                                   scheduled_end: r.endsAt,
-                                   bytes: r.bytes, chunks: r.chunks });
-          } catch (e) {}
-        }
+        fireEnd(rid, { reason: 'drained', at: t, scheduled_end: r.endsAt,
+                       bytes: r.bytes, chunks: r.chunks });
       }
       return ended;
     }
@@ -193,13 +204,8 @@
         r.endedAt = t;
         r.endsAt = Math.min(r.endsAt, t);
         out.push(r.id);
-        if (opts.onAudioEnd) {
-          try {
-            opts.onAudioEnd(r.id, { reason: r.endedBy, at: t,
-                                    scheduled_end: r.endsAt,
-                                    bytes: r.bytes, chunks: r.chunks });
-          } catch (e) {}
-        }
+        fireEnd(r.id, { reason: r.endedBy, at: t, scheduled_end: r.endsAt,
+                        bytes: r.bytes, chunks: r.chunks });
       }
       return out;
     }
@@ -276,6 +282,11 @@
     return {
       push: push,
       generationDone: generationDone,
+      /* Subscribe to the end of a response's audio. Additive, so a caller that
+         passed onAudioEnd to the constructor keeps it. */
+      onAudioEnd: function (fn) {
+        if (typeof fn === 'function') endListeners.push(fn);
+      },
       tick: tick,
       flush: flush,
       drained: drained,

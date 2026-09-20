@@ -785,7 +785,16 @@ def realtime_session_endpoint(session_id: str = Query(default=None)):
         return {"error": "live conversation is switched off", "enabled": False,
                 "status": realtime.status()}
     try:
-        out = realtime.mint_client_secret()
+        # WHICH WIRE THIS DRIVE OPENS. config.VOICE_BACKEND decides, and the two
+        # mints return the same shape on purpose (see xai_voice.mint_client_secret)
+        # so the page's connect path dispatches on `voice_backend` in the payload
+        # rather than on a vendor name of its own.
+        if config.VOICE_BACKEND == "xai_voice":
+            import xai_voice
+
+            out = xai_voice.mint_client_secret()
+        else:
+            out = realtime.mint_client_secret()
     except Exception as e:
         print(f"[realtime] session mint failed: {type(e).__name__}: {e}", flush=True)
         sessions.log_live(session_id, "session_failed",
