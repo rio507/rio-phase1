@@ -82,13 +82,14 @@ def main():
     c, lp = fresh(REASONING_VENDOR=None, NEWS_VENDOR=None, CHAT_VENDOR=None)
     for role, want in (("reasoning", c.XAI_REASONING_MODEL),
                        ("news", c.XAI_REASONING_MODEL),
-                       ("chat", c.XAI_CHAT_MODEL)):
+                       ("chat", c.XAI_CHAT_MODEL),
+                       ("visual", c.XAI_VISUAL_MODEL)):
         ok(f"{role} answers as {want}",
            lp.vendor_of(role) == "xai" and lp.model_of(role) == want,
            f"{lp.vendor_of(role)}/{lp.model_of(role)}")
     ok("...and every one of them is a pinned version, not an alias",
        all("latest" not in lp.model_of(r)
-           for r in ("reasoning", "news", "chat")))
+           for r in ("reasoning", "news", "chat", "visual")))
 
     # The effort per role, which is deliberately not one value.
     ok(f"the reasoning roles think at {c.XAI_REASONING_EFFORT!r} — 17.8 s median "
@@ -98,6 +99,29 @@ def main():
     ok(f"and chat at {c.XAI_CHAT_EFFORT!r}, because it runs BEFORE the answer: "
        "585 ms against 3,179 for one more correct classification in fourteen",
        lp.reasoning_effort("chat") == c.XAI_CHAT_EFFORT)
+    ok(f"and the visual turn at {c.XAI_VISUAL_EFFORT!r}: 1,200 ms against 8,619 "
+       "at low, on a question about something going past the window",
+       lp.reasoning_effort("visual") == c.XAI_VISUAL_EFFORT)
+    ok("the visual role is its OWN role, not chat wearing a different budget — "
+       "it sends images and it was the fourth vendor nobody had named",
+       "visual" in lp.ROLE_VENDOR and lp.ROLE_API["visual"] == "chat")
+
+    section("visual_qa builds no client of its own")
+    src = (REPO / "visual_qa.py").read_text()
+    import suite_sweep as _sw
+    code = _sw.mask_non_code(src)
+    ok("OpenAI(" not in code,
+       "no OpenAI client is constructed in visual_qa's code — it asked for one at "
+       "import and read OPENAI_VISUAL_MODEL, which made the visual turn invisible "
+       "to the vendor switch")
+    ok('model_of("visual")' in code and 'client("visual")' in code,
+       "it asks for the visual ROLE's model and client")
+    ok("class RemoteChatAdapter" in code and "OpenAIChatAdapter" not in code,
+       "and the adapter is named for what it is — remote — rather than for one "
+       "vendor it no longer necessarily talks to")
+    ok("class QwenChatAdapter" in code,
+       "...while the LOCAL Qwen adapter beside it is untouched: vision stays on "
+       "this box, and only the model that writes the sentence moved")
     ok("...which is also what this path has always sent, so the flip changed the "
        "vendor and not the behaviour",
        c.XAI_CHAT_EFFORT == c.OPENAI_REASONING_EFFORT)

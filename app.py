@@ -418,6 +418,7 @@ def health():
             "models": {
                 "vision": vision.MODEL_ID,
                 "chat": llm_provider.model_of("chat"),
+                "visual": llm_provider.model_of("visual"),
                 "reasoning": llm_provider.model_of("reasoning"),
                 "news": llm_provider.model_of("news"),
                 "realtime": config.OPENAI_REALTIME_MODEL,
@@ -430,7 +431,7 @@ def health():
             # above cannot answer on its own: two roles can share a model name
             # and sit on different vendors, and a drive log needs to know.
             "vendors": {r: llm_provider.describe(r)
-                        for r in ("reasoning", "news", "chat")},
+                        for r in ("reasoning", "news", "chat", "visual")},
             # WHICH DETECTOR THIS PROCESS IS ACTUALLY RUNNING. Not a health
             # question -- eager is a perfectly good answer and is the one the
             # car has been driven on -- but it IS the first thing to ask when a

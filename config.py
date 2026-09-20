@@ -90,12 +90,40 @@ from rio_prompts import RIO_SYSTEM_PROMPT
 REASONING_VENDOR = os.getenv("REASONING_VENDOR", "xai")
 NEWS_VENDOR = os.getenv("NEWS_VENDOR", "xai")
 CHAT_VENDOR = os.getenv("CHAT_VENDOR", "xai")
+# THE FOURTH ROLE, and it was hiding because it had no name. visual_qa built its
+# own OpenAI client and read OPENAI_VISUAL_MODEL -- which is defined as
+# OPENAI_CHAT_MODEL, so it looked like the chat role and was not one: it sends
+# IMAGES, it has its own token budget and its own effort, and it is the most
+# latency-sensitive remote call RIO makes (the thing being asked about is going
+# past the window). It gets a role of its own rather than being folded into chat.
+VISUAL_VENDOR = os.getenv("VISUAL_VENDOR", "xai")
 
 # --- xAI's side of each role ------------------------------------------------
 # Pinned versioned names, not aliases, for the same reason the realtime model is
 # pinned: an alias moving under a running drive is a change nobody made.
 XAI_REASONING_MODEL = os.getenv("XAI_REASONING_MODEL", "grok-4.6")
 XAI_CHAT_MODEL = os.getenv("XAI_CHAT_MODEL", "grok-4.3")
+
+# THE MULTIMODAL TURN, and image input is real on the text models rather than a
+# separate vision model: every grok text model prices prompt_image_token_price at
+# the same rate as text (grok-4.3 at 12,500, grok-4.6 at 20,000), and the
+# grok-imagine-* models are GENERATION rather than understanding.
+#
+# MEASURED on a road frame, "What do you see ahead?", 488-605 prompt tokens:
+#
+#   gpt-5.5        effort low   2,983 ms  "A black sedan is directly ahead in the
+#                                          lane, with open roadway and lane
+#                                          markings around it..."
+#   grok-4.3       effort none  1,200 ms  "A black sedan is traveling ahead of us
+#                                          on the road."
+#   grok-4.3       effort low   8,619 ms  richer, and far too slow
+#
+# All three correct. none is 2.5x faster than the old path and TERSER -- twelve
+# output tokens against twenty-nine -- which happens to be what her instructions
+# ask for on a first answer. low is not a candidate: 8.6 s on a question about
+# something moving past the window is not an answer, it is an anecdote.
+XAI_VISUAL_MODEL = os.getenv("XAI_VISUAL_MODEL", "grok-4.3")
+XAI_VISUAL_EFFORT = os.getenv("XAI_VISUAL_EFFORT", "none")
 
 # --- her voice under xAI ----------------------------------------------------
 # PINNED TO THE VERSIONED NAME, not the alias, exactly as the realtime model is:
@@ -284,6 +312,10 @@ def chat_model() -> str:
     return XAI_CHAT_MODEL if CHAT_VENDOR == "xai" else OPENAI_CHAT_MODEL
 
 
+def visual_model() -> str:
+    return XAI_VISUAL_MODEL if VISUAL_VENDOR == "xai" else OPENAI_VISUAL_MODEL
+
+
 # HOW MANY TIMES A CALL MAY BE RETRIED, PER ROLE.
 #
 # The SDK's default is 2, and its `timeout` is per ATTEMPT -- so every timeout
@@ -312,12 +344,18 @@ def max_retries_for_role(role: str) -> int:
 def reasoning_effort_for(role: str):
     """The effort string for a role, or "" for none."""
     vendor = {"reasoning": REASONING_VENDOR, "news": NEWS_VENDOR,
-              "chat": CHAT_VENDOR}.get(role, "openai")
+              "chat": CHAT_VENDOR, "visual": VISUAL_VENDOR}.get(role, "openai")
     if vendor == "xai":
-        return XAI_CHAT_EFFORT if role == "chat" else XAI_REASONING_EFFORT
+        if role == "chat":
+            return XAI_CHAT_EFFORT
+        if role == "visual":
+            return XAI_VISUAL_EFFORT
+        return XAI_REASONING_EFFORT
     if role == "chat":
         # What this path has always sent.
         return OPENAI_REASONING_EFFORT
+    if role == "visual":
+        return OPENAI_VISUAL_REASONING_EFFORT
     return OPENAI_REASONING_EFFORT_DEEP if role == "reasoning" else ""
 
 

@@ -68,23 +68,53 @@ class ChatAdapter:
         raise NotImplementedError
 
 
-class OpenAIChatAdapter(ChatAdapter):
-    """GPT-5.5 through the OpenAI client the rest of the app already uses."""
+class RemoteChatAdapter(ChatAdapter):
+    """The remote model that writes the answer, whichever vendor that is.
 
-    name = config.OPENAI_VISUAL_MODEL
+    WAS OpenAIChatAdapter, AND THE NAME WAS THE PROBLEM. It built its own
+    OpenAI() client and read config.OPENAI_VISUAL_MODEL, so the visual turn was a
+    fourth role with no name -- invisible to the per-role vendor switch, and still
+    calling OpenAI after everything else had moved. It looked like the chat role
+    because OPENAI_VISUAL_MODEL is defined as OPENAI_CHAT_MODEL, and it is not
+    one: it sends images, it has its own token budget and effort, and it is the
+    most latency-sensitive remote call RIO makes -- the thing being asked about is
+    going past the window.
+
+    IMAGE INPUT IS REAL ON THE TEXT MODELS. Every grok text model prices
+    prompt_image_token_price at the same rate as text; the grok-imagine-* models
+    are generation, not understanding. Measured on a road frame: 1,200 ms against
+    2,983, both correct, the newer one terser. See config.XAI_VISUAL_MODEL.
+
+    THE LOCAL ADAPTER BELOW IS UNTOUCHED. Vision stays on this box; this is the
+    model that writes a SENTENCE about what the frame contains, which is a
+    different job from seeing it.
+    """
 
     def __init__(self):
-        from openai import OpenAI
+        import llm_provider
 
-        self.client = OpenAI()
+        self._provider = llm_provider
+
+    @property
+    def name(self):
+        # A property rather than a class attribute: the old one was evaluated at
+        # import and would keep reporting whatever vendor was configured when this
+        # module was first imported.
+        return self._provider.model_of("visual")
 
     def stream(self, system: str, messages: list):
-        stream = self.client.chat.completions.create(
-            model=config.OPENAI_VISUAL_MODEL,
+        import llm_provider
+
+        kw = {}
+        effort = llm_provider.reasoning_effort("visual")
+        if effort:
+            kw["reasoning_effort"] = effort
+        stream = llm_provider.client("visual").chat.completions.create(
+            model=llm_provider.model_of("visual"),
             messages=[{"role": "system", "content": system}] + messages,
             max_completion_tokens=config.OPENAI_VISUAL_MAX_TOKENS,
-            reasoning_effort=config.OPENAI_VISUAL_REASONING_EFFORT,
             stream=True,
+            **kw,
         )
         for chunk in stream:
             if not chunk.choices:
@@ -228,7 +258,7 @@ def get_chat_adapter(prefer: str = None) -> ChatAdapter:
             return _qwen_adapter
     with _chat_lock:
         if _chat_adapter is None:
-            _chat_adapter = OpenAIChatAdapter()
+            _chat_adapter = RemoteChatAdapter()
         return _chat_adapter
 
 
@@ -669,7 +699,7 @@ class VisualAnswer:
             self._images.append(("frame", len(self._frame.jpeg)))
         self._messages = [{"role": "user", "content": parts}]
         self.meta["request"] = {
-            "model": config.OPENAI_VISUAL_MODEL,
+            "model": __import__("llm_provider").model_of("visual"),
             "images": [{"kind": k, "bytes": n} for k, n in self._images],
             "history_turns": 0,
             "grounding_bytes": len(listing),
@@ -1259,7 +1289,7 @@ class VisualAnswer:
         messages.append({"role": "user", "content": parts})
         self._messages = messages
         self.meta["request"] = {
-            "model": config.OPENAI_VISUAL_MODEL,
+            "model": __import__("llm_provider").model_of("visual"),
             "images": [{"kind": k, "bytes": n} for k, n in self._images],
             "history_turns": len(self.session.recent_turns()),
             "grounding_bytes": len(json.dumps(grounding)),

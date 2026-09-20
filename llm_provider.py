@@ -21,6 +21,11 @@ this file does not own them, it routes them.
                 reasoning by design (no second search stack) but a different
                 CALL, for the reasons in localnews.py's header.
     chat        the text conversation path (/talk, /ask).
+    visual      the multimodal turn: a frame and a question, answered in prose.
+                NOT the same as chat despite sharing a model id on the old stack --
+                it sends images, has its own budget and effort, and is the most
+                latency-sensitive remote call RIO makes. The LOCAL Qwen adapter
+                beside it is untouched: vision stays on this box.
 
 WHAT WAS MEASURED BEFORE ANY OF THIS WAS WRITTEN, because the spec asked for
 stage 1 to be measured against the current stack and the answer changes what the
@@ -170,6 +175,7 @@ ROLE_VENDOR = {
     "reasoning": config.REASONING_VENDOR,
     "news": config.NEWS_VENDOR,
     "chat": config.CHAT_VENDOR,
+    "visual": config.VISUAL_VENDOR,
 }
 
 # WHICH API EACH ROLE SPEAKS, and it matters for exactly one thing: the set of
@@ -186,12 +192,16 @@ ROLE_API = {
     "reasoning": "responses",
     "news": "responses",
     "chat": "chat",
+    # Images go through chat/completions as image_url content parts, so the
+    # visual role speaks the same endpoint as chat and gets the same effort set.
+    "visual": "chat",
 }
 
 ROLE_MODEL = {
     "reasoning": lambda: config.reasoning_model(),
     "news": lambda: config.news_model(),
     "chat": lambda: config.chat_model(),
+    "visual": lambda: config.visual_model(),
 }
 
 
