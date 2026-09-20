@@ -189,7 +189,17 @@ async def drive(prepared, turns, verbose):
                 first = None
                 called = None
                 spoke = False
-                pending_call = None
+                # EVERY CALL IN THE RESPONSE, not the last one. This held a single
+                # `pending_call`, so a turn in which the model asked for two tools
+                # left the second one with no output -- and a conversation holding a
+                # function call with no output produces NO ANSWER AT ALL. That is
+                # what "DEGRADED: the tool result produced no answer" was, twice, on
+                # the drive of 2026-09-20: not the model declining to speak, this
+                # harness not answering what it was asked. The browser's controller
+                # answers every call (rio_realtime.js dispatches per
+                # response.function_call_arguments.done), so a harness that answered
+                # one was testing a sequence the car does not run.
+                pending_calls = []
 
                 while True:
                     try:
@@ -221,8 +231,8 @@ async def drive(prepared, turns, verbose):
 
                     elif t == "response.function_call_arguments.done":
                         called = ev.get("name")
-                        pending_call = (ev.get("name"), ev.get("call_id"),
-                                        ev.get("arguments"))
+                        pending_calls.append((ev.get("name"), ev.get("call_id"),
+                                              ev.get("arguments")))
                         tool_calls.append(called)
                         print(f"      tool: {called}")
 
@@ -249,17 +259,24 @@ async def drive(prepared, turns, verbose):
                           "tool call — a session that connects, runs VAD and never "
                           "speaks must not look healthy")
 
-                if pending_call:
-                    name, call_id, args = pending_call
-                    try:
-                        out = realtime.run_tool(name, args, session_key="harness")
-                    except Exception as e:
-                        out = {"ok": False, "note": f"{type(e).__name__}"}
-                    print(f"      {name} -> ok={out.get('ok')} "
-                          f"{str(out.get('note') or '')[:60]}")
-                    await send({"type": "conversation.item.create", "item": {
-                        "type": "function_call_output", "call_id": call_id,
-                        "output": json.dumps(out)[:4000]}})
+                if pending_calls:
+                    if len(pending_calls) > 1:
+                        print(f"      (the model asked for {len(pending_calls)} "
+                              f"tools in one turn: "
+                              f"{[c[0] for c in pending_calls]} — every one of "
+                              f"them is answered, because one left open blocks "
+                              f"the whole turn)")
+                    for name, call_id, args in pending_calls:
+                        try:
+                            out = realtime.run_tool(name, args,
+                                                    session_key="harness")
+                        except Exception as e:
+                            out = {"ok": False, "note": f"{type(e).__name__}"}
+                        print(f"      {name} -> ok={out.get('ok')} "
+                              f"{str(out.get('note') or '')[:60]}")
+                        await send({"type": "conversation.item.create", "item": {
+                            "type": "function_call_output", "call_id": call_id,
+                            "output": json.dumps(out)[:4000]}})
                     # ...AND ONLY NOW ASK FOR THE ANSWER. The gate.
                     await play.wait_idle()
                     await send({"type": "response.create"})

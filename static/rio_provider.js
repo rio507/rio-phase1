@@ -225,11 +225,20 @@
     /* ----------------------------------------------------------------
        xAI grok-voice over WebSocket.
 
-       NOT YET EXERCISED. Every value here is from xAI's published docs, and
-       the two that the docs do not answer are UNKNOWN rather than guessed.
-       The account this repo holds a key for is credit-blocked
-       (team_blocked: true on /v1/api-key), so nothing below has been seen on a
-       wire. `require('xai_voice')` will say so.
+       EXERCISED, AND THE RECORD SAYS WHICH LINES WERE. This block was written
+       from published docs while the account was credit-blocked, and said so;
+       most of it has since been seen on the wire, so each value now names its
+       evidence and the ones that are still documentation rather than
+       measurement say that in as many words. Nothing here is a guess wearing a
+       boolean: what is unknown is UNKNOWN.
+
+       What has been measured against api.x.ai: the transcription item_id
+       binding, the three .completed repeats, the refusal of
+       output_audio_buffer.clear, the transcript-suppressing commit,
+       force_message's two spellings, interruptible:false, resumption on the
+       query string, and the two reasoning efforts. What has NOT: WebRTC (there
+       is no documented SDP exchange to probe), and anything about a real
+       driver's voice in a real cabin.
 
        TRANSPORT IS WEBSOCKET, AND THAT IS THE WHOLE COST OF THE MIGRATION.
        xAI documents output_audio_buffer.* as WebRTC/SIP only, ephemeral tokens
