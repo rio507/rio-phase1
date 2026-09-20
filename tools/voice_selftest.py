@@ -355,10 +355,23 @@ def run_scene_gate():
        "...and a generic-looking paraphrase does NOT shortcut a question the "
        "driver asked about one particular thing")
 
-    # The transcript has to actually travel, or the above is theatre.
+    # The transcript has to actually travel, or the above is theatre. Matched on
+    # the FIELD and its source rather than on one spelling of the call: the
+    # controller config moved into controllerConfig() when the second transport
+    # arrived, `controllerTranscript` became `w.transcript`, and this check failed
+    # on a rename while the transcript still travelled. What matters is that the
+    # tool call carries `spoken` and that it comes from the controller's own view
+    # of the turn -- so both halves are checked, in both files that now have one.
     js = Path(REPO / "static/rio_realtime.js").read_text()
-    ok("spoken: controllerTranscript()" in js,
+    ok("spoken: w.transcript()" in js or "spoken: controllerTranscript()" in js,
        "the panel sends the driver's own last transcript with every tool call")
+    ok("spoken_this_turn" in js,
+       "...taken from the words that became THIS turn, not from the last "
+       "transcript of any kind — a fragment is a transcript and is not a turn")
+    xs = Path(REPO / "static/rio_xai_session.js").read_text()
+    ok("spoken_this_turn" in xs,
+       "...and the second transport supplies the same thing, so a tool call on "
+       "either wire sees the question rather than the relay")
     # Asked of the CALL rather than of one spelling of it. This read
     # `"spoken=body.get(\"spoken\")" in app` until app.py wrapped the argument
     # onto its own line and passed it positionally -- the passthrough was
@@ -564,10 +577,24 @@ def run_clips():
        "it is SELECTABLE now — the server mint, the session policy, the playout "
        "queue and the event seam in both directions all exist, and a live harness "
        "drives a whole turn through them")
-    ok(config.VOICE_BACKEND != "xai_voice",
-       f"...and not the DEFAULT ({config.VOICE_BACKEND}), because the browser "
-       "controller does not exist yet: selecting it would start a session the "
-       "page cannot render, which is a worse failure than not offering it")
+    # IT IS THE DEFAULT NOW, and the thing that made it unsafe to be one was
+    # that the page had no way to render the session. So the check is no longer
+    # "is it the default" -- that is a config value and asserting a config value
+    # against itself proves nothing -- it is WHETHER THE PAGE CAN RENDER
+    # WHATEVER IS DEFAULTED TO. A backend the browser cannot open is a car that
+    # comes up mute, and that is true of any backend, not just this one.
+    index = Path(REPO / "static/index.html").read_text()
+    needs = {"xai_voice": ["rio_xai_session.js", "rio_playout.js",
+                           "rio_provider.js", "rio_realtime.js"],
+             "openai_realtime": ["rio_provider.js", "rio_realtime.js"],
+             "gpt_live": ["rio_live.js"],
+             "elevenlabs": ["rio_voice_eleven.js", "rio_realtime.js"]}
+    want_js = needs.get(config.VOICE_BACKEND, [])
+    absent = [j for j in want_js if f'src="/static/{j}"' not in index]
+    ok(bool(want_js) and not absent,
+       f"the page loads what the DEFAULT backend needs to make a sound "
+       f"({config.VOICE_BACKEND}: {', '.join(want_js)})"
+       + (f" — MISSING: {absent}" if absent else ""))
     ok(eve_dir != ra.audio_dir("openai_realtime"),
        f"its clips live apart from the shipped set ({eve_dir.name}/), so a "
        "backend switch cannot leave one voice's files to be played by another")

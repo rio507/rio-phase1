@@ -553,9 +553,13 @@ def main():
 
     print("RIO visual conversation — Phase A acceptance tests")
     print(f"  source: {args.frames or args.video}  from frame {args.start}")
+    # THE MODEL THAT WILL ACTUALLY ANSWER, through the role. This named
+    # OPENAI_VISUAL_MODEL, which stopped being what answers the moment the visual
+    # role moved vendors -- and a header that names the wrong model is read as
+    # evidence about the run underneath it.
     print(f"  models: RF-DETR + UFLDv2 + Depth Anything + "
           f"{'Qwen3-VL' if config.ENRICH_ENABLED else 'no enrichment'} + "
-          f"{'(skipped)' if args.no_model else config.OPENAI_VISUAL_MODEL}")
+          f"{'(skipped)' if args.no_model else config.visual_model()}")
 
     # Warm everything BEFORE anything is timed. A cold Qwen load is ~13 s and
     # would otherwise land inside a stage measurement and be reported as the

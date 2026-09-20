@@ -340,11 +340,30 @@ def check_voice():
     import config as _cfg
 
     backend = _cfg.VOICE_BACKEND
-    check(backend in ("elevenlabs", "openai_realtime"),
+    # ASKED OF CONFIG, NOT LISTED HERE. This held its own pair of names and a
+    # third backend made it wrong: with VOICE_BACKEND=xai_voice preflight said
+    # "RIO starts with no voice at all" about a backend that works. config.py is
+    # where a backend is added and where the check belongs.
+    check(backend in _cfg.VOICE_BACKENDS,
           f"VOICE_BACKEND={backend}",
           "the backend name is not one this build knows; RIO starts with no "
           "voice at all.",
-          "VOICE_BACKEND=elevenlabs|openai_realtime in .env")
+          f"VOICE_BACKEND={'|'.join(_cfg.VOICE_BACKENDS)} in .env")
+
+    if backend == "xai_voice":
+        # The key the browser's session is minted with, and the one clip runs use.
+        raw = os.environ.get("XAI_API_KEY", "")
+        check(bool(raw.strip()), "XAI_API_KEY set",
+              "the live session cannot be minted: RIO comes up with no voice.",
+              "add it to .env")
+        check(raw == raw.strip(), "...and free of stray whitespace",
+              "a key that survived a copy-paste with a non-breaking space fails "
+              "as 'invalid key', which reads as a revoked key and is not one.",
+              "re-paste it")
+        print(f"  (speech to speech in {_cfg.XAI_VOICE} on "
+              f"{_cfg.XAI_VOICE_MODEL}; the page renders her audio itself — "
+              f"static/rio_playout.js)")
+        return
 
     if backend != "elevenlabs":
         print(f"  (speech to speech in {_cfg.OPENAI_REALTIME_VOICE}; "

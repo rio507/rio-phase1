@@ -355,11 +355,30 @@ def mint_client_secret() -> dict:
 # So: the content-array form, and the transcript checked against the words even
 # here. "Exact by construction" is a property of ONE spelling of this event.
 #
-# NOT YET MEASURED: interruptible:false. The field is documented to drop caller
-# audio during playback, which is a policy change rather than a mechanism one --
-# commit 0bdec46 ("Eleven refused barge-ins were eleven questions being
-# answered") is the argument for using it only on the red tier and the imminent
-# turn call. Testing it needs a barge-in to refuse, which needs two speakers.
+# interruptible:false IS REAL, and measured -- tools/xai_interruptible_probe.py,
+# which needed no second person: a barge-in is audio arriving while she talks, and
+# audio is a file. The same line, the same injected clip, the same timing, twice:
+#
+#   no field           her audio 4,709 ms, cut short; speech_started True,
+#                      committed True, transcript "Back off now." -- and then she
+#                      ANSWERED it: "Okay. I'm here if you need me."
+#   interruptible:false her audio 7,830 ms, the whole line; speech_started never
+#                      fired at all, nothing committed, nothing transcribed.
+#
+# Read the control again, because it is the hazard rather than the baseline: a
+# noise over a red-tier warning does not merely interrupt the warning, it REPLACES
+# it with a reply. The driver is told "Okay. I'm here if you need me." instead of
+# being told to back off.
+#
+# So the field works, and it is still not a default. Commit 0bdec46 -- eleven
+# refused barge-ins were eleven questions being answered -- is the argument, and it
+# cuts the other way for everything except the lines that must be heard: the red
+# tier and the imminent turn call. Using it needs the deterministic-line path on
+# this backend to go through force_message rather than through the model, which is
+# a change to the safety path and is not made here.
+#
+# NOT MEASURED, and worth saying: whether a REAL voice in a cabin is dropped. The
+# clip is Eve with no room, no distance and no engine behind it.
 
 def force_message_item(line: str, interruptible: bool = True) -> dict:
     """The conversation.item.create item that says `line` verbatim.

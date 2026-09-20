@@ -392,12 +392,20 @@
         // conversation.item.create with item.type 'force_message':
         // synthesised verbatim, no model in the path.
         verbatim: 'force_message',
-        // interruptible: false. Note what it MEANS before using it: caller
-        // audio is DROPPED during playback, so a driver speaking over the line
-        // is not heard at all rather than merely ignored. Commit 0bdec46 —
-        // eleven refused barge-ins were eleven questions being answered — is
-        // the one that says which way we care. Red tier and the imminent turn
-        // call only.
+        // interruptible: false, MEASURED rather than read off a page --
+        // tools/xai_interruptible_probe.py. With the field, her line ran its
+        // full 7,830 ms and speech_started never fired at all. Without it, the
+        // same injected audio cut her off at 4,709 ms, was transcribed, and she
+        // ANSWERED it -- so a noise over a red-tier warning does not merely
+        // interrupt the warning, it replaces it with "Okay. I'm here if you
+        // need me."
+        //
+        // Caller audio is DROPPED during playback, so a driver speaking over
+        // the line is not heard at all rather than merely ignored. Commit
+        // 0bdec46 — eleven refused barge-ins were eleven questions being
+        // answered — is the one that says which way we care. Red tier and the
+        // imminent turn call only, and not wired yet: it needs the
+        // deterministic line to go through force_message rather than the model.
         uninterruptibleLines: true,
         // `replace`: phrase -> spoken form, applied pre-TTS, case-insensitive,
         // whole-word. Transcript PRESERVED, which is the part that matters:
@@ -406,14 +414,33 @@
         // transcripts would poison it.
         pronunciation: 'replace',
 
-        // resumption.enabled + the server-assigned conversation_id on
-        // reconnect. Replaces nothing we have — we lose the conversation on a
-        // real drop today — but it overlaps our own resume, which carries what
-        // was HEARD rather than what was generated. Two resume mechanisms that
-        // disagree about what she said is worse than one.
-        resumption: 'conversation_id',
+        // RESUMPTION IS REAL, AND IT LIVES ON THE QUERY STRING. Measured,
+        // tools/xai_resumption_probe.py: the session assigns a conversation id
+        // in a `conversation.created` event, and reconnecting with
+        // `?conversation_id=<id>` on the socket URL comes back with the SAME id
+        // and the conversation intact — she answered a question about something
+        // said before the drop.
+        //
+        // THE OTHER TWO SPELLINGS LOOK IDENTICAL AND ARE NOT. Sending the id in
+        // session.update (as session.conversation_id, or inside
+        // session.resumption) is ACCEPTED WITH NO ERROR, assigns a brand new
+        // conversation id, and loses everything: "I don't remember that. If you
+        // told me, it didn't stick." That is force_message's lesson again — a
+        // vendor extension is a property of one spelling — and it is why this
+        // says which one.
+        //
+        // Not wired into the reconnect path yet, deliberately: it OVERLAPS our
+        // own resume, which carries what the driver HEARD rather than what was
+        // generated, and two resume mechanisms that disagree about what she said
+        // is worse than one. The transport records the id (see
+        // rio_xai_session.js) so the decision is a policy change and not another
+        // probe.
+        resumption: 'conversation_id:query_string',
         // A WebSocket is open or it is gone. There is no state between them to
-        // grace, so REALTIME_PEER_DISCONNECT_GRACE_MS has nothing to time.
+        // grace, so REALTIME_PEER_DISCONNECT_GRACE_MS has nothing to time --
+        // which is why the 8 s grace has no equivalent here and the controller
+        // is told at once. What replaces it is not a grace but a resumption:
+        // see above.
         peerGrace: false,
 
         // 'high' | 'none', defaulting to HIGH — on the path with our tightest

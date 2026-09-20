@@ -1174,11 +1174,14 @@ def run_endpoints():
             llm_provider.override("reasoning", original)
 
     st = realtime.status()
-    ok(st["model"] == config.OPENAI_REALTIME_MODEL and
+    # `model` is the WIRE THE NEXT DRIVE OPENS, per backend -- it named OpenAI's
+    # under every backend until the third one arrived, which is a health endpoint
+    # lying about the vendor to the first person who checks after a switch.
+    ok(st["model"] == realtime.backend_model() and
        st["reasoning_model"] == llm_provider.model_of("reasoning"),
-       "status() reports both model ids without calling anything — the realtime "
-       "one from config (that backend has not moved) and the reasoning one from "
-       "the role, which is the only way it can be right after a vendor switch")
+       "status() reports both model ids without calling anything — the voice "
+       "one from the configured backend and the reasoning one from the role, "
+       "which is the only way either can be right after a vendor switch")
     ok(st.get("reasoning_vendor") == llm_provider.vendor_of("reasoning"),
        f"...and says WHOSE it is ({st.get('reasoning_vendor')}), because two "
        "vendors can offer a model with a similar name and a drive log cannot "
@@ -1321,7 +1324,10 @@ def run_dictation():
     # because /nav/voice and friends synthesise on the same voice id — so the
     # mechanism above is kept whole and switched off rather than removed, and
     # this checks the switch rather than assuming a backend.
-    ok(config.VOICE_BACKEND in ("elevenlabs", "openai_realtime"),
+    # ASKED OF CONFIG. A tuple here is a second list of backends to forget to
+    # add to, which is exactly what happened: this said "RIO's voice is a named
+    # backend" and then failed on a named backend.
+    ok(config.VOICE_BACKEND in config.VOICE_BACKENDS,
        f"RIO's voice is a named backend ({config.VOICE_BACKEND})")
     if config.VOICE_BACKEND == "elevenlabs":
         ok(config.ELEVENLABS_VOICE_ID and
@@ -3449,27 +3455,62 @@ def run_backend(live: bool = False):
     section("B2. the backend — whose voice, and whether it is the same one "
             "everywhere")
 
-    ok(config.VOICE_BACKEND == "openai_realtime",
-       f"RIO's voice is the live session's own ({config.VOICE_BACKEND}): "
+    # WHICHEVER BACKEND IS CONFIGURED, ASKED RATHER THAN NAMED. These checks
+    # used to read `== "openai_realtime"` and `== "marin"`, which meant that the
+    # day the default moved they reported 42 failures about a car that was fine
+    # -- and the alternative anybody reaches for, skipping the section under
+    # another backend, is how 463 checks stopped running once before. So the
+    # claims are the same claims, made about the backend that is actually on.
+    S2S = ("openai_realtime", "xai_voice")
+    backend = config.VOICE_BACKEND
+    ok(backend in S2S,
+       f"RIO's voice is the live session's own ({backend}): "
        "speech to speech, no text between the model and the speaker")
-    ok(config.OPENAI_REALTIME_VOICE == "marin",
-       f"and the voice is marin ({config.OPENAI_REALTIME_VOICE})")
 
-    cfg = realtime.session_config()
+    if backend == "xai_voice":
+        import xai_voice
+
+        cfg = xai_voice.session_policy()
+        want_voice = config.XAI_VOICE
+        want_model = config.XAI_VOICE_MODEL
+        want_stt = config.XAI_STT_SESSION_MODEL
+        # The token ceiling is ADVISORY on this vendor (asked 200, got 849;
+        # asked 3000, got 5041), which is why the client-side cap exists. The
+        # session does not carry one at all, so there is nothing here to assert
+        # and the bound is checked where it is enforced.
+        cap = None
+    else:
+        cfg = realtime.session_config()
+        want_voice = config.OPENAI_REALTIME_VOICE
+        want_model = config.OPENAI_REALTIME_MODEL
+        want_stt = "gpt-transcribe"
+        cap = 1200
+
+    ok(want_voice in ("marin", "Eve"),
+       f"and the voice is one of the two that have been verified line by line "
+       f"({want_voice})")
     ok(cfg["output_modalities"] == ["audio"],
        "the session is asked for AUDIO — the thing that was text under the "
        "other backend, and the only thing the backend is allowed to change")
-    ok(cfg["audio"]["output"]["voice"] == "marin",
-       f"in marin ({cfg['audio']['output']['voice']})")
-    ok(cfg["audio"]["input"]["transcription"]["model"] == "gpt-transcribe",
-       "and it transcribes the driver with gpt-transcribe — the id the "
+    ok(cfg["audio"]["output"]["voice"] == want_voice,
+       f"in {want_voice} ({cfg['audio']['output']['voice']})")
+    ok(cfg["audio"]["input"]["transcription"]["model"] == want_stt,
+       f"and it transcribes the driver with {want_stt} — the id the "
        "playground calls \"User transcript model\"")
-    ok(int(cfg["max_output_tokens"]) == 1200,
-       f"the ceiling on a spoken answer is 1,200 AUDIO tokens "
-       f"({cfg['max_output_tokens']}) — the same ~35 seconds of speech that "
-       f"300 bought in text mode, in the currency this session is billed in")
-    ok(config.OPENAI_REALTIME_MODEL == "gpt-realtime-2.1",
-       f"on the same model as before ({config.OPENAI_REALTIME_MODEL})")
+    if cap is None:
+        ok("max_output_tokens" not in cfg,
+           "the spoken-answer ceiling is not in this session, because on this "
+           "vendor it is ADVISORY (asked 200, got 849) — the bound that holds "
+           "is the client-side one")
+    else:
+        ok(int(cfg["max_output_tokens"]) == cap,
+           f"the ceiling on a spoken answer is 1,200 AUDIO tokens "
+           f"({cfg['max_output_tokens']}) — the same ~35 seconds of speech that "
+           f"300 bought in text mode, in the currency this session is billed in")
+    ok("latest" not in want_model and want_model in
+       ("gpt-realtime-2.1", config.XAI_VOICE_MODEL),
+       f"on a PINNED model rather than an alias ({want_model}) — an alias moves "
+       "under a drive")
 
     # --- ONE VOICE: the deterministic channels ------------------------------
     # A nav callout, a health announcement and a headway line are policy text.
@@ -3501,9 +3542,8 @@ def run_backend(live: bool = False):
     from tools import render_alerts as ra
 
     want = ra.voice_signature()
-    ok(want == {"backend": "openai_realtime", "voice": "marin",
-                "model": config.OPENAI_REALTIME_MODEL},
-       f"clips rendered today would be marin on the live model ({want})")
+    ok(want == {"backend": backend, "voice": want_voice, "model": want_model},
+       f"clips rendered today would be {want_voice} on the live model ({want})")
 
     doc = ra.manifest()
     rendered = doc.get("clips", {})
@@ -3586,11 +3626,15 @@ def run_backend(live: bool = False):
             missing.append(f"{raw} -> {kind}/{direction}")
             continue
         cid = nav_speech.junction_clip_id(line)
-        path = ra.AUDIO_DIR / f"{cid}.mp3"
+        # THIS VOICE'S DIRECTORY, not the module-level one. The clips are kept
+        # per voice precisely because they cannot be re-made at the moment they
+        # are needed, so a check that reads one directory while the car reads
+        # another is checking the wrong car.
+        path = ra.audio_dir() / f"{cid}.mp3"
         got = rendered.get(cid) or {}
         ok(bool(line) and path.exists() and path.stat().st_size > 0
-           and got.get("voice") == "marin",
-           f"{raw} -> {line!r}, on disk in marin ({cid}.mp3)")
+           and got.get("voice") == want_voice,
+           f"{raw} -> {line!r}, on disk in {want_voice} ({cid}.mp3)")
     ok(not missing,
        f"every maneuver the provider can emit has a junction call or is named "
        f"as silent" + (f" — MISSING: {missing}" if missing else ""))
@@ -3657,7 +3701,7 @@ def run_backend(live: bool = False):
             latitude=0.0, longitude=0.0, route_distance_position=0.0,
             polyline_index=0, instruction="Merge onto I-10 E"))
         cid = (b.get("clips") or {}).get("junction")
-        ok(cid and (ra.AUDIO_DIR / f"{cid}.mp3").exists()
+        ok(cid and (ra.audio_dir() / f"{cid}.mp3").exists()
            and b["junction"] == clips[cid],
            f"{kind}/{direction} -> {b.get('junction')!r} ({cid}.mp3)")
 
@@ -3719,12 +3763,12 @@ def run_backend(live: bool = False):
     expected = (sorted(ra.CLIP_LINES) + sorted(ra.TIRE_CLIPS)
                 + sorted(ra.IMMINENT_CLIPS))
     for line in expected:
-        path = ra.AUDIO_DIR / f"{line}.mp3"
+        path = ra.audio_dir() / f"{line}.mp3"
         got = rendered.get(line) or {}
         ok(path.exists() and path.stat().st_size > 0
-           and got.get("voice") == "marin"
-           and got.get("backend") == "openai_realtime",
-           f"{line}: on disk and in marin "
+           and got.get("voice") == want_voice
+           and got.get("backend") == backend,
+           f"{line}: on disk and in {want_voice} "
            f"({got.get('backend')}/{got.get('voice')}, "
            f"{path.stat().st_size if path.exists() else 0} B)")
     ok(doc.get("voice") == want,

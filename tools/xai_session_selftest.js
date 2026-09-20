@@ -97,7 +97,7 @@ function fakeCtx() {
 }
 
 function harness(opts) {
-  opts = opts || {};
+  opts = opts || {};   // merged into session.open below, for the resume case
   const WS = fakeWS();
   const ctx = fakeCtx();
   /* ONE CLOCK, because that is the arrangement being tested: the session takes
@@ -120,7 +120,7 @@ function harness(opts) {
      the clock this test advances. `pump()` below calls exactly what connect()
      armed, so what runs here is what runs in the car. */
   const armed = [];
-  const s = session.open({
+  const s = session.open(Object.assign({}, opts, {
     mint: {
       ws_url: 'wss://example.test/v1/realtime?model=m',
       ws_subprotocol: 'xai-client-secret.tok',
@@ -134,7 +134,7 @@ function harness(opts) {
     setIntervalImpl: (fn, ms) => { armed.push({ fn, ms }); return armed.length; },
     clearIntervalImpl: (id) => { armed.length = 0; },
     onEvent: (e) => events.push(e),
-  });
+  }));
   return { s, WS, ctx, p: s.playout, events, bus, controller, controllerSent,
            armed,
            advance: (sec) => { ctx._advance(sec); },
@@ -615,6 +615,37 @@ section('Z: the same script through a PLAUSIBLE transport, which gets it wrong')
      + 'the overlap their own migration note warns about and the gate refuses');
   ok(h.armed.length === 1 && bus2.length > 0,
      'both transports were driven by the same script; only one of them is right');
+}
+
+// ---------------------------------------------------------------------------
+section('the conversation has an id, and a drop is recoverable with it');
+// ---------------------------------------------------------------------------
+{
+  const h = harness();
+  await h.s.connect();
+  ok(h.s.conversationId() === null,
+     'no id until the session gives one — a guess here would be a reconnect '
+     + 'into a conversation that does not exist');
+  h.s._onMessage(JSON.stringify({ type: 'conversation.created',
+                                  conversation: { id: 'conv-1' } }));
+  ok(h.s.conversationId() === 'conv-1' && h.s.health().conversation_id === 'conv-1',
+     'the id from conversation.created is recorded and readable');
+  ok(h.events.some(e => e.type === 'XAI_CONVERSATION'
+                        && e.conversation_id === 'conv-1'),
+     '...and announced, so a page that wants to reconnect has it without '
+     + 'reaching into the transport');
+
+  /* AND IT GOES ON THE URL. Measured: the id in session.update is accepted and
+     silently starts a NEW conversation, so the query string is not a style
+     choice — it is the only spelling that resumes anything. */
+  const h2 = harness({ resumeConversationId: 'conv-1' });
+  await h2.s.connect();
+  ok(h2.WS.last.url.indexOf('conversation_id=conv-1') > 0,
+     `a resume puts the id on the socket URL (${h2.WS.last.url.slice(-40)})`);
+  ok(!h2.WS.sent.some(e => e.type === 'session.update'
+       && JSON.stringify(e.session).indexOf('conv-1') >= 0),
+     '...and NOT in session.update, which is accepted, assigns a new id and '
+     + 'loses the conversation — the same shape as force_message\'s `text` form');
 }
 
 // ---------------------------------------------------------------------------

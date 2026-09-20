@@ -200,6 +200,20 @@
     var ws = null;
     var speaker = null;
     var closed = false;
+    /* THE CONVERSATION'S OWN ID, so a drop is recoverable rather than merely
+       reported. Measured (tools/xai_resumption_probe.py): the session assigns
+       this in a conversation.created event, and a new socket opened with
+       `?conversation_id=<id>` comes back with the conversation intact -- the same
+       id, and she can answer a question about something said before the drop.
+       Only the query string works; the id in session.update is accepted and
+       silently starts a new conversation.
+
+       RECORDED, NOT YET USED. Reconnecting with it overlaps the controller's own
+       resume, which carries what the driver HEARD rather than what was generated,
+       and two resume mechanisms disagreeing about what she said is worse than
+       one. Keeping the id here means that decision is a policy change and not
+       another round of probing. */
+    var conversationId = null;
     /* WHICH UTTERANCES HAVE BEEN SEEN, so the three .completed events for one
        utterance become one. By id, not by count: counting would break the day the
        repeat count changes, and the id is what makes them provably the same
@@ -338,6 +352,13 @@
 
       if (t === 'ping') return;
 
+      if (t === 'conversation.created') {
+        var conv = ev.conversation || {};
+        conversationId = conv.id || ev.conversation_id || conversationId;
+        emit({ type: 'XAI_CONVERSATION', conversation_id: conversationId,
+               resumed: !!opts.resumeConversationId });
+      }
+
       if (t === 'session.updated') {
         emit({ type: 'XAI_SESSION_UP',
                model: (ev.session || {}).model || null });
@@ -474,8 +495,15 @@
     function connect() {
       return new Promise(function (resolve, reject) {
         var sock;
+        /* RESUMING ONE. The id goes on the URL because that is the only place it
+           works; see the note on conversationId above. */
+        var url = mint.ws_url;
+        if (opts.resumeConversationId) {
+          url += (url.indexOf('?') >= 0 ? '&' : '?')
+            + 'conversation_id=' + encodeURIComponent(opts.resumeConversationId);
+        }
         try {
-          sock = new WS(mint.ws_url, [mint.ws_subprotocol]);
+          sock = new WS(url, [mint.ws_subprotocol]);
         } catch (e) { reject(e); return; }
         ws = sock;
         sock.onmessage = function (m) { onMessage(m.data); };
@@ -514,9 +542,13 @@
       stats: function () {
         return JSON.parse(JSON.stringify(stats));
       },
+      /* For a reconnect that wants the conversation back. Null until the
+         session says so. */
+      conversationId: function () { return conversationId; },
       health: function () {
         return {
           connected: !!ws && !closed,
+          conversation_id: conversationId,
           degraded: silence.degraded,
           silent_responses: silence.responses,
           pending_requests: pending.length,
