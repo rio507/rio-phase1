@@ -330,6 +330,49 @@ section('honesty — an unmeasured fact cannot be read as a boolean');
 }
 
 // ---------------------------------------------------------------------------
+section('outbound — the half of the seam a name map alone does not cover');
+// ---------------------------------------------------------------------------
+{
+  /* createController SENDS seven kinds of event, and an inbound-only normaliser
+     leaves every one of them unmapped. On a WebSocket transport that is not
+     academic: output_audio_buffer.clear comes back "Invalid event received" --
+     an ERROR on the wire, on the barge-in path, at the moment the driver is
+     trying to interrupt. Measured against the live endpoint, not inferred. */
+  const oai = provider.create('openai_realtime');
+  const xai = provider.create('xai_voice');
+
+  let same = 0;
+  const OUT = ['response.create', 'response.cancel', 'session.update',
+               'conversation.item.create', 'input_audio_buffer.clear',
+               'input_audio_buffer.commit', 'output_audio_buffer.clear'];
+  OUT.forEach((t) => { const e = { type: t }; if (oai.normaliseOut(e) === e) same++; });
+  ok(same === OUT.length,
+     `all ${OUT.length} outbound events pass through openai_realtime as the SAME `
+     + 'object — the current stack sends exactly what it always sent');
+
+  const flush = xai.normaliseOut({ type: 'output_audio_buffer.clear' });
+  ok(flush && flush.local === 'output_audio_buffer.clear',
+     'on xai_voice the buffer clear becomes a LOCAL action rather than a wire '
+     + 'event, because the wire refuses it — and a local flush is better than '
+     + 'the event it replaces: no round trip to a server that then has to tell '
+     + 'us the sound stopped');
+  ok(xai.normaliseOut({ type: 'input_audio_buffer.commit' }) === null,
+     'and the explicit commit is DROPPED: accepted by the wire, and measured to '
+     + 'suppress the transcript entirely when server_vad is on — two of the '
+     + 'three failures that made the voice models look unlicensed');
+  ['response.create', 'response.cancel', 'conversation.item.create',
+   'session.update', 'input_audio_buffer.clear'].forEach((t) => {
+    const e = { type: t };
+    ok(xai.normaliseOut(e) === e,
+       `${t} goes out unchanged — measured accepted on the live endpoint`);
+  });
+
+  const st = xai.stats();
+  ok(st.out && st.out.local === 1 && st.out.dropped === 1,
+     `the ledger counts what it did to them (${JSON.stringify(st.out)})`);
+}
+
+// ---------------------------------------------------------------------------
 section('the record is a copy, and the resolver knows a voice from a wire');
 // ---------------------------------------------------------------------------
 {

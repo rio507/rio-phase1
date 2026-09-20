@@ -85,6 +85,20 @@
   var CANONICAL_SET = {};
   for (var ci = 0; ci < CANONICAL.length; ci++) CANONICAL_SET[CANONICAL[ci]] = true;
 
+  /* AN OUTBOUND TARGET MEANING "handle this here, never send it".
+   *
+   * The inbound map alone is half a seam. createController also SENDS seven
+   * kinds of event, and on a WebSocket transport one of them does not exist:
+   * measured, `output_audio_buffer.clear` comes back "Invalid event received".
+   * It is not a harmless no-op -- it is an error on the wire, on the barge-in
+   * path, at the moment the driver is trying to interrupt.
+   *
+   * What it MEANS still has to happen: stop the sound now. On this transport we
+   * own the queue, so the answer is better than the event it replaces -- a local
+   * flush with no round trip to a server that then has to tell us it stopped.
+   */
+  var LOCAL = '__local__';
+
   /* A mapping target meaning "the controller must never see this". Distinct
      from an absent mapping, which means "pass it through untouched": the
      default for an unrecognised event is to pass it, because the controller's
@@ -248,6 +262,29 @@
          * instance keeps the last one for whoever wants it.
          */
         'conversation.item.input_audio_transcription.updated': DROP,
+      },
+      /* WHAT GOES OUT, measured against the live endpoint rather than read off a
+         table. Anything not named here is sent unchanged.
+
+           response.cancel            ACCEPTED (its "no active response found"
+                                      was a semantic complaint, not an unknown
+                                      event -- it works when there is one)
+           input_audio_buffer.clear   accepted
+           conversation.item.create   accepted
+           session.update             accepted
+           response.create            accepted, and GATED -- see the playout queue
+       */
+      outbound: {
+        // Refused outright: "Invalid event received". Becomes a local flush,
+        // which is what it was always asking for.
+        'output_audio_buffer.clear': LOCAL,
+        /* ACCEPTED BY THE WIRE AND STILL WRONG TO SEND. With server_vad the
+           SERVER decides where an utterance ends; committing as well is the
+           client arguing with the detector it just asked for, and measured, it
+           suppresses the transcript entirely -- speech_started and committed
+           fire, and .completed never arrives. That is two of the three failures
+           that made me report the voice models as unlicensed. */
+        'input_audio_buffer.commit': DROP,
       },
       caps: {
         // WebRTC/SIP only, and we have no reachable WebRTC. Set false per the
@@ -435,6 +472,7 @@
     }
 
     var events = profile.events || {};
+    var outbound = profile.outbound || {};
     var caps = profile.caps || {};
     var unknowns = profile.unknowns || {};
 
@@ -443,6 +481,7 @@
        place in the system where a console.log per call would be a real cost.
        The panel reads these; nothing prints them. */
     var stats = { seen: 0, renamed: 0, dropped: 0, unmapped: {} };
+    var statsOut = { renamed: 0, dropped: 0, local: 0 };
 
     /* The last cumulative input transcript, for a provider that sends one.
        Kept because it is the only evidence available if transcriptionItemId
@@ -500,6 +539,31 @@
       }
 
       stats.renamed++;
+      var out = {};
+      for (var k in ev) {
+        if (Object.prototype.hasOwnProperty.call(ev, k)) out[k] = ev[k];
+      }
+      out.type = mapped;
+      return out;
+    }
+
+    /* ONE EVENT, ON ITS WAY OUT.
+     *
+     * Returns the event to send, null to drop it, or {local: name} for something
+     * this transport handles itself. Same three-way shape as `normalise`, and the
+     * same reason: a caller that cannot tell "sent", "dropped" and "handled here"
+     * apart will eventually do the wrong one of the three quietly.
+     */
+    function normaliseOut(ev) {
+      if (!ev || typeof ev.type !== 'string') return ev || null;
+      var mapped = outbound[ev.type];
+      if (mapped === undefined) return ev;
+      if (mapped === DROP) { statsOut.dropped++; return null; }
+      if (mapped === LOCAL) {
+        statsOut.local++;
+        return { local: ev.type, event: ev };
+      }
+      statsOut.renamed++;
       var out = {};
       for (var k in ev) {
         if (Object.prototype.hasOwnProperty.call(ev, k)) out[k] = ev[k];
@@ -581,6 +645,7 @@
       label: profile.label,
       transport: profile.transport,
       normalise: normalise,
+      normaliseOut: normaliseOut,
       capability: capability,
       /* A copy. The record is read in a lot of places and a caller that could
          edit it would be a second source of truth with no file of its own. */
@@ -599,7 +664,9 @@
       cumulativeTranscript: function () { return cumulativeTranscript; },
       stats: function () {
         return { seen: stats.seen, renamed: stats.renamed,
-                 dropped: stats.dropped,
+                 dropped: stats.dropped, out: {
+                   renamed: statsOut.renamed, dropped: statsOut.dropped,
+                   local: statsOut.local },
                  unmapped: JSON.parse(JSON.stringify(stats.unmapped)) };
       },
     };
