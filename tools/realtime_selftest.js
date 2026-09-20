@@ -150,6 +150,10 @@ function harness(opts) {
     echoTailMs: opts.echoTailMs,
     echoTextWindowS: opts.echoTextWindowS,
     echoTextOverlap: opts.echoTextOverlap,
+    // How recent her voice has to be for a ONE-WORD transcript to be hers.
+    // Named here for the reason the comment below gives: an option the
+    // harness does not pass is an option the controller never sees.
+    echoTextShortMs: opts.echoTextShortMs,
     /* The backstop under semantic_vad's tail. Listed here for the same reason
        every key above is: this object is an explicit mapping and not a spread,
        so an option the harness does not name is an option the controller never
@@ -3858,6 +3862,77 @@ section('road noise — five fragments, one answer at most');
   ok(h.events.filter(e => e.type === 'LIVE_NOISE_SILENCED').length === 1,
      '...and it is in the drive log, which is what session 738fbb82 could not say');
 }
+
+section('"hello" is a greeting when nobody is echoing — the desk of 2026-09-20');
+
+{
+  /* THE FAULT, REPRODUCED. A driver at a desk says hello into a working
+     microphone and is told "Didn't catch that." Measured from
+     /realtime/cutoffs for that session:
+
+       turn_fragment  "Hello."  t=517.4     the transcript arrived, complete
+       noise_silenced           t=517.4     the server's response, cancelled
+       noise_reply    "Hello."  t=519.4     the window closed on it
+       spoke  direct, generated_chars 18 =  "Didn't catch that."
+
+     ...and again twenty-one seconds later. Nothing was mis-heard: the word was
+     transcribed, server_vad closed the turn, and the gate threw it away
+     because "hello" is in noise_tokens. */
+  const h = noiseHarness();
+  const spoken = [];
+  h.arbiter.onEvent(ev => { if (ev.type === 'start' && ev.item) spoken.push(ev.item.text); });
+  fragment(h, 'Hello.');
+  await settle(10);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_FRAGMENT').length === 1,
+     'it still enters the buffer as a fragment — when it ARRIVES there is no '
+     + 'evidence either way, and the server\'s stacked response is still '
+     + 'cancelled on sight');
+
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 0,
+     'but the window closes on a GREETING, not on road noise: no '
+     + '"Didn\'t catch that."');
+  const rec = h.events.filter(e => e.type === 'LIVE_TURN_RECOVERED');
+  ok(rec.length === 1 && rec[0].why === 'social',
+     '...it is recovered as a turn, and the log says why — '
+     + JSON.stringify(rec.length ? rec[0].why : null));
+  ok(h.sent.filter(e => e.type === 'response.create').length === 1,
+     '...and she is asked to answer it, once');
+  ok(spoken.length === 0, '...with nothing apologised for — '
+     + JSON.stringify(spoken));
+  ok(h.controller.state().last_turn === 'Hello.',
+     '...and it is the turn now, so what the driver says next continues it');
+}
+
+{
+  // THE ECHO LOOP STAYS CLOSED, which is why those words were in the list.
+  // "Hey. What's up." out of the speaker comes back through the input
+  // transcriber as "Hello." — and THAT one must still be thrown away.
+  const h = noiseHarness();
+  h.controller.handle({ type: 'response.created', response: { id: 'r_her' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r_her', delta: "Hey. What's up." });
+  fragment(h, 'Hello.');
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_RECOVERED').length === 0,
+     'her own voice back through the speaker is NOT a greeting to answer');
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 1,
+     '...it goes down the noise path exactly as it did — the self-sustaining '
+     + 'loop of 2026-09-09 stays broken, and the words that break it are '
+     + 'still noise while she is the one saying them');
+}
+
+{
+  // A BURST IS THE ROAD. Unchanged, and this is the pair that makes the
+  // distinction honest: the same first word, a different second event.
+  const h = noiseHarness();
+  ['Hello.', 'Hello.', 'Yeah.'].forEach(t => fragment(h, t));
+  await settle(120);
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_RECOVERED').length === 0,
+     'three social fragments inside one window are still the road');
+  ok(h.events.filter(e => e.type === 'LIVE_NOISE_REPLY').length === 1,
+     '...and get the one answer road noise gets');
+}
 }
 
 function phoneHarness(opts) {
@@ -3881,6 +3956,46 @@ function speaking(h, rid, said) {
   h.controller.handle({ type: 'response.created', response: { id: rid } });
   h.controller.handle({ type: 'response.output_audio_transcript.delta',
                         response_id: rid, delta: said || 'Hey. What\'s up.' });
+}
+
+{
+  /* THE MARGIN, MEASURED, ON THE COLUMN WHERE THE GATE IS OFF.
+   *
+   * config.py has carried two echo margins since the iPhone fix -- 0 on a
+   * desk, 6 dB on touch -- and neither came from a reading of a room, because
+   * the only code that read the meter was gated on the number already being
+   * non-zero:
+   *
+   *     function echoShaped() {
+   *       if (!bargeEchoMarginDb) return false;   // desk: the test is off
+   *       var v = readLevels();                   // <- never reached
+   *
+   * So a desk session produced echo_suppressed: 0 and NO measurements at all,
+   * and the zero was read as "no echo here" when it meant "never looked". The
+   * census runs on both columns and decides nothing. */
+  const h = phoneHarness({ onsetGuard: 0, bargeEchoMarginDb: 0 });
+  h.asEcho();                          // mic -46, out -18: a margin of -28 dB
+  speaking(h, 'r1', 'A sentence long enough to be measured while it plays');
+  await settle(260);                   // a couple of census samples
+  h.controller.handle({ type: 'response.done',
+                        response: { id: 'r1', status: 'completed' } });
+  await settle(20);
+  const cen = h.events.filter(e => e.type === 'LIVE_ECHO_CENSUS');
+  ok(cen.length === 1,
+     'a desk session with the gate OFF still measures the room — '
+     + cen.length + ' census');
+  ok(cen.length === 1 && cen[0].n > 0 && cen[0].margin_max_db <= -20,
+     '...and reports what the microphone actually heard against the speaker: '
+     + (cen.length ? cen[0].margin_max_db + ' dB peak over ' + cen[0].n
+                     + ' samples' : 'nothing'));
+  ok(cen.length === 1 && cen[0].required_db === 0,
+     '...next to the threshold that was in force, which is what makes it '
+     + 'actionable rather than a number');
+  ok(h.controller.state().counters.echo_census_samples > 0,
+     '...and the session can be asked how much evidence it has');
+  ok(h.events.filter(e => e.type === 'LIVE_ECHO_SUPPRESSED').length === 0,
+     '...while suppressing nothing: the census is instrumentation and cannot '
+     + 'cause or prevent a barge-in');
 }
 
 {
@@ -3977,6 +4092,44 @@ function speaking(h, rid, said) {
   ok(ph.length === 1 && ph[0].why === 'echo_of_her_own_words',
      'a navigation call echoing back is not a driver asking for a left turn',
      'the arbiter is the one place that sees everything she says');
+}
+
+{
+  /* A ONE-WORD ANSWER IS NOT AN ECHO ELEVEN SECONDS LATER.
+   *
+   * MEASURED on the desk of 2026-09-20: turn_phantom, why
+   * `echo_of_her_own_words`, text "Yeah.", since_audio_ms 10932. The driver
+   * was answering her question. "yeah" had appeared somewhere in fifteen
+   * seconds of her own talking, and below echoTextMinWords only exact
+   * containment counts -- which one word always satisfies.
+   *
+   * A loudspeaker in the same room is microseconds of air plus the capture
+   * path. It is not eleven seconds late. So the short-utterance test has a
+   * clock on it now, and this is that clock. */
+  const h = phoneHarness({ onsetGuard: 0, echoTextShortMs: 30 });
+  h.controller.handle({ type: 'response.created', response: { id: 'r1' } });
+  h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                        response_id: 'r1', delta: 'Yeah, that one there' });
+  h.controller.handle({ type: 'response.done',
+                        response: { id: 'r1', status: 'completed' } });
+  await settle(80);                   // her voice has been out of the room
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Yeah.' });
+  await settle();
+  const late = h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM'
+                               && e.why === 'echo_of_her_own_words');
+  ok(late.length === 0,
+     'a one-word answer long after her last audio is a driver, not an echo');
+
+  // ...and the same word while she is still audible is still hers.
+  const h2 = phoneHarness({ onsetGuard: 0, echoTextShortMs: 30 });
+  speaking(h2, 'r1', 'Yeah, that one there');
+  h2.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'Yeah.' });
+  await settle();
+  ok(h2.events.filter(e => e.type === 'LIVE_TURN_PHANTOM'
+                      && e.why === 'echo_of_her_own_words').length === 1,
+     '...while the same word over the top of her own voice still is one');
 }
 
 {

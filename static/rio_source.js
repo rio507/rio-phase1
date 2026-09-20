@@ -54,6 +54,46 @@
   };
   var subs = [];
 
+  /* THE ONE LIVE PIPELINE, AND EVERY HAND ON IT.
+   *
+   * startFeed() used to acquire, unconditionally, once per caller. Three
+   * callers meant three feeds were possible and the owner knew about none of
+   * them: on 2026-09-20 a drive and a clip's caption watcher fed the same
+   * session half a second apart, 640x480 against 1920x1080, and perception
+   * answered from whichever frame arrived last.
+   *
+   * So there is ONE feed object for the page and callers take a HANDLE on it.
+   * A second caller does not get a second camera; it gets the same one, and
+   * stopFeed() releases the device only when the last hand comes off. Two
+   * active sources are not unlikely here, they are unrepresentable: there is
+   * one variable and it holds one feed.
+   *
+   * `holders` is a list of names rather than a count because "who is still
+   * holding the camera" is the question asked when it will not turn off, and
+   * a number cannot answer it. */
+  var liveFeed = null;
+  var faults = [];            // loud, kept, and readable by the page and tests
+
+  function fault(code, detail) {
+    var rec = { code: code, detail: detail || {}, at: Date.now() };
+    faults.push(rec);
+    if (faults.length > 20) faults.shift();
+    try {
+      if (root.console && console.error) {
+        console.error('[source] ' + code + ' ' + JSON.stringify(rec.detail));
+      }
+    } catch (e) {}
+    /* AND INTO THE DRIVE'S OWN RECORD. A fault that exists only in a console
+       nobody has open is a fault nobody has. RIO.pageMark is the page's own
+       session-log hook; absent (a test, an older page), the console line above
+       is all there is and that is still better than silence. */
+    try {
+      var m = root.RIO && (root.RIO.pageMark || root.RIO.mark);
+      if (typeof m === 'function') m('SOURCE_' + code, rec.detail);
+    } catch (e) {}
+    return rec;
+  }
+
   function doc() {
     return root.document && root.document.getElementById ? root.document : null;
   }
@@ -119,6 +159,13 @@
     state.kind = CLIP;
     state.clipUrl = String(url || '');
     state.clipName = String(fileName || '') || 'clip';
+    /* AND THE FEED THAT IS ALREADY RUNNING MOVES WITH IT.
+       Choosing a clip while a drive is on the camera used to change the answer
+       for everything EXCEPT the loop that was already holding a camera feed --
+       which is one of the two ways a session ends up with two sources. The
+       choice is the choice: the camera is released here, now, and every holder
+       of the feed is looking at the clip on its next capture. */
+    retarget();
     emit();
     return kind();
   }
@@ -127,51 +174,94 @@
      that vanished because some other part of the page wanted a camera is the
      bug this file exists for, running in the opposite direction. */
   function useCamera() {
+    /* THE ELEMENT IS EMPTIED HERE, by the owner, and not only by whichever
+       button happened to call this.
+       Since startFeed() adopts a clip it finds on the screen (see reconcile),
+       leaving a src on the element would make the next acquisition put the
+       clip straight back -- silently undoing the one explicit choice this
+       module has. "The way back is explicit" has to mean the way back stays. */
     var p = byId('preview');
     if (p) {
       try { p.pause(); } catch (e) {}
+      try {
+        p.src = '';
+        if (typeof p.removeAttribute === 'function') p.removeAttribute('src');
+        if (typeof p.load === 'function') p.load();
+      } catch (e) {}
     }
     state.kind = CAMERA;
     state.clipUrl = '';
     state.clipName = '';
+    retarget();
     emit();
     return kind();
   }
 
+  /* THE SOURCE CHANGED UNDER A RUNNING FEED.
+   *
+   * Nothing is torn down and rebuilt: the holders keep the same feed object,
+   * whose `element` is a getter that follows the owner (see makeFeed), so a
+   * drive, a conversation and the caption loop all move together. What DOES
+   * happen here is the release of whatever the old source held -- a camera
+   * stays on otherwise, which on a desk is a lit indicator and in the log is a
+   * second producer waiting to be resumed.
+   *
+   * Asynchronous in the clip -> camera direction only, because that one needs
+   * a device. Camera -> clip is immediate, which is the direction that matters:
+   * the clip must win the instant it is chosen. */
+  function retarget() {
+    if (!liveFeed) return Promise.resolve(null);
+    var want = kind();
+    if (liveFeed.kind === want) return Promise.resolve(liveFeed);
+    var from = liveFeed.kind;
+    releaseDevice(liveFeed);
+    liveFeed.kind = want;
+    liveFeed.stream = null;
+    if (want === CLIP) {
+      playClip();
+      return Promise.resolve(liveFeed);
+    }
+    if (want === NONE) return Promise.resolve(liveFeed);
+    return acquireCamera().then(function (stream) {
+      if (liveFeed) liveFeed.stream = stream;
+      return liveFeed;
+    }, function (e) {
+      fault('RETARGET_FAILED', { from: from, to: want,
+                                 error: (e && e.name) || String(e) });
+      return liveFeed;
+    });
+  }
+
   function isClip() { return kind() === CLIP; }
 
-  /* THE ONE ACQUISITION. Every start path calls this and none of them calls
-     getUserMedia.
-     -> Promise<{kind, element, stream, error}>
-     `stream` is null for a clip, and that is not a failure: there is nothing
-     to stop afterwards and nothing to release. */
-  function startFeed() {
-    var k = kind();
+  /* WHAT A CAMERA IS ASKED FOR, IN ONE PLACE.
+   *
+   * The permission probe in the Start Drive tap used to ask for bare
+   * `video: true` -- it read `RIO.source.videoConstraints`, which did not
+   * exist, and fell through to the default. `video: true` is whatever the
+   * device feels like: 640x480 on a desktop webcam, the FRONT camera on a
+   * phone. So the probe opened one camera and startFeed then opened a
+   * different one, which is two acquisitions for one picture and two different
+   * pictures to choose between. Both ask through here now. */
+  function videoConstraints() {
+    return { facingMode: state.facing };
+  }
 
-    if (k === CLIP) {
-      var clip = byId('preview');
-      if (!clip) {
-        return Promise.resolve({ kind: NONE, element: null, stream: null,
-                                 error: 'clip element missing' });
-      }
-      // The clip must be RUNNING for frames to advance; a paused element hands
-      // back the same frame forever, which reads downstream as a stopped car.
-      var played = null;
-      try { played = clip.play(); } catch (e) { played = null; }
-      return Promise.resolve(played)
-        .catch(function () { /* autoplay refusal is not fatal: the driver can press play */ })
-        .then(function () {
-          return { kind: CLIP, element: clip, stream: null, error: null };
-        });
-    }
+  function playClip() {
+    var clip = byId('preview');
+    if (!clip) return Promise.resolve(null);
+    // The clip must be RUNNING for frames to advance; a paused element hands
+    // back the same frame forever, which reads downstream as a stopped car.
+    var played = null;
+    try { played = clip.play(); } catch (e) { played = null; }
+    return Promise.resolve(played)
+      .catch(function () { /* autoplay refusal is not fatal: the driver can press play */ })
+      .then(function () { return clip; });
+  }
 
-    if (k === NONE) {
-      return Promise.resolve({ kind: NONE, element: null, stream: null,
-                               error: 'no camera on this page' });
-    }
-
+  function acquireCamera() {
     return root.navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: state.facing }, audio: false })
+      .getUserMedia({ video: videoConstraints(), audio: false })
       .then(function (stream) {
         var v = byId('video');
         if (v) {
@@ -181,8 +271,156 @@
             if (p && p.catch) p.catch(function () {});
           } catch (e) {}
         }
-        return { kind: CAMERA, element: v, stream: stream, error: null };
+        return stream;
       });
+  }
+
+  function releaseDevice(feed) {
+    if (feed && feed.stream) {
+      try { feed.stream.getTracks().forEach(function (t) { t.stop(); }); }
+      catch (e) {}
+    }
+    if (feed && feed.kind === CAMERA) {
+      var v = byId('video');
+      if (v) v.srcObject = null;
+    }
+    if (feed && feed.kind === CLIP) {
+      var c = byId('preview');
+      if (c) { try { c.pause(); } catch (e) {} }
+    }
+  }
+
+  /* The feed handed to callers. `element` is a GETTER, not a value, and that
+     is the whole of how a source change reaches a loop that is already
+     running: rio_frames.js asks for the element on every frame, so the next
+     capture after an upload comes from the clip without anybody restarting
+     anything. It was a fixed value, captured at acquisition, and a drive that
+     had one could not be told about anything. */
+  function makeFeed(k, stream) {
+    var feed = { kind: k, stream: stream || null, error: null, holders: [] };
+    try {
+      Object.defineProperty(feed, 'element', {
+        enumerable: true,
+        get: function () {
+          return feed.kind === CLIP ? byId('preview')
+               : feed.kind === CAMERA ? byId('video') : null;
+        },
+      });
+    } catch (e) {
+      feed.element = k === CLIP ? byId('preview') : byId('video');
+    }
+    return feed;
+  }
+
+  /* WHAT IS ON THE SCREEN, RECONCILED WITH WHAT THE OWNER BELIEVES.
+   *
+   * A clip that is loaded in the page but not registered here is the exact
+   * state the driver described on 2026-09-20: a clip on the glass, Start Drive
+   * pressed, and the camera opened anyway -- because every start path asks
+   * `kind()`, and `kind()` only knows what setClip() was told. One missed call
+   * (an upload handler that threw before it got there, a clip put on the
+   * element by anything other than the upload input, a cached older page)
+   * and the owner is confidently wrong.
+   *
+   * So the acquisition does not trust the record alone: if #preview has a
+   * source in it, the driver has put a picture on the screen, and that is the
+   * selected source whatever this module last recorded. Adopting it is loud --
+   * something failed to say so, and that is worth a line -- and it happens
+   * BEFORE any device is opened, which is what makes "the camera is never
+   * opened over a clip" true rather than intended. */
+  function reconcile() {
+    if (kind() === CLIP) return;
+    var clip = byId('preview');
+    if (!clip) return;
+    var src = clip.currentSrc || clip.src || '';
+    if (!src) return;
+    fault('ADOPTED_VISIBLE_CLIP', { src: String(src).slice(0, 80),
+                                    was: kind() });
+    state.kind = CLIP;
+    state.clipUrl = String(src);
+    state.clipName = state.clipName || 'clip';
+    retarget();
+    emit();
+  }
+
+  /* THE ONE ACQUISITION. Every start path calls this and none of them calls
+     getUserMedia.
+     -> Promise<{kind, element, stream, error}>
+     `stream` is null for a clip, and that is not a failure: there is nothing
+     to stop afterwards and nothing to release.
+
+     A SECOND CALLER GETS THE SAME FEED. It does not get a second camera and it
+     does not get a second capture pipeline: it gets a handle on the one that
+     is already open, and the device is released when the last handle is
+     dropped. `who` names the caller so that "what is still holding the camera"
+     has an answer. */
+  function startFeed(who) {
+    reconcile();
+    var k = kind();
+    var name_ = String(who || 'unnamed');
+
+    if (liveFeed) {
+      /* Already running. The kinds cannot disagree -- retarget() moves the one
+         feed whenever the source changes -- but if they ever did, that is two
+         sources by definition and the feed is moved rather than duplicated. */
+      if (liveFeed.kind !== k) {
+        fault('FEED_KIND_DRIFT', { feed: liveFeed.kind, source: k,
+                                   holders: liveFeed.holders.slice() });
+        return retarget().then(function () {
+          liveFeed.holders.push(name_);
+          return liveFeed;
+        });
+      }
+      liveFeed.holders.push(name_);
+      /* A NEW HAND ON A STOPPED CLIP STILL NEEDS IT MOVING. The feed being
+         live is not the same fact as frames advancing: a clip paused by the
+         driver, or by the end of the last holder's use of it, hands back one
+         frame forever, and downstream that is a stopped car rather than a
+         stopped clip. */
+      if (liveFeed.kind === CLIP) {
+        return playClip().then(function () { return liveFeed; });
+      }
+      return Promise.resolve(liveFeed);
+    }
+
+    if (k === CLIP) {
+      var clip = byId('preview');
+      if (!clip) {
+        return Promise.resolve({ kind: NONE, element: null, stream: null,
+                                 error: 'clip element missing' });
+      }
+      return playClip().then(function () {
+        liveFeed = makeFeed(CLIP, null);
+        liveFeed.holders.push(name_);
+        return liveFeed;
+      });
+    }
+
+    if (k === NONE) {
+      return Promise.resolve({ kind: NONE, element: null, stream: null,
+                               error: 'no camera on this page' });
+    }
+
+    return acquireCamera().then(function (stream) {
+      liveFeed = makeFeed(CAMERA, stream);
+      liveFeed.holders.push(name_);
+      return liveFeed;
+    });
+  }
+
+  /* One source per session, asserted rather than assumed. -> {ok, kind,
+     holders, faults}. The page puts this on the Feed chip and the suites
+     assert on it; anything that is not `ok` is a state this module was built
+     to make impossible, so it is reported as a fault and not as a value. */
+  function liveState() {
+    return {
+      ok: !liveFeed || liveFeed.kind === kind(),
+      live: liveFeed ? 1 : 0,
+      kind: liveFeed ? liveFeed.kind : null,
+      source: kind(),
+      holders: liveFeed ? liveFeed.holders.slice() : [],
+      faults: faults.slice(),
+    };
   }
 
   /* THE CAMERA CAME BACK, OR IT DID NOT.
@@ -213,22 +451,36 @@
       }
     } catch (e) {}
     if (v) v.srcObject = null;
-    return startFeed().then(function (feed) {
-      return !!(feed && feed.stream);
+    /* Straight to the device, not through startFeed(): this is the SAME feed
+       coming back, not a new hand on it, and going through startFeed would
+       return the live feed untouched (it is still there — it is its track that
+       died) and never re-acquire anything. */
+    return acquireCamera().then(function (stream) {
+      if (liveFeed && liveFeed.kind === CAMERA) liveFeed.stream = stream;
+      return !!stream;
     }, function () { return false; });
   }
 
-  /* Release whatever startFeed acquired. A clip feed owns nothing, so this is
-     a no-op for one — which is why callers can call it unconditionally. */
+  /* Release one HANDLE on the feed. The device goes when the last one does.
+   *
+   * A clip feed owns no device, so this is nearly a no-op for one — which is
+   * why callers can call it unconditionally. What it is never allowed to do is
+   * take the camera away from a loop that is still using it: the conversation
+   * ending while a drive runs used to be guarded against at every call site
+   * ("if (!RIO.driving)"), which is the same decision made in three places by
+   * three callers who cannot see each other. It is made here now. */
   function stopFeed(feed) {
-    if (feed && feed.stream) {
-      try { feed.stream.getTracks().forEach(function (t) { t.stop(); }); }
-      catch (e) {}
+    if (!feed) return;
+    if (feed !== liveFeed) {
+      // A feed from before a retarget, or a caller's own object. Release
+      // anything it still holds and leave the live one alone.
+      releaseDevice(feed);
+      return;
     }
-    if (feed && feed.kind === CAMERA) {
-      var v = byId('video');
-      if (v) v.srcObject = null;
-    }
+    if (feed.holders.length) feed.holders.pop();
+    if (feed.holders.length) return;        // somebody is still looking
+    releaseDevice(feed);
+    liveFeed = null;
   }
 
   root.RIO = root.RIO || {};
@@ -236,11 +488,23 @@
     CAMERA: CAMERA, CLIP: CLIP, NONE: NONE,
     kind: kind, name: name, label: label, element: element,
     isClip: isClip, facing: function () { return state.facing; },
+    videoConstraints: videoConstraints,
+    /* Called by a start path BEFORE it asks for permissions, because the
+       permission probe opens a camera of its own and the decision about
+       whether to ask for one at all depends on this. startFeed() calls it
+       too; it is idempotent. */
+    reconcile: reconcile,
     setClip: setClip, useCamera: useCamera,
     startFeed: startFeed, stopFeed: stopFeed, reacquire: reacquire,
     onChange: onChange,
+    // One source per session, asked rather than assumed. See liveState().
+    liveState: liveState,
+    faults: function () { return faults.slice(); },
     // Tests, and the panel's own reset paths.
-    _reset: function () { state.kind = CAMERA; state.clipUrl = ''; state.clipName = ''; },
+    _reset: function () {
+      state.kind = CAMERA; state.clipUrl = ''; state.clipName = '';
+      liveFeed = null; faults = [];
+    },
   };
 
   if (typeof module !== 'undefined' && module.exports) {

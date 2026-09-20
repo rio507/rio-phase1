@@ -284,12 +284,21 @@ global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
   };
 }
 const gps = { sink: null, at: { lat: 34.0219, lng: -118.4814 } };
-global.navigator = {
-  geolocation: {
-    getCurrentPosition: (okc) => okc({ coords: {
-      latitude: gps.at.lat, longitude: gps.at.lng, accuracy: 8 } }),
+/* NOT `global.navigator = ...`, AND THIS IS THE THIRD FILE TO LEARN IT.
+   Node 18 made `navigator` a real global and by node 22 it is an accessor with
+   no setter, so a plain assignment throws "Cannot set property navigator of
+   #<Object> which has only a getter" — here, at load, before check one. The
+   suite did not fail; it never ran, which is the failure mode tools/suite_sweep.js
+   exists for (23f4185, then source_selftest.js, then this). */
+Object.defineProperty(global, 'navigator', {
+  value: {
+    geolocation: {
+      getCurrentPosition: (okc) => okc({ coords: {
+        latitude: gps.at.lat, longitude: gps.at.lng, accuracy: 8 } }),
+    },
   },
-};
+  writable: true, configurable: true, enumerable: true,
+});
 const RIO = global.RIO || (global.RIO = {});
 RIO.sessionId = sessionId;
 RIO.url = (p) => base + p + (p.indexOf('?') >= 0 ? '&' : '?') +

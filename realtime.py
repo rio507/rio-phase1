@@ -1064,6 +1064,10 @@ _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
                   # answer correctly thrown away, and counting it as a cut-off
                   # would make the fix look like the fault.
                   "turns": {},
+                  # WHAT THE MICROPHONE HEARS WHILE SHE IS SPEAKING, per
+                  # device column. One entry per response, summarised; the
+                  # threshold for a room is read off this and off nothing else.
+                  "echo_margin": {},
                   "recent": []}
 # The kinds the browser reports about turn arbitration. Kept next to the store
 # so adding one is an edit in a single place.
@@ -1091,6 +1095,11 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                # false_barge_in, it is the only honest argument for moving
                # REALTIME_BARGE_ECHO_MARGIN_DB_TOUCH in either direction.
                "barge_detected", "barge_deferred", "barge_missed",
+               # THE MARGIN, MEASURED, in a room rather than in an argument.
+               # See _echo_margin below and rio_realtime.startCensus: it
+               # decides nothing and is the only source of the number
+               # REALTIME_BARGE_ECHO_MARGIN_DB* has to be set from.
+               "echo_census",
                # A transcript that arrived after the answer to it had started.
                # Ordinary; counted so it stops being read as a phantom.
                "turn_self",
@@ -1107,6 +1116,79 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
 _CUTOFF_RECENT_MAX = 50
 
 
+def _note_echo_census(detail: dict) -> None:
+    """One response's mic-vs-output margin, into this room's distribution.
+
+    Called under _cutoff_lock. Per DEVICE COLUMN, because a desk and a car are
+    two rooms and the whole point of the measurement is that they are not
+    interchangeable -- config.py has carried two numbers since the iPhone fix
+    and neither of them came from a reading.
+
+    What is kept is one summary per response, not every sample: a drive is
+    hundreds of responses and the question is the shape of the distribution,
+    not its raw form.
+    """
+    device = str(detail.get("device") or "unknown")[:16]
+    row = _cutoffs["echo_margin"].setdefault(
+        device, {"responses": 0, "samples": 0, "p50": [], "p90": [],
+                 "max": None, "min": None, "required_db": None,
+                 "floor_db": None})
+    row["responses"] += 1
+    row["samples"] += int(detail.get("n") or 0)
+    for key, src in (("p50", "margin_p50_db"), ("p90", "margin_p90_db")):
+        v = detail.get(src)
+        if isinstance(v, (int, float)):
+            row[key].append(float(v))
+            if len(row[key]) > 500:
+                del row[key][0]
+    mx = detail.get("margin_max_db")
+    if isinstance(mx, (int, float)) and (row["max"] is None or mx > row["max"]):
+        row["max"] = float(mx)
+    mn = detail.get("margin_min_db")
+    if isinstance(mn, (int, float)) and (row["min"] is None or mn < row["min"]):
+        row["min"] = float(mn)
+    for key, src in (("required_db", "required_db"), ("floor_db", "floor_db")):
+        v = detail.get(src)
+        if isinstance(v, (int, float)):
+            row[key] = float(v)
+
+
+def _echo_margin_report() -> dict:
+    """The distribution, per room, in the shape a threshold is read off.
+
+    `headroom_db` is the number that answers the question directly: how far the
+    LOUDEST instant the microphone ever beat the speaker by fell short of the
+    margin the gate demands. Positive means the shipped threshold has never
+    been reached in this room by her own voice -- which is what a margin is
+    supposed to guarantee -- and negative means it has, and every one of those
+    instants is a barge-in the gate would have allowed.
+    """
+    out = {}
+    for device, row in _cutoffs["echo_margin"].items():
+        def med(vals):
+            if not vals:
+                return None
+            s = sorted(vals)
+            return round(s[len(s) // 2], 1)
+        req = row.get("required_db")
+        mx = row.get("max")
+        out[device] = {
+            "responses": row["responses"],
+            "samples": row["samples"],
+            # Medians of the per-response medians: robust to one loud response
+            # and to one long one, which a pooled mean is not.
+            "p50_db": med(row["p50"]),
+            "p90_db": med(row["p90"]),
+            "max_db": None if mx is None else round(mx, 1),
+            "min_db": None if row.get("min") is None else round(row["min"], 1),
+            "required_db": req,
+            "floor_db": row.get("floor_db"),
+            "headroom_db": (None if (req is None or mx is None)
+                            else round(req - mx, 1)),
+        }
+    return out
+
+
 def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
     """One cut-off, one resume, or one absorbed blip, as reported by the page."""
     with _cutoff_lock:
@@ -1116,6 +1198,12 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
         elif kind in ("resumed", "resume_skipped", "blips_absorbed",
                       "echo_suppressed", "session_silent"):
             _cutoffs[kind] += 1
+        elif kind == "echo_census":
+            # Counted like any other turn kind, AND kept as a distribution:
+            # "how often was it measured" and "what did it measure" are
+            # different questions and the tally can only answer the first.
+            _cutoffs["turns"][kind] = _cutoffs["turns"].get(kind, 0) + 1
+            _note_echo_census(detail or {})
         elif kind in _TURN_KINDS:
             # Counted rather than tallied as a cut-off: a supersede is not a
             # failure of the answer, it is the answer being correctly thrown
@@ -1126,6 +1214,11 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
         rec.update({k: v for k, v in (detail or {}).items()
                     if k in ("response_id", "reason", "detail", "said_chars",
                              "by", "mic_db", "out_db", "margin_db", "device",
+                             # THE MARGIN CENSUS — measured, per room.
+                             "n", "sample_ms", "mic_peak_db", "out_peak_db",
+                             "required_db", "floor_db",
+                             "margin_p50_db", "margin_p90_db", "margin_max_db",
+                             "margin_min_db", "margin_mean_db",
                              # NEWEST WINS. Which turn was dropped, which one
                              # replaced it, what it cost in tool calls, and how
                              # old the answer would have been. Without these a
@@ -1217,6 +1310,11 @@ def cutoff_tally() -> dict:
             # ...and the ones that never reached the gate, because the level
             # test said the microphone was hearing the loudspeaker.
             "echo_suppressed": _cutoffs["echo_suppressed"],
+            # ...and what the microphone was ACTUALLY hearing while she spoke,
+            # which is the only thing a margin can honestly be set from. Empty
+            # until a session runs with a meter; zero suppressions and no
+            # distribution mean "not measured", not "no echo".
+            "echo_margin": _echo_margin_report(),
             # Responses that made no sound at all. A non-zero number here means
             # the driver was talking to something that was not answering, which
             # is a different fault from every other number in this dict.
@@ -1249,6 +1347,7 @@ def reset_cutoffs() -> None:
         _cutoffs["resume_skipped"] = 0
         _cutoffs["blips_absorbed"] = 0
         _cutoffs["echo_suppressed"] = 0
+        _cutoffs["echo_margin"] = {}
         # The turn counters too. `turn_phantom` is the number that says whether
         # the echo loop is closed, and a measured phone run that starts with
         # the last run's phantoms already on the board cannot say anything.
@@ -1544,6 +1643,10 @@ def drive_policy(cfg: dict) -> dict:
         "echo_text_window_s": float(config.REALTIME_ECHO_TEXT_WINDOW_S),
         "echo_text_overlap": float(config.REALTIME_ECHO_TEXT_OVERLAP),
         "echo_text_min_words": int(config.REALTIME_ECHO_TEXT_MIN_WORDS),
+        # ...and how recent her voice has to be for a ONE-WORD reply to be
+        # counted as hers. A "Yeah." eleven seconds after her last audio is a
+        # driver answering, not a loudspeaker. See REALTIME_ECHO_TEXT_SHORT_MS.
+        "echo_text_short_ms": int(config.REALTIME_ECHO_TEXT_SHORT_MS),
         # NEWEST WINS. The turn policy travels with the session for the same
         # reason the barge policy does: config.py decides it, the browser holds
         # no second copy, and tools/realtime_selftest.py checks the one copy.
@@ -1563,6 +1666,10 @@ def drive_policy(cfg: dict) -> dict:
             "noise_reply_cooldown_ms": int(config.REALTIME_NOISE_REPLY_COOLDOWN_MS),
             "noise_reply": str(config.REALTIME_NOISE_REPLY),
             "noise_tokens": list(config.REALTIME_NOISE_TOKENS),
+            # The subset that is a whole turn when she is not the one saying
+            # it. "hello" on a desk is a greeting; "hello" over her own voice
+            # is the echo loop. See REALTIME_SOCIAL_TOKENS.
+            "social_tokens": list(config.REALTIME_SOCIAL_TOKENS),
         },
         # DICTATION IS A PROPERTY OF THE openai_realtime BACKEND, and it is
         # what makes ONE VOICE EVERYWHERE true on it.

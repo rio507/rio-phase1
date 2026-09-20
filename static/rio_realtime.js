@@ -859,6 +859,11 @@
                         muted, nothing was cancelled, and the answer carried on.
                         On a desk this is always zero -- the gate is off. */
                      echo_suppressed: 0,
+                     /* HOW OFTEN THE MARGIN WAS MEASURED AT ALL — the number
+                        whose absence made every threshold a guess. See
+                        startCensus(); it runs on a desk and in a car, and it
+                        decides nothing. */
+                     echo_census_responses: 0, echo_census_samples: 0,
                      /* Dictations abandoned on their budget whose response
                         turned up anyway and was killed before it could read
                         the line a second voice was already reading. The number
@@ -1110,6 +1115,14 @@
                      'thank', 'you', 'got', 'it', 'wow', 'well', 'so', 'like',
                      'the', 'a', 'and', 'for', 'your', 'help', 'good', 'nice',
                      'cool', 'alright', 'sorry', 'please', 'there'],
+      /* The words above that are a WHOLE TURN when she is not the one saying
+         them. See config.REALTIME_SOCIAL_TOKENS and the desk session of
+         2026-09-20, where "hello" into a working microphone was answered
+         "Didn't catch that." twice. */
+      social_tokens: ['hey', 'hello', 'hi', 'yeah', 'yep', 'yes', 'no',
+                      'nope', 'ok', 'okay', 'right', 'sure', 'thanks',
+                      'thank', 'wow', 'good', 'nice', 'cool', 'alright',
+                      'sorry', 'please'],
     };
     var turnPolicy = {};
     for (var tk in TURN_DEFAULTS) turnPolicy[tk] = TURN_DEFAULTS[tk];
@@ -1250,6 +1263,45 @@
       return true;
     }
 
+    /* SHE IS NOT IN THE ROOM. Nothing she has said could be coming back.
+     *
+     * The one fact that separates "hello" the greeting from "hello" the echo
+     * of her own opening line, and the only reason the social words below can
+     * be treated differently from the rest of the noise list at all. It is
+     * deliberately stricter than looksLikeEcho(): not "these words are not
+     * hers" but "there is nothing of hers in the air", so a short reply is
+     * answered only when the room is genuinely quiet. */
+    function nothingToEcho() {
+      if (speaking && !speaking.cancelled) return false;
+      if (!lastAudioAt) return true;
+      return (now() - lastAudioAt) > echoTailMs;
+    }
+
+    /* Is this the shortest complete turn there is — a greeting, a yes, a no?
+     *
+     * THE FAULT THIS CLOSES, measured on the desk on 2026-09-20: the driver
+     * said "hello" into a working microphone and was told "Didn't catch that."
+     * twice, and answered "No." to a question twice more. The transcripts were
+     * perfect. grok-transcribe returned the word, server_vad closed the turn,
+     * and the gate threw it away because it was one word long and that word is
+     * in noise_tokens.
+     *
+     * Those words are in the list because they are what HER voice comes back
+     * as -- and that is a statement about a moment, not about a vocabulary.
+     * When she has said nothing to echo, a greeting is a greeting. */
+    function shortSocialTurn(text) {
+      var words = normWords(text);
+      if (!words.length || words.length > 3) return false;
+      var social = policyList('social_tokens', []);
+      for (var i = 0; i < words.length; i++) {
+        if (social.indexOf(words[i]) < 0) return false;
+      }
+      // Her own voice, or a moment where it could be: the old behaviour
+      // exactly, which is what keeps the echo loop broken.
+      if (!nothingToEcho() || looksLikeEcho(text)) return false;
+      return true;
+    }
+
     function unintelligible(text) {
       var t = String(text == null ? '' : text).trim();
       if (!t) return true;
@@ -1313,10 +1365,33 @@
       /* NO LENGTH CEILING HERE, deliberately: a buffer is as long as the road
          was rough, and what decides it is whether anything in it is a
          request. */
-      if (!noContentWords(joined) && normWords(joined).length > 1) {
+      var recovered = (!noContentWords(joined) && normWords(joined).length > 1)
+                      ? 'coalesced'
+      /* ...OR IT WAS SOMEBODY SAYING HELLO.
+       *
+       * ONE fragment in the window, made of nothing but social words, with
+       * nothing of hers in the air to be an echo of. The burst is what makes
+       * road noise road noise -- "Hello. Hello. Thanks for your help. Got it."
+       * inside ten milliseconds, five pieces with nothing joining them -- and
+       * a person who says hello says it once and then waits.
+       *
+       * DECIDED HERE, AT THE CLOSE OF THE WINDOW, and not when the fragment
+       * arrived, because when it arrived there was no evidence either way:
+       * the first fragment of a burst and a greeting are the same transcript.
+       * Two seconds later they are not, and the fragment path in the meantime
+       * is unchanged -- the server's stacked response is still cancelled on
+       * sight, which is what that path is for.
+       *
+       * MEASURED, the desk session of 2026-09-20: "Hello." at t=517.4 and
+       * again at t=538.2, twenty-one seconds apart, one fragment in each
+       * window, both answered "Didn't catch that." */
+                      : (buf.n === 1 && shortSocialTurn(joined)) ? 'social'
+                      : null;
+      if (recovered) {
         counters.fragments_recovered++;
         emit('LIVE_TURN_RECOVERED', {
           turn: turnSeq, n: buf.n, text: joined.slice(0, 200),
+          why: recovered,
           span_ms: Math.round(buf.last - buf.first),
         });
         turnSeq++;
@@ -1456,10 +1531,29 @@
         }
         if (!mine.length) return false;
         var hay = ' ' + mine.join(' ') + ' ';
+        /* CONTAINMENT, WITH A CLOCK ON IT FOR THE SHORT ONES.
+         *
+         * Fifteen seconds is the right memory for a verbatim sentence of hers
+         * coming back. It is far too long for one word: "yeah" appears
+         * somewhere in almost anything she says, so any driver who agrees with
+         * her inside a quarter of a minute is refused as an echo.
+         *
+         * MEASURED on the desk, 2026-09-20: turn_phantom "Yeah." refused as
+         * echo_of_her_own_words with since_audio_ms = 10932. A loudspeaker in
+         * the same room is not eleven seconds late; that was a driver
+         * answering, and the answer was dropped.
+         *
+         * So a short utterance is only hers if her voice was in the room just
+         * now -- see config.REALTIME_ECHO_TEXT_SHORT_MS. */
+        var shortOne = words.length < echoTextMinWords;
+        if (shortOne && lastAudioAt && (at - lastAudioAt) > echoTextShortMs
+            && !(speaking && !speaking.cancelled)) {
+          return false;
+        }
         if (hay.indexOf(' ' + words.join(' ') + ' ') >= 0) return true;
         // Below a couple of words, only exact containment counts: "yes" and
         // "no" share every word with almost anything she has ever said.
-        if (words.length < echoTextMinWords) return false;
+        if (shortOne) return false;
         var hit = 0;
         for (var j = 0; j < words.length; j++) {
             if (hay.indexOf(' ' + words[j] + ' ') >= 0) hit++;
@@ -1617,10 +1711,18 @@
     var turnBackstopMicDb = (cfg.turnBackstopMicDb === undefined
                              || cfg.turnBackstopMicDb === null)
                             ? -45 : cfg.turnBackstopMicDb;
+    /* How often the margin is sampled while she is audible. 100 ms is the
+       same cadence startEchoWatch already uses to make a live decision, so the
+       census and the gate see the same signal at the same rate. */
+    var CENSUS_SAMPLE_MS = 100;
     var echoTailMs = cfg.echoTailMs || 600;
     var echoTextWindowMs = (cfg.echoTextWindowS || 15) * 1000;
     var echoTextOverlap = cfg.echoTextOverlap || 0.8;
     var echoTextMinWords = cfg.echoTextMinWords || 2;
+    /* How recent her voice has to be for a ONE-WORD transcript to be counted
+       as hers. Not the same number as the window above and not the same test:
+       that one is about her words, this one is about the room. */
+    var echoTextShortMs = cfg.echoTextShortMs || 2000;
 
     /* ---- THE ECHO GATE, and why the desk does not have one -----------------
      *
@@ -2325,6 +2427,7 @@
          land. */
       clearOnsetHold();
       stopEchoWatch();
+      stopCensus('response_end');
       if (entry.resolve) entry.resolve();          // the arbiter marks it spoken
     }
 
@@ -2495,6 +2598,99 @@
         required_db: bargeEchoMarginDb,
         since_suppress_ms: Math.round(age),
         text: String(text || '').slice(0, 160),
+      });
+    }
+
+    /* ---- THE MARGIN, MEASURED, WHETHER OR NOT THE GATE IS ARMED ----------
+     *
+     * "That margin is a number to measure per environment, not guess — and
+     * desk and car need different ones." Both halves of that were impossible
+     * before this. config.py has carried two columns since the iPhone fix
+     * (REALTIME_BARGE_ECHO_MARGIN_DB = 0 on a desk, 6 on touch) and NEITHER
+     * number came from a measurement of a room, because the only code that
+     * ever read the meter was code gated on the number already being set:
+     *
+     *     function echoShaped() {
+     *       if (!bargeEchoMarginDb) return false;   // desk: the test is off
+     *       var v = readLevels();                   // <- never reached
+     *
+     * So on a desk the meter was built, attached, and never read; the only
+     * mic-vs-output numbers that ever reached the log came from sessions where
+     * the gate fired, which is exactly the sample you cannot set a threshold
+     * from. echo_suppressed: 0 meant "no evidence", and it was being read as
+     * "no echo".
+     *
+     * This samples the same meter while she is SPEAKING and the output is
+     * above the floor -- the only moments when echo is possible at all -- and
+     * reports the distribution. A desk and a car then produce two histograms
+     * of the same quantity, and the margin for each is a reading off them
+     * rather than an opinion.
+     *
+     * It decides nothing. No gate consults it; it cannot suppress or cause a
+     * barge-in. It is instrumentation, and it runs on both columns. */
+    var census = null;          // { n, sum, min, max, sorted[] } per response
+    var censusTimer = null;
+
+    function censusSample() {
+      var v = readLevels();
+      if (!v) return;
+      if (v.out < bargeEchoFloorDb) return;   // she is not making a sound
+      var margin = v.mic - v.out;
+      if (!census) return;
+      census.n++;
+      census.sum += margin;
+      census.samples.push(margin);
+      if (census.min === null || margin < census.min) census.min = margin;
+      if (census.max === null || margin > census.max) census.max = margin;
+      if (v.mic > (census.mic_max === null ? -Infinity : census.mic_max)) census.mic_max = v.mic;
+      if (v.out > (census.out_max === null ? -Infinity : census.out_max)) census.out_max = v.out;
+    }
+
+    function startCensus(rid) {
+      if (!levels || censusTimer) return;
+      census = { rid: rid, n: 0, sum: 0, min: null, max: null,
+                 mic_max: null, out_max: null, samples: [] };
+      censusTimer = setInterval(censusSample, CENSUS_SAMPLE_MS);
+    }
+
+    function stopCensus(why) {
+      if (censusTimer) { clearInterval(censusTimer); censusTimer = null; }
+      var c = census;
+      census = null;
+      if (!c || !c.n) return;
+      var sorted = c.samples.slice().sort(function (a, b) { return a - b; });
+      var q = function (f) {
+        return Math.round(sorted[Math.min(sorted.length - 1,
+                          Math.floor(f * sorted.length))] * 10) / 10;
+      };
+      counters.echo_census_responses++;
+      counters.echo_census_samples += c.n;
+      emit('LIVE_ECHO_CENSUS', {
+        response_id: c.rid,
+        why: why || null,
+        n: c.n,
+        sample_ms: CENSUS_SAMPLE_MS,
+        /* mic minus output, in dB, while she was audible. NEGATIVE is the
+           normal state -- the microphone hears less than the speaker renders.
+           A margin at or above the configured requirement is what the gate
+           would have called a driver.
+
+           Flat, not a nested object: these rows are read one per line out of
+           /realtime/cutoffs next to mic_db and out_db from the gate's own
+           events, and one of the two shapes has to give. */
+        margin_p50_db: q(0.5),
+        margin_p90_db: q(0.9),
+        margin_max_db: Math.round(c.max * 10) / 10,
+        margin_min_db: Math.round(c.min * 10) / 10,
+        margin_mean_db: Math.round((c.sum / c.n) * 10) / 10,
+        mic_peak_db: c.mic_max === null ? null : Math.round(c.mic_max * 10) / 10,
+        out_peak_db: c.out_max === null ? null : Math.round(c.out_max * 10) / 10,
+        /* WHAT THE SHIPPED NUMBER WOULD HAVE DONE with this room in it, so the
+           two columns can be compared against one recording rather than
+           against each other's reputation. */
+        required_db: bargeEchoMarginDb,
+        floor_db: bargeEchoFloorDb,
+        device: cfg.device || 'unknown',
       });
     }
 
@@ -3687,6 +3883,9 @@
               if (speaking && speaking.responseId === ev.response_id
                   && !speaking.audioAt) {
                 speaking.audioAt = Date.now();
+                // Her voice is on its way out of the speaker: the only window
+                // in which a microphone reading says anything about echo.
+                startCensus(ev.response_id);
               }
             }
             break;
@@ -4395,6 +4594,11 @@
           bargeOnsetGuardMs: w.barge.onset_guard_ms || 0,
           bargeEchoMarginDb: w.barge.echo_margin_db || 0,
           bargeEchoFloorDb: session.barge_echo_floor_db,
+          /* WHICH COLUMN THIS SESSION IS ON, carried so the margin census is
+             labelled with the environment it was measured in. A desk reading
+             and a car reading are the same quantity from two rooms, and a
+             number without its room is not a measurement. */
+          device: isTouchDevice() ? 'touch' : 'desktop',
           /* The meter is installed later, when there is a remote track to
              measure; until then the level test has no evidence and the gate
              behaves as it does on a desk. */
@@ -4410,6 +4614,7 @@
           echoTextWindowS: session.echo_text_window_s,
           echoTextOverlap: session.echo_text_overlap,
           echoTextMinWords: session.echo_text_min_words,
+          echoTextShortMs: session.echo_text_short_ms,
           /* NEWEST WINS. The commands that preempt, how long two fragments may
              be apart and still be one question, and what a continuation looks
              like — all decided in config.py and carried here with the session,
@@ -4508,7 +4713,20 @@
            which is what every session had until now. */
         function armMeter() {
           if (meter) return;
-          if (!barge.echo_margin_db) return;      // desk: nothing to measure
+          /* BUILT ON BOTH COLUMNS. This used to read
+           *
+           *     if (!barge.echo_margin_db) return;   // desk: nothing to measure
+           *
+           * and that comment is the reason the desk number could only ever be
+           * guessed: the meter was the only thing that could measure a room,
+           * and it was not built in the room whose margin is zero. "Nothing to
+           * measure" was a statement about the GATE, which is off on a desk
+           * and should stay off; it was not true of the measurement.
+           *
+           * An analyser on the microphone costs a few floats per frame. The
+           * gate is still governed by echo_margin_db alone -- see echoShaped()
+           * -- so a desk session behaves exactly as it did and now produces
+           * the readings the next threshold has to come from. */
           var shared = null;
           try {
             var o = root.RIO && root.RIO.output;

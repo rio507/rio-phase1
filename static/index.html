@@ -3278,7 +3278,7 @@ async function startLiveFrames() {
   if (RIO.source.kind() === 'none') return false;
   let feed;
   try {
-    feed = await RIO.source.startFeed();
+    feed = await RIO.source.startFeed('conversation');
   } catch (e) {
     // No camera, or refused. The conversation still works; RIO simply cannot
     // see, and the look tool says so rather than inventing a road.
@@ -3323,10 +3323,12 @@ function stopLiveFrames() {
   // The card stops claiming a feed that has stopped. A drive underneath keeps
   // its own, and its next frame relabels this within half a second.
   if (!RIO.driving) { try { RIO.ui.feedLabel(null); } catch (e) {} }
-  // Releases a camera if this feed opened one; a clip feed owns nothing, so
-  // the clip is still loaded and still the source when the conversation ends.
-  // A drive running underneath keeps its own feed either way.
-  if (liveFrames.feed && !RIO.driving) RIO.source.stopFeed(liveFrames.feed);
+  /* Drops this loop's HANDLE on the feed. Not "releases the camera": the
+     camera goes when the last holder lets go, which is a decision RIO.source
+     makes because it is the only thing that can see every holder. The
+     `!RIO.driving` this used to carry was that same decision, made here, by a
+     caller who could only see itself. */
+  if (liveFrames.feed) RIO.source.stopFeed(liveFrames.feed);
   liveFrames.feed = null;
 }
 
@@ -3413,6 +3415,13 @@ const LIVE_REPORTED = {
   // whole point of reporting it: the fix is visible in /realtime/cutoffs as
   // one tally going up while the other goes to zero.
   LIVE_ECHO_SUPPRESSED: 'echo_suppressed',
+  /* THE MARGIN, MEASURED, ON BOTH COLUMNS. Not a decision and not a fault:
+     one response's worth of "what did the microphone hear while she was
+     talking", which is the reading REALTIME_BARGE_ECHO_MARGIN_DB* has to come
+     from. It was unmeasurable until now — the meter was only built where the
+     gate was armed, so a desk produced no numbers at all and the desk
+     threshold was set by reasoning about it instead. */
+  LIVE_ECHO_CENSUS: 'echo_census',
   /* WHY SHE STOPPED TALKING — the half of that question the log could not
    * answer, added after the drive of 2026-09-17.
    *
@@ -3644,6 +3653,21 @@ function reportLive(ev) {
           /* THE LEVEL THE GATE WANTED, next to the one it got. A margin
              without its threshold is a number nobody can act on. */
           required_db: ev.required_db === undefined ? null : ev.required_db,
+          /* ...AND THE WHOLE DISTRIBUTION, once per response, from the census
+             that runs whether or not the gate is armed. This is the reading
+             the desk and car thresholds have to come from; see
+             LIVE_ECHO_CENSUS. `device` says which room it was measured in,
+             because a number without its room is not a measurement. */
+          device: ev.device || null,
+          sample_ms: ev.sample_ms === undefined ? null : ev.sample_ms,
+          mic_peak_db: ev.mic_peak_db === undefined ? null : ev.mic_peak_db,
+          out_peak_db: ev.out_peak_db === undefined ? null : ev.out_peak_db,
+          floor_db: ev.floor_db === undefined ? null : ev.floor_db,
+          margin_p50_db: ev.margin_p50_db === undefined ? null : ev.margin_p50_db,
+          margin_p90_db: ev.margin_p90_db === undefined ? null : ev.margin_p90_db,
+          margin_max_db: ev.margin_max_db === undefined ? null : ev.margin_max_db,
+          margin_min_db: ev.margin_min_db === undefined ? null : ev.margin_min_db,
+          margin_mean_db: ev.margin_mean_db === undefined ? null : ev.margin_mean_db,
           guard_ms: ev.guard_ms === undefined ? null : ev.guard_ms,
           holding_ms: ev.holding_ms === undefined ? null : ev.holding_ms,
           since_suppress_ms: ev.since_suppress_ms === undefined
@@ -4384,6 +4408,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // Must happen here, before any await, while the tap is still trusted.
     if (RIO.headway) { RIO.headway.unlock(); RIO.headway.startWatch(); }
 
+    /* WHAT IS ON THE SCREEN, BEFORE ANYTHING IS ASKED FOR.
+     *
+     * The permission probe below opens a camera of its own, and whether it
+     * does is decided by `RIO.source.kind()`. So a clip the owner has not been
+     * told about has to be adopted HERE, before that question is asked — after
+     * it, a camera has already been opened over the driver's clip and the
+     * drive is the second thing to find out. See rio_source.reconcile(). */
+    if (RIO.source.reconcile) RIO.source.reconcile();
+
     /* PERMISSIONS, ASKED HERE AND NOWHERE ELSE, INSIDE THE TAP.
      *
      * All three requests are STARTED before the first await below. A gesture
@@ -4412,7 +4445,7 @@ document.addEventListener('DOMContentLoaded', () => {
     say('Starting drive...');
     let feed;
     try {
-      feed = await RIO.source.startFeed();
+      feed = await RIO.source.startFeed('drive');
     } catch (e) {
       say(RIO.mediaError(e));
       return;
@@ -4502,7 +4535,23 @@ document.addEventListener('DOMContentLoaded', () => {
     hwFrames = 0;
     RIO.ui.session(sid);
     RIO.ui.frameSent(0);
-    say('Drive active - session ' + sid.slice(0, 8));
+    /* WHICH PICTURE THIS DRIVE IS RUNNING ON, IN THE DRIVE'S OWN RECORD.
+     *
+     * The drive of 2026-09-20 ran on a desktop camera with a clip loaded, and
+     * the log could not say so: the marks recorded the wake lock, the frame
+     * transport, the socket states and the GPS, and not one of them recorded
+     * the source. It had to be inferred, afterwards, from the SHAPE of the
+     * frames that reached /perceive — 640x480 against 1920x1080 — which is a
+     * long way to go to answer "what was it looking at".
+     *
+     * `live` carries the owner's own account of how many feeds exist, because
+     * "the source is the clip" and "only the clip is feeding" are different
+     * facts and the second one is the one that was false. */
+    const startedOn = RIO.source.kind();
+    RIO.ui.feedLabel('drive · ' + startedOn);
+    mark('DRIVE_SOURCE', { source: startedOn, name: RIO.source.name(),
+                           live: RIO.source.liveState ? RIO.source.liveState() : null });
+    say('Drive active - session ' + sid.slice(0, 8) + ' - ' + RIO.source.label());
     schedule();
     startHeadway();
     scheduleHeartbeat();
@@ -4799,6 +4848,24 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watcher) clearInterval(watcher);
     watcher = setInterval(() => {
       if (preview.paused || preview.ended || inflight) return;
+      /* A DRIVE OWNS THE FRAME PATH. THIS LOOP WAS THE SECOND SOURCE.
+       *
+       * Every other capture loop on this page already yields to a drive --
+       * startLiveFrames' tick, autoStart, the camera-box preview -- and this
+       * one, added for captions on a clip, never asked. It posts /perceive
+       * through RIO.url(), which carries the SESSION id once a drive is
+       * running, so a clip playing behind a drive wrote its frames into the
+       * drive's own ring.
+       *
+       * MEASURED, drive 0ab8ad39 on 2026-09-20: six /perceive frames in eight
+       * seconds under one session id, five at 1920x1080 and one at 640x480,
+       * 0.6 s apart. Two producers, one key, and the frame selector choosing
+       * between two different places on sharpness.
+       *
+       * The clip is not ignored — if the clip is the SOURCE, the drive loop is
+       * already capturing it, at the drive's own cadence, and this loop would
+       * only be a second upload of the same picture. */
+      if (RIO.driving) return;
       const running = !!(RIO.headway && RIO.headway.videoRunning);
       const due = running ? PERCEIVE_MS_HEADWAY : PERCEIVE_MS_SOLO;
       const now = performance.now();
@@ -5452,6 +5519,11 @@ document.addEventListener('DOMContentLoaded', () => {
     opts = opts || {};
     framesSeen++;
     paintHud(j);
+    /* TWO SOURCES IN ONE SESSION, SAID OUT LOUD, WHILE IT IS HAPPENING.
+       The server is the only place that can see both producers (app.py
+       _push_frame); this is the only message it sends often enough for the
+       driver to find out before the drive is over. */
+    if (j && j.source_conflict) noteSourceConflict(j.source_conflict);
     /* FRAMES ARE FLOWING. One assignment, on the one path every headway
        result comes back through -- camera, clip replay and manual grab alike.
        The teacher card paces itself off this rather than off which button was
@@ -5961,6 +6033,28 @@ document.addEventListener('DOMContentLoaded', () => {
   /* The banner. Two states and an off, and it never traps a tap: it sits
      above the picture and is `pointer-events: none` in effect because there is
      nothing on it to press. */
+  /* THE CONFLICT, ONCE. Two live producers push several times a second and
+     the chip must not flicker, nor the log fill. Latched on the server's own
+     timestamp for the conflict, so a NEW one after a genuine handover is a new
+     message and the same one is not. */
+  let lastConflictAt = 0;
+  function noteSourceConflict(c) {
+    try {
+      const at = c && c.at ? c.at : 0;
+      const origins = (c && c.origins ? c.origins : []).join(' + ');
+      if (RIO.ui && RIO.ui.feedLabel) RIO.ui.feedLabel('TWO SOURCES · ' + origins);
+      if (at === lastConflictAt) return;
+      lastConflictAt = at;
+      if (RIO.pageMark) RIO.pageMark('SOURCE_CONFLICT_SEEN', c);
+      const el = document.getElementById('drivestatus');
+      if (el) {
+        el.textContent = 'Two sources are feeding this session (' + origins
+          + '). Perception is answering from whichever frame arrived last.';
+      }
+      console.error('[source] two live sources:', c);
+    } catch (e) {}
+  }
+
   function paintFeedState(state, detail) {
     const el = document.getElementById('feedstate');
     if (!el) return;

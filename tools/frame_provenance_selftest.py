@@ -172,6 +172,53 @@ def main() -> int:
     f2.jpeg = smaller.getvalue()
     ok("and so is a resize", framebuf.verify_raw(f2) is False)
 
+    section("TWO LIVE SOURCES IN ONE SESSION — the drive of 2026-09-20")
+    # A drive on the desktop camera and an uploaded clip's caption watcher,
+    # both pushing into one session key, 0.6 s apart. Emptying the ring on each
+    # flip is the right thing to DO and it answered nothing: every reset looked
+    # local and reasonable, and the pattern — the thing that made perception
+    # change its mind — was counted nowhere.
+    ring2 = framebuf.FrameRing(seconds=30, max_frames=8)
+    cam, clip = "s1:camera", "s1:clip"
+    ring2.push(jpeg(10), RESULT, origin=cam)
+    ok("one producer is not a conflict", ring2.conflict is None
+       and ring2.origin_flips == 0)
+
+    ring2.push(jpeg(11), RESULT, origin=clip)
+    ok("nor is a HANDOVER — a driver loading a clip flips the origin once",
+       ring2.conflict is None, f"flips={ring2.origin_flips}")
+    ok("...and the ring still empties, which is the part that was right",
+       len(ring2.frames()) == 1)
+
+    ring2.push(jpeg(12), RESULT, origin=cam)
+    ok("flipping BACK is two live producers — one cannot do that",
+       ring2.conflict is not None, str(ring2.conflict))
+    ok("...and it names both of them",
+       (ring2.conflict or {}).get("origins") == sorted([cam, clip]))
+    ok("...and is LATCHED: a conflict that stopped is still why the last "
+       "answer was wrong",
+       ring2.push(jpeg(13), RESULT, origin=cam) is not None
+       and ring2.conflict is not None)
+    ok("the stats a dashboard reads carry it",
+       ring2.stats().get("conflict") is not None
+       and ring2.stats().get("origin_flips") == 2)
+
+    ring3b = framebuf.FrameRing(seconds=30, max_frames=8)
+    ring3b.push(jpeg(14), RESULT, origin=cam)
+    ring3b._flip_times.clear()
+    ring3b.push(jpeg(15), RESULT, origin=clip)
+    # Two flips far apart in time are two handovers, not two producers: the
+    # window is what separates them, so it has to be the thing that decides.
+    ring3b._flip_times.clear()
+    ring3b.conflict = None
+    ring3b.push(jpeg(16), RESULT, origin=cam)
+    ok("two changes OUTSIDE the window are two handovers, not a conflict",
+       ring3b.conflict is None)
+
+    ring2.reset_origin()
+    ok("a new drive on the key starts clean",
+       ring2.conflict is None and ring2.origin_flips == 0)
+
     section("the guard is not vacuous: a good frame still gets through")
     ring3, f3 = pushed_frame(jpeg(3))
     ok("an untouched frame from the ring is returned, not refused",

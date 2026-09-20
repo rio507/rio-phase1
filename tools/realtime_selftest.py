@@ -3807,6 +3807,39 @@ def run_backend(live: bool = False):
     ok("[" not in realtime.VERBATIM_INSTRUCTION,
        "and a dictated line carries no bracket either")
 
+    # drive_policy() is what carries every number the BROWSER applies — both
+    # mints hand the page this same dict, which is the whole reason it exists
+    # (see its docstring: 27 fields the second wire was not carrying).
+    cfg2 = realtime.drive_policy(realtime.session_config())
+    tp2 = cfg2.get("turn_policy") or {}
+
+    # --- "HELLO" IS A GREETING WHEN NOBODY IS ECHOING (the desk of
+    #     2026-09-20, where it was answered "Didn't catch that." twice).
+    #
+    # The social list is a SUBSET of the noise list, and it has to stay one:
+    # a word that is social but not noise would never reach the gate the
+    # subset exists to soften, and would look like it worked.
+    social = list(tp2.get("social_tokens") or [])
+    ok(social == list(config.REALTIME_SOCIAL_TOKENS),
+       f"...and the social tokens travel with the session ({len(social)} of them)")
+    stray = [w for w in social if w not in config.REALTIME_NOISE_TOKENS]
+    ok(not stray,
+       "...every one of which is in the noise list it softens"
+       + (f" — stray: {stray}" if stray else ""))
+    ok("hello" in social and "yeah" in social and "no" in social,
+       "...including the three the drive of 2026-09-20 actually lost")
+    ok("uh" not in social and "um" not in social and "the" not in social,
+       "...and not the ones nobody says on purpose, which stay road noise")
+    ok(cfg2.get("echo_text_short_ms") == config.REALTIME_ECHO_TEXT_SHORT_MS,
+       f"...and a one-word reply counts as hers only within "
+       f"{cfg2.get('echo_text_short_ms')} ms of her voice, not the "
+       f"{cfg2.get('echo_text_window_s')} s the text window allows — a "
+       f'"Yeah." 10.9 s after her last audio was refused as an echo')
+    ok(config.REALTIME_ECHO_TEXT_SHORT_MS
+       < config.REALTIME_ECHO_TEXT_WINDOW_S * 1000,
+       "...which is necessarily the tighter of the two: acoustic echo is the "
+       "room, and the room does not answer eleven seconds late")
+
     if not live:
         return
 

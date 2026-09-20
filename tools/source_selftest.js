@@ -215,15 +215,20 @@ function stubPage() {
 
     const drive = html.slice(html.indexOf('async function startDrive'),
                              html.indexOf('async function endDrive'));
-    ok(/RIO\.source\.startFeed\(\)/.test(drive),
-       'Start Drive asks the owner for a feed');
+    ok(/RIO\.source\.startFeed\('drive'\)/.test(drive),
+       'Start Drive asks the owner for a feed, and NAMES ITSELF — "which '
+       + 'loop is still holding the camera" is the question asked when it '
+       + 'will not turn off, and a count cannot answer it');
+    ok(/DRIVE_SOURCE/.test(drive),
+       'and records which source it started on, in the drive\'s own log — '
+       + 'the drive of 2026-09-20 could not say');
     ok(!/getUserMedia/.test(drive),
        'and opens no camera of its own');
 
     const liveFeed = html.slice(html.indexOf('async function startLiveFrames'),
                                 html.indexOf('function stopLiveFrames'));
-    ok(/RIO\.source\.startFeed\(\)/.test(liveFeed),
-       'the live session asks the owner too');
+    ok(/RIO\.source\.startFeed\('conversation'\)/.test(liveFeed),
+       'the live session asks the owner too, under its own name');
     ok(!/getUserMedia/.test(liveFeed),
        'and no longer starts a feed of its own — the regression, asserted');
 
@@ -231,6 +236,118 @@ function stubPage() {
        'an upload sets the clip as the source');
     ok(/id="camsource"/.test(html) && /id="usecamera"/.test(html),
        'the source is shown in the HUD and can be handed back to the camera');
+
+    /* THE SECOND PRODUCER, WHICH WAS NOT A START PATH AT ALL.
+       The clip's caption watcher posts /perceive through RIO.url(), which
+       carries the SESSION id once a drive is running — so a clip playing
+       behind a drive wrote its frames into the drive's ring. It is the one
+       capture loop on this page that never asked whether a drive was on. */
+    const watcher = html.slice(html.indexOf("preview.addEventListener('play'"),
+                               html.indexOf("preview.addEventListener('pause'"));
+    ok(/if \(RIO\.driving\) return;/.test(watcher),
+       'the clip caption loop yields to a drive — it was the second source '
+       + 'in session 0ab8ad39 (1920x1080 against the drive\'s 640x480, '
+       + '0.6 s apart, one key)');
+    ok(/source_conflict/.test(html),
+       'and the page hears the server when two producers are live anyway');
+
+    /* THE PERMISSION PROBE OPENS A CAMERA TOO, and it decides whether to from
+       RIO.source.kind(). Asked after that question, an adoption is too late:
+       the camera is already open over the driver's clip. */
+    const askIdx = drive.indexOf('RIO.permissions.request');
+    const recIdx = drive.indexOf('RIO.source.reconcile');
+    ok(recIdx >= 0 && recIdx < askIdx,
+       'Start Drive reconciles what is on the screen BEFORE it asks for the '
+       + 'camera permission, not after');
+    ok(/videoConstraints/.test(drive)
+       && /videoConstraints: videoConstraints/.test(
+            fs.readFileSync(path.join(__dirname, '..', 'static',
+                                      'rio_source.js'), 'utf8')),
+       'and the probe asks the owner what a camera is, rather than falling '
+       + 'through to bare `video: true` — which is 640x480 on a desktop '
+       + 'webcam and the FRONT camera on a phone');
+  }
+
+  // -------------------------------------------------------------------------
+  section('one feed, however many callers ask for one');
+  {
+    const { src, els, asked } = stubPage();
+
+    const drive = await src.startFeed('drive');
+    const convo = await src.startFeed('conversation');
+    ok(asked.length === 1,
+       'two callers, ONE camera — a second caller gets a handle on the feed '
+       + 'that is open, not a second pipeline (' + asked.length + ' requests)');
+    ok(drive === convo, 'and it is literally the same feed object');
+    ok(src.liveState().live === 1 && src.liveState().holders.length === 2,
+       'the owner can say who is holding it: '
+       + src.liveState().holders.join(', '));
+
+    src.stopFeed(convo);
+    ok(els.video.srcObject !== null,
+       'the conversation ending does NOT take the camera off a drive that is '
+       + 'still using it — the decision is made once, here, by the only thing '
+       + 'that can see both holders');
+    ok(src.liveState().live === 1, 'one feed, one holder left');
+
+    src.stopFeed(drive);
+    ok(els.video.srcObject === null && src.liveState().live === 0,
+       'and the last hand off it releases the device');
+  }
+
+  // -------------------------------------------------------------------------
+  section('a clip on the screen wins, even if nothing told the owner');
+  {
+    const { src, els, asked } = stubPage();
+    /* THE FAULT OF 2026-09-20, in the state it was actually found in: a clip
+       loaded in the page, the owner still saying "camera", and Start Drive
+       opening the camera over it. Whatever failed to call setClip — an upload
+       handler that threw, a cached page, a clip put there by something else —
+       the picture on the glass is the driver's choice and it is the one the
+       drive has to run on. */
+    els.preview.src = 'blob:a-clip-the-owner-was-never-told-about';
+    ok(src.kind() === 'camera', 'the owner believes the camera is the source');
+
+    const feed = await src.startFeed('drive');
+    ok(asked.length === 0,
+       'Start Drive opens NO camera — the clip on the screen is adopted '
+       + 'before any device is asked for');
+    ok(feed.kind === 'clip' && feed.element === els.preview,
+       'and the drive feeds from the clip');
+    ok(src.faults().some(f => f.code === 'ADOPTED_VISIBLE_CLIP'),
+       'and it is LOUD: something failed to say the source had changed, '
+       + 'which is a fault even though this recovered from it');
+
+    /* ...AND THE WAY BACK STILL STAYS. Adoption reads the element, so the
+       explicit "use camera" has to empty it -- otherwise the next acquisition
+       silently puts the clip back and the one deliberate choice in this module
+       is the one that does not stick. */
+    src.stopFeed(feed);
+    src.useCamera();
+    const back = await src.startFeed('drive');
+    ok(asked.length === 1 && back.kind === 'camera',
+       'after an explicit "use camera" the clip is NOT adopted again — the '
+       + 'element is emptied by the owner, not by whichever button called it');
+  }
+
+  // -------------------------------------------------------------------------
+  section('choosing a clip mid-drive moves the drive onto it');
+  {
+    const { src, els, asked } = stubPage();
+    const feed = await src.startFeed('drive');
+    ok(asked.length === 1 && feed.kind === 'camera', 'a drive on the camera');
+
+    src.setClip('blob:uploaded-mid-drive', 'coastal.mp4');
+    ok(els.video.srcObject === null,
+       'uploading a clip during a drive releases the camera — it does not '
+       + 'leave it running as a second producer');
+    ok(feed.element === els.preview,
+       'and the feed the drive is already holding now yields the CLIP: the '
+       + 'element is a getter that follows the owner, so a loop that started '
+       + 'before the change still hears about it');
+    ok(els.preview.paused === false, 'with the clip playing');
+    ok(src.liveState().live === 1 && src.liveState().ok,
+       'one source, and the owner says so');
   }
 
   console.log('\n' + (failures ? 'FAILED ' + failures + '/' : 'PASSED ')

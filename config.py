@@ -1168,6 +1168,25 @@ REALTIME_ECHO_TEXT_OVERLAP = 0.8
 # "no" share every word with almost anything.
 REALTIME_ECHO_TEXT_MIN_WORDS = 2
 
+
+# HOW RECENT HER VOICE HAS TO BE FOR A SHORT REPLY TO BE HERS.
+#
+# The window above is 15 s, which is right for the test it was built for: a
+# verbatim sentence of hers coming back is still hers a long time later. It is
+# far too long for a one-word containment match, and that is a different test
+# with a different physics.
+#
+# MEASURED, same desktop session: turn_phantom "Yeah." refused as
+# `echo_of_her_own_words` with since_audio_ms = 10932. Eleven seconds after her
+# last audio. Acoustic echo is the loudspeaker in the room -- microseconds of
+# air, then the capture and transcription path -- and it does not arrive eleven
+# seconds late. That was a driver answering her question, and it was dropped
+# because "yeah" appeared somewhere in fifteen seconds of her own talking.
+#
+# Two seconds is generous against the path this has to cover: 5.8 ms of base
+# latency plus ~20-30 ms of output latency (bus_health, same session) and then
+# the transcriber, which is the slow part.
+REALTIME_ECHO_TEXT_SHORT_MS = 2000
 # ---------------------------------------------------------------------------
 # Newest wins: superseding a turn (item 4 of the first real-drive punch list)
 # ---------------------------------------------------------------------------
@@ -1273,6 +1292,42 @@ REALTIME_NOISE_TOKENS = (
     "right", "sure", "thanks", "thank", "you", "got", "it", "wow", "well",
     "so", "like", "the", "a", "and", "for", "your", "help", "good", "nice",
     "cool", "alright", "sorry", "please", "there",
+)
+
+# ...AND THE ONES THAT ARE A WHOLE TURN WHEN NOBODY IS ECHOING.
+#
+# THE FAULT, from the desktop session of 2026-09-20. The driver said "hello"
+# into a working microphone and was answered "Didn't catch that." Twice. Then
+# "No." to a question, twice more. Measured, from /realtime/cutoffs:
+#
+#     turn_fragment  "Hello."   t=517.4    the transcript arrived, complete
+#     noise_silenced            t=517.4    the server's response, cancelled
+#     noise_reply    "Hello."   t=519.4    the window closed on it
+#     spoke          direct, 18 generated chars = "Didn't catch that."
+#
+# Nothing was mis-heard. grok-transcribe returned the word, server_vad closed
+# the turn, and the gate above threw it away because "hello" is one word and
+# that word is in the list -- which is correct for a phone on a mount in a car
+# with the windows down, and wrong for a person saying hello.
+#
+# WHY THOSE WORDS ARE IN THE LIST AT ALL: they are what HER OWN VOICE comes
+# back as. "Hey. What's up." out of the speaker returns through the input
+# transcriber as "Hello." and that loop is the one this whole mechanism was
+# built to break. But the list was the only net at the time. There is a second
+# one now -- looksLikeEcho(), against her own recent transcript -- and it is
+# the one that can tell those two cases apart, because it knows whether she
+# said anything to echo.
+#
+# So the words below are noise ONLY when she could plausibly be the source of
+# them. Alone, in a quiet moment, from a driver, they are the shortest complete
+# turn there is: a greeting, a yes, a no, a thanks. Every one of them takes an
+# answer. What stays unconditional noise is the rest of REALTIME_NOISE_TOKENS
+# -- "uh", "mm", "the", "your" -- which nobody says on purpose and which is
+# what a rough road actually produces.
+REALTIME_SOCIAL_TOKENS = (
+    "hey", "hello", "hi", "yeah", "yep", "yes", "no", "nope", "ok", "okay",
+    "right", "sure", "thanks", "thank", "wow", "good", "nice", "cool",
+    "alright", "sorry", "please",
 )
 
 # ---------------------------------------------------------------------------
@@ -2889,6 +2944,21 @@ VISUAL_QA_ENABLED = True
 # cannot grow the buffer without bound.
 RING_SECONDS = 6.0
 RING_MAX_FRAMES = 32
+
+# --- ONE SOURCE PER SESSION -------------------------------------------------
+# How close together two origin changes have to be before they mean both
+# producers are still running rather than one handing over to the other.
+#
+# A handover flips once: the driver loads a clip, the ring empties, and every
+# frame after that is the clip's. Flipping BACK is arithmetically impossible
+# for a single producer, so two flips inside this window is not a heuristic --
+# it is a proof that two feeds are live in one session.
+#
+# Six seconds is the ring's own length, which is the right scale: inside it,
+# the two producers' frames are literally adjacent in the buffer the frame
+# selector chooses from, which is the harm. On the drive of 2026-09-20 the two
+# were 0.6 s apart.
+SOURCE_CONFLICT_WINDOW_S = 6.0
 
 # Raw frames are NEVER written to disk unless this is turned on. The ring is
 # RAM-only and dies with the session; nothing in the normal path leaves a

@@ -549,6 +549,59 @@ def _frame_origin(session_id, source):
     return f"{_visual_key(session_id)}:{kind}"
 
 
+# ONE SOURCE PER SESSION, AND THE ONLY PLACE THAT CAN SEE BOTH.
+#
+# The page decides what it is looking through; the server is where the frames
+# of two different things arrive under one key, half a second apart, and it is
+# therefore the only vantage point from which "two feeds are live" is a
+# statement anyone can make. framebuf counts the flips (see FrameRing._note_flip);
+# this turns the count into a line in the log, a mark in the DRIVE's own record,
+# and a field the dashboard can put on the glass.
+#
+# THE DRIVE OF 2026-09-20, which is why this exists: the drive loop pushed
+# 640x480 frames from a desktop camera while an uploaded clip's caption watcher
+# pushed 1920x1080 frames of something else into the same key. Perception
+# answered from whichever frame it got. The ring emptied itself over and over
+# -- correctly, one frame at a time -- and nothing, anywhere, said that the
+# session had two sources. A drive must not be able to run in that state and
+# have it be quiet.
+_source_conflicts_seen = {}
+
+
+def _push_frame(key: str, jpeg: bytes, result: dict, origin: str,
+                session_id: str = None) -> None:
+    """Retain one frame, and shout if this key now has two producers."""
+    ring = framebuf.get_ring(key)
+    ring.push(jpeg, result, origin=origin)
+    conflict = ring.conflict
+    if not conflict:
+        return
+    # ON THE WIRE BACK TO THE PAGE, not only in the log: the frame result is
+    # the one message this server sends the dashboard several times a second,
+    # and "your session has two sources" belongs on the glass while it is
+    # happening rather than in a file somebody reads afterwards. Added only
+    # when there IS one -- a `"source_conflict": null` on every frame of every
+    # drive is a key in the log that means nothing, several times a second.
+    if isinstance(result, dict):
+        result["source_conflict"] = conflict
+    # Once per conflict, not once per frame: two live producers push several
+    # times a second and this must not become the log.
+    at = conflict.get("at")
+    if _source_conflicts_seen.get(key) == at:
+        return
+    _source_conflicts_seen[key] = at
+    origins = ", ".join(conflict.get("origins") or [])
+    print(f"[source] {key}: TWO LIVE SOURCES — {origins} "
+          f"({conflict.get('flips')} origin changes in "
+          f"{conflict.get('window_s')} s). Perception is answering from "
+          f"whichever frame arrived last.", flush=True)
+    if session_id:
+        try:
+            sessions.mark(session_id, "SOURCE_CONFLICT", conflict)
+        except Exception:
+            pass
+
+
 def _route_and_prepare(transcript: str, session_id: str):
     """Classify the utterance and, if it is visual, build the turn. -> (route, va).
 
@@ -1579,8 +1632,8 @@ async def headway_frame_endpoint(
     # long — see framebuf.py.
     if config.VISUAL_QA_ENABLED:
         try:
-            framebuf.get_ring(_visual_key(session_id)).push(
-                image_bytes, result, origin=_frame_origin(session_id, source))
+            _push_frame(_visual_key(session_id), image_bytes, result,
+                        _frame_origin(session_id, source), session_id)
         except Exception as e:
             # Losing a frame from the buffer costs a better answer later. It
             # must never cost the headway frame that has already been computed.
@@ -1839,9 +1892,9 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
 
             if config.VISUAL_QA_ENABLED:
                 try:
-                    framebuf.get_ring(vkey).push(
-                        frame.jpeg, result,
-                        origin=_frame_origin(session_id, frame.source))
+                    _push_frame(vkey, frame.jpeg, result,
+                                _frame_origin(session_id, frame.source),
+                                session_id)
                 except Exception as e:
                     print(f"[framebuf] push failed: {type(e).__name__}: {e}", flush=True)
 

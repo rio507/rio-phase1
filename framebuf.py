@@ -168,6 +168,29 @@ class FrameRing:
         # one ring -- a question answered from the seam gets a frame selector
         # choosing between two different roads on sharpness.
         self.origin = None
+        # ...AND HOW OFTEN THAT HAS HAPPENED, WHICH IS THE PART THAT WAS MUTE.
+        #
+        # Emptying the ring is the right thing to DO and it is not an answer to
+        # the question the driver is actually asking, which is "why does
+        # perception keep changing its mind". On the drive of 2026-09-20 two
+        # producers wrote into one key for the whole of a drive -- the drive
+        # loop from a 640x480 desktop camera and a 1920x1080 clip's caption
+        # watcher, 0.6 s apart -- and the only trace of it was a ring that kept
+        # going empty. Each reset looked local and reasonable; the pattern was
+        # the fault, and nothing counted the pattern.
+        #
+        # ONE HANDOVER FLIPS ONCE. A driver who swaps camera for clip changes
+        # origin a single time and then stays there. Flipping BACK inside the
+        # window means both producers are still running, which is the condition
+        # that cannot be allowed to be quiet.
+        self.origin_flips = 0
+        self.prev_origin = None
+        self.last_flip_t = 0.0
+        self._flip_times = deque(maxlen=16)
+        # Latched, not momentary: the flips stop the instant one producer is
+        # shut off, and a conflict that cleared itself is still the reason the
+        # last answer was wrong. Cleared by reset_origin() -- a new drive.
+        self.conflict = None
 
     # -- writing -------------------------------------------------------------
     def push(self, jpeg: bytes, result: dict,
@@ -191,6 +214,7 @@ class FrameRing:
             # harness posting into a key a drive was using. Whatever is in here
             # is of a different place; keep none of it.
             self.reset()
+            self._note_flip(origin)
         self.origin = origin
         self._seq += 1
         rf = RingFrame(
@@ -252,6 +276,43 @@ class FrameRing:
             self._frames.clear()
         self.tracker.reset()
 
+    def _note_flip(self, origin: str) -> None:
+        """The producer changed. Count it, and decide whether TWO are live.
+
+        -> the conflict dict if this flip declared one, else None. The caller
+        (app.py) is what turns that into a line in the drive's own log; this
+        layer owns the arithmetic and nothing else.
+        """
+        prev = self.origin
+        now = time.time()
+        self.origin_flips += 1
+        self.prev_origin = prev
+        self.last_flip_t = now
+        self._flip_times.append(now)
+        recent = [t for t in self._flip_times
+                  if now - t <= config.SOURCE_CONFLICT_WINDOW_S]
+        if len(recent) < 2:
+            return None
+        # Two flips inside the window: A -> B -> A. One producer cannot do
+        # that, so both are still pushing.
+        pair = sorted({str(prev), str(origin)})
+        self.conflict = {
+            "at": now,
+            "origins": pair,
+            "flips": len(recent),
+            "window_s": config.SOURCE_CONFLICT_WINDOW_S,
+        }
+        return self.conflict
+
+    def reset_origin(self) -> None:
+        """A new drive on this key. The old provenance, and its fault, go."""
+        self.origin = None
+        self.prev_origin = None
+        self.origin_flips = 0
+        self.last_flip_t = 0.0
+        self._flip_times.clear()
+        self.conflict = None
+
     def stats(self) -> dict:
         fs = self.frames()
         return {
@@ -264,6 +325,12 @@ class FrameRing:
             # worth showing here too: "the ring has frames" and "the ring has
             # THIS session's frames" are different facts.
             "origin": self.origin,
+            # ...and whether it has been only one. A card that says "Feed:
+            # drive - camera" is telling the truth about the frame it read and
+            # can still be describing a session two producers are writing into.
+            "origin_flips": self.origin_flips,
+            "prev_origin": self.prev_origin,
+            "conflict": self.conflict,
         }
 
 
