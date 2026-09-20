@@ -31,6 +31,7 @@ decision and not a default. That is the whole of the privacy posture at this
 layer: the buffer is six seconds long, it is not a recording, and when the
 drive ends it is gone.
 """
+import hashlib
 import threading
 import time
 from collections import OrderedDict, deque
@@ -42,6 +43,29 @@ import config
 import scene as scene_mod
 
 PERSIST_DIR = Path("/workspace/rio-phase1/training_data/visual")
+
+
+def verify_raw(frame) -> bool:
+    """Are this frame's bytes still the ones the detector measured?
+
+    FAIL CLOSED, and the two ways it fails are both deliberate:
+
+      the digest DIFFERS   something between the ring and here re-encoded,
+                           resized, annotated or substituted the picture. The
+                           measurements no longer describe these pixels.
+      the digest is ABSENT  a frame that did not come through push() -- a
+                           synthesised object, a composited preview, a fixture
+                           built by hand. Unknown provenance is not provenance,
+                           and an empty string must not read as "fine".
+
+    A caller that gets False must not show the picture to a model. What it may do
+    instead is show nothing, which every image site here already handles.
+    """
+    sha = getattr(frame, "raw_sha", "") or ""
+    jpeg = getattr(frame, "jpeg", None)
+    if not sha or not jpeg:
+        return False
+    return hashlib.sha256(jpeg).hexdigest() == sha
 
 
 @dataclass
@@ -62,6 +86,21 @@ class RingFrame:
     # the frame so an answer built from it can be checked against the session
     # that is asking. See the origin note on FrameRing.
     origin: str = "api:unknown"
+    # THE DIGEST OF THE BYTES THE DETECTOR WAS HANDED, taken at push.
+    #
+    # WHY A DIGEST AND NOT JUST `jpeg`. Comparing a frame's jpeg with itself
+    # proves nothing -- it is the same attribute. What has to be provable is that
+    # the bytes about to be shown to a MODEL are the bytes RF-DETR measured, and
+    # that needs a fingerprint taken at the moment of measurement, before anything
+    # downstream could have drawn on it, re-encoded it or swapped it.
+    #
+    # THIS CLASS OF BUG HAS NOW APPEARED THREE TIMES. Teachers were reading a
+    # composited clip (9b0b0b1). /perceive was drawing boxes on the frame it then
+    # asked about. And an annotated align-harness frame went to the visual model,
+    # which read "car 18.2m" off the overlay and reported it as a distance -- a
+    # measured-looking number RIO had not measured. The first two were found by
+    # accident; this exists so the third kind cannot be.
+    raw_sha: str = ""
     _decoded: object = field(default=None, repr=False)
 
     @property
@@ -165,6 +204,11 @@ class FrameRing:
             ego=scene_mod.ego_from_result(result),
             quality=scene_mod.quality_from_result(result),
             origin=origin,
+            # Taken HERE, from the bytes that were just processed. push() is
+            # called after the detector has run on exactly this buffer -- see
+            # this method's own docstring -- so this is the fingerprint of the
+            # picture the measurements belong to.
+            raw_sha=hashlib.sha256(jpeg).hexdigest(),
         )
         with self._lock:
             self._frames.append(rf)

@@ -450,6 +450,53 @@ def drop_session(key: str) -> bool:
 # ---------------------------------------------------------------------------
 # The turn
 # ---------------------------------------------------------------------------
+def _raw_frame_or_none(frame, meta: dict, where: str):
+    """The frame, if its pixels are still the detector's. Otherwise None.
+
+    THE GUARD, AND THE THIRD TIME THIS CLASS OF BUG HAS SHOWN UP.
+
+      a shadow model was reading a composited clip                   (9b0b0b1)
+      /perceive drew boxes on the frame it then asked about
+      an annotated align-harness frame reached the visual model, which read
+        "car 18.2m" off the overlay and reported it as a distance
+
+    The third one is the shape that matters most, because nothing about it looks
+    wrong: the model answers fluently, the number is plausible, and it is a
+    MEASUREMENT RIO DID NOT MAKE. A driver told "about eighteen metres" has been
+    told something no sensor on this car produced, in the voice of something that
+    measures. There is no tier underneath that to catch it.
+
+    So the bytes are checked against the fingerprint framebuf took at push, which
+    is the moment the detector measured them -- the same byte-for-byte discipline
+    the shadow panel's payload already gets, asserted as "the ring entry with that
+    FRAME ID, byte for byte... not a re-encode, not a resize, not an annotated
+    copy". See commit 9b0b0b1 for where that lives; the module is deliberately not
+    named here, because the shadow-model firewall suite refuses that word in this
+    file on the grounds that the only reason to write it is that somebody was
+    thinking of wiring one in. That guard is right, it caught an earlier draft of
+    this very comment, and its own boundary would have let a filename through --
+    so this respects what it is for rather than what it matches.
+
+    FAIL CLOSED means the picture is not shown. It does NOT mean the turn dies:
+    every image site here is already conditional, and an answer built from the
+    perception grounding alone is honest -- that grounding is measured data rather
+    than a picture with numbers painted on it. What must not happen is a frame of
+    unknown provenance reaching a model that will describe whatever it is given.
+    """
+    if frame is None:
+        return None
+    if framebuf.verify_raw(frame):
+        return frame
+    fid = getattr(frame, "frame_id", "?")
+    print(f"[visual] REFUSED a frame at {where}: {fid} is not byte-identical to "
+          f"what the detector measured (annotated, re-encoded or of unknown "
+          f"provenance). No picture is being sent.", flush=True)
+    bad = meta.setdefault("frames_refused", [])
+    bad.append({"frame_id": fid, "where": where,
+                "has_provenance": bool(getattr(frame, "raw_sha", ""))})
+    return None
+
+
 def _data_url(jpeg: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
 
@@ -692,11 +739,12 @@ class VisualAnswer:
                      f"It could be any of these:\n{listing}\n\n"
                      "Ask which one they mean, in one short question."),
         }]
-        if self._frame is not None:
+        _f = _raw_frame_or_none(self._frame, self.meta, "clarify")
+        if _f is not None:
             parts.append({"type": "image_url", "image_url": {
-                "url": _data_url(self._frame.jpeg),
+                "url": _data_url(_f.jpeg),
                 "detail": config.VISUAL_FRAME_DETAIL}})
-            self._images.append(("frame", len(self._frame.jpeg)))
+            self._images.append(("frame", len(_f.jpeg)))
         self._messages = [{"role": "user", "content": parts}]
         self.meta["request"] = {
             "model": __import__("llm_provider").model_of("visual"),
@@ -1254,23 +1302,35 @@ class VisualAnswer:
                       "text": "PERCEPTION GROUNDING (not for reading aloud):\n"
                               + json.dumps(grounding, ensure_ascii=False)})
 
-        if self._frame is not None:
+        _f = _raw_frame_or_none(self._frame, self.meta, "answer")
+        # CROPS ARE DERIVED AND CANNOT MATCH A DIGEST, so they inherit the
+        # frame's verdict instead. A crop is a region of one frame; if that frame
+        # is not the detector's picture then neither is anything cut out of it, and
+        # a crop is the MORE dangerous of the two -- it is enlarged for legibility,
+        # so an overlay inside it arrives larger and more readable than it was.
+        _crops_ok = _f is not None or (self._frame is None
+                                       and self._crop_info.get("from_memory"))
+        if not _crops_ok and (self._crop is not None or self._compare):
+            print("[visual] REFUSED the crops too: the frame they were cut from "
+                  "is not the detector's picture", flush=True)
+            self.meta.setdefault("crops_refused", True)
+        if _f is not None:
             current = ("Current road scene (the object asked about is NOT in "
                        "this one):" if self.meta.get("referent_visible") is False
                        else "Full road scene:")
             parts.append({"type": "text", "text": current})
             parts.append({"type": "image_url", "image_url": {
-                "url": _data_url(self._frame.jpeg),
+                "url": _data_url(_f.jpeg),
                 "detail": (config.READ_TEXT_FRAME_DETAIL
                            if self.route["request_type"] == router.READ_TEXT
                            else config.VISUAL_FRAME_DETAIL)}})
-            self._images.append(("frame", len(self._frame.jpeg)))
-        for i, (obj, crop, _info) in enumerate(self._compare):
+            self._images.append(("frame", len(_f.jpeg)))
+        for i, (obj, crop, _info) in enumerate(self._compare if _crops_ok else []):
             parts.append({"type": "text", "text": f"Crop {i + 1}:"})
             parts.append({"type": "image_url", "image_url": {
                 "url": _data_url(crop), "detail": config.VISUAL_CROP_DETAIL}})
             self._images.append((f"crop{i + 1}", len(crop)))
-        if self._crop is not None and not self._compare:
+        if self._crop is not None and not self._compare and _crops_ok:
             label = ("Close crop of the object being asked about, from when it "
                      "was last visible:" if self.meta.get("referent_visible") is False
                      else "Close crop of the object being asked about:")
