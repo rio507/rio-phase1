@@ -72,6 +72,83 @@
     return out;
   }
 
+  /* THE ANTI-ALIAS FILTER, and why it is a real one rather than an average.
+   *
+   * Taking every Nth sample folds everything above the far end's Nyquist back
+   * down INTO the speech band: at 48 kHz in and 24 kHz out, a 15 kHz sound
+   * arrives as a 9 kHz one, sitting on top of the consonants a transcriber
+   * works from. Two cheaper filters were tried against that exact tone in
+   * tools/mic_rate_selftest.js and both are written down here because "an
+   * average is surely enough" is the reasoning that has to lose an argument to
+   * a number rather than to taste:
+   *
+   *     every Nth sample        the fault, for reference
+   *     box over one period     67% of the tone came back at 9 kHz
+   *     triangle over two       30%
+   *     this                    see the suite; it asserts under 1%
+   *
+   * A windowed sinc is the textbook answer and costs ~16 multiplies per output
+   * sample, which at 24 kHz is a rounding error next to the FFT the echo meter
+   * already runs on the same thread.
+   *
+   * `TAPS_PER_SIDE` is in output samples: the kernel is that many zero
+   * crossings either side of centre, scaled up by `ratio` to reach the same
+   * distance in input samples. Four is the usual place to stop for speech --
+   * the stopband is already deep and every extra tap is latency.
+   */
+  var TAPS_PER_SIDE = 4;
+
+  function sinc(x) {
+    if (x === 0) return 1;
+    var pix = Math.PI * x;
+    return Math.sin(pix) / pix;
+  }
+
+  /* One output frame at RATE, read out of a buffer captured at some other
+     rate. -> {out, pos} or null when there is not enough audio yet.
+
+     `pos` is FRACTIONAL and is handed back, because the ratio is not generally
+     an integer -- 44100 Hz gives 1.8375 -- and a remainder dropped at the end
+     of each callback is a sample of drift per frame.
+
+     The kernel is centred `half` samples INTO the buffer rather than on `pos`
+     itself, so it only ever reads forward and the caller needs no history
+     margin. That is a fixed delay of TAPS_PER_SIDE output samples -- 167 µs --
+     which is not a number anyone can hear or name.
+
+     Module level, and on the export seam below, so the node suite can run the
+     resampler the browser runs rather than a second copy of the arithmetic. */
+  function frameAtRate(buf, pos, frames, ratio) {
+    if (!(ratio > 0) || !isFinite(ratio)) ratio = 1;
+    // Cut off just below the far end's Nyquist, expressed against the INPUT
+    // rate. Never above 0.45, so a context already at RATE is not filtered
+    // against a frequency higher than it has.
+    var fc = Math.min(0.45, 0.45 / ratio);
+    var half = TAPS_PER_SIDE / (2 * fc);          // kernel half-width, input samples
+    if (Math.ceil(pos + (frames - 1) * ratio + 2 * half) + 1 > buf.length) return null;
+    var out = new Float32Array(frames);
+    var p = pos;
+    for (var i = 0; i < frames; i++) {
+      var c = p + half;
+      var a = Math.floor(c - half);
+      var b = Math.ceil(c + half);
+      if (a < 0) a = 0;
+      if (b > buf.length) b = buf.length;
+      var sum = 0, wsum = 0;
+      for (var j = a; j < b; j++) {
+        var d = (j + 0.5) - c;
+        if (d <= -half || d >= half) continue;
+        // Hamming over the kernel's own width, then the band-limiting sinc.
+        var w = (0.54 + 0.46 * Math.cos(Math.PI * d / half)) * sinc(2 * fc * d);
+        sum += buf[j] * w;
+        wsum += w;
+      }
+      out[i] = wsum > 0 ? sum / wsum : 0;
+      p += ratio;
+    }
+    return { out: out, pos: p };
+  }
+
   function bytesToB64(bytes) {
     var s = '';
     for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
@@ -223,6 +300,12 @@
     var pending = [];
     var stats = {
       audio_in_frames: 0, audio_out_bytes: 0, transcripts: 0,
+      /* WHAT THE MICROPHONE IS ACTUALLY AT, and what had to be done about it.
+         Declared here so the shape is stable and so a drive can be asked the
+         question afterwards -- the 2026-09-21 fault was a mic at 48000 feeding
+         a session opened at 24000, and nothing anywhere recorded either number.
+         A ratio of 1 means the context happened to match. */
+      audio_in_rate: null, audio_in_ratio: null,
       transcript_repeats_dropped: 0, local_flushes: 0, gated_requests: 0,
       responses: 0, spoke: 0, silent_responses: 0, gate_timeouts: 0,
       /* Cancelled, failed or incomplete responses that made no sound. Counted
@@ -498,6 +581,36 @@
        the session does. */
     var pumping = false;
 
+    /* THE MICROPHONE IS NOT AT 24 kHz AND THIS IS WHERE THAT GETS FIXED.
+     *
+     * RATE is what the session was OPENED with -- xai_voice.mint_client_secret
+     * sends audio.input.format = {type: 'audio/pcm', rate: 24000} -- so it is
+     * what the far end will decode these bytes as. The AudioContext these
+     * samples arrive on is the shared output bus, built at 48000 (see
+     * rio_output.js), because her voice has to go through the echo canceller
+     * with everything else RIO says.
+     *
+     * Those two numbers were never reconciled. This function took 48 kHz
+     * samples, cut them into 960-sample pieces because 960 is 40 ms AT 24 kHz,
+     * and shipped them raw. Every frame the driver spoke arrived at the
+     * transcriber as twice its length an octave down -- a real voice saying
+     * real words, slowed to half speed. grok-transcribe transcribed it the way
+     * anything transcribes a tape at half speed, and the drive of 2026-09-21
+     * has the shape of that in its own numbers: four barge detections, three
+     * responses, and those three answers 15, 24 and 15 characters long. That
+     * is the length of "Didn't catch that." She was not silent and she was not
+     * cut off -- cutoffs_total was 0 and all three played to completion. She
+     * was answering a garbled sentence with the only honest reply to one.
+     *
+     * So the stream is resampled to RATE before it is sent. A BOX AVERAGE over
+     * each output sample's input span, not a nearest-sample pick: dropping
+     * every other sample folds everything above 12 kHz back into the speech
+     * band as aliasing, and a band-limit is the entire difference between
+     * decimation and damage. For a context that already runs at RATE the span
+     * is one sample and this is a copy.
+     *
+     * `ratio` is read per call rather than cached: the sample rate belongs to
+     * the context, and a context can be rebuilt under us by an unlock. */
     function pumpFrom(micStream) {
       if (!micStream || !opts.ctx) return;
       var ctx = opts.ctx;
@@ -507,28 +620,35 @@
         ? ctx.createScriptProcessor(4096, 1, 1) : null;
       if (!node) return;              // a browser without it gets no capture
       pumping = true;
-      var acc = [];
-      var accLen = 0;
+      /* One flat buffer with a FRACTIONAL read position, because the ratio is
+         not generally an integer (44100 Hz gives 1.8375) and the leftover has
+         to survive into the next callback or the stream drifts a sample every
+         frame. */
+      var buf = new Float32Array(0);
+      var pos = 0;
       node.onaudioprocess = function (e) {
         if (!pumping) return;
         var ch = e.inputBuffer.getChannelData(0);
-        acc.push(new Float32Array(ch));
-        accLen += ch.length;
-        while (accLen >= frames) {
-          var out = new Float32Array(frames);
-          var got = 0;
-          while (got < frames) {
-            var head = acc[0];
-            var take = Math.min(frames - got, head.length);
-            out.set(head.subarray(0, take), got);
-            got += take;
-            if (take === head.length) acc.shift();
-            else acc[0] = head.subarray(take);
+        var grown = new Float32Array(buf.length + ch.length);
+        grown.set(buf, 0);
+        grown.set(ch, buf.length);
+        buf = grown;
+        var ratio = (ctx.sampleRate || RATE) / RATE;
+        if (!(ratio > 0) || !isFinite(ratio)) ratio = 1;
+        stats.audio_in_rate = ctx.sampleRate || null;
+        stats.audio_in_ratio = ratio;
+        for (;;) {
+          var got = frameAtRate(buf, pos, frames, ratio);
+          if (!got) break;            // not enough audio yet; wait for more
+          pos = got.pos;
+          var drop = Math.floor(pos);
+          if (drop > 0) {
+            buf = buf.slice(drop);     // slice, not subarray: a view would
+            pos -= drop;               // keep the whole backing store alive
           }
-          accLen -= frames;
           stats.audio_in_frames++;
           send({ type: 'input_audio_buffer.append',
-                 audio: bytesToB64(floatToPcm16(out)) });
+                 audio: bytesToB64(floatToPcm16(got.out)) });
         }
       };
       src.connect(node);
@@ -813,6 +933,7 @@
 
   var apiOut = { open: open, attach: attach, createSpeaker: createSpeaker,
                  pcm16ToFloat: pcm16ToFloat, floatToPcm16: floatToPcm16,
+                 frameAtRate: frameAtRate,
                  RATE: RATE, FRAME_MS: FRAME_MS };
 
   root.RIO = root.RIO || {};
