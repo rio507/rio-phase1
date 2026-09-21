@@ -1595,6 +1595,35 @@
             // waiting on a tool call.
             return { allow: true, why: null };
         }
+        /* A LOUDSPEAKER IS NOT SIX SECONDS LATE.
+         *
+         * The test above needs BOTH "she is not speaking" and "her tail has
+         * passed", and `speaking` stays true for the whole of a response --
+         * including the gap between its last audio chunk and response.done,
+         * which on a tool turn is however long the tool takes. So a driver who
+         * asks a second question into that gap is refused as her own echo.
+         *
+         * MEASURED, 2026-09-21: turn_phantom "What are they playing?" refused
+         * as barge_not_sustained with since_audio_ms = 6483, speaking true,
+         * self_answered false. Her voice had not been in the room for six and
+         * a half seconds. The question was a driver's and it was dropped; the
+         * showtimes it was asking about were asked for again four seconds
+         * later.
+         *
+         * This is the same fault this file already fixed once, one path over:
+         * the short-utterance echo test carries a note reading "a loudspeaker
+         * in the same room is not eleven seconds late; that was a driver
+         * answering, and the answer was dropped." The reasoning was never
+         * applied here.
+         *
+         * So: past ECHO_IMPOSSIBLE_MS of actual silence, an echo is not
+         * physically available as an explanation and `speaking` does not get a
+         * vote. An acoustic path across a cabin is tens of milliseconds and
+         * the playout tail is a fraction of a second; two seconds is far past
+         * both, and still well inside the gap a tool call opens. */
+        if (tail > ECHO_IMPOSSIBLE_MS) {
+            return { allow: true, why: null };
+        }
         /* She is speaking, or has only just stopped. The ONLY evidence that
            this is a driver and not a loudspeaker is the barge gate -- which
            has already refused it in three of its paths, all of them meaning
@@ -1716,6 +1745,11 @@
        census and the gate see the same signal at the same rate. */
     var CENSUS_SAMPLE_MS = 100;
     var echoTailMs = cfg.echoTailMs || 600;
+    /* How long her voice must have been out of the room before an echo stops
+       being a possible explanation for a transcript. Not a tuning knob: it is
+       a claim about acoustics, and it lives in config.py beside the tail it is
+       not the same as. See the note in the supersede gate. */
+    var ECHO_IMPOSSIBLE_MS = cfg.echoImpossibleMs || 2000;
     var echoTextWindowMs = (cfg.echoTextWindowS || 15) * 1000;
     var echoTextOverlap = cfg.echoTextOverlap || 0.8;
     var echoTextMinWords = cfg.echoTextMinWords || 2;
@@ -4611,6 +4645,7 @@
           turnBackstopMs: session.turn_backstop_ms,
           turnBackstopMicDb: session.turn_backstop_mic_db,
           echoTailMs: session.echo_tail_ms,
+          echoImpossibleMs: session.echo_impossible_ms,
           echoTextWindowS: session.echo_text_window_s,
           echoTextOverlap: session.echo_text_overlap,
           echoTextMinWords: session.echo_text_min_words,

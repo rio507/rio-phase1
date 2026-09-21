@@ -1150,6 +1150,23 @@ REALTIME_MAX_RESUMES = 1
 # tail of her own sentence is still judged as an echo rather than as a question.
 REALTIME_ECHO_TAIL_MS = 600
 
+# HOW LONG HER VOICE MUST HAVE BEEN OUT OF THE ROOM before an echo stops being
+# a possible explanation for a transcript.
+#
+# Not the same number as the tail above and not a tuning knob: that one is how
+# long her sound hangs about after she stops, and this is a claim about
+# acoustics. A loudspeaker in a cabin is tens of milliseconds away; the playout
+# tail is a fraction of a second. Two seconds is far past both.
+#
+# It exists because the supersede gate needed BOTH "she is not speaking" and
+# "her tail has passed", and `speaking` stays true for the whole of a response
+# -- including the gap between its last audio chunk and response.done, which on
+# a tool turn is however long the tool takes. MEASURED 2026-09-21: a driver
+# asking "What are they playing?" into that gap was refused as her own echo
+# with since_audio_ms = 6483. Six and a half seconds of silence, and the
+# question was dropped.
+REALTIME_ECHO_IMPOSSIBLE_MS = 2000
+
 # The second net: does the transcript look like something she just said?
 #
 # Deliberately a SECOND net and not the first one, because it cannot be relied

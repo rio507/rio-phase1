@@ -384,6 +384,52 @@ section('SILENCE WHERE AUDIO WAS EXPECTED IS A FAULT, NOT A LULL');
   ok(!q.events.some(e => e.type === 'XAI_SESSION_SILENT'),
      '...and nothing was reported to the panel');
 
+  /* ...AND THE FOURTH SHAPE, which is a TOOL CALL and which the three above
+     did not cover. The model emits a function call, the response COMPLETES
+     having said nothing, and the words arrive in the next response once the
+     result is submitted. That is the design of the tool path.
+
+     The drive of 2026-09-21 reported five silent sessions and every one of
+     them was this: each landed within 70 ms of a tool call starting --
+     vehicle_status at 36.0 s, look at 47.6 s, find_places at 65.1 s, deep_dive
+     at 81.1 s and 128.7 s. Five of roughly a dozen responses, reported as
+     "she is listening but not answering" while she was doing exactly what the
+     tool path asks of her. */
+  const tl = harness();
+  await tl.s.connect();
+  ['deep_dive', 'look', 'find_places'].forEach((tool, i) => {
+    tl.s._onMessage(JSON.stringify({ type: 'response.created',
+                                     response: { id: 't' + i } }));
+    tl.s._onMessage(JSON.stringify({
+      type: 'response.function_call_arguments.done',
+      call_id: 'c' + i, name: tool, arguments: '{}' }));
+    tl.s._onMessage(JSON.stringify({ type: 'response.done',
+                                     response: { id: 't' + i, status: 'completed' } }));
+  });
+  ok(tl.s.health().degraded === false,
+     'a response that IS a tool call makes no sound and is not a fault — the '
+     + 'answer comes in the next response, once the result is submitted');
+  ok(tl.s.health().silent_responses === 0,
+     '...so the drive of 2026-09-21 would report zero, not five');
+  ok(tl.s.health().silent_tool_calls === 3,
+     '...counted under their own name, because "silent by design" has to be '
+     + 'readable rather than trusted: a drive of nothing but silent tool calls '
+     + 'and a driver who heard nothing IS a fault, and it would hide in the '
+     + 'aggregate');
+  ok(!tl.events.some(e => e.type === 'XAI_SESSION_SILENT'),
+     '...and nothing reached the panel');
+
+  /* AND THE DETECTOR STILL FIRES on the shape it was written for, in the same
+     session, straight after three tool calls. A guard that can be switched off
+     by an earlier event is not a guard. */
+  tl.s._onMessage(JSON.stringify({ type: 'response.created',
+                                   response: { id: 'tq' } }));
+  tl.s._onMessage(JSON.stringify({ type: 'response.done',
+                                   response: { id: 'tq', status: 'completed' } }));
+  ok(tl.s.health().silent_responses === 1,
+     'a genuinely silent response right after a tool call is still caught — '
+     + 'the tool flag is per response, not per session');
+
   h.s._onMessage(JSON.stringify({ type: 'response.created',
                                   response: { id: 'r2' } }));
   h.s._onMessage(JSON.stringify({ type: 'response.output_audio.delta',

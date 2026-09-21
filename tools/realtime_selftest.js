@@ -148,6 +148,12 @@ function harness(opts) {
     bargeEchoFloorDb: opts.bargeEchoFloorDb,
     levels: opts.levels,
     echoTailMs: opts.echoTailMs,
+    // ...and how long past that an echo stops being physically
+    // available as an explanation at all. Named here for the reason the
+    // comment below gives, which this key proved again the day it was
+    // added: unnamed, the test ran against the 2000 ms default and
+    // failed for the right answer.
+    echoImpossibleMs: opts.echoImpossibleMs,
     echoTextWindowS: opts.echoTextWindowS,
     echoTextOverlap: opts.echoTextOverlap,
     // How recent her voice has to be for a ONE-WORD transcript to be hers.
@@ -4017,6 +4023,51 @@ function speaking(h, rid, said) {
      '...and the answer it was an echo OF is not cancelled');
   ok(h.controller.state().counters.turns_phantom === 1,
      '...and it is counted, so a drive can be asked how often this happens');
+}
+
+{
+  /* A LOUDSPEAKER IS NOT SIX SECONDS LATE.
+   *
+   * The drive of 2026-09-21 logged turn_phantom "What are they playing?"
+   * refused as barge_not_sustained with since_audio_ms = 6483, speaking true,
+   * self_answered false. `speaking` stays true for the whole of a response,
+   * including the gap between its last audio and response.done -- which on a
+   * tool turn is however long the tool takes -- so a driver asking a second
+   * question into that gap was classified as her own echo and dropped. The
+   * showtimes it was asking about were asked for again four seconds later.
+   *
+   * The same reasoning was already written down one path over, for the
+   * short-utterance echo test: "a loudspeaker in the same room is not eleven
+   * seconds late". It had never been applied here.
+   */
+  const h = phoneHarness({ echoImpossibleMs: 40 });
+  speaking(h, 'r1');
+  // Her audio arrives, and then stops while a tool call runs.
+  h.controller.handle({ type: 'response.output_audio.delta',
+                        response_id: 'r1', delta: 'AAAA' });
+  await new Promise(r => setTimeout(r, 80));   // past echoImpossibleMs
+  h.asEcho();                                  // the meter still says "her"
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'What are they playing?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 0,
+     'a question asked after her voice has been out of the room long enough '
+     + 'for an echo to be impossible is a DRIVER, whatever `speaking` says');
+}
+
+{
+  // ...and the guard is a threshold, not a switch: inside it, her echo is
+  // still refused with the meter's verdict.
+  const h = phoneHarness({ echoImpossibleMs: 100000 });
+  speaking(h, 'r1');
+  h.controller.handle({ type: 'response.output_audio.delta',
+                        response_id: 'r1', delta: 'AAAA' });
+  h.asEcho();
+  h.controller.handle({ type: 'conversation.item.input_audio_transcription.completed',
+                        transcript: 'What are they playing?' });
+  await settle();
+  ok(h.events.filter(e => e.type === 'LIVE_TURN_PHANTOM').length === 1,
+     '...while inside it, her own voice coming back is still refused');
 }
 
 {

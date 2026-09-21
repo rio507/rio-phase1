@@ -313,6 +313,14 @@
          cancelled on sight is the noise gate working -- and because a drive log
          that cannot tell the two apart is what produced a false "degraded". */
       silent_by_design: 0,
+      /* ...of which THIS many were a tool call, counted apart so "silent by
+         design" can be read rather than trusted. A drive whose every response
+         is a silent tool call and whose driver heard nothing is a real fault,
+         and it would hide inside the aggregate. */
+      silent_tool_calls: 0,
+      // Set while a response is emitting a function call; cleared at
+      // response.done beside spoke_this_response.
+      tool_this_response: false,
     };
     /* SILENT-SESSION DETECTION. `expecting` is set when a response opens and
        cleared by its first audio; a response that closes with it still set is one
@@ -515,6 +523,16 @@
         stats.transcripts++;
       }
 
+      /* A RESPONSE THAT IS A TOOL CALL IS SUPPOSED TO MAKE NO SOUND.
+         Tracked here rather than read off response.done, because the shape of
+         `response.output` is a vendor's business and the seam exists so this
+         file does not have to know it. The arguments-done event is canonical
+         across both backends (rio_provider.CANONICAL) and it fires exactly
+         once per tool call, before the response completes. */
+      if (t === 'response.function_call_arguments.done') {
+        stats.tool_this_response = true;
+      }
+
       if (t === 'response.done') {
         /* GENERATION IS OVER; THE SOUND MAY NOT BE. The queue is told, and the
            controller's holdTail is what waits. */
@@ -532,14 +550,31 @@
            is a response the server said it COMPLETED that nonetheless made no
            sound. A cancelled one is not evidence of anything. */
         var status = (ev.response && ev.response.status) || null;
-        if (stats.spoke_this_response !== true && status === 'completed') {
+        /* ...AND THAT IS THE FOURTH KIND OF SILENCE THIS HAS HAD TO LEARN.
+           The note above lists three -- cancelled, noise-gated, barged -- and
+           a TOOL CALL is the fourth: the model emits a function call, the
+           response completes having said nothing, and the words arrive in the
+           NEXT response once the result is submitted. That is the design.
+
+           On the drive of 2026-09-21 all five `session_silent` marks were
+           this. Every one landed within 70 ms of a tool call starting:
+           vehicle_status at 36.0 s, look at 47.6 s, find_places at 65.1 s,
+           deep_dive at 81.1 s and again at 128.7 s -- five of roughly a dozen
+           responses, reported as "she is listening but not answering" while
+           she was doing exactly what the tool path asks of her. A detector
+           that fires on healthy behaviour is worse than no detector: it is the
+           one that teaches everyone to ignore the alarm. */
+        if (stats.spoke_this_response !== true && status === 'completed'
+            && stats.tool_this_response !== true) {
           stats.silent_responses++;
           silence.responses++;
           noteSilence('a response the server called completed made no sound');
         } else if (stats.spoke_this_response !== true) {
           stats.silent_by_design++;
+          if (stats.tool_this_response === true) stats.silent_tool_calls++;
         }
         stats.spoke_this_response = false;
+        stats.tool_this_response = false;
         startedSent = false;
       }
 
@@ -716,6 +751,7 @@
           degraded: silence.degraded,
           silent_responses: silence.responses,
           silent_by_design: stats.silent_by_design,
+          silent_tool_calls: stats.silent_tool_calls,
           pending_requests: pending.length,
           gate_timeouts: stats.gate_timeouts,
           queued_until: speaker ? speaker.queuedUntil() : 0,

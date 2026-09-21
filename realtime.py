@@ -1640,6 +1640,7 @@ def drive_policy(cfg: dict) -> dict:
         # counts as hearing herself in a transcript. See config.REALTIME_ECHO_*
         # and the iPhone test that produced them.
         "echo_tail_ms": int(config.REALTIME_ECHO_TAIL_MS),
+        "echo_impossible_ms": int(config.REALTIME_ECHO_IMPOSSIBLE_MS),
         "echo_text_window_s": float(config.REALTIME_ECHO_TEXT_WINDOW_S),
         "echo_text_overlap": float(config.REALTIME_ECHO_TEXT_OVERLAP),
         "echo_text_min_words": int(config.REALTIME_ECHO_TEXT_MIN_WORDS),
