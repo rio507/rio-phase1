@@ -2482,14 +2482,22 @@ def look(question: str, session_key: str = "default",
                 contested_rule = ""
                 try:
                     import reconcile as _rc
+                    import rio_prompts as _rp
                     _reading = observer.reading(session_key, hit)
                     if _reading:
                         base["reading_fields"] = _reading["fields"]
                         base["contested"] = _reading.get("contested") or []
                         base["detector"] = _reading.get("detector")
+                        base["truncated"] = bool(_reading.get("truncated"))
+                        base["stripped"] = _reading.get("stripped") or []
                         contested_rule = _rc.rule_for({
                             "contested": base["contested"],
                             "detector": base["detector"]})
+                        # ...and what is wrong with the reading that its own
+                        # words do not show: a fragment at the token cap, and
+                        # measurements a frame could not have produced. See
+                        # rio_prompts.reading_caveats.
+                        contested_rule += _rp.reading_caveats(_reading)
                 except Exception as e:
                     # A reconciliation that fails may not cost an answer.
                     print(f"[look] reading block failed: "

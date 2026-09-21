@@ -47,7 +47,7 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
 from rio_prompts import (OBSERVER_PROMPT, SENSOR_PROMPT,
                          SENSOR_PROMPT_TERSE, is_prompt_example,
-                         sensor_faults)
+                         sensor_faults, strip_measurements)
 from teachers import canned
 
 MODEL_ID = config.local_vision_model_id()
@@ -317,9 +317,72 @@ _flags = {
     "advisory": 0,
     # the frame had nothing in it to read, and no model was asked
     "blank_frame": 0,
+    # the reading invented a speed or a distance and it was stripped out. A
+    # frame cannot show a speed; a distance needs geometry. See
+    # rio_prompts.strip_measurements.
+    "invented_units": 0,
+    # the reading hit the token cap mid-sentence and its last field is a
+    # fragment. Counted apart from everything else because it is a BUDGET
+    # fault, not a model fault -- the fix is a bigger cap or a shorter prompt,
+    # and a rate here is how anyone would know which.
+    "truncated": 0,
     "total": 0,
 }
 _repeats = canned.RepeatTracker()
+
+# WHAT ELSE THE LAST READING CARRIED, beside the words. observe() returns a
+# string -- every caller since it was written expects one, and "" means no
+# observation -- so the facts ABOUT that string live here and are picked up by
+# observer._record on the same thread, under the same lock, immediately after.
+_last_meta = {"truncated": False, "stripped": []}
+
+
+def last_reading_meta() -> dict:
+    """Truncation and stripped measurements for the reading just returned."""
+    return dict(_last_meta)
+
+
+def _eos_ids():
+    """Every token id this checkpoint may legitimately stop on. -> set."""
+    ids = set()
+    for src in (getattr(_model, "generation_config", None), _processor,
+                getattr(_processor, "tokenizer", None)):
+        val = getattr(src, "eos_token_id", None)
+        if isinstance(val, int):
+            ids.add(val)
+        elif isinstance(val, (list, tuple, set)):
+            ids.update(int(v) for v in val if isinstance(v, int))
+    return ids
+
+
+def _reading_truncated(out, inputs, gen_kw) -> bool:
+    """Did this generation run out of budget mid-sentence? -> bool.
+
+    TWO CONDITIONS, BOTH REQUIRED. The generation used its whole allowance,
+    AND the last token is not one the model stops on. Either alone is wrong: a
+    reading that happens to finish exactly on the cap is complete, and a
+    reading that stopped early cannot have been cut.
+
+    Asked of the TOKENS because there is nothing reliable in the text. The
+    reading of 2026-09-21 ended "RISK: collision between car 20 km/h and car"
+    -- no ellipsis, no dangling bracket, a grammatical noun at the end. It
+    reads like a finished clause and is half of one.
+
+    Never raises: a guard that can fail a reading is worse than the fault it
+    was written for, so anything unexpected here answers "not truncated" and
+    the reading goes out as it always did.
+    """
+    try:
+        cap = int(gen_kw.get("max_new_tokens") or 0)
+        if cap <= 0:
+            return False
+        generated = int(out.shape[1]) - int(inputs["input_ids"].shape[1])
+        if generated < cap:
+            return False
+        last = int(out[0, -1])
+        return last not in _eos_ids()
+    except Exception:
+        return False
 
 
 def reading_refused(text, repeats: int = 0):
@@ -434,10 +497,19 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
         ).to(_model.device)
-        out = _model.generate(**inputs, **_generate_kwargs())
+        _gen_kw = _generate_kwargs()
+        out = _model.generate(**inputs, **_gen_kw)
         raw = _processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
+        # DID IT FINISH, OR DID IT RUN OUT OF BUDGET? Asked of the tokens, not
+        # of the words: a reading cut at the cap ends mid-clause and there is
+        # nothing in the text that reliably says so. The two conditions have to
+        # hold together -- the generation used its whole allowance AND the last
+        # token is not an end-of-sequence -- because a reading that finishes
+        # exactly on the cap is complete, and one that stopped early cannot
+        # have been cut.
+        truncated = _reading_truncated(out, inputs, _gen_kw)
         _flags["total"] += 1
         # A REASONING TRACE IS NOT A READING. Stripped, counted, and if it never
         # closed there is nothing after it to publish.
@@ -503,6 +575,39 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
                           f"({advisory}): {text[:120]!r}", flush=True)
                 clear_holder()
                 return ""
+        # A FRAME CANNOT SHOW A SPEED, so one in a reading did not come from
+        # the road. Stripped here rather than asked for in the prompt, because
+        # the prompt already asks ("no speed or distance in numbers unless you
+        # can read them in the frame") and on 2026-09-21 three invented speeds
+        # went past it and into RIO's evidence as "car 20 km/h, car 40 km/h,
+        # car 50 km/h". A measurement in a reading is only true if it came from
+        # geometry or the ECU, and neither of those goes through this model.
+        #
+        # LAST OF THE GUARDS, deliberately. Everything above decides whether to
+        # PUBLISH the reading at all, and those questions are about the text
+        # the model actually produced -- a loop guard run on an edited string
+        # would be scoring this file's edit. This one changes the text, so it
+        # goes after all of them.
+        text, stripped = strip_measurements(text)
+        if stripped:
+            _flags["invented_units"] += 1
+            if _flags["invented_units"] in (1, 10, 100):
+                print(f"[vision] reading invented {len(stripped)} "
+                      f"measurement(s), stripped: {stripped} "
+                      f"({_flags['invented_units']} so far)", flush=True)
+        if truncated:
+            _flags["truncated"] += 1
+            if _flags["truncated"] in (1, 10, 100):
+                print(f"[vision] reading hit the {_gen_kw.get('max_new_tokens')}"
+                      f"-token cap mid-sentence; its last field is a fragment "
+                      f"({_flags['truncated']} so far): {text[-60:]!r}",
+                      flush=True)
+        # ...and if stripping emptied it, there is no reading left to publish.
+        if not text.strip():
+            clear_holder()
+            return ""
+        _last_meta["truncated"] = bool(truncated)
+        _last_meta["stripped"] = list(stripped)
         _last_observation = text
         _last_observed_at = time.time()
         _last_observed_frame = frame_id

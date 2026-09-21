@@ -102,6 +102,16 @@
       warn.title = f.why || 'the tracker holds road users the reading missed';
       head.appendChild(warn);
     }
+    /* THE CUT LANDED IN THIS FIELD. Marked on the row rather than on the card,
+       because the row is what a driver has to distrust -- and a RISK field cut
+       just after its name reads at a glance as a completed all-clear, which is
+       the worst possible thing for this card to imply. */
+    if (f.truncated) {
+      var cut = el('span', 'teach-recited', ' cut off');
+      cut.title = 'the model ran out of its token budget here — this field is '
+                + 'an unfinished fragment, not a finding';
+      head.appendChild(cut);
+    }
     row.appendChild(head);
     if (f.present) {
       row.appendChild(el('div', 'teach-text' + (f.contested ? ' contested' : ''),
@@ -113,6 +123,11 @@
       if (f.contested && f.detector) {
         row.appendChild(el('div', 'teach-detector',
                            'tracking ' + f.detector));
+      }
+      if (f.truncated) {
+        row.appendChild(el('div', 'teach-cut',
+                           '\u2026 unfinished — the reading ran out of tokens '
+                           + 'here, so this is not a complete finding'));
       }
     } else {
       /* RULE 2. Not blank, and not "--": the sentence says which of the two
@@ -238,6 +253,22 @@
         }
       } else {
         s.col.appendChild(unparsedRow(reading));
+      }
+      /* NUMBERS THE MODEL INVENTED AND THE READING NO LONGER CARRIES.
+         Said on the card rather than silently dropped: a driver comparing the
+         glass with the boxes should know why a reading has no distances on it
+         when the overlay does, and "it was removed" is a different fact from
+         "the model did not say". */
+      if ((reading.stripped || []).length) {
+        var st = el('div', 'teach-hint',
+                    'removed ' + reading.stripped.length
+                    + (reading.stripped.length === 1 ? ' measurement: '
+                                                     : ' measurements: ')
+                    + reading.stripped.join(', ')
+                    + ' — a frame cannot measure speed or distance, so these '
+                    + 'were not observations. Real ranges come from the '
+                    + 'tracker.');
+        s.col.appendChild(st);
       }
       s.col.appendChild(rawRow(reading));
       paint(s.cols);

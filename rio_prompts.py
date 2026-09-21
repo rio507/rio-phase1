@@ -307,6 +307,134 @@ def split_sensor_reading(text: str) -> dict:
     }
 
 
+# A NUMBER WITH A UNIT ON IT, which is the one thing a reading may not invent.
+#
+# From the payload of 2026-09-21, handed to RIO as what the camera saw:
+#
+#     TRAFFIC: car 20 km/h, car 40 km/h, car 50 km/h
+#
+# A single frame cannot show a speed. There is no second frame to difference
+# against, no timestamp pair, no ego motion -- the model produced three of them
+# from one picture and they read on the glass exactly like the measured gap the
+# headway loop computes from depth, geometry and a tracker. The prompt already
+# forbids this ("no speed or distance in numbers unless you can read them in
+# the frame") and the model did it anyway, which is the argument for a rule
+# rather than a better sentence: a prompt is a request and this is a property.
+#
+# THE RULE: a speed or a distance may appear in a reading only if it came from
+# measured geometry or the ECU. Neither of those goes through this model, so
+# any number with a unit in a reading is removed here.
+#
+# WHAT THIS ALSO REMOVES, stated rather than discovered later: a speed limit
+# read off a real sign. The prompt permits that and it is a legitimate
+# observation -- but a reading carries no provenance for its numbers, so there
+# is no way to tell "50 on that sign" from "50 km/h, invented" downstream, and
+# a driver cannot tell either. Removing both is the conservative half of an
+# unavoidable choice. If a sign's number is ever wanted it needs its own field
+# with its own provenance, not a looser rule here.
+_MEASUREMENT_RE = re.compile(
+    r"""(?<![\w.])            # not mid-token
+    (?:about\s+|approx\.?\s+|approximately\s+|around\s+|~\s*|roughly\s+)?
+    \d+(?:[.,]\d+)?           # the number
+    \s*(?:-|–|to)?\s*(?:\d+(?:[.,]\d+)?)?   # ...or a range, "20-30"
+    \s*
+    (?:km/?h|kph|kmh|mph|m/s|ms\^?-?1|knots?      # speeds
+      |m(?:et(?:er|re)s?)?                        # metres
+      |k(?:ilo)?m(?:et(?:er|re)s?)?               # kilometres
+      |ft|feet|foot|yd|yards?|mi(?:les?)?         # imperial
+      |cm|in(?:ches)?)
+    \b""",
+    re.IGNORECASE | re.VERBOSE)
+
+# Tidy-up after a removal: doubled separators, a separator against a bracket,
+# and leading/trailing ones. Removing "20 km/h" from "car 20 km/h, car" must
+# not leave "car , car".
+_TIDY = (
+    (re.compile(r"\s{2,}"), " "),
+    (re.compile(r"\s+([,;.])"), r"\1"),
+    (re.compile(r"([,;])\s*(?=[,;])"), ""),
+    (re.compile(r"\(\s*\)"), ""),
+    # ...and the preposition the number was the object of. "queue ahead at
+    # 5-10 mph" must not become "queue ahead at": a dangling preposition reads
+    # as a truncation, and this edit is not one.
+    (re.compile(r"\s+(?:at|to|of|by|within|under|over|about|around|near|"
+                r"approx\.?|approximately)\s*(?=$|[,;|])", re.IGNORECASE), ""),
+    (re.compile(r"^[\s,;]+|[\s,;]+$"), ""),
+)
+
+
+def strip_measurements(text: str):
+    """Remove invented speeds and distances from a reading. -> (clean, removed)
+
+    `removed` is every measurement taken out, in order, so the fault can be
+    COUNTED rather than merely prevented -- a model that invents three numbers
+    a frame is a different problem from one that does it once an hour, and the
+    difference is only visible if somebody is keeping the tally. See
+    vision.flag_rate()["invented_units"].
+
+    Bare numbers are left alone. "ROAD: four, two" is a lane count and "two
+    cars ahead" is an observation; neither claims a measurement. Only a number
+    carrying a unit is a measurement, and that is the whole test.
+    """
+    raw = text or ""
+    removed = [m.group(0).strip() for m in _MEASUREMENT_RE.finditer(raw)]
+    if not removed:
+        return raw, []
+    clean = _MEASUREMENT_RE.sub("", raw)
+    # Per-field tidy, so a bar separator is never swallowed by the whitespace
+    # rules and the field structure survives the edit intact.
+    parts = clean.split("|")
+    out = []
+    for part in parts:
+        for pattern, repl in _TIDY:
+            part = pattern.sub(repl, part)
+        out.append(part)
+    clean = " | ".join(p.strip() for p in out)
+    return clean.strip(), removed
+
+
+def reading_caveats(reading: dict) -> str:
+    """What RIO must be told ABOUT a reading, beyond the reading. -> "" or text.
+
+    Two things can be wrong with a reading that is still worth publishing, and
+    both are invisible in the words:
+
+    IT WAS CUT OFF. A generation that hit the token cap ends mid-clause with no
+    ellipsis and no dangling bracket. On 2026-09-21 that produced "RISK:
+    collision between car 20 km/h and car" -- and the worst case is the one
+    where the cut lands just after the field name, because "RISK:" followed by
+    a fragment reads at a glance as a completed "no risk". She is told which
+    field is a fragment and told not to finish it.
+
+    ITS NUMBERS WERE REMOVED. strip_measurements takes out speeds and distances
+    the model invented, and an assistant looking at "car, car, car" may helpfully
+    supply the distance she thinks is implied. So the rule says the reading
+    carries no measurements and that she has none to give -- the real gap comes
+    from the headway loop and reaches her by another road entirely.
+    """
+    if not isinstance(reading, dict):
+        return ""
+    bits = []
+    if reading.get("truncated"):
+        cut = [f["name"] for f in (reading.get("fields") or [])
+               if f.get("truncated")]
+        where = f" Its {cut[0]} field" if cut else " Its last field"
+        bits.append(
+            " THIS READING WAS CUT OFF mid-sentence when the camera model ran "
+            "out of its token budget." + where + " is an unfinished fragment, "
+            "not a finding. Do not read it as complete, do not finish it, and "
+            "do not treat it as an all-clear -- if the driver asked about that, "
+            "say the camera did not get a full answer out this time.")
+    if reading.get("stripped"):
+        bits.append(
+            " THIS READING CARRIES NO SPEEDS OR DISTANCES, and any it appeared "
+            "to carry were removed because a single frame cannot measure "
+            "either. Do not state or estimate a distance or a speed from it. "
+            "A real following distance comes from the car's own tracker, not "
+            "from this.")
+    return "".join(bits)
+
+
 def sensor_faults(text: str) -> list:
     """-> reasons this reading may not be published as a reading. [] is clean.
 

@@ -143,6 +143,32 @@ def main():
            [f["text"] for f in (look.get("reading_fields") or [])]
            == [f["text"] for f in r["fields"]])
 
+    # ---- WHAT MAY NOT REACH HER AT ALL --------------------------------------
+    # A measurement in a reading did not come from the road: a single frame has
+    # no second frame to difference against and no geometry behind it. This is
+    # the live half of tools/reading_honesty_selftest.py -- that one proves the
+    # stripper works, this one proves it is ON THE PATH she is served from.
+    import re as _re
+    units = _re.compile(r"\d[\d.,]*\s*(?:km/?h|kph|mph|m/s|m\b|metres?|meters?|"
+                        r"km\b|ft\b|feet|yards?|miles?)", _re.IGNORECASE)
+    hit = units.search(look.get("answer") or "")
+    ok("no invented speed or distance reaches the live session",
+       hit is None, f"found {hit.group(0)!r}" if hit else "")
+    ok("...nor the card", units.search(r["raw"]) is None)
+    if r.get("stripped"):
+        ok("...and what was removed is on the record, not silently dropped",
+           isinstance(r["stripped"], list) and r["stripped"],
+           str(r["stripped"]))
+    # A reading cut at the token cap must carry that fact to both consumers,
+    # and must name the field the cut landed in.
+    if r.get("truncated"):
+        cut = [f["name"] for f in r["fields"] if f.get("truncated")]
+        ok("a truncated reading names the field that is a fragment",
+           len(cut) == 1, str(cut))
+        ok("...and tells the live session it was cut off",
+           "CUT OFF" in (look.get("rules") or "")
+           if look.get("path", "").startswith("observer") else True)
+
     # ---- THE ROWS ----------------------------------------------------------
     import rio_prompts as rp
     names = [f["name"] for f in r["fields"]]

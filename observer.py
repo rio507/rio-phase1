@@ -63,7 +63,14 @@ def _clean(text: str) -> str:
     return t.rstrip(".").strip()
 
 
-def _record(text, frame, key=None):
+def _record(text, frame, key=None, meta=None):
+    # WHAT ELSE THE READING CARRIED. vision.observe() returns a string -- every
+    # caller expects one -- so the facts ABOUT it come across separately and
+    # are pinned onto the record here, where they outlive the call. `truncated`
+    # is the one that changes what a driver may conclude: a reading cut at the
+    # token cap ends mid-clause, and its last field is a fragment wearing the
+    # clothes of a finished answer.
+    meta = meta if isinstance(meta, dict) else {}
     # IS THIS SPEAKABLE AS HER? Decided when the line is written rather than
     # when a driver is waiting for it, and stored — the answer is a property of
     # the sentence and does not change with time the way freshness does.
@@ -98,6 +105,8 @@ def _record(text, frame, key=None):
             "frame_age_s": round(getattr(frame, "age_s", 0.0) or 0.0, 2),
             "origin": getattr(frame, "origin", None),
             "session_key": str(key) if key else None,
+            "truncated": bool(meta.get("truncated")),
+            "stripped": list(meta.get("stripped") or []),
         }
     faults = persona.lint(text)
     return {
@@ -118,6 +127,8 @@ def _record(text, frame, key=None):
         # question, and they are not. See serve_to() and look().
         "origin": getattr(frame, "origin", None),
         "session_key": str(key) if key else None,
+        "truncated": bool(meta.get("truncated")),
+        "stripped": list(meta.get("stripped") or []),
     }
 
 
@@ -211,7 +222,7 @@ def _tick(key, state):
         # examples: vision refuses those outright. Nothing is recorded, so
         # look() finds nothing and the honest path answers instead.
         return False
-    rec = _record(text, frame, key)
+    rec = _record(text, frame, key, vision.last_reading_meta())
     with _lock:
         state["record"] = rec
         state["n"] += 1
@@ -382,6 +393,23 @@ def reading(session_key: str, rec: dict = None) -> dict:
     out["speakable"] = bool(rec.get("speakable"))
     # The observer's own threshold, shipped rather than guessed at by a card.
     out["fresh_s"] = float(getattr(config, "OBSERVER_FRESH_S", 2.0))
+    # WHAT WAS WRONG WITH THIS READING THAT ITS WORDS DO NOT SHOW.
+    #
+    # Truncation is marked on the FIELD the cut landed in -- the last one with
+    # any text -- because that is the row a driver has to distrust, and a card
+    # that only said "truncated" somewhere near the top would leave them
+    # reading a fragment as a finding. A reading cut just after "RISK:" is the
+    # dangerous case: it looks like a completed all-clear.
+    out["truncated"] = bool(rec.get("truncated"))
+    out["stripped"] = list(rec.get("stripped") or [])
+    if out["truncated"]:
+        present = [f for f in out["fields"] if f.get("present")]
+        if present:
+            present[-1]["truncated"] = True
+        else:
+            # Cut before any field was finished -- there is nothing to mark, so
+            # the whole reading carries it.
+            out["parsed"] = out["parsed"] and False
     # THE DETECTOR, WHICH WINS ON EXISTENCE. Keyed by the visual key, which is
     # the key this reading is filed under too -- see headway/census.py.
     try:
@@ -504,7 +532,7 @@ def observe_now(session_key: str, max_age_s: float = None) -> dict:
         return {}
     if not text:
         return {}
-    rec = _record(text, frame, key)
+    rec = _record(text, frame, key, vision.last_reading_meta())
     with _lock:
         st["record"] = rec
         st["n"] += 1
