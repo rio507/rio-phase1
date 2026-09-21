@@ -2490,6 +2490,7 @@ def look(question: str, session_key: str = "default",
                         base["detector"] = _reading.get("detector")
                         base["truncated"] = bool(_reading.get("truncated"))
                         base["stripped"] = _reading.get("stripped") or []
+                        base["source"] = _reading.get("source")
                         contested_rule = _rc.rule_for({
                             "contested": base["contested"],
                             "detector": base["detector"]})

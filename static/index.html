@@ -3365,6 +3365,12 @@ async function startLiveFrames() {
     if (liveFrames.timer) liveFrames.timer = setTimeout(tick, LIVE_FRAME_MS);
   };
   liveFrames.timer = setTimeout(tick, 0);
+  /* AND THE REST OF THE PAGE FINDS OUT. This loop used to be the only thing
+     that knew a camera had opened: it fed the ring at 2 fps and the sensor
+     reading, the Perception card and the headway HUD all stayed dark, because
+     every one of them was waiting on Start Drive. The feed is the event; the
+     drive is not. */
+  try { if (RIO.capture) RIO.capture.sync('live_frames_start'); } catch (e) {}
   return true;
 }
 
@@ -3373,6 +3379,9 @@ function stopLiveFrames() {
   // The card stops claiming a feed that has stopped. A drive underneath keeps
   // its own, and its next frame relabels this within half a second.
   if (!RIO.driving) { try { RIO.ui.feedLabel(null); } catch (e) {} }
+  // The picture is going away, so the loops that were capturing it stop --
+  // unless a drive underneath still has one, which syncCapture decides.
+  try { if (RIO.capture) RIO.capture.sync('live_frames_stop'); } catch (e) {}
   /* Drops this loop's HANDLE on the feed. Not "releases the camera": the
      camera goes when the last holder lets go, which is a decision RIO.source
      makes because it is the only thing that can see every holder. The
@@ -4310,8 +4319,63 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function say(msg) { status.textContent = msg; }
 
+  /* WHAT MAKES FRAMES FLOW, AND IT IS NO LONGER "A DRIVE IS RUNNING".
+   *
+   * Every loop in this block used to begin `if (!RIO.driving) return`, and
+   * that one line was doing two unrelated jobs. One of them is real: a drive
+   * OWNS the camera it opened, and a second loop feeding the same ring would
+   * be two uploads of one road. The other was an accident: `RIO.driving` is
+   * `sessionId !== null` -- it means A SESSION IS BEING LOGGED -- and using it
+   * as the switch made logging the precondition for seeing.
+   *
+   * What that cost is on the record. On 2026-09-21 a clip played, boxes were
+   * drawn, the detector tracked three cars and the observer read the road
+   * every second, while the card said FRAMES 0 / SESSION — / Standby and the
+   * perception loop never ran once. Nothing was broken. Nobody had pressed
+   * Start Drive, and half the page had been wired to that button.
+   *
+   * So the question these loops ask is now the one they actually meant: IS
+   * THERE A PICTURE, AND IS IT MINE TO CAPTURE.
+   *
+   *   no source adopted          -> nothing to capture, and never was
+   *   a clip, no drive           -> rio_frames' own clip runner owns it
+   *                                 (autoStart/runVideo) and the clip watcher
+   *                                 owns /perceive. Two runners on one clip is
+   *                                 the double-upload this used to prevent.
+   *   a clip, drive running      -> the drive owns it, at the drive's cadence
+   *   a camera that is OPEN      -> ours, drive or no drive. A camera is open
+   *                                 because a drive opened it or because a
+   *                                 live conversation did; if neither has,
+   *                                 there is no camera to capture from and
+   *                                 this would be posting black frames.
+   *
+   * `RIO.driving` still appears below, and every remaining use is one of the
+   * two things it is now allowed to mean: a mark or a heartbeat that needs a
+   * session id to be written against, or the drive's ownership of its camera.
+   */
+  function feedingFrom() {
+    try {
+      if (!RIO.source || RIO.source.kind() === 'none') return null;
+      if (RIO.source.isClip() && !RIO.driving) return null;
+      if (!RIO.driving && !liveFrames.timer) return null;
+      return feedEl() || null;
+    } catch (e) { return null; }
+  }
+
+  /* The status line, which used to open with "Drive active" whatever was
+     happening. A conversation feeding a camera with no drive is a real state
+     and saying "Drive active" about it is how a driver learns not to trust
+     this line. */
+  function feedWord() {
+    return RIO.driving ? 'Drive active' : 'Live feed';
+  }
+  function sessionWord() {
+    return RIO.driving ? ' - session ' + RIO.sessionId.slice(0, 8)
+                       : ' - not logged (no drive)';
+  }
+
   async function captureOnce() {
-    if (inflight || !RIO.driving) return;
+    if (inflight || !feedingFrom()) return;
     inflight = true;
     try {
       const el = feedEl();
@@ -4329,8 +4393,9 @@ document.addEventListener('DOMContentLoaded', () => {
       frames++;
       RIO.ui.observation(j.observation);
       RIO.ui.frameSent(frames);
-      RIO.ui.feedLabel('drive · ' + (RIO.source.kind() || 'feed'));
-      say('Drive active - ' + frames + ' frames - session ' + RIO.sessionId.slice(0, 8));
+      RIO.ui.feedLabel((RIO.driving ? 'drive · ' : 'live · ')
+                       + (RIO.source.kind() || 'feed'));
+      say(feedWord() + ' - ' + frames + ' frames' + sessionWord());
     } catch (e) {
       // Never let one bad frame kill the drive loop.
       say('Drive active - last capture failed (' + (e.name || e) + ')');
@@ -4341,9 +4406,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Chained timeout, not setInterval: a slow /observe must not let calls stack up.
   function schedule() {
+    if (timer) return;                 // one loop, however many callers ask
     timer = setTimeout(async () => {
+      timer = null;
       await captureOnce();
-      if (RIO.driving) schedule();
+      // Re-asked every tick rather than latched at start: a clip loaded
+      // mid-conversation, a camera released, a drive ending under a live
+      // session -- all of those change the answer, and none of them used to
+      // reach this loop except by ending it.
+      if (feedingFrom()) schedule(); else stopCapture('no_feed');
     }, perceiveInterval());
   }
 
@@ -4398,6 +4469,52 @@ document.addEventListener('DOMContentLoaded', () => {
      runs when rio_frames.js is absent, when a proxy strips the upgrade, or
      when the socket has failed three times and this page has stopped asking.
      A drive at 4 fps is a working drive; a drive with no picture is not. */
+  /* START AND STOP THE CAPTURE LOOPS FROM THE SITUATION, NOT FROM A BUTTON.
+   *
+   * Called wherever the answer to feedingFrom() can change: a drive starting
+   * or ending, a live conversation opening or closing its feed, the headway
+   * toggle, a source being adopted or released. Idempotent in both directions,
+   * so every one of those callers can simply say "look again" rather than
+   * knowing what the others have done.
+   *
+   * This is what replaces `schedule(); startHeadway();` sitting at the bottom
+   * of startDrive(): capture belongs to the picture, and the drive is one of
+   * several things that can produce one. */
+  function syncCapture(why) {
+    if (feedingFrom()) startCapture(why);
+    else stopCapture(why);
+  }
+  RIO.capture = {
+    sync: syncCapture,
+    get running() { return !!(timer || hwTimer); },
+    get feeding() { return !!feedingFrom(); },
+  };
+
+  function startCapture(why) {
+    if (!feedingFrom()) return;
+    schedule();                        // the sensor reading; no-op if running
+    if (!hwTimer) startHeadway();      // the detector; no-op if running
+  }
+
+  /* -> the frame transport's closing stats, or null. Returned rather than
+     discarded because endDrive writes them into the drive's own log, and
+     stopStream() answers only the first caller -- two calls would leave that
+     mark empty. */
+  function stopCapture(why) {
+    if (timer) { clearTimeout(timer); timer = null; }
+    // hwTimer is a timeout on the fallback loop and an interval on the socket
+    // path. Browsers share one id space, but saying so out loud is cheaper
+    // than the day somebody splits them.
+    if (hwTimer) { clearTimeout(hwTimer); clearInterval(hwTimer); hwTimer = null; }
+    // The socket belongs to the loop, not to the drive. Stopped here rather
+    // than only in endDrive(), because capture can now end without a drive
+    // ending -- a conversation closing its feed is the ordinary case.
+    try {
+      return (RIO.headway && RIO.headway.stopStream)
+        ? RIO.headway.stopStream() : null;
+    } catch (e) { return null; }
+  }
+
   function startHeadway() {
     if (!headwayOn()) return;
     const stream = RIO.headway.startStream(feedEl, staleStop);
@@ -4405,14 +4522,14 @@ document.addEventListener('DOMContentLoaded', () => {
       // The panel's own counter still counts what came BACK, and now reads it
       // off the transport rather than off a loop it no longer owns.
       hwTimer = setInterval(() => {
-        if (!RIO.driving) return;
+        if (!feedingFrom()) return;
         const st = RIO.headway.streamStats();
         if (!st) return;
         hwFrames = st.results;
         const age = st.frame_age_ms && st.frame_age_ms.p50;
-        say('Drive active - ' + frames + ' perceive / ' + hwFrames + ' headway @ '
+        say(feedWord() + ' - ' + frames + ' perceive / ' + hwFrames + ' headway @ '
             + st.fps + ' fps' + (age === null || age === undefined ? '' : ' - ' + age + ' ms old')
-            + ' - session ' + RIO.sessionId.slice(0, 8));
+            + sessionWord());
       }, 1000);
       return;
     }
@@ -4425,19 +4542,22 @@ document.addEventListener('DOMContentLoaded', () => {
   function scheduleHeadway(delayMs) {
     const cadence = (RIO.headway && RIO.headway.cadenceMs) || 500;
     hwTimer = setTimeout(async () => {
-      if (!RIO.driving) return;
+      const el = feedingFrom();
+      if (!el) { hwTimer = null; return; }
       let spent = 0;
       if (headwayOn()) {
         const t0 = performance.now();
         try {
-          const j = await RIO.headway.captureFromVideo(feedEl());
+          const j = await RIO.headway.captureFromVideo(el);
           // The frame path learns about a dead session sooner than the
-          // heartbeat does, because it runs sixteen times as often.
-          if (j && j.stale) { await staleStop(); return; }
+          // heartbeat does, because it runs sixteen times as often. Only a
+          // DRIVE has a session to go stale: without one there is nothing for
+          // the server to have forgotten.
+          if (j && j.stale && RIO.driving) { await staleStop(); return; }
           if (j && j.ok !== false) {
             hwFrames++;
-            say('Drive active - ' + frames + ' perceive / ' + hwFrames
-                + ' headway - session ' + RIO.sessionId.slice(0, 8));
+            say(feedWord() + ' - ' + frames + ' perceive / ' + hwFrames
+                + ' headway' + sessionWord());
           }
         } catch (e) {
           // A dropped headway frame is survivable (camera not ready, a blip):
@@ -4445,7 +4565,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         spent = performance.now() - t0;
       }
-      if (RIO.driving) scheduleHeadway(Math.max(0, cadence - spent));
+      if (feedingFrom()) scheduleHeadway(Math.max(0, cadence - spent));
+      else hwTimer = null;
     }, delayMs === undefined ? cadence : delayMs);
   }
 
@@ -4632,8 +4753,9 @@ document.addEventListener('DOMContentLoaded', () => {
     mark('DRIVE_SOURCE', { source: startedOn, name: RIO.source.name(),
                            live: RIO.source.liveState ? RIO.source.liveState() : null });
     say('Drive active - session ' + sid.slice(0, 8) + ' - ' + RIO.source.label());
-    schedule();
-    startHeadway();
+    // The loops may already be running -- a live conversation feeding a camera
+    // starts them without any drive. This re-asks rather than restarts.
+    syncCapture('drive_start');
     scheduleHeartbeat();
     /* The DeviceMotion permission is asked for HERE and only here: iOS grants
        it from a user gesture and from nothing else, and this tap is the
@@ -4650,17 +4772,14 @@ document.addEventListener('DOMContentLoaded', () => {
   async function endDrive(opts) {
     opts = opts || {};
     const sid = RIO.sessionId;
-    if (timer) { clearTimeout(timer); timer = null; }
-    // hwTimer is a timeout on the fallback loop and an interval on the socket
-    // path. Browsers share one id space, but saying so out loud is cheaper
-    // than the day somebody splits them.
-    if (hwTimer) { clearTimeout(hwTimer); clearInterval(hwTimer); hwTimer = null; }
-    if (hbTimer) { clearTimeout(hbTimer); hbTimer = null; }
     /* The transport's own account of the drive, into the drive's own log,
        before the session id is cleared. Frame age at p50/p90/p99, how many
        frames were dropped rather than queued, and by whom. This is the number
-       the first real drive could not produce for any of its 1949 frames. */
-    const tstats = RIO.headway ? RIO.headway.stopStream() : null;
+       the first real drive could not produce for any of its 1949 frames.
+       It comes back from stopCapture because that is what now owns the
+       socket -- see the note there. */
+    const tstats = stopCapture('drive_end');
+    if (hbTimer) { clearTimeout(hbTimer); hbTimer = null; }
     if (tstats && sid) {
       try {
         fetch('/session/mark?session_id=' + encodeURIComponent(sid)
@@ -5951,11 +6070,42 @@ document.addEventListener('DOMContentLoaded', () => {
         // nothing on the server could compute it and nothing ever did.
         replayNote('frame_age_ms', performance.now() - tCap);
         nFrames++;
+        /* AND THE COUNTERS UNDER THE PICTURE SAY SO.
+         *
+         * This loop fed the server for the whole of a clip replay and
+         * incremented nothing: Frames read 0, Session read em-dash, Feed read
+         * em-dash and the status line was blank, while boxes were being drawn
+         * over the clip from the frames it was posting. Every one of those
+         * fields is written by the DRIVE loop and by nothing else, which is
+         * the same assumption as `if (!RIO.driving) return` wearing different
+         * clothes: the drive was taken to be the only thing that could feed.
+         *
+         * Session stays em-dash, correctly and deliberately -- a replay is not
+         * logged, there is no session, and claiming one would be worse than
+         * the blank. */
+        try {
+          RIO.ui.frameSent(nFrames);
+          RIO.ui.feedLabel('clip · replay');
+          const st = document.getElementById('drivestatus');
+          if (st && !RIO.driving) {
+            st.textContent = 'Headway run - ' + nFrames
+                           + ' frames - not logged (no drive)';
+          }
+        } catch (e) {}
       } catch (e) { /* one bad frame must not end the run */ }
       const wait = Math.max(0, REPLAY_CADENCE_MS - (performance.now() - t0));
       await new Promise(r => setTimeout(r, wait));
     }
     if (haveScout) { try { scout.pause(); } catch (e) {} }
+    // The card stops claiming a feed that has stopped. A drive underneath
+    // keeps its own and relabels this on its next frame.
+    try {
+      if (!RIO.driving) {
+        RIO.ui.feedLabel(null);
+        const st = document.getElementById('drivestatus');
+        if (st) st.textContent = '';
+      }
+    } catch (e) {}
     const secs = (performance.now() - tStart) / 1000;
     if (nFrames && secs > 0.5) {
       const lag = (RIO.overlay && RIO.overlay.lagStats)
@@ -6093,6 +6243,13 @@ document.addEventListener('DOMContentLoaded', () => {
       enabled = !enabled;
       if (enabled) { unlock(); startWatch(); } else { stopWatch(); }
       apply();
+      /* ITS OWN CONTROL, ACTED ON WHEREVER THERE IS A PICTURE. Switching
+         headway on used to do nothing at all until somebody pressed Start
+         Drive -- the loop it governs began `if (!RIO.driving) return`. Now it
+         starts on whatever source is adopted: the clip runner below for a
+         clip, and the capture loop for a camera a conversation has opened. */
+      try { if (RIO.capture) RIO.capture.sync('headway_toggle'); } catch (e) {}
+      if (enabled) autoStart(); else if (videoRunning) runVideo();
     });
   }
   apply();

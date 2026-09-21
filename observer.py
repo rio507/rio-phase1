@@ -402,6 +402,14 @@ def reading(session_key: str, rec: dict = None) -> dict:
     # dangerous case: it looks like a completed all-clear.
     out["truncated"] = bool(rec.get("truncated"))
     out["stripped"] = list(rec.get("stripped") or [])
+    # WHICH PICTURE THIS IS A READING OF. The record carries the frame's origin
+    # as "<session key>:<kind>" (app._frame_origin); the kind is the half a
+    # driver and RIO both need, because "the camera" and "the clip you loaded"
+    # are different answers to "what are you looking at" and a drive is no
+    # longer what decides which one is feeding. See the source audit in the
+    # capture block of index.html.
+    origin = str(rec.get("origin") or "")
+    out["source"] = origin.rsplit(":", 1)[-1] if ":" in origin else None
     if out["truncated"]:
         present = [f for f in out["fields"] if f.get("present")]
         if present:

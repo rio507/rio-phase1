@@ -432,6 +432,19 @@ def reading_caveats(reading: dict) -> str:
             "either. Do not state or estimate a distance or a speed from it. "
             "A real following distance comes from the car's own tracker, not "
             "from this.")
+    # WHICH PICTURE SHE IS LOOKING THROUGH. A drive is no longer what decides
+    # whether anything is feeding -- a clip replays and a live conversation
+    # opens a camera, both with no drive running -- so "what do you see" can be
+    # answered off either, and answering off a clip as though it were the road
+    # in front of the car is the one way that answer is dishonest.
+    src = reading.get("source")
+    if src == "clip":
+        bits.append(
+            " THIS IS THE UPLOADED CLIP, not the road in front of the car. Say "
+            "so plainly if you describe it -- 'in the clip' -- and never speak "
+            "about it as what is ahead of us right now.")
+    elif src == "camera":
+        bits.append(" This is the live camera: it is the road ahead right now.")
     return "".join(bits)
 
 
