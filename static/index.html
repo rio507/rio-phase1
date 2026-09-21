@@ -1728,6 +1728,20 @@
     margin-top: 3px; font-size: 12px; line-height: 1.45;
     color: var(--warn-text); font-style: italic;
   }
+  /* PROSE, which is what this model produces when it is asked a question
+     rather than handed a template. Not clamped to three lines: the answer is
+     the reading now, and hiding two thirds of it behind a Show all would be
+     the card deciding which sentence mattered. */
+  .teach-col.sensor-col .teach-text.prose {
+    -webkit-line-clamp: unset; overflow: visible;
+  }
+  /* ...and what it is worth. Reads as a caveat rather than a warning: the
+     reading is usually right about the gist, and the card must not train
+     anyone to skip it — only to distrust its specifics. */
+  .teach-unverified {
+    margin-top: 5px; font-size: 11px; line-height: 1.45;
+    color: var(--t4); font-style: italic;
+  }
 
   .teach-name {
     font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;

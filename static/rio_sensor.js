@@ -77,6 +77,15 @@
     var age = reading.age_s;
     var fresh = (typeof reading.fresh_s === 'number') ? reading.fresh_s : 2;
     pair('read', ageText(age), typeof age === 'number' && age > fresh);
+    /* ...and how much of that age is the model rather than the road. A
+       reasoning model takes three or four seconds to answer, so a reading of a
+       picture six seconds old may have been written two seconds ago. Both
+       numbers, because "the road has moved on" and "the eye is slow" are
+       different complaints with different fixes. */
+    if (typeof reading.filed_age_s === 'number'
+        && typeof age === 'number' && age - reading.filed_age_s > 0.5) {
+      pair('model took', (age - reading.filed_age_s).toFixed(1) + ' s');
+    }
     if (reading.frame_id) pair('frame', reading.frame_id);
     /* An instrument's reading is never spoken in her voice. Said on the card
        so nobody reads these words as words RIO would use -- she is given them
@@ -162,17 +171,29 @@
     return row;
   }
 
-  /* A reading the parser could not find any field in. Shown whole rather than
-     rendered as three empty rows -- three "not in this reading" rows would say
-     the model answered badly, and what actually happened is that it answered
-     in a different shape. */
-  function unparsedRow(reading) {
+  /* THE READING, AS PROSE, WHICH IS NOW THE ORDINARY CASE.
+   *
+   * The model is asked a plain question and answers in sentences -- there is
+   * no three-field template any more, because the template is what produced
+   * "sedan ahead, hatchback behind" on a daylight frame and a night frame
+   * alike. This used to be the exception and said so ("not in the three-field
+   * sensor format"); saying that now would be the card complaining that the
+   * model did the right thing.
+   *
+   * WHAT IT DOES SAY is what the reading is worth. Cosmos sees the gist and
+   * invents specifics with complete fluency -- makes, models, lane counts, a
+   * speedometer that is not in the frame. Nothing can separate the two halves
+   * of one sentence, so the card does not pretend to: it marks the whole thing
+   * an impression, which is the same thing RIO is told (rio_prompts.
+   * reading_caveats). */
+  function proseRow(reading) {
     var row = el('div', 'teach-field');
-    row.appendChild(el('div', 'teach-label', 'Reading'));
-    row.appendChild(el('div', 'teach-text', reading.extra || reading.raw || ''));
-    var hint = el('div', 'teach-hint',
-                  'not in the three-field sensor format — shown as written');
-    row.appendChild(hint);
+    row.appendChild(el('div', 'teach-label', 'What the camera model says'));
+    row.appendChild(el('div', 'teach-text prose', reading.extra || reading.raw || ''));
+    row.appendChild(el('div', 'teach-unverified',
+                       'Unverified impression \u2014 right about the gist, '
+                       + 'confident about specifics it cannot see. Ranges and '
+                       + 'road users come from the tracker, not from this.'));
     return row;
   }
 
@@ -252,7 +273,7 @@
           s.col.appendChild(ex);
         }
       } else {
-        s.col.appendChild(unparsedRow(reading));
+        s.col.appendChild(proseRow(reading));
       }
       /* NUMBERS THE MODEL INVENTED AND THE READING NO LONGER CARRIES.
          Said on the card rather than silently dropped: a driver comparing the
@@ -270,7 +291,10 @@
                     + 'tracker.');
         s.col.appendChild(st);
       }
-      s.col.appendChild(rawRow(reading));
+      // "As given to RIO" is only worth its space when the rows above are a
+      // RENDERING of the reading. When the reading is prose, the row above IS
+      // the reading and repeating it verbatim underneath says nothing.
+      if (reading.parsed) s.col.appendChild(rawRow(reading));
       paint(s.cols);
     },
     busy: function () { note('Looking…', lastName); },

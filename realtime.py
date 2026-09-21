@@ -2302,6 +2302,55 @@ def teacher_context(teachers: dict, question: str) -> dict:
     return out
 
 
+# How old the camera model's impression may be and still be worth handing over
+# as context beside a fresh answer. Generous, because it is not the answer and
+# is labelled with its age -- and bounded, because a minute-old impression of a
+# road the car has left is not context, it is noise.
+SIDE_READING_MAX_AGE_S = 20.0
+
+
+def _side_reading(session_key: str) -> dict:
+    """The resident eye's latest reading, for a turn it did not answer. -> {}|dict"""
+    try:
+        import observer
+        rec = observer.cached(session_key)
+        if not rec or not observer.serve_to(rec, session_key):
+            return {}
+        r = observer.reading(session_key, rec)
+        if not r or not r.get("raw"):
+            return {}
+        if (r.get("age_s") or 1e9) > SIDE_READING_MAX_AGE_S:
+            return {}
+        return {"camera_model_impression": {
+            "text": r["raw"], "model": r.get("model"),
+            "seconds_ago": r.get("age_s"), "verified": False}}
+    except Exception:
+        return {}
+
+
+def _side_reading_rule(session_key: str) -> str:
+    """The sentence that goes with it, or "" when there is nothing to say."""
+    block = _side_reading(session_key)
+    if not block:
+        return ""
+    try:
+        import rio_prompts as _rp
+        import observer
+        caveats = _rp.reading_caveats(
+            observer.reading(session_key) or {"truncated": False,
+                                              "stripped": [], "fields": []})
+    except Exception:
+        caveats = ""
+    age = block["camera_model_impression"].get("seconds_ago")
+    return ("`camera_model_impression` is what the car's own camera model said "
+            f"about the road about {age:.0f} seconds ago. IT IS NOT THIS "
+            "ANSWER and it is older than the picture you were just shown — the "
+            "answer above came from looking at the road now. Use it only if it "
+            "adds something the picture did not, and never let it override what "
+            "you can see."
+            + caveats + "\n")
+
+
 def look(question: str, session_key: str = "default",
          spoken: str = None, teachers: dict = None) -> dict:
     """RIO's eyes: the existing visual pipeline, called from a live session.
@@ -2609,6 +2658,18 @@ def look(question: str, session_key: str = "default",
         "frame_wall_t": meta.get("frame_wall_t"),
         "frame_id": meta.get("frame_id"),
         "meta": meta or None,
+        # THE CAMERA MODEL'S OWN IMPRESSION, RIDING ALONG, labelled and aged.
+        #
+        # The resident eye is a reasoning model now and it produces a reading
+        # about once every ten seconds, so the fast path above almost never
+        # hits and this path answers nearly every scene question. Without this
+        # block RIO would never see what the camera-side model said at all --
+        # the card would show it and she would not, which is exactly the split
+        # the card exists to close.
+        #
+        # It is CONTEXT, not the answer: the answer above came from a real look
+        # at a current frame. See the rule that goes with it.
+        **_side_reading(session_key),
         "rules": (
             "FIRST ANSWER, AND IT IS SHORT: one or two sentences, in your own "
             "words, from what is here and nothing else. Do not research this "
@@ -2619,6 +2680,7 @@ def look(question: str, session_key: str = "default",
             "short clause offering it: 'want to know more about it?'. Not every "
             "time, and not for ordinary traffic or an empty road, where there "
             "is nothing to offer and asking is noise.\n"
+            + _side_reading_rule(session_key) +
             "`seen_s_ago` is how old the picture you are describing is. Under "
             "two seconds, say it plainly. Older than that, say WHEN — 'a few "
             "seconds ago there was...' — because at speed a road changes and a "

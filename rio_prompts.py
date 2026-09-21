@@ -557,6 +557,33 @@ def reading_caveats(reading: dict) -> str:
     # opens a camera, both with no drive running -- so "what do you see" can be
     # answered off either, and answering off a clip as though it were the road
     # in front of the car is the one way that answer is dishonest.
+    # EVERYTHING THIS MODEL SAYS IS UNVERIFIED, and it is labelled as such
+    # rather than trusted field by field.
+    #
+    # Asked plainly, Cosmos-Reason2 sees: three daylight frames get three
+    # different descriptions, a dark frame is called night, a blank frame is
+    # called blank. It also confabulates specifics with total fluency -- "the
+    # speedometer shows 60 miles per hour" on a frame with no speedometer in
+    # it, "a black Lexus sedan... a white Toyota Corolla... a white Volkswagen
+    # Beetle" at a distance where no badge is resolvable, lane counts of seven
+    # and thirteen on a four-lane road.
+    #
+    # No guard can separate the true half from the invented half of one
+    # sentence, and a guard that claimed to would be the most dangerous thing
+    # on this card. So the whole reading is handed over as an impression, the
+    # detector is named as the thing that actually knows, and she is told not
+    # to state any of it as fact.
+    bits.append(
+        " THIS IS AN UNVERIFIED IMPRESSION FROM A CAMERA MODEL, not a "
+        "measurement and not a fact. It is often right about the gist -- the "
+        "kind of road, the light, whether there is traffic -- and it invents "
+        "specifics with complete confidence: vehicle makes and models, lane "
+        "counts, instrument readings it cannot see. Use it for the GIST only. "
+        "Do not repeat any specific detail from it as though it were "
+        "established: no makes, no models, no counts, no numbers. If the "
+        "driver asks about a particular thing, say you are not sure from the "
+        "camera and use the tool again to look properly. What the car actually "
+        "KNOWS about other road users comes from its tracker, not from this.")
     src = reading.get("source")
     if src == "clip":
         bits.append(

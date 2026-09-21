@@ -32,10 +32,40 @@ second, differently-wrong one.
 
 WHY IT IS NOT ALWAYS RUNNING
 ----------------------------
-It costs ~0.4 s of the same GPU the 4 fps headway loop is using, which is real
-money on a card that is also running detection, depth and lanes on every frame.
-So it runs only while a live conversation is open, only while frames are
-actually arriving, and it stops itself when neither is true.
+It costs the same GPU the headway loop is using, which is real money on a card
+that is also running detection, depth and lanes on every frame. So it runs only
+while a live conversation is open, only while frames are actually arriving, and
+it stops itself when neither is true.
+
+AND IT IS NO LONGER A 1 Hz LOOP. READ THIS BEFORE TRUSTING ANYTHING ABOVE.
+--------------------------------------------------------------------------
+Everything above was written when the eye was Qwen answering a three-field
+template in ~0.4 s. The eye is now Cosmos-Reason2 asked the way its own model
+card says to ask a reasoning model -- a question, a <think> trace, 512 tokens
+-- and that is a different instrument.
+
+MEASURED on this pod, with the detector feeding at ~15 fps on the same card:
+
+    one reading per ~10 seconds.
+
+Not 1 Hz. A reading is typically 5 s old when a question arrives and can be 10
+or more, which is past OBSERVER_ANSWER_MAX_AGE_S, so THE FAST PATH USUALLY
+MISSES AND THE FULL VISUAL PATH ANSWERS. That is not a regression to be tuned
+away by widening the window: a fifteen-second-old description served at 13 m/s
+is a description of a road two hundred metres back, and the full path takes
+about two seconds and looks at the road NOW.
+
+So what this module is for has changed, and the honest statement of it is:
+
+    the CARD is the consumer. It repaints every 15 s and a 10 s cadence
+    feeds it perfectly well.
+
+    RIO gets the reading when it happens to be recent, as labelled and
+    timestamped evidence, and otherwise asks properly. Which is the right
+    trade: on the measurement that produced this note, the cached reading
+    invented "a white sedan accelerating rapidly toward another vehicle
+    ahead" and the full path, on the same frame, said "three lanes ahead,
+    empty mostly, white sedan cruising in the right lane".
 """
 import contextlib
 import threading
@@ -386,7 +416,24 @@ def reading(session_key: str, rec: dict = None) -> dict:
         return {}
     out = _rp.split_sensor_reading(rec["text"])
     out["model"] = rec.get("model") or config.local_vision_label()
-    out["age_s"] = rec.get("age_s")
+    # HOW OLD THE PICTURE IS, not how long ago the model stopped typing.
+    #
+    # cached() ages a record from `at`, the moment the reading was FILED. With
+    # a reasoning model that is three to four seconds after the frame was
+    # taken, so the card was under-reporting the age of what it was showing by
+    # the whole length of the generate -- and recent(), which gates whether RIO
+    # may be told at all, measures from the frame. Two different ages for one
+    # reading, and the smaller one on the glass.
+    #
+    # A driver reading "2 s ago" wants to know when the PICTURE was, which is
+    # the only question the number can usefully answer.
+    _frame_t = rec.get("frame_wall_t") or rec.get("at")
+    out["age_s"] = (round(time.time() - float(_frame_t), 2)
+                    if _frame_t else rec.get("age_s"))
+    # ...and the filing age beside it, because "the model took four seconds"
+    # and "the picture is four seconds old" are different facts and a slow
+    # model is a thing somebody will want to see.
+    out["filed_age_s"] = rec.get("age_s")
     out["frame_id"] = rec.get("frame_id")
     out["frame_age_s"] = rec.get("frame_age_s")
     # An instrument's reading is never spoken as hers. See _record above.

@@ -67,6 +67,58 @@ def _sensor_prompt():
     return SENSOR_PROMPT_TERSE
 
 
+# ---------------------------------------------------------------------------
+# ASKED THE WAY ITS OWN MODEL CARD SAYS TO ASK IT
+# ---------------------------------------------------------------------------
+# Cosmos-Reason2 is a REASONING model. NVIDIA's card is explicit about how to
+# use one: a system prompt, a plain question, and an instruction to think
+# inside <think>...</think> before answering. Its own worked example is
+#
+#     system: "You are a helpful assistant."
+#     user:   "Is it safe to turn right? Answer the question using the
+#              following format:\n\n<think>\nYour reasoning.\n</think>\n\n
+#              Write your final answer immediately after the </think> tag."
+#
+# with temperature 0.6, top_p 0.98 and 256 tokens.
+#
+# THIS REPO WAS DOING ALMOST NONE OF THAT. No system prompt. A three-field
+# template instead of a question. 48 tokens -- a fifth of NVIDIA's budget, for
+# a model whose whole design is to reason before answering. Greedy decoding.
+# And then the reasoning was stripped and an unterminated trace refused.
+#
+# A chain-of-thought model given no room to think does not think; it pattern-
+# matches. That is what the drive of 2026-09-21 got: "sedan ahead, hatchback
+# behind" on a daylight frame and on a night frame, byte-identical, and a
+# near-copy of the prompt's own worked example on every frame of a clip that
+# had none of it in view.
+#
+# Asked NVIDIA's way on clean frames, the same weights produce, unprompted:
+#
+#     day   "The highway curves gently to the left... a lush green area with
+#            trees, contrasting with the dry, brown grassy hill on the right"
+#     dark  "a lonely, dimly lit nighttime drive on a two-laned road"
+#     blank "entirely black with no discernible features"
+#
+# -- three different answers for three different pictures, which is the whole
+# of what a sensor has to do and is the one thing the template never did.
+#
+# THERE IS NO TEMPLATE HERE AND THERE MUST NOT BE ONE. Everything downstream
+# adapts to what the model says: the card renders prose, RIO is handed prose.
+# The three-field format was convenient for parsing and it cost the readings.
+COSMOS_SYSTEM = "You are a helpful assistant."
+
+# Verbatim from the model card, including the line breaks.
+COSMOS_FORMAT = ("Answer the question using the following format:\n\n<think>\n"
+                 "Your reasoning.\n</think>\n\nWrite your final answer "
+                 "immediately after the </think> tag.")
+
+# A QUESTION, NOT A SPECIFICATION. It says what is wanted and nothing about the
+# shape of the answer -- no fields, no example, no vocabulary to borrow.
+COSMOS_QUESTION = str(getattr(
+    config, "LOCAL_VISION_QUESTION",
+    "What do you see on the road ahead?")).strip()
+
+
 TEACHER_PROMPT = (OBSERVER_PROMPT if config.local_vision_speaks_directly()
                   else _sensor_prompt())
 
@@ -247,7 +299,17 @@ def _generate_kwargs() -> dict:
     think = int(getattr(config, "LOCAL_VISION_THINK_BUDGET", 0) or 0)
     if think > 0 and not config.local_vision_speaks_directly():
         budget = max(budget, think)
-    kw = {"max_new_tokens": budget, "do_sample": False}
+    # SAMPLED, THE WAY THE CARD SAYS, for the reasoning model. NVIDIA's own
+    # example runs Cosmos-Reason2 at temperature 0.6 / top_p 0.98, and greedy
+    # decoding of a chain-of-thought model is a different thing from what was
+    # measured on the model card. The observer model (Qwen) stays greedy: it
+    # was measured greedy and it is not a reasoner.
+    if config.local_vision_speaks_directly():
+        kw = {"max_new_tokens": budget, "do_sample": False}
+    else:
+        kw = {"max_new_tokens": budget, "do_sample": True,
+              "temperature": float(config.TEACHER_TEMPERATURE),
+              "top_p": float(config.TEACHER_TOP_P)}
     cache = str(getattr(config, "LOCAL_VISION_CACHE", "") or "").strip()
     if cache and cache != "dynamic":
         # 25.8 -> 8.1 ms/token, which is 97% of a reading. The whole fix.
@@ -322,6 +384,9 @@ _flags = {
     # frame cannot show a speed; a distance needs geometry. See
     # rio_prompts.strip_measurements.
     "invented_units": 0,
+    # the answer carried no observation: a bare "yes", a "no", a fragment too
+    # short to describe anything. See _says_nothing.
+    "says_nothing": 0,
     # the reading handed the prompt's own wording back as an answer
     # (rio_prompts.echoes_prompt). A smaller relative of prompt_example: not
     # the whole example, a phrase out of the instructions used as a value.
@@ -390,6 +455,41 @@ def _reading_truncated(out, inputs, gen_kw) -> bool:
         return False
 
 
+# A BARE "YES" IS NOT AN OBSERVATION.
+#
+# Asked an open question, a reasoning model sometimes invents a closed one and
+# answers that instead. Its trace says so out loud -- "The user is asking if
+# the black sedan is in front of the white sedan" -- and what comes out after
+# </think> is "yes". Three of thirteen readings on the clean corpus were a
+# bare yes or no.
+#
+# Refused, because it carries nothing: no road, no light, no road users. An
+# empty string is what every caller already handles and means "no observation",
+# and the honest slow path picks it up. This is NOT a format rule -- the model
+# may answer in any shape it likes and usually answers in prose. It is a
+# content rule, the same kind as the loop and catalogue guards: a reading has
+# to say something about the picture.
+#
+# A leading yes or no in front of a real answer is fine and common -- "No,
+# there is nothing visible in the image" is a perfectly good reading of a blank
+# frame -- so the test is what is left AFTER the affirmation, not whether there
+# is one.
+_LEADING_YESNO = re.compile(
+    r"^\s*(?:yes|no|yeah|nope|maybe|correct|incorrect|true|false)\b[\s,.:;!-]*",
+    re.IGNORECASE)
+
+# Words of actual content a reading must carry. Four is enough to say "a
+# two-lane road, clear" and far below anything that describes a scene.
+MIN_READING_WORDS = 4
+
+
+def _says_nothing(text: str) -> bool:
+    """Is this answer empty of observation? -> bool."""
+    t = _LEADING_YESNO.sub("", (text or "").strip())
+    t = re.sub(r"[^\w\s]", " ", t)
+    return len(t.split()) < MIN_READING_WORDS
+
+
 def reading_refused(text, repeats: int = 0):
     """Is this reading a recitation or a decoding loop? -> the verdict, or None.
 
@@ -456,6 +556,45 @@ def last_lock_wait_ms() -> float:
     return _last_lock_wait_ms
 
 
+def prompt_in_use() -> str:
+    """Every word this model was given for a reading, as one string.
+
+    The echo guard compares a reading against its own instructions, so it has
+    to be the instructions that were sent -- which under a sensor model is the
+    system prompt, the question and the card's format line, and under an
+    observer model is TEACHER_PROMPT.
+    """
+    if config.local_vision_speaks_directly():
+        return TEACHER_PROMPT
+    return COSMOS_SYSTEM + "\n" + COSMOS_QUESTION + "\n" + COSMOS_FORMAT
+
+
+def _messages(pil):
+    """The chat this model is actually given. -> the messages list.
+
+    ONE BUILDER, so observe() and warm() cannot drift apart -- the static cache
+    pays its compile on the first call at a given shape and a warm that built a
+    different chat would move that cost onto a drive's first frame.
+
+    Under a SENSOR model this is NVIDIA's own shape: a system prompt, a plain
+    question, and the card's <think> format instruction. Under an observer
+    model (Qwen, speaking in her voice) it is the prompt that was written for
+    it, unchanged -- that model is not a reasoner and has no trace to ask for.
+    """
+    if config.local_vision_speaks_directly():
+        return [{"role": "user", "content": [
+            {"type": "image", "image": pil},
+            {"type": "text", "text": TEACHER_PROMPT},
+        ]}]
+    return [
+        {"role": "system", "content": [{"type": "text", "text": COSMOS_SYSTEM}]},
+        {"role": "user", "content": [
+            {"type": "image", "image": pil},
+            {"type": "text", "text": COSMOS_QUESTION + "\n\n" + COSMOS_FORMAT},
+        ]},
+    ]
+
+
 def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
     """Run VLM on a new frame, cache + return the observation."""
     global _last_observation, _last_observed_at, _last_observed_frame, _last_lock_wait_ms
@@ -494,10 +633,7 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
                       f"({_flags['blank_frame']} so far)", flush=True)
             clear_holder()
             return ""
-        msgs = [{"role": "user", "content": [
-            {"type": "image", "image": pil},
-            {"type": "text", "text": TEACHER_PROMPT},
-        ]}]
+        msgs = _messages(pil)
         inputs = _processor.apply_chat_template(
             msgs, add_generation_prompt=True, tokenize=True,
             return_dict=True, return_tensors="pt",
@@ -542,7 +678,20 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         # produced for a hundred and fifty readings: "vehicles that matter" in
         # the TRAFFIC field, once as `vehicles_that_matter_and_where`. Derived
         # from whichever prompt is in use, so it cannot fall behind a rewrite.
-        _echo = echoes_prompt(text, TEACHER_PROMPT)
+        # Against what was ACTUALLY SENT. TEACHER_PROMPT is the observer
+        # model's prompt and is not what a sensor model is given any more --
+        # comparing against it would be checking for echoes of words the model
+        # never saw, which is a guard that cannot fire.
+        # A bare yes/no answers a question nobody asked. See _says_nothing.
+        if _says_nothing(text):
+            _flags["says_nothing"] += 1
+            if _flags["says_nothing"] in (1, 10, 100):
+                print(f"[vision] reading refused -- it says nothing about the "
+                      f"picture ({text[:40]!r}, {_flags['says_nothing']} so far)",
+                      flush=True)
+            clear_holder()
+            return ""
+        _echo = echoes_prompt(text, prompt_in_use())
         if _echo:
             _flags["prompt_echo"] += 1
             if _flags["prompt_echo"] in (1, 10, 100):
@@ -652,10 +801,7 @@ def warm() -> None:
         # it were the road ahead.
         try:
             pil = Image.new("RGB", (64, 64), (0, 0, 0))
-            msgs = [{"role": "user", "content": [
-                {"type": "image", "image": pil},
-                {"type": "text", "text": TEACHER_PROMPT},
-            ]}]
+            msgs = _messages(pil)
             inputs = _processor.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=True,
                 return_dict=True, return_tensors="pt",

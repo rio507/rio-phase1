@@ -239,8 +239,29 @@ def main() -> int:
     fresh("cosmos")
     import vision as vis2
     kw = vis2._generate_kwargs()
-    ok("the reading is capped at the measured budget, not at a trace's",
-       kw["max_new_tokens"] == 48, str(kw["max_new_tokens"]))
+    # 48 WAS A FIFTH OF WHAT A REASONING MODEL NEEDS TO ANSWER AT ALL, and
+    # this check spent a month asserting it. Measured on 13 clean frames: at
+    # 256 the model closed its trace and answered 3 times out of 13, at 512 it
+    # answered 13 out of 13. See config.LOCAL_VISION_MAX_TOKENS.
+    ok("the reading is capped where the model can actually finish",
+       kw["max_new_tokens"] >= 512, str(kw["max_new_tokens"]))
+    ok("...and a reasoning model is SAMPLED, the way its card says",
+       kw.get("do_sample") is True and kw.get("temperature") == cfg.TEACHER_TEMPERATURE
+       and kw.get("top_p") == cfg.TEACHER_TOP_P,
+       f"do_sample={kw.get('do_sample')} temp={kw.get('temperature')} "
+       f"top_p={kw.get('top_p')}")
+    ok("...it is given a system prompt, which it never used to be",
+       "COSMOS_SYSTEM" in (REPO / "vision.py").read_text())
+    ok("...and a QUESTION rather than a template",
+       "ROAD:" not in vis2.prompt_in_use() and "|" not in vis2.prompt_in_use(),
+       repr(vis2.prompt_in_use()[:60]))
+    ok("...with the model card's own think/answer instruction",
+       "<think>" in vis2.COSMOS_FORMAT and "</think>" in vis2.COSMOS_FORMAT)
+    ok("a bare yes/no answers a question nobody asked and is refused",
+       vis2._says_nothing("Yes") and vis2._says_nothing("no"))
+    ok("...while a yes in front of a real answer is kept",
+       not vis2._says_nothing("No, there is nothing visible in the image"))
+    ok("...and it is counted", "says_nothing" in vis2.flag_rate())
     ok("...with the repetition penalty that removed the decoding loop",
        kw.get("repetition_penalty") == 1.05, str(kw.get("repetition_penalty")))
     ok("...and NOT the compiled static cache, which broke the live observer",

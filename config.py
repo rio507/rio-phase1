@@ -2271,7 +2271,46 @@ def local_vision_speaks_directly() -> bool:
 # 96 is sized on the answer: three fields, 50 output tokens at p50, and 1 of 20
 # frames truncated at 96 against 4 of 20 at 64. Below ~64 the RISK field starts
 # being cut off, which is the one field the narrowed job is about.
-LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "48"))
+# 48 WAS A FIFTH OF WHAT THIS MODEL NEEDS TO ANSWER AT ALL.
+#
+# Cosmos-Reason2 is a reasoning model: NVIDIA's card says to ask it to think
+# inside <think>...</think> and gives 256 tokens in its own example. This ran
+# it at 48, greedy, with no system prompt, and then refused any reading whose
+# trace had not closed. A chain-of-thought model with no room to think does not
+# think -- it pattern-matches, which is what the drive of 2026-09-21 got.
+#
+# MEASURED on 13 clean frames (tools/reading_discriminates.py), asked "What do
+# you see?" NVIDIA's way:
+#
+#     cap   closed its trace and answered   latency p50
+#     256            3 / 13                   2293 ms
+#     512           13 / 13                   3184 ms
+#
+# 512 buys the answer. It costs about a second, and most readings finish well
+# inside it -- the median generation is ~276 tokens, so the cap is a ceiling
+# rather than a target.
+LOCAL_VISION_MAX_TOKENS = int(os.getenv("LOCAL_VISION_MAX_TOKENS", "512"))
+
+# THE QUESTION, AND IT IS THE PLAINEST ONE ON PURPOSE.
+#
+# Three were put through the picture-changes gate on the same 13 clean frames.
+# The gate is the only criterion: does the answer move with the frame.
+#
+#     "What do you see?"                               13/13 answered  PASSED
+#     "What do you see on the road ahead?"              8/13 answered  passed
+#     "Describe the road ahead and any other road       10/13 answered  FAILED
+#      users."
+#
+# The last one FAILED on a blank frame, which it described as "a straight,
+# black asphalt road stretching into the distance, flanked by green grass
+# verges". A LEADING QUESTION MAKES A SENSOR LIE: ask about the road ahead and
+# it will find you a road ahead. The plainest question is the one that lets the
+# model say there is nothing there -- on the blank frame it answered "No, there
+# is nothing visible in the image", and on random noise, "no".
+#
+# Not a template and not a specification. It says what is wanted and nothing
+# about the shape of the answer: no fields, no example, no vocabulary to copy.
+LOCAL_VISION_QUESTION = os.getenv("LOCAL_VISION_QUESTION", "What do you see?")
 
 # WHICH SENSOR PROMPT, and this is the lever that actually made the cadence.
 #
@@ -3358,9 +3397,18 @@ RESOLVE_MAX_SIDE_PX = int(os.getenv("RESOLVE_MAX_SIDE_PX", "768"))
 # out of a network call.
 OBSERVER_ENABLED = True
 
-# ~1 Hz. Measured cost is ~0.4 s of GPU per observation, on the same card the
-# 4 fps headway loop is using, so this is a real share of it — and the reason
-# the loop runs only while a conversation is open.
+# THE FLOOR ON THE LOOP, WHICH IS NO LONGER THE RATE.
+#
+# This was 1 Hz when the eye was Qwen answering a template in ~0.4 s. The eye
+# is now a reasoning model asked NVIDIA's way at 512 tokens, and the generate
+# is what sets the cadence: MEASURED on this pod, with the detector feeding at
+# ~15 fps on the same card, ONE READING PER ~10 SECONDS.
+#
+# The period is left at 1.0 because it is a floor and not a target -- the loop
+# waits this long between attempts and then waits however long the model takes.
+# Raising it would slow a cold card down for no reason; lowering it would busy-
+# wait on the lock. What the number does NOT mean any more is the rate, and
+# observer.py's header says so at length.
 OBSERVER_PERIOD_S = 1.0
 
 # How old a cached description may be and still be spoken as current. At 60
@@ -3384,8 +3432,22 @@ OBSERVER_FRESH_S = 2.0
 # At 13 m/s five seconds is about sixty metres. Every result carries
 # `seen_s_ago` and the rules tell RIO how old it is, so this is a timestamped
 # answer rather than a stale one.
+#
+# RAISED TO 8 s WHEN THE EYE BECAME A REASONING MODEL, and the arithmetic is
+# the whole justification. Cosmos-Reason2 asked NVIDIA's way takes p50 3.2 s
+# and up to 5.1 s to answer (tools/reading_discriminates.py, 13 clean frames),
+# so a reading is ALREADY three seconds old at the instant it is filed. At 5 s
+# the tail of that distribution fell outside the window and the answer path
+# threw away readings that had only just been written.
+#
+# OBSERVER_FRESH_S is deliberately NOT raised to match. That one means "serve
+# this as though it were now", and a four-second-old description spoken as
+# current at motorway speed is exactly the lie its own note warns about. So the
+# fast path now rarely fires and the answer path serves the reading WITH ITS
+# AGE, which look() already attaches and her rules already require her to say.
+# Slower to read aloud, and true.
 OBSERVER_ANSWER_MAX_AGE_S = float(
-    os.getenv("OBSERVER_ANSWER_MAX_AGE_S", "5.0"))
+    os.getenv("OBSERVER_ANSWER_MAX_AGE_S", "8.0"))
 
 # How long the answer path waits for an on-demand observation before going on
 # without it. The pass cannot be cancelled -- it is a local GPU call -- so it

@@ -104,8 +104,22 @@ ok("a stripped reading is declared too", "NO SPEEDS OR DISTANCES" in rule2)
 ok("...and she is told not to supply the numbers herself",
    "not state or estimate" in rule2.lower().replace("do not", "not"))
 ok("...and where a real distance comes from", "tracker" in rule2)
-ok("a clean reading gets no caveat at all",
-   rp.reading_caveats({"truncated": False, "stripped": [], "fields": []}) == "")
+# ...AND EVERY READING CARRIES THE UNVERIFIED LABEL, clean or not. This check
+# used to assert the opposite -- that a clean reading got no caveat -- and that
+# was right while the reading was three constrained fields. It is wrong now.
+# Asked a plain question, Cosmos sees the gist and invents specifics with
+# complete fluency: "the speedometer shows 60 miles per hour" on a frame with
+# no speedometer, makes and models at distances where no badge resolves, lane
+# counts of seven and thirteen on a four-lane road. Nothing can separate the
+# true half from the invented half of one sentence, so the whole thing is
+# labelled rather than any part of it trusted.
+clean = rp.reading_caveats({"truncated": False, "stripped": [], "fields": []})
+ok("every reading is labelled an unverified impression", "UNVERIFIED" in clean)
+ok("...naming what it is reliably right about", "GIST" in clean.upper())
+ok("...and what it invents", "makes and models" in clean or "models" in clean)
+ok("...forbidding any specific being stated as fact",
+   "as though it were established" in clean)
+ok("...and naming the thing that actually knows", "tracker" in clean)
 
 print("\n== 5. the two facts are counted, not just prevented ==\n")
 import vision                                             # noqa: E402
