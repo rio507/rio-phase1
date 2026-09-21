@@ -1675,6 +1675,23 @@
   }
   .teach-col[data-model="alpamayo1.5"]   { border-left-color: var(--teach-a-line); }
   .teach-col[data-model="cosmos-reason2"]{ border-left-color: var(--teach-c-line); }
+  /* THE RESIDENT EYE, in the same shape as the shadow columns and a different
+     colour from both. It is the one model on this page whose reading reaches
+     RIO, so it takes the page's own accent rather than a teacher's: the teacher
+     colours mean "watched, not in the loop", and this one is in the loop. The
+     selector is a class rather than a data-model, because which checkpoint is
+     resident is a config question and the card must not name it. */
+  .teach-col.sensor-col { border-left-color: var(--accent-line); }
+  .teach-col.sensor-col .teach-name { color: var(--t1); }
+  /* Its meta row is the one place an AGE is load-bearing, so it reads at body
+     size rather than nano: past `fresh_s` the rest of this card describes a
+     moment that has gone, and that number is how a driver knows. */
+  .teach-col.sensor-col .teach-meta { font-size: var(--fs-nano); }
+  .teach-col.sensor-col .teach-meta .stale b { color: var(--warn-text); }
+  /* A reading's fields are short by construction -- six words each -- so they
+     are not clamped the way a four-hundred-word reasoning trace is. The raw
+     row below them is, and keeps its Show all. */
+  .teach-col.sensor-col .teach-field .teach-text { -webkit-line-clamp: 3; }
 
   .teach-name {
     font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;
@@ -2249,7 +2266,13 @@ acted on, never consulted by the arbiter.">Shadow</div>
         <div class="col-sub" id="subperception">Seeing</div>
       </div>
 
-      <div id="observation">No observation yet.</div>
+      <!-- THE SENSOR COLUMN. Empty here on purpose: static/rio_sensor.js fills
+           every node of it from the /perceive response, and there is not one
+           model name, field name or sentence written into this markup. It uses
+           the .teach-* classes the Cosmos-Reason2 teacher column used, because
+           it is the same kind of object -- a named model reading this road --
+           and the two should not look like different species. -->
+      <div id="sensorcard"></div>
 
       <div class="col-sublabel">History &middot; last 5</div>
       <div class="history" id="obshistory"></div>
@@ -3104,33 +3127,39 @@ if (window.RIO && RIO.ui) RIO.ui.talkState = setMicState;
 
 const frameBtn = document.getElementById('frame');
 const player = document.getElementById('player');
-const obs = document.getElementById('observation');
 /* WHAT THE VOICE SESSION IS DOING, said in the voice card.
  *
- * Every line below used to go into `obs` -- the PERCEPTION card's observation
- * slot -- because the session had nowhere of its own to write. That is how a
- * live drive on 2026-09-20 showed "She is listening but not answering — session
- * degraded" in the column that describes what the camera can see. The perception
- * line is for perception; this is for the session.
+ * Every line below used to go into the PERCEPTION card's observation slot,
+ * because the session had nowhere of its own to write. That is how a live drive
+ * on 2026-09-20 showed "She is listening but not answering — session degraded"
+ * in the column that describes what the camera can see. The perception line is
+ * for perception; this is for the session.
  *
- * Falls back to `obs` only if the element is missing, so an older cached page
- * still says something rather than nothing. */
+ * There is no fallback into the perception card any more and there must not be
+ * one: that slot is now a sensor reading with fields and an age (see
+ * static/rio_sensor.js), and a session message written into it would be a
+ * sentence about the microphone wearing the camera's clothes. A missing
+ * #voicestatus is a page fault, so it goes to the console and nowhere else. */
 function voiceStatus(text) {
   const el = document.getElementById('voicestatus');
   if (el) { el.textContent = text || ''; return; }
-  if (obs) obs.textContent = text || '';
+  try { console.warn('[rio] no #voicestatus for:', text); } catch (e) {}
 }
 let recorder, chunks;
 
 async function startRec() {
   // Unlock playback while we are still inside the tap gesture (iOS Safari).
   RIO.unlockAudio(player);
-  if (!RIO.mediaAvailable()) { obs.textContent = RIO.mediaError(); return; }
+  /* A MICROPHONE FAULT IS NOT A PERCEPTION FAULT. These two lines wrote
+     "no microphone" into the card that describes what the camera can see --
+     the exact mislabelling the note above voiceStatus() was written about,
+     left behind when the rest of it moved. */
+  if (!RIO.mediaAvailable()) { voiceStatus(RIO.mediaError()); return; }
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (e) {
-    obs.textContent = RIO.mediaError(e);
+    voiceStatus(RIO.mediaError(e));
     return;
   }
   recorder = new MediaRecorder(stream);
@@ -4060,8 +4089,8 @@ micBtn.addEventListener('touchcancel', e => { e.preventDefault(); if (!liveMode)
 micBtn.addEventListener('contextmenu', e => e.preventDefault());
 
 frameBtn.addEventListener('click', async () => {
-  obs.textContent = 'Capturing...';
-  if (!RIO.mediaAvailable()) { obs.textContent = RIO.mediaError(); return; }
+  RIO.sensor.busy();
+  if (!RIO.mediaAvailable()) { RIO.sensor.fail(RIO.mediaError()); return; }
   let blob, temp = null;
   try {
     if (RIO.source.isClip()) {
@@ -4084,23 +4113,23 @@ frameBtn.addEventListener('click', async () => {
       blob = await RIO.frameFromVideo(video);
     }
   } catch (e) {
-    obs.textContent = RIO.mediaError(e);
+    RIO.sensor.fail(RIO.mediaError(e));
     return;
   } finally {
     if (temp) temp.getTracks().forEach(t => t.stop());
   }
-  obs.textContent = 'Analyzing...';
+  RIO.sensor.busy();
   if (RIO.overlay) RIO.overlay.clear();   // drop the previous frame's boxes
   const fd = new FormData();
   fd.append('image', blob, 'frame.jpg');
   try {
     const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
     const j = await r.json();
-    obs.textContent = j.observation || '(empty)';
+    RIO.sensor.render(j);
     if (RIO.overlay) RIO.overlay.render(j);
     RIO.ui.observation(j.observation);
   } catch (e) {
-    obs.textContent = 'Observe failed: ' + e;
+    RIO.sensor.fail(e);
   }
 });
 });
@@ -4222,7 +4251,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const driveBtn = document.getElementById('drive');
   const status = document.getElementById('drivestatus');
   const video = document.getElementById('video');
-  const obs = document.getElementById('observation');
   const player = document.getElementById('player');
 
   // Perception cadence. With live headway running, /perceive drops to a slow
@@ -4275,7 +4303,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // column is fed exactly as before.
       const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
       const j = await r.json();
-      obs.textContent = j.observation || '(empty)';
+      RIO.sensor.render(j);
       if (RIO.overlay) RIO.overlay.render(j, feedEl());
       frames++;
       RIO.ui.observation(j.observation);
@@ -4802,19 +4830,17 @@ document.addEventListener('DOMContentLoaded', () => {
   const upload = document.getElementById('upload');
   const preview = document.getElementById('preview');
   const grabBtn = document.getElementById('grab');
-  const obs = document.getElementById('observation');
 
   // Shared by upload-image, "Grab This Frame", and the playing-video watcher.
   // `overlayEl` names the element the boxes belong on; left out, the overlay
   // picks whichever element is currently filling the camera box.
   async function sendFrame(blob, overlayEl) {
-    obs.style.display = 'block';
-    obs.textContent = 'Analyzing...';
+    RIO.sensor.busy();
     const fd = new FormData();
     fd.append('image', blob, 'frame.jpg');
     const r = await fetch(RIO.url('/perceive'), { method: 'POST', body: fd });
     const j = await r.json();
-    obs.textContent = j.observation || '(empty)';
+    RIO.sensor.render(j);
     if (RIO.overlay) RIO.overlay.render(j, overlayEl);
     RIO.ui.observation(j.observation);
   }
@@ -7104,6 +7130,11 @@ document.addEventListener('DOMContentLoaded', () => {
      revert -- switching back is a config change and a restart, not a build. -->
 <script src="/static/rio_live.js"></script>
 <script src="/static/rio_speak.js"></script>
+<!-- The Perception card's renderer. Before rio_frames.js, which drives the
+     clip watcher that calls it, and before the inline blocks below that call
+     RIO.sensor on every /perceive. It reads the response and writes the DOM:
+     no fetch of its own, no parsing of its own, nothing that can speak. -->
+<script src="/static/rio_sensor.js"></script>
 <script src="/static/rio_frames.js"></script>
 <!-- THE ENCODER WORKER'S URL, STAMPED LIKE EVERY OTHER ASSET.
      `new Worker('/static/rio_frame_encoder.js')` is a fetch the page makes at

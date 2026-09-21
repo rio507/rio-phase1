@@ -533,6 +533,35 @@ def _visual_key(session_id, client_id: str = None):
     return f"client:{cid}" if cid else "default"
 
 
+def _reading_block(rec) -> dict:
+    """An observer record -> the block both the card and look() are given.
+
+    One function so the two cannot drift. Everything in it comes off the record
+    the observer wrote when it described the frame: the text, the instrument's
+    own name, the age, and which frame it was. The fields are split here rather
+    than in the browser for the same reason -- a second parser is a second
+    opinion about what the model said.
+    """
+    if not isinstance(rec, dict) or not (rec.get("text") or "").strip():
+        return None
+    import rio_prompts as _rp
+    text = rec["text"]
+    out = _rp.split_sensor_reading(text)
+    out["model"] = rec.get("model") or config.local_vision_label()
+    out["age_s"] = rec.get("age_s")
+    out["frame_id"] = rec.get("frame_id")
+    out["frame_age_s"] = rec.get("frame_age_s")
+    # An instrument's reading is never spoken as hers; the card says so rather
+    # than letting a driver assume the words on the glass are the words she
+    # would use. See observer._record and config.local_vision_speaks_directly.
+    out["speakable"] = bool(rec.get("speakable"))
+    # The age at which the observer itself stops serving a reading as current
+    # (observer.fresh). Shipped rather than hard-coded in the browser, so the
+    # card's idea of stale and the answer path's idea of stale are one number.
+    out["fresh_s"] = float(getattr(config, "OBSERVER_FRESH_S", 2.0))
+    return out
+
+
 def _frame_origin(session_id, source):
     """WHO IS TAKING THESE PICTURES, as one string on every frame.
 
@@ -1540,8 +1569,32 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
         result["caption_source"] = "observer"
         result["caption_age_s"] = rec.get("age_s") if isinstance(rec, dict) else None
         result["skipped"] = "headway_live"
+        # THE READING, AS THE CARD SHOWS IT AND AS SHE IS GIVEN IT.
+        #
+        # The Perception card used to get one string and print it in one box,
+        # which is why a decoding loop looked like a description of a road and
+        # why a missing field looked like an empty one. It gets the record now:
+        # the fields split out by the one parser (rio_prompts.split_sensor_
+        # reading, beside the prompt that names them), the instrument that
+        # produced it, and how old it is.
+        #
+        # `raw` inside that block is the WHOLE reading, unedited. It is the
+        # same string realtime.look() puts in `answer` and the browser sends
+        # into the live session as function_call_output -- same observer
+        # record, same key, same parser -- so what is on the glass is what she
+        # infers from, and tools/sensor_card_selftest.py asserts the two are
+        # byte-identical against a running server rather than leaving it here
+        # as a claim.
+        result["reading"] = _reading_block(rec)
     else:
         result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug))
+        # Not the observer's reading: this branch runs perceive's own caption
+        # prompt, which is prose and has no fields. Said plainly so the card
+        # can say which instrument it is showing rather than parsing prose into
+        # three empty rows.
+        result.setdefault("caption_source", "perceive")
+        result.setdefault("caption_age_s", 0.0)
+        result["reading"] = None
     sessions.log_perceive(session_id, len(image_bytes), result, (_t.time() - _t0) * 1000)
     return result
 

@@ -38,6 +38,7 @@ Re-version this file whenever the bible is updated.
 # is checked against persona.lint() before it is allowed anywhere near a
 # speaker. A line that fails goes back to being composed by her — the slow
 # path still exists and is still correct, it is just no longer the only one.
+import re        # noqa: E402  (split_sensor_reading, below)
 import persona   # noqa: E402  (the banned-word list, and the lint that enforces it)
 
 # THE EXAMPLES ARE THE HAZARD, and they are kept here as data because of it.
@@ -225,6 +226,85 @@ SENSOR_BANNED = (
     "be careful", "watch out", "i recommend", "i suggest", "let's ",
     "we should", "keep in mind", "make sure",
 )
+
+
+# THE THREE FIELDS, IN THE ORDER THE PROMPT ASKS FOR THEM. One list, here,
+# beside the prompt that names them: a card that hard-coded its own row labels
+# would be a second opinion about what a reading contains, and the first time
+# the prompt gained a field the glass would quietly stop showing it.
+SENSOR_FIELDS = ("ROAD", "TRAFFIC", "RISK")
+
+# A field name at the start of a piece: "ROAD:" or "ROAD :", any case. Matched
+# on the NAMES rather than on the bars, and that is not a stylistic choice --
+# the separator is a bar, a model in a decoding loop repeats the unit it is
+# emitting, and the loop readings of 2026-09-21 were full of bars:
+#
+#     ROAD: single|single|curb|CURB|CURB|CURB|CURB|...
+#
+# Splitting that on "|" gives thirteen fields and no reading. Splitting on the
+# names gives one field whose value is the whole loop, which is the truth about
+# it and is what the card should show. (Such a reading no longer reaches here
+# at all -- vision.reading_refused stops it -- but a parser that falls apart on
+# malformed input is a parser that will be blamed for the next fault.)
+_SENSOR_FIELD_RE = re.compile(
+    r"\b(" + "|".join(SENSOR_FIELDS) + r")\s*:", re.IGNORECASE)
+
+
+def split_sensor_reading(text: str) -> dict:
+    """A sensor reading -> its fields, for a card that shows them as rows.
+
+    THE POINT OF THIS FUNCTION BEING HERE, and not in the browser: the card and
+    the live session must show and be told the SAME reading. One parser, called
+    by /perceive for the glass and by realtime.look() for her, over one
+    observer record, is what makes that true by construction rather than by two
+    implementations agreeing for now. tools/sensor_card_selftest.py measures it
+    end to end against a running server.
+
+    -> {"raw", "fields": [{"name", "text", "present"}...], "extra", "parsed"}
+
+    Every field in SENSOR_FIELDS gets a row whether or not the model wrote it,
+    with `present` False when it did not. A missing field is a fact about the
+    reading -- the model was asked for three and gave two -- and a blank row
+    says nothing, which is the one thing a card must never do.
+
+    `extra` is anything the model wrote outside the three fields, kept rather
+    than dropped: a reading that ignored the format entirely comes back with
+    parsed False and the whole of it in `extra`, which is honest and reviewable.
+    """
+    raw = (text or "").strip()
+    found = {}
+    extra = ""
+    matches = list(_SENSOR_FIELD_RE.finditer(raw))
+    if matches:
+        if matches[0].start() > 0:
+            extra = raw[:matches[0].start()].strip(" |\t")
+        for i, m in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+            name = m.group(1).upper()
+            value = raw[m.end():end].strip().strip("|").strip()
+            # A repeated field name keeps the FIRST value: a second "ROAD:" is
+            # the model restarting, and the first answer is the one it gave to
+            # the frame rather than to its own output.
+            if name not in found:
+                found[name] = value
+    else:
+        extra = raw
+    fields = []
+    for name in SENSOR_FIELDS:
+        value = found.get(name)
+        fields.append({
+            "name": name,
+            "text": value or "",
+            "present": bool(value),
+        })
+    return {
+        "raw": raw,
+        "fields": fields,
+        "extra": extra or None,
+        # True when the format was recognisable at all -- at least one named
+        # field. It is not a claim that the reading is good.
+        "parsed": bool(matches),
+    }
 
 
 def sensor_faults(text: str) -> list:

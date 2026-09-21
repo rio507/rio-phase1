@@ -2470,6 +2470,22 @@ def look(question: str, session_key: str = "default",
                 # model's output, and she should know whose.
                 base["reading_from"] = (hit.get("model")
                                         or config.local_vision_label())
+                # ...AND THE SAME READING, SPLIT THE SAME WAY THE GLASS SPLITS
+                # IT. `answer` above is the whole string and stays the thing
+                # she composes from; this is that string through
+                # rio_prompts.split_sensor_reading, which is the one parser the
+                # Perception card also goes through. Two consumers, one record,
+                # one parser -- so "what I read on the glass is what she infers
+                # from" is a property of the code rather than a hope about two
+                # code paths, and tools/sensor_card_selftest.py checks the two
+                # payloads are byte-identical on a running server.
+                try:
+                    import rio_prompts as _rp
+                    base["reading_fields"] = _rp.split_sensor_reading(
+                        hit["text"])["fields"]
+                except Exception:
+                    # A card decoration may never cost an answer.
+                    pass
                 sensor = not config.local_vision_speaks_directly()
                 base["rules"] = (
                     "This is what the camera is seeing right now — "
