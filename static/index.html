@@ -934,6 +934,21 @@
   #navsimspeed { flex: 0 0 48px; text-align: center; font-family: var(--font-mono); padding: 9px 4px; }
   #navorigin { flex: 1 1 0; }
 
+  /* THE SAFETY LAYER IS RUNNING AND CANNOT CONCLUDE ANYTHING.
+     Sits over the picture, in the warning colour, because it is not a status
+     line -- it is the system telling the driver it will not be speaking. */
+  .hw-inert {
+    position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 6;
+    padding: 9px 12px; border-radius: var(--r-ctl);
+    background: rgba(24, 16, 4, 0.92);
+    box-shadow: inset 2px 0 0 var(--warn, #e0a33e);
+    color: var(--warn-text, #ffcb85);
+    font-size: 12px; line-height: 1.45;
+  }
+  .hw-inert b { display: block; font-weight: 600; letter-spacing: 0.01em; }
+  .hw-inert i { font-style: normal; color: var(--t3); }
+  .hw-inert[hidden] { display: none !important; }
+
   /* ---------- perception ---------- */
 
   #observation {
@@ -2215,6 +2230,16 @@
              must be visible without opening the log. -->
         <span class="hw-line"><i>Lanes</i> <b id="hwlanes" class="hw-lanesrc">--</b></span>
       </div>
+      <!-- WHAT IT MEANS THAT THERE IS NO SPEED, not merely that there is none.
+           The drive of 2026-09-21 ran 167 seconds and 2174 frames with
+           `band UNKNOWN` and `voice_reason suppressed_by_unknown_speed` on
+           every single one: the detector tracked, the depth ran, a lead gap
+           was computed on 1034 frames, and not one word could ever have been
+           said, because tau is a gap over a speed and there was no speed.
+           The HUD said "no speed" in mono at the bottom of a five-line block.
+           That is a fact about a field. This is the consequence, and it is the
+           consequence a driver has to see. Filled by rio_frames.js. -->
+      <div id="hwinert" class="hw-inert" hidden></div>
     </div>
 
     <!-- The counters and the drive status, under the picture rather than on
@@ -5427,6 +5452,22 @@ document.addEventListener('DOMContentLoaded', () => {
    */
   let watchdogTimer = null;
   let rearms = 0;
+  // The last few intervals between fixes, in seconds. What this radio's idea
+  // of "delivering" is, measured rather than assumed. See the note in the
+  // success handler below.
+  let fixGaps = [];
+
+  /* The watchdog threshold this radio has earned. -> seconds.
+
+     Twice the slowest of the recent gaps, floored at the configured value and
+     capped so a pathological gap cannot switch the watchdog off entirely. With
+     no measurements yet it is exactly what it always was. */
+  function effectiveWatchdogS() {
+    const base = watchCfg.watchdog_s;
+    if (!fixGaps.length) return base;
+    const slowest = Math.max.apply(null, fixGaps);
+    return Math.min(60, Math.max(base, slowest * 2));
+  }
   let lastFixAt = 0;
   // When the CURRENT watch was armed. The first-fix grace is measured from
   // here rather than from the last fix, because before the first fix there is
@@ -5474,8 +5515,35 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       watchId = navigator.geolocation.watchPosition(
         pos => {
-          rearms = 0;                     // it is delivering again
-          lastFixAt = performance.now();
+          /* HOW OFTEN THIS RADIO ACTUALLY DELIVERS. The watchdog's job is "it
+             was delivering and went quiet", and that sentence needs to know
+             what delivering looks like HERE. On the drive of 2026-09-21 it did
+             not: a desktop wifi fix arrives about every five seconds, the
+             watchdog's four-second threshold fired between every pair of them,
+             and the radio was torn down and rebuilt 33 times in 167 seconds --
+             each rebuild returning a cached fix, resetting the counter to zero,
+             and doing it again. Every one of those 33 marks read `attempt: 1`,
+             which is what a counter that never gets anywhere looks like.
+
+             So the interval is measured, and the effective watchdog is twice
+             the slowest recent gap, floored at the configured value. A radio
+             that goes genuinely quiet still trips it; one that is merely slow
+             is left alone. */
+          const nowFix = performance.now();
+          if (lastFixAt !== null && lastFixAt > 0) {
+            const gapS = (nowFix - lastFixAt) / 1000;
+            if (gapS > 0.2 && gapS < 120) {
+              fixGaps.push(gapS);
+              if (fixGaps.length > 8) fixGaps.shift();
+            }
+          }
+          // ...and the rearm counter only clears when the fix came back
+          // FASTER than this radio's own rhythm. Clearing it on every fix is
+          // what made 33 rearms look like 33 first attempts.
+          if (lastFixAt === null || (nowFix - lastFixAt) / 1000 < effectiveWatchdogS()) {
+            rearms = 0;                   // it is delivering again
+          }
+          lastFixAt = nowFix;
           // coords.speed is null on most desktops and on the first fixes of a
           // phone; null is passed through as "no speed", never coerced to 0.
           gpsSpeed = (pos.coords && typeof pos.coords.speed === 'number'
@@ -5509,12 +5577,20 @@ document.addEventListener('DOMContentLoaded', () => {
       : (performance.now() - lastFixAt) / 1000;
     rearms++;
     const coarse = rearms > watchCfg.coarse_after;
+    const effective = effectiveWatchdogS();
     // `first_fix` in the log separates "never delivered" from "stopped
     // delivering". They were the same line before, which is why six drives of
     // this looked like a flaky radio rather than a cancelled prompt.
     noteGps('gps_watch_rearm', { quiet_s: Math.round(quiet * 10) / 10,
                                  attempt: rearms, coarse: coarse,
-                                 first_fix: first });
+                                 first_fix: first,
+                                 // What it was measured against, and what this
+                                 // radio has been doing. Without these two a
+                                 // rearm mark cannot say whether the threshold
+                                 // was wrong, which is what it was.
+                                 watchdog_s: Math.round(effective * 10) / 10,
+                                 fix_gaps_s: fixGaps.map(
+                                   g => Math.round(g * 10) / 10) });
     // Torn down and rebuilt, not merely re-requested: a stalled watch does not
     // start delivering again because it was asked twice.
     try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
@@ -5536,7 +5612,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       const quiet = (performance.now() - lastFixAt) / 1000;
-      if (quiet < watchCfg.watchdog_s) return;
+      if (quiet < effectiveWatchdogS()) return;
       if (rearms >= watchCfg.max_rearms) {
         // The radio is not coming back. Churning it further costs battery and
         // buys nothing; the tracker's dead reckoning is what is holding the
@@ -5551,6 +5627,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (watchId !== null || !navigator.geolocation) return;
     rearms = 0;
     gpsErrors = 0;
+    fixGaps = [];
     /* NOT `performance.now()`. This used to stamp the age as "now" the moment
        the watch was armed, so a drive that never received a single fix
        reported a FRESH position age for its whole length -- which is exactly
@@ -5639,8 +5716,53 @@ document.addEventListener('DOMContentLoaded', () => {
     obd: 'OBD', gps: 'GPS', gps_coasted: 'GPS held', none: 'no speed',
   };
 
+  /* HOW LONG THE SAFETY LAYER MAY BE UNABLE TO CONCLUDE BEFORE IT SAYS SO.
+     Long enough that the first few frames of a drive, before a fix or a lead,
+     do not put a warning on the screen; short enough that a driver who is
+     about to rely on this finds out early. */
+  const INERT_AFTER_S = 8;
+  let inertSince = null;
+
+  /* The banner. -> nothing; it writes the DOM.
+
+     TWO FACTS AND A FIX, in that order, because "no speed" on its own is the
+     thing that was already on the screen and was read as a field rather than
+     as a verdict. What the driver needs is: the warnings are off, this is why,
+     and here is the one action that turns them on. */
+  function paintInert(j) {
+    const el = document.getElementById('hwinert');
+    if (!el) return;
+    const sp = (j && j.speed) || null;
+    const src = sp ? sp.source : null;
+    const reason = (j && j.voice_reason) || null;
+    // The server's own word for it. `suppressed_by_unknown_speed` is the one
+    // that ran for a whole drive; the others are momentary by nature.
+    const mute = (src === 'none' || reason === 'suppressed_by_unknown_speed');
+    if (!mute) { inertSince = null; el.hidden = true; return; }
+    const now = performance.now();
+    if (inertSince === null) inertSince = now;
+    const heldS = (now - inertSince) / 1000;
+    if (heldS < INERT_AFTER_S) { el.hidden = true; return; }
+    const onClip = !!(RIO.source && RIO.source.isClip && RIO.source.isClip());
+    el.textContent = '';
+    const b = document.createElement('b');
+    b.textContent = 'No speed \u2014 following-distance warnings are OFF';
+    el.appendChild(b);
+    const i = document.createElement('i');
+    i.textContent = onClip
+      ? ('A gap is being measured, but time-to-contact is gap \u00f7 speed and '
+         + 'there is no speed on a clip. Set a speed override to classify. '
+         + Math.round(heldS) + ' s so far.')
+      : ('Time-to-contact is gap \u00f7 speed and no speed is reaching the car '
+         + '\u2014 allow Location, or connect the OBD bus. '
+         + Math.round(heldS) + ' s so far.');
+    el.appendChild(i);
+    el.hidden = false;
+  }
+
   function paintHud(j) {
     if (!hud) return;
+    paintInert(j);
     const band = (j && j.band) || 'UNKNOWN';
     hud.className = 'hw-' + band;
     elBand.textContent = BAND_LABEL[band] || band;
@@ -5688,6 +5810,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!hud) return;
     hud.className = 'hw-UNKNOWN';
     elBand.textContent = 'Standby';
+    // A stopped feed is not an inert safety layer, it is no feed. The banner
+    // goes with the HUD it belongs to.
+    inertSince = null;
+    const _inert = document.getElementById('hwinert');
+    if (_inert) _inert.hidden = true;
     elTau.textContent = '--'; elTrend.textContent = '--';
     elGap.textContent = '--'; elSpeed.textContent = '--';
     if (elSpeedSrc) { elSpeedSrc.textContent = '--'; elSpeedSrc.className = 'hw-speedsrc'; }
