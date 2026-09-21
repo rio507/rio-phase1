@@ -149,6 +149,32 @@ rio_resolve_python() {
 }
 rio_resolve_python
 
+# The CONTAINER's python3 -- the one in the image, which is the thing the venv
+# has to agree with. Deliberately not a bare `python3`: $ENV_FILE puts
+# $VENV/bin at the front of PATH and bootstrap sources it before the venv is
+# ever checked, so `python3` there is the very interpreter under suspicion, and
+# the check would be asking the suspect to vouch for itself. Any venv would do
+# the same -- a teacher env, an activated $VIRTUAL_ENV -- so the test is
+# structural rather than a list of paths: a bin/ directory with a pyvenv.cfg
+# beside it IS a venv, whichever one it is, and it is not the container's
+# python. /usr/bin last, unconditionally, for a PATH that has nothing else.
+rio_container_python() {
+    local dir
+    local IFS=:
+    for dir in $PATH /usr/local/bin /usr/bin /bin; do
+        [ -x "$dir/python3" ] || continue
+        [ -f "$dir/../pyvenv.cfg" ] && continue
+        printf '%s\n' "$dir/python3"
+        return 0
+    done
+    return 1
+}
+
+# major.minor of an interpreter, or nothing at all if it will not run.
+rio_py_xy() {
+    "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null
+}
+
 # On the PERSISTENT volume, deliberately. A boot log inside the container layer
 # is a boot log that disappears with the thing it was describing.
 BOOT_LOG=/workspace/boot.log
@@ -229,6 +255,11 @@ step_summary() {
 #                      .venv/bin/python and .venv/bin/uvicorn explicitly rather
 #                      than `python`, which means whatever the caller's PATH
 #                      says and on a fresh pod means an empty interpreter.
+#                      The one thing it does NOT survive is the image's python
+#                      moving under it -- a venv is only valid for the
+#                      interpreter that built it -- so bootstrap_venv checks
+#                      its version against the container's before trusting it
+#                      and rebuilds it when they differ. See the comment there.
 #   /workspace/node    node, npm, and Claude Code as an npm global (npm's
 #                      prefix resolves to $NODE_DIR because node lives there).
 #   /workspace/env.sh  the PATH that ties those two to any shell, restored by
@@ -371,24 +402,73 @@ bootstrap_venv() {
         return 1
     fi
 
-    # A venv whose interpreter cannot run is the failure mode this arrangement
-    # can still have: `python3 -m venv` records the image's interpreter, and
-    # while the binary is copied in (--copies below) its shared libraries are
-    # not. If the pod comes back on an image with a different python, the venv
-    # on the volume is so much dead weight -- so prove it runs before trusting
-    # it, and rebuild it from requirements.txt if it does not.
-    if [ -e "$VENV" ] && ! "$VENV_PY" -c 'import sys' > /dev/null 2>&1; then
-        echo "   !! $VENV_PY does not run — this venv was built against an"
-        echo "      interpreter this pod no longer has. Removing and rebuilding it."
+    # A venv on the volume outlives the container it was built in, and the
+    # image's python is free to move under it. THIS IS THE FAILURE MODE THIS
+    # ARRANGEMENT HAS, and it does not announce itself as one. Seen on this pod
+    # on 2026-09-21, when the image went 3.11 -> 3.12:
+    #
+    #   bin/python a SYMLINK to /usr/bin/python3 (what a plain `python3 -m
+    #   venv` writes) -- it runs, it is the NEW python, and it computes its
+    #   site-packages as lib/python3.12/, which is not the lib/python3.11/ that
+    #   holds every package this repo installed. Nothing fails loudly. The
+    #   first symptom is `ModuleNotFoundError: No module named 'pip'`, which
+    #   reads like one broken package rather than an environment whose
+    #   interpreter walked away from its own libraries.
+    #
+    #   bin/python a COPY (--copies, what this script creates) -- the copied
+    #   binary may not start at all once the libpython it links against goes,
+    #   or may start, still be 3.11, and be the wrong python for a pod whose
+    #   own is now 3.12.
+    #
+    # So the question asked here is not "does it run" but "is it the SAME
+    # PYTHON THE CONTAINER HAS", asked three ways, because each catches a case
+    # the others cannot: the version pyvenv.cfg recorded at creation, the
+    # version the interpreter reports today, and the lib/pythonX.Y directory
+    # the packages are actually sitting in. Any disagreement and the venv is
+    # dead weight -- say which one disagreed, remove it, and let the rebuild
+    # below reinstall requirements.txt. A version mismatch must never reach the
+    # user as a missing pip.
+    local sys_py sys_xy venv_xy cfg_xy lib_xy stale=""
+    sys_py=$(rio_container_python) || {
+        echo "   !! no python3 in this container — cannot build or check a venv"
+        return 1
+    }
+    sys_xy=$(rio_py_xy "$sys_py")
+    if [ -e "$VENV" ]; then
+        venv_xy=$(rio_py_xy "$VENV_PY")
+        # `version = 3.12.3`, or `version_info = 3.12.3.final.0` on some builds.
+        cfg_xy=$(sed -n 's/^[[:space:]]*version\(_info\)\?[[:space:]]*=[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\2/p' \
+                 "$VENV/pyvenv.cfg" 2>/dev/null | head -1)
+        lib_xy=$(ls -d "$VENV"/lib/python[0-9]* 2>/dev/null | sed 's#.*/python##' | head -1)
+        if [ -z "$venv_xy" ]; then
+            stale="$VENV_PY does not run at all"
+        elif [ -n "$sys_xy" ] && [ "$venv_xy" != "$sys_xy" ]; then
+            stale="venv python is $venv_xy, this container's is $sys_xy ($sys_py)"
+        elif [ -n "$cfg_xy" ] && [ "$cfg_xy" != "$venv_xy" ]; then
+            stale="venv was built for python $cfg_xy, its interpreter is now $venv_xy"
+        elif [ -n "$lib_xy" ] && [ "$lib_xy" != "$venv_xy" ]; then
+            stale="packages are in lib/python$lib_xy, the interpreter is python $venv_xy"
+        elif ! "$VENV_PY" -m pip --version > /dev/null 2>&1; then
+            stale="python $venv_xy in this venv cannot import pip"
+        fi
+    fi
+    if [ -n "$stale" ]; then
+        echo "   !! this venv no longer matches this container: $stale"
+        echo "      A venv is only good for the python that built it, and this one"
+        echo "      outlived its own. Removing $VENV and rebuilding it from"
+        echo "      requirements.txt — that is the slow path, a few minutes."
         rm -rf "$VENV"
     fi
 
     if [ ! -x "$VENV_PY" ]; then
         # --copies rather than symlinks: a symlink into /usr/bin is a pointer
         # into the container layer, and the point of this directory is to not
-        # be one.
-        echo "   creating: python3 -m venv --copies $VENV"
-        python3 -m venv --copies "$VENV" || {
+        # be one. (It does not make the venv survive a python upgrade -- see
+        # above -- it makes the upgrade detectable rather than silent.)
+        # $sys_py rather than `python3` for the same reason rio_container_python
+        # exists: PATH may still lead into the venv being replaced.
+        echo "   creating: $sys_py -m venv --copies $VENV  (python $sys_xy)"
+        "$sys_py" -m venv --copies "$VENV" || {
             echo "   !! could not create the venv (is python3-venv installed?)"
             return 1
         }
@@ -397,6 +477,7 @@ bootstrap_venv() {
     fi
     rio_resolve_python
     echo "   python:  $("$VENV_PY" -V 2>&1) at $VENV_PY"
+    echo "   matches this container's $("$sys_py" -V 2>&1) at $sys_py"
 
     # Stamped with the hash of requirements.txt, so re-running bootstrap on a
     # provisioned pod is a no-op rather than a five-minute dependency resolve.
