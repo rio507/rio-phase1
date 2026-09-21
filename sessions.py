@@ -60,9 +60,36 @@ def start_session(metadata: Optional[dict] = None) -> str:
     return sid
 
 
+# HOW LONG A CLOSED DRIVE STILL ACCEPTS ITS OWN LATE ROWS.
+#
+# A drive's most valuable single artefact is the frame transport's closing
+# summary, and on 2026-09-21 it landed in stray-<id>.jsonl instead of the drive
+# log: the page posts it and /session/end as two fire-and-forget fetches, and
+# the second was served first. So did a deep_dive result that came back 29.7 s
+# after the driver stopped -- a tool call the drive asked for, answered, and
+# belonging to no file.
+#
+# A row that arrives late about a session that just ended is not a stray. A
+# stray is a row for a drive nobody was on, which is what this mechanism was
+# written for and what it still catches after the window closes.
+LATE_WRITE_S = 60.0
+
+# session_id -> when it ended. Small, bounded by _prune_ended below.
+_recently_ended = {}
+
+
+def _prune_ended(now: float = None) -> None:
+    now = time.time() if now is None else now
+    for sid in [k for k, t in _recently_ended.items()
+                if now - t > LATE_WRITE_S]:
+        _recently_ended.pop(sid, None)
+
+
 def end_session(session_id: str, reason: str = "closed") -> bool:
     _write(session_id, "session_end", {"reason": reason})
     _last_seen.pop(session_id, None)
+    _prune_ended()
+    _recently_ended[session_id] = time.time()
     # The rows queued for this session are written by the writer thread;
     # the handle is closed only once they are on disk.
     flush()
@@ -124,6 +151,24 @@ def log_observe(session_id: Optional[str], frame_bytes_len: int, observation: st
     })
 
 
+def _reading_facts(reading) -> Optional[dict]:
+    """The half of a reading block that cannot be re-derived from its text."""
+    if not isinstance(reading, dict):
+        return None
+    return {
+        "model": reading.get("model"),
+        "age_s": reading.get("age_s"),
+        "frame_id": reading.get("frame_id"),
+        "source": reading.get("source"),
+        "truncated": bool(reading.get("truncated")),
+        "stripped": list(reading.get("stripped") or []),
+        "contested": list(reading.get("contested") or []),
+        "detector": reading.get("detector"),
+        "unknown_fields": list(reading.get("unknown_fields") or []),
+        "parsed": bool(reading.get("parsed")),
+    }
+
+
 def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, latency_ms: float) -> None:
     """Structured perception event — boxes, distances, corridor, caption.
 
@@ -147,6 +192,21 @@ def log_perceive(session_id: Optional[str], frame_bytes_len: int, result: dict, 
         "caption_source": result.get("caption_source", "qwen"),
         "caption_age_s": result.get("caption_age_s"),
         "skipped": result.get("skipped"),
+        # WHAT WAS WRONG WITH THE READING, IN THE DRIVE'S OWN RECORD.
+        #
+        # This row carried the caption and nothing else about it, so the drive
+        # log could not say whether a reading was cut off at the token cap,
+        # whether measurements had been stripped out of it, whether the
+        # detector contradicted it, or which picture it was of -- all four of
+        # which the Perception card was showing at the time. Answering "how
+        # often was the reading truncated on that drive" meant replaying the
+        # captions through the guards afterwards, which is archaeology.
+        #
+        # The fields themselves are NOT repeated here: `caption` is the whole
+        # reading and the split is deterministic from it
+        # (rio_prompts.split_sensor_reading). What goes in is what cannot be
+        # recovered from the text alone.
+        "reading": _reading_facts(result.get("reading")),
     })
 
 
@@ -459,6 +519,17 @@ _DROPPED = {"n": 0}
 def _write_now(session_id: str, line: str) -> None:
     f = _open_handles.get(session_id)
     if not f:
+        # A ROW THAT ARRIVED LATE ABOUT A DRIVE THAT JUST ENDED belongs to that
+        # drive. The handle is closed, so this reopens the file to append --
+        # rare, and the alternative is losing the transport summary and every
+        # tool result that outlived the button. See LATE_WRITE_S.
+        ended = _recently_ended.get(session_id)
+        if ended is not None and (time.time() - ended) <= LATE_WRITE_S:
+            path = SESSIONS_DIR / f"{session_id}.jsonl"
+            if path.exists():
+                with path.open("a") as g:
+                    g.write(line + "\n")
+                return
         # Session not active. Drop the event but keep a breadcrumb in a stray file.
         stray = SESSIONS_DIR / f"stray-{session_id}.jsonl"
         with stray.open("a") as g:

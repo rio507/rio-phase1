@@ -2844,6 +2844,15 @@ def backend_voice() -> str:
     return config.OPENAI_REALTIME_VOICE
 
 
+def _eye_status() -> dict:
+    """The resident model, its prompt, and every guard's count. {} if absent."""
+    try:
+        import vision
+        return vision.model_info()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def status() -> dict:
     """What the panel and /health need to know, without calling anything."""
     return {
@@ -2875,6 +2884,12 @@ def status() -> dict:
         # feels slow on visual questions is either not observing or observing
         # something stale, and both are visible here.
         "observer": _observer_status(),
+        # WHAT THE EYE HAS REFUSED, AS A RATE. vision.model_info() has carried
+        # this since the swap and nothing served it, so the only way to learn
+        # that a drive's readings were truncated a hundred times was to grep
+        # stdout for lines that print at 1, 10 and 100. A guard nobody can read
+        # the output of is a guard nobody can tell is working.
+        "eye": _eye_status(),
         "tool_timeout_s": float(config.REALTIME_TOOL_TIMEOUT_S),
         "key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),
     }

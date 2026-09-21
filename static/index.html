@@ -4780,9 +4780,21 @@ document.addEventListener('DOMContentLoaded', () => {
        socket -- see the note there. */
     const tstats = stopCapture('drive_end');
     if (hbTimer) { clearTimeout(hbTimer); hbTimer = null; }
+    /* AWAITED, because the two requests race and the wrong one won.
+       This mark and /session/end below are both fire-and-forget fetches, and
+       on 2026-09-21 the server handled the END first: it closed the drive's
+       file, and the most valuable single artefact of the run -- frame age at
+       p50/p90/p99, what was dropped and by whom -- landed in
+       stray-<id>.jsonl. Awaiting it here costs a few milliseconds at the end
+       of a drive and makes the ordering a fact rather than a race.
+
+       The server now also keeps a drive's file openable for a minute after it
+       closes (sessions.LATE_WRITE_S), which catches what awaiting cannot: a
+       tool result that comes back thirty seconds after the driver stopped.
+       Two fixes because they are for two different late arrivals. */
     if (tstats && sid) {
       try {
-        fetch('/session/mark?session_id=' + encodeURIComponent(sid)
+        await fetch('/session/mark?session_id=' + encodeURIComponent(sid)
               + '&tag=frame_transport&note='
               + encodeURIComponent(JSON.stringify(tstats).slice(0, 900)),
               { method: 'POST' }).catch(() => {});
