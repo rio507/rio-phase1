@@ -297,9 +297,52 @@ def main() -> int:
     ok("...and repetition is a HINT, reported apart from proof",
        canned.describe("ROAD: clear", 4).get("strength") == "weak")
 
+    # -----------------------------------------------------------------------
+    # AND NOW THE REFUSAL ITSELF, which is a different claim from every check
+    # above and is the one that was not being made.
+    #
+    # Everything before this line asks whether canned.describe FLAGS a bad
+    # reading. It does, and it did on 2026-09-21, and the reading went to the
+    # Perception card anyway: the branch in vision.py that acts on a verdict
+    # listed `markers or loop` and word_loop had been added to the guard
+    # without it. The suite passed because it tested the detector and then
+    # grepped vision.py for a substring -- neither of which can fail the way
+    # the system failed.
+    #
+    # So these run vision.reading_refused: the function the live path calls.
+    # The two strings are the ones this pod's own log printed under "(not
+    # refused)" while a clip was playing.
+    LIVE_LOOPS = [
+        ("the drive of 2026-09-21, bar-separated with case mixing",
+         "ROAD: single|single|curb|CURB|CURB|CURB|CURB|CURB|CURB|CURB|CURB|"
+         "CURB|CURB|CURB|"),
+        ("...and its mixed-separator variant from the same drive",
+         "ROAD: two|single|curb|CURB: curb|CURB CURB CURB CURB CURB CURB "
+         "CURB CURB CURB CU"),
+        ("the 5721 ms word loop", "ROAD: three lanes, asphalt, "
+         + "interstate " * 203),
+        ("a memorised label row", recited),
+        ("a repeated sentence", loop),
+    ]
+    for why, text in LIVE_LOOPS:
+        v = vis.reading_refused(text, 0)
+        ok(f"the LIVE PATH refuses {why}", bool(v),
+           (v or {}).get("why") or "NOT REFUSED — this reaches the card")
+    for good in ("ROAD: five, two-way, asphalt | TRAFFIC: none | RISK: none",
+                 "A white sedan two cars ahead, and the lane is clear.",
+                 "the the road ahead", "very very very good"):
+        ok(f"...and publishes a real reading ({good[:34]}…)",
+           vis.reading_refused(good, 0) is None)
+    ok("...while repetition ALONE is still only a hint, never a refusal",
+       vis.reading_refused("ROAD: clear | TRAFFIC: none | RISK: none", 9) is None)
+    # The refusal set is asked OF the guard rather than kept as a second list
+    # here, which is what stops the next kind of loop repeating this fault.
+    ok("...and the refusal set is canned.py's own strength, not a copied list",
+       'verdict.get("strength") == "strong"' in (REPO / "vision.py").read_text())
+
     vsrc = (REPO / "vision.py").read_text()
     ok("the canned guard runs on EVERY reading, not just teacher rows",
-       "canned.describe(text, repeats)" in vsrc)
+       "reading_refused(text, repeats)" in vsrc)
     ok("...and its refusals are counted as a rate",
        "def flag_rate" in vsrc and '"canned": 0' in vsrc)
     fr = vis.flag_rate()

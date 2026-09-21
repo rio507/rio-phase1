@@ -322,6 +322,44 @@ _flags = {
 _repeats = canned.RepeatTracker()
 
 
+def reading_refused(text, repeats: int = 0):
+    """Is this reading a recitation or a decoding loop? -> the verdict, or None.
+
+    THE DECISION, AS A FUNCTION SOMETHING ELSE CAN CALL. It was four words
+    inside observe() -- `verdict.get("markers") or verdict.get("loop")` -- and
+    on 2026-09-21 that list was one flag short of the guard it was reading.
+    `word_loop` had been added to teachers/canned.py for precisely the terse
+    sensor format, with its own acceptance check, and the branch that ACTS on a
+    verdict never learned about it. So this reached the Perception card:
+
+        ROAD: single|single|curb|CURB|CURB|CURB|CURB|CURB|CURB|CURB|CURB|...
+
+    under a log line reading "reading repeated x3 (not refused)". The guard was
+    right the whole time -- canned.describe scores that string word_loop 11,
+    strength strong, case mixing and leading pieces and all. The consumer was
+    wrong, and nothing could see it, because the suite tested the DETECTOR and
+    then grepped this file for a substring.
+
+    Two things follow, and both are the point of this function existing:
+
+      The refusal set is `strength == "strong"`, which is canned.py's own
+      statement of proof versus hint rather than a list kept in a second file.
+      A new kind of loop added there is refused here the day it lands.
+
+      It is importable, so tools/local_vision_selftest.py can run the decision
+      the live path runs instead of asserting that the file contains a string.
+      A test that cannot fail the way the system failed is not a test of it.
+
+    `repeats` is how many keyframes in a row have carried this exact text (see
+    canned.RepeatTracker). Repetition ALONE is weak and never refused here: on
+    an unchanging road the same reading may simply be right again.
+    """
+    verdict = canned.describe(text or "", repeats)
+    if verdict and verdict.get("strength") == "strong":
+        return verdict
+    return None
+
+
 def flag_rate() -> dict:
     """-> the flag counts with a rate per reading. `total` is readings ATTEMPTED.
 
@@ -437,18 +475,18 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         # across frames, which is the only way the byte-identical case is
         # visible at all.
         repeats = _repeats.note(config.LOCAL_VISION_MODEL, "reading", text)
-        verdict = canned.describe(text, repeats)
-        if verdict:
-            if verdict.get("markers") or verdict.get("loop"):
-                _flags["canned"] += 1
-                if _flags["canned"] in (1, 10, 100):
-                    print(f"[vision] reading refused -- {verdict.get('why')}: "
-                          f"{text[:120]!r}", flush=True)
-                clear_holder()
-                return ""
-            # Repetition alone is a hint and is NOT a refusal: on an unchanging
-            # road the same reading may simply be right again. Counted so the
-            # rate can be read, and left to be published.
+        refusal = reading_refused(text, repeats)
+        if refusal:
+            _flags["canned"] += 1
+            if _flags["canned"] in (1, 10, 100):
+                print(f"[vision] reading refused -- {refusal.get('why')}: "
+                      f"{text[:120]!r}", flush=True)
+            clear_holder()
+            return ""
+        # Repetition alone is a hint and is NOT a refusal: on an unchanging
+        # road the same reading may simply be right again. Counted so the
+        # rate can be read, and left to be published.
+        if repeats >= canned.REPEAT_FLOOR:
             _flags["repeated"] += 1
             if _flags["repeated"] in (1, 10, 100):
                 print(f"[vision] reading repeated x{repeats} (not refused): "
