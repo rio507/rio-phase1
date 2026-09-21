@@ -298,6 +298,14 @@ def log_headway(session_id: Optional[str], result: dict, latency_ms: float) -> N
         "lane_conf": result.get("lane_conf"),
         "lane_offset": result.get("lane_offset"),
         "lane_fallback_reason": (result.get("lane_info") or {}).get("fallback_reason"),
+        # WAS THE PAINT BELIEVABLE. One boolean, and the drive log did not have
+        # it: the confidence and the fallback reason were both here, so a
+        # reader could see that the corridor fell back and why, and could not
+        # see whether the lanes that WERE found had been rejected as
+        # implausible or accepted. The polylines themselves stay out -- 2174
+        # frames of them would dwarf the file, which is the same reason
+        # membership.to_log is as terse as it is.
+        "lane_plausible": result.get("lane_plausible"),
         "lead_out_of_corridor": result.get("lead_out_of_corridor"),
         # Per-candidate membership, every frame. This is the largest thing in
         # the log by some way -- six candidates of ~9 short keys at 4 Hz is

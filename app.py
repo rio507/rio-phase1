@@ -1203,6 +1203,17 @@ def voice_status_endpoint():
     }
 
 
+# Tools whose answer depends on their arguments and not on the moment they
+# were asked. See the note in the endpoint below: `look` is deliberately absent
+# because the road moves, and so are the tools that answer about where the car
+# is right now.
+JOINABLE_TOOLS = frozenset({"deep_dive"})
+
+# (visual key, tool, arguments) -> the asyncio task already answering it.
+# Entries remove themselves when the task finishes.
+_inflight_tools: dict = {}
+
+
 @app.post("/realtime/tool")
 async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
                                  session_id: str = Query(default=None)):
@@ -1305,7 +1316,58 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
             except Exception:
                 pass
 
-    work = asyncio.create_task(_run_tool())
+    # THE SAME RESEARCH QUESTION, ASKED TWICE, RUN TWICE.
+    #
+    # On 2026-09-21 the live session called deep_dive with
+    # "What movies are currently playing at Regal Sherman Oaks Galleria?" at
+    # t=81.1 s, and called it again with the identical string at t=92.1 s --
+    # while the first was still running, 2.3 s from returning. The second took
+    # 16.70 s. That is sixteen seconds of a 167-second drive, and a second
+    # billed reasoning call, spent re-answering a question that was about to be
+    # answered.
+    #
+    # So an identical call that is already in flight is JOINED rather than
+    # started. Both callers get the same result and the same `call_id` handling
+    # they always had; nothing about cancellation changes, because the work was
+    # already detached from any single request (see the abandonment path
+    # below).
+    #
+    # ONLY FOR TOOLS WHOSE ANSWER DEPENDS ON THE ARGUMENTS AND NOT ON THE
+    # MOMENT, which is the whole of the rule and the reason this is a named set
+    # rather than "any tool". `look` must never be joined: the road moves, and
+    # two identical "what do you see" a second apart are two different
+    # questions about two different pictures. Neither may nav_status,
+    # vehicle_status or find_places, whose answers turn on where the car is
+    # right now. A research question does not change while it is being
+    # researched.
+    joined = False
+    share_key = None
+    if name in JOINABLE_TOOLS:
+        try:
+            share_key = (_visual_key(session_id), name,
+                         json.dumps(args, sort_keys=True, default=str))
+        except Exception:
+            share_key = None
+    work = _inflight_tools.get(share_key) if share_key else None
+    if work is not None and not work.done():
+        joined = True
+        sessions.log_live(session_id, "tool_joined", {
+            "tool": name,
+            "note": "an identical call was already running; waiting on it "
+                    "rather than starting a second",
+        })
+        # The GPU lease this request took is released immediately: the work it
+        # would have guarded is somebody else's and already under way.
+        try:
+            _gpu.__exit__(None, None, None)
+        except Exception:
+            pass
+    else:
+        work = asyncio.create_task(_run_tool())
+        if share_key:
+            _inflight_tools[share_key] = work
+            work.add_done_callback(
+                lambda t, k=share_key: _inflight_tools.pop(k, None))
 
     async def _abandoned():
         while True:
@@ -1319,6 +1381,22 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
     if work in done:
         watcher.cancel()
         result = work.result()
+        # A SHALLOW COPY, BECAUSE THE TASK MAY HAVE TWO CALLERS NOW.
+        #
+        # A joined call hands both requests the same dict, and this endpoint
+        # then MUTATES it -- `result.pop("meta")` below, and the `joined` flag
+        # just under here. Without this line the second caller pops a key the
+        # first one is still expecting, or reads a flag that belongs to the
+        # other request. Copied unconditionally rather than only on the joined
+        # path: which of two requests got here first is not a thing this code
+        # should have to know.
+        if isinstance(result, dict):
+            result = dict(result)
+            # Whether this answer was researched for this call or was already
+            # being researched for another. On the wire as well as in the log,
+            # so the panel's own counters can tell the difference.
+            if joined:
+                result["joined"] = True
     else:
         # The driver moved on. The tool is left to finish into nothing.
         work.add_done_callback(lambda t: t.exception())
@@ -1329,7 +1407,12 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
         })
         return JSONResponse({"ok": False, "note": "abandoned"}, status_code=499)
     logged = {"tool": name, "ok": bool(result.get("ok")),
-              "took_ms": result.get("took_ms")}
+              "took_ms": result.get("took_ms"),
+              # Whether this answer was researched for this call or was
+              # already being researched for another. Without it the drive log
+              # reports two calls of thirteen and sixteen seconds and cannot
+              # say that the second one did no work.
+              "joined": bool(joined)}
     # WHICH PATH a visual answer took, in the drive's own record. The three are
     # a hundredfold apart in cost — 4 ms from the running observation, a local
     # forward pass, or the full remote turn — and which one a question got is
