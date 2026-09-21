@@ -188,19 +188,101 @@ Rules:
 # a thing that gets copied, whether it is four paired sentences, an angle-bracket
 # placeholder, or one quoted phrase inside a rule. "ROAD: five, four, asphalt" is
 # terse and a bit thin; it is also honest, and it keeps its field names.
+# THE FORMAT LINE WAS A FILL-IN-THE-BLANK AND THE MODEL FILLED IT IN.
+#
+# It used to read:
+#
+#     ROAD: lanes, surface, light | TRAFFIC: vehicles that matter and where |
+#     RISK: what could bite in the next few seconds, or none seen
+#
+# with a rule underneath saying "replace each field's description with what you
+# actually see". Cosmos-Reason2-2B does not replace them. The drive of
+# 2026-09-21 returned, among 150 readings:
+#
+#     Road: lanes 5, surface asphalt, light green      <- all three slot words
+#     Traffic: vehicles that matter cars, trucks, buses <- the slot phrase
+#     ...|homes|vehicles_that_matter_and_where          <- the slot, slugged
+#     TRAFFIC: ... bicycles that matter, vehicles that matter, cars
+#
+# A template shown to a model is a thing to complete, and the stronger the
+# formatting instruction the more completing it looks like obedience. So there
+# is no template here any more. The shape is described, the fields are NAMED,
+# and what belongs in each is an instruction rather than a blank -- which is
+# the same lesson as the angle brackets before it, and the paired examples
+# before that. is_prompt_example and echoes_prompt are what stop it coming back
+# quietly.
+#
+# AND IT SAYS WHAT NOT TO DO, because the second failure on that drive was not
+# copying the prompt, it was reciting a vocabulary:
+#
+#     TRAFFIC: sedan|truck|car|bus|van|minibus|taxi|ambulance|fire truck|pol
+#     TRAFFIC: cars|minivans|sedans|trucks|jeeps|mazdas|xpo|bmws|hyundais|audi
+#
+# -- a taxonomy of vehicle types and then of marques, on a road with four cars
+# on it. Neither is a loop and neither is memorised label text, so neither
+# guard saw it. The rule against it is stated here and canned.list_run is what
+# measures it.
+# THE ONE EXAMPLE, AND WHY IT IS BACK AFTER BEING REMOVED TWICE.
+#
+# This prompt's format line used to be a fill-in-the-blank -- "ROAD: lanes,
+# surface, light | TRAFFIC: vehicles that matter and where | ..." -- and
+# Cosmos-Reason2-2B filled the blanks in rather than replacing them. The drive
+# of 2026-09-21 returned "Road: lanes 5, surface asphalt, light green" and
+# "vehicles_that_matter_and_where", 150 readings of it.
+#
+# The obvious fix was to take the template away and describe the shape in
+# words. MEASURED ON 30 REAL ROAD FRAMES, THAT WAS WORSE: with no exemplar the
+# model stopped writing the field names at all -- 0 of 30 readings carried all
+# three, against 30 of 30 before. A bare skeleton ("ROAD: | TRAFFIC: | RISK:")
+# is worse still: 0 of 12, and the model returned the skeleton unchanged,
+# colons and all, on every frame.
+#
+# What works is ONE FILLED EXAMPLE about an obviously different road. Measured
+# by tools/sensor_prompt_ab.py over the same 30 frames of road_40s.mp4, one a
+# second, which is the cadence the observer actually runs at:
+#
+#                        all 3 fields   truncated   item loop   refused   tokens   ms
+#     old (the drive's)      30/30         9/30          3         3        44    408
+#     new (this one)         30/30         0/30          0         0        28    275
+#
+# Nothing truncated, nothing refused, a third off the latency and a third off
+# the tokens -- and the readings say WHERE things are ("sedan ahead, hatchback
+# behind", "sedan in adjacent lane") where the old ones invented distances
+# ("car 58.3m, car 67.1m, car 26.4m"). The model needs to see the shape; what
+# it must not see is a shape with slots in it.
+#
+# So the example is here, and the defences against the thing examples do are
+# the ones this repo already had to build:
+#   - it is a WET DUSK road with a van and a cyclist, while this pod's frames
+#     are dry daylight highway, so a copy is visible at a glance;
+#   - it is in OBSERVER_EXAMPLES, so is_prompt_example refuses it verbatim;
+#   - echoes_prompt refuses any three-word phrase of it;
+#   - and the line after it says, in the imperative, which frame to answer
+#     about.
+SENSOR_EXAMPLE = ("ROAD: three lanes, wet, dusk | TRAFFIC: van braking ahead, "
+                  "cyclist on the left | RISK: van stopping short")
+
 SENSOR_PROMPT_TERSE = """Report this frame as a sensor reading for another system. Not a sentence to a person.
 
-Exactly three fields, one line, separated by a vertical bar, at most six words each, in this order and with these names:
+Answer on ONE line with exactly three fields, separated by vertical bars, each starting with its name and a colon, in this order: ROAD, TRAFFIC, RISK.
 
-ROAD: lanes, surface, light | TRAFFIC: vehicles that matter and where | RISK: what could bite in the next few seconds, or none seen
+ROAD is how many lanes you can count, the surface, and the light.
+TRAFFIC is each vehicle or person that matters to this car, and where it is. Write none if the road is empty.
+RISK is what could bite in the next few seconds. Write none seen if nothing could.
+Six words at most after each colon.
+
+The shape, on a DIFFERENT road from this one:
+""" + SENSOR_EXAMPLE + """
+Answer about THIS frame, not that one.
 
 Rules:
-- Replace each field's description with what you actually see. Keep the field names.
-- Write no angle brackets, no square brackets, no quotes around a field.
-- Only what is visible in this frame. No guessing.
+- Only what is in THIS frame. Name what you can see, never a category you know.
+- Do NOT list kinds of vehicle. A list of vehicle types is a vocabulary, not a reading. Every vehicle you name must be one you can point at in this picture, and you must say where it is.
+- Do not repeat any word of these instructions back as an answer.
+- No angle brackets, no square brackets, no quotes around a field.
 - If the frame cannot be read, write unreadable in each field. That is a valid reading.
 - If this is not a road, say what it actually is. Do not describe a road.
-- No advice, no instruction to a driver, no speed or distance in numbers unless you can read them in the frame.
+- No advice, no instruction to a driver, no speed or distance in numbers.
 - No reasoning, no preamble. The three fields only."""
 
 # The same prompt with the paired examples appended, for the A/B. Kept as a
@@ -249,6 +331,22 @@ SENSOR_FIELDS = ("ROAD", "TRAFFIC", "RISK")
 _SENSOR_FIELD_RE = re.compile(
     r"\b(" + "|".join(SENSOR_FIELDS) + r")\s*:", re.IGNORECASE)
 
+# ANY field name, not only the three that were asked for. Cosmos invents them:
+# the drive of 2026-09-21 returned "LIGHT: red" in the middle of a reading and
+# "ROAD MARKING: single solid line, double solid lines, dashed lines" as a
+# field of its own. Matching only the three known names meant an invented one
+# was swallowed into the value of whichever field came before it --
+#
+#     ROAD: lanes, two, asphalt | LIGHT: red | TRAFFIC: cars, ...
+#     -> ROAD = "lanes, two, asphalt | LIGHT: red"
+#
+# -- which reads on the card as a model that said something odd about the road,
+# rather than as a model that answered a question nobody asked. A bare word in
+# caps, or Title Case, followed by a colon. Bounded in length so a sentence
+# ending in a colon is not mistaken for a field.
+_ANY_FIELD_RE = re.compile(
+    r"(?:^|[|\n])\s*([A-Z][A-Za-z]{1,14}(?:\s+[A-Z][A-Za-z]{1,14}){0,2})\s*:")
+
 
 def split_sensor_reading(text: str) -> dict:
     """A sensor reading -> its fields, for a card that shows them as rows.
@@ -274,6 +372,14 @@ def split_sensor_reading(text: str) -> dict:
     raw = (text or "").strip()
     found = {}
     extra = ""
+    # Every field name the model wrote, asked-for or not. The invented ones are
+    # reported under `unknown` so the card can say the model answered a
+    # question nobody asked, rather than folding the answer into its neighbour.
+    unknown = []
+    for m in _ANY_FIELD_RE.finditer(raw):
+        name = m.group(1).strip()
+        if name.upper() not in SENSOR_FIELDS and name not in unknown:
+            unknown.append(name)
     matches = list(_SENSOR_FIELD_RE.finditer(raw))
     if matches:
         if matches[0].start() > 0:
@@ -282,6 +388,15 @@ def split_sensor_reading(text: str) -> dict:
             end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
             name = m.group(1).upper()
             value = raw[m.end():end].strip().strip("|").strip()
+            # ...and an invented field inside this one's value is cut off it
+            # rather than shown as part of the answer. What it said is kept --
+            # it moves to `extra`, which the card renders as "Also written".
+            cut = _ANY_FIELD_RE.search(value)
+            if cut and cut.group(1).upper() not in SENSOR_FIELDS:
+                spare = value[cut.start():].strip().strip("|").strip()
+                if spare:
+                    extra = (extra + " | " + spare).strip(" |")
+                value = value[:cut.start()].strip().strip("|").strip()
             # A repeated field name keeps the FIRST value: a second "ROAD:" is
             # the model restarting, and the first answer is the one it gave to
             # the frame rather than to its own output.
@@ -304,6 +419,11 @@ def split_sensor_reading(text: str) -> dict:
         # True when the format was recognisable at all -- at least one named
         # field. It is not a claim that the reading is good.
         "parsed": bool(matches),
+        # Field names the model invented. Not an error and not refused -- a
+        # model noticing a traffic light is not misbehaving -- but it is a fact
+        # about the reading and the card says so rather than hiding it inside
+        # another field's value.
+        "unknown_fields": unknown,
     }
 
 
@@ -473,7 +593,144 @@ def _normalise(text: str) -> str:
     return "".join(out).strip()
 
 
-_EXAMPLE_KEYS = frozenset(_normalise(e) for e in OBSERVER_EXAMPLES)
+# The sensor prompt's worked example belongs in here for the same reason the
+# observer's do: it is a sentence about a road that is not in front of the
+# car, and returning it verbatim is the failure this set exists to refuse.
+_EXAMPLE_KEYS = frozenset(_normalise(e)
+                          for e in list(OBSERVER_EXAMPLES) + [SENSOR_EXAMPLE])
+
+
+# THE PROMPT'S OWN WORDS, COMING BACK AS A VALUE.
+#
+# is_prompt_example below catches a whole EXAMPLE returned verbatim, which was
+# the 2026-09-19 fault. The 2026-09-21 fault is smaller and slipped straight
+# past it: not the example, a PHRASE out of the instructions, used as an answer.
+#
+#     Road: lanes 5, surface asphalt, light green
+#     Traffic: vehicles that matter cars, trucks, buses
+#     ...|homes|vehicles_that_matter_and_where
+#     TRAFFIC: ... bicycles that matter, vehicles that matter, cars
+#
+# "lanes", "surface", "light", "vehicles that matter and where" were the slot
+# descriptions in the format line. The prompt no longer contains that line --
+# see SENSOR_PROMPT_TERSE -- but the next prompt will contain SOME wording, and
+# a model that completes a template will complete whatever is put in front of
+# it. So this is derived FROM the prompt rather than from a list of phrases
+# somebody has to remember to update.
+#
+# Three or more consecutive content words shared with the prompt. Three,
+# because two is a coincidence in English ("in the", "of a") and a reading
+# genuinely saying "stopped at the red light" shares nothing that long with an
+# instruction about what a field means.
+_ECHO_MIN_WORDS = 3
+
+# PLAIN WORD n-GRAMS, function words and all, and the first version of this got
+# that wrong. It stripped stopwords first, on the reasoning that "the" and
+# "that" carry no evidence -- which deleted "that" and "matter" out of
+# "vehicles that matter" and left one word, and the guard then missed all three
+# readings it had been written for. The function words ARE the phrase.
+#
+# AND IT IS WHAT LETS THE PROMPT CARRY AN ANTI-EXAMPLE. SENSOR_PROMPT_TERSE
+# says: '"sedan, truck, bus, van, taxi" is a vocabulary, not a reading'. This
+# repo's whole history with prompts says a model will copy that -- the paired
+# examples, then the angle brackets, then the slot descriptions. It may stay in
+# because a reading that copies it is caught here, by name, as an echo.
+
+# Built once per prompt text. A module-level cache keyed by identity and
+# verified by value, so a prompt swapped at runtime -- which the A/B harness
+# does -- is never compared against a stale vocabulary.
+_ECHO_CACHE = {}
+
+
+# AN n-GRAM OF NOTHING BUT FUNCTION WORDS IS NOT EVIDENCE OF COPYING. The
+# prompt says "in the next few seconds" and a perfectly good reading says
+# "lorry ahead in the next lane"; they share "in the next", which is three
+# words and no information. So an n-gram is only kept when at least one of its
+# words carries meaning.
+#
+# Deliberately a list of FUNCTION words rather than a list of road words: the
+# road vocabulary is what this must never suppress, and enumerating it would be
+# a second, differently-wrong copy of what a reading may contain.
+_FUNCTION_WORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by",
+    "can", "do", "does", "each", "every", "for", "from", "has", "have", "if",
+    "in", "into", "is", "it", "its", "just", "may", "more", "most", "must",
+    "next", "no", "not", "of", "on", "one", "only", "or", "other", "out",
+    "over", "own", "same", "should", "so", "some", "than", "that", "the",
+    "their", "them", "then", "there", "these", "they", "this", "those", "to",
+    "up", "was", "were", "what", "when", "where", "which", "while", "will",
+    "with", "would", "you", "your",
+}
+
+
+def _ngrams(words, n):
+    out = set()
+    for i in range(0, max(0, len(words) - n + 1)):
+        g = tuple(words[i:i + n])
+        if all(w in _FUNCTION_WORDS for w in g):
+            continue
+        out.add(g)
+    return out
+
+
+# THE WORKED EXAMPLE IS HELD TO A DIFFERENT STANDARD FROM THE INSTRUCTIONS,
+# and it has to be. The instructions are prose about how to answer: a reading
+# sharing three words with them has copied them, always. The example is a
+# SENTENCE ABOUT A ROAD, deliberately shaped like the answer -- so a real
+# reading of a genuinely wet road at dusk shares "lanes wet dusk" with it and
+# has copied nothing. That is not a hypothetical: it was the first false
+# positive this guard produced.
+#
+# So the example needs four words before it counts, which is past coincidence
+# for a six-word field ("van braking ahead cyclist" is a copy; "lanes wet dusk"
+# is a road), and a verbatim return is refused by is_prompt_example regardless.
+_ECHO_EXAMPLE_MIN_WORDS = 4
+
+
+def _prompt_ngrams(prompt: str):
+    key = id(prompt) if prompt is not None else 0
+    hit = _ECHO_CACHE.get(key)
+    if hit is None or hit[0] != prompt:
+        text = prompt or ""
+        # The example is scored separately and at a longer length; take it out
+        # of the instructions' vocabulary rather than counting it twice.
+        instructions = text.replace(SENSOR_EXAMPLE, " ")
+        grams = _ngrams(_normalise(instructions).split(), _ECHO_MIN_WORDS)
+        if SENSOR_EXAMPLE in text:
+            grams |= _ngrams(_normalise(SENSOR_EXAMPLE).split(),
+                             _ECHO_EXAMPLE_MIN_WORDS)
+        _ECHO_CACHE[key] = hit = (prompt, grams)
+    return hit[1]
+
+
+def echoes_prompt(text: str, prompt: str = None) -> list:
+    """Phrases this reading took from its own instructions. [] is clean.
+
+    Returns the overlapping phrases rather than a bool, because "it copied the
+    prompt" is a claim somebody will want to check and the phrase is the
+    evidence. vision.observe refuses on a non-empty list and counts it.
+
+    `prompt` defaults to the sensor prompt actually in use. Underscores are
+    normalised away first: the drive that produced this returned a slot as
+    `vehicles_that_matter_and_where`, one token, which no word-level comparison
+    would otherwise have seen.
+
+    THE FIELD NAMES ARE NOT AN ECHO. Every reading contains ROAD, TRAFFIC and
+    RISK because it was told to, and three of them in a row with a colon
+    between is the FORMAT, not a copy. They are dropped before comparing.
+    """
+    if prompt is None:
+        prompt = SENSOR_PROMPT_TERSE
+    flat = (text or "").replace("_", " ")
+    for name in SENSOR_FIELDS:
+        flat = re.sub(name + r"\s*:", " ", flat, flags=re.IGNORECASE)
+    words = _normalise(flat).split()
+    if len(words) < _ECHO_MIN_WORDS:
+        return []
+    grams = _prompt_ngrams(prompt)
+    mine = _ngrams(words, _ECHO_MIN_WORDS) | _ngrams(words,
+                                                     _ECHO_EXAMPLE_MIN_WORDS)
+    return sorted(" ".join(g) for g in (mine & grams))
 
 
 def is_prompt_example(text: str) -> bool:

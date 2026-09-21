@@ -157,6 +157,119 @@ def word_loop_run(text: str) -> int:
     return best
 
 
+# A CATALOGUE IS NOT A READING, and this is the third way a model stops
+# looking without repeating itself. From the drive of 2026-09-21, on a road
+# with four cars on it:
+#
+#     TRAFFIC: sedan|truck|car|bus|van|minibus|taxi|ambulance|fire truck|pol
+#     TRAFFIC: cars, minivans, sedans, hatchbacks, SUVs, trucks, vans,
+#              motorcycles, bicycles, bicycles that matter, vehicles that matter
+#     TRAFFIC: cars|minivans|sedans|trucks|jeeps|mazdas|xpo|bmws|hyundais|audi
+#     ROAD:    two|four|asphalt|single|straight|no|no|no|no
+#
+# Nothing repeats, so word_loop_run scores 1. Nothing is memorised label text,
+# so markers() is empty. Every one of them is fluent, well-formed, in the right
+# format -- and is the model emptying a category out of its vocabulary instead
+# of describing the picture. It is the SAME FAILURE as reciting a training
+# label, arrived at from the other end: there, one memorised sentence; here,
+# the whole list the sentence would have come from.
+#
+# Six, because a real reading of a road does use short lists and they are
+# short: "four, asphalt, moderate" is three, "five, two, single lane, asphalt,
+# signalized" is five and is a perfectly good ROAD field. Nine one-word items
+# is a vocabulary.
+LIST_FLOOR = 6
+
+# ...and the length at which an item stops being a bare category. "sedan" is a
+# catalogue entry; "white sedan right lane" is an observation. Counted in
+# words, per item.
+LIST_ITEM_MAX_WORDS = 2
+
+# Where a thing IS, which is what the prompt asks for and what a catalogue
+# never has. A field carrying any of these is describing a scene rather than
+# emptying a category, however many items it has.
+_PLACE_WORDS = (
+    "ahead", "behind", "left", "right", "front", "beside", "next to", "lane",
+    "oncoming", "adjacent", "kerb", "curb", "verge", "shoulder", "junction",
+    "crossing", "parked", "stopped", "turning", "merging", "queue", "near",
+    "far", "centre", "center", "side", "opposite", "across", "up", "back",
+)
+
+# One piece of a list. Bars and commas only -- a semicolon or a colon can
+# separate a field from its name, and splitting on those would make every
+# reading look like a list of three.
+_LIST_SPLIT = re.compile(r"\s*[|,]\s*")
+
+# ...matched on WORD BOUNDARIES, which cost a measurement to learn: as a plain
+# substring test, "back" is inside "hatchbacks" and the twelve-item vehicle
+# catalogue of 2026-09-21 therefore read as a scene that said where things
+# were. A place word has to be a word.
+_PLACE_RE = re.compile(
+    r"\b(?:" + "|".join(w.replace(" ", r"\s+") for w in _PLACE_WORDS) + r")\b",
+    re.IGNORECASE)
+
+# A field name at the front of a list item: "TRAFFIC: cars" is the item "cars"
+# in the TRAFFIC field, not a different item from the "cars" after it. Without
+# this, "TRAFFIC: cars|cars|cars" runs to two and passes.
+_ITEM_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z _]{2,20}:\s*")
+
+
+def list_run(text: str) -> int:
+    """Longest run of bare catalogue items in any one field. -> count.
+
+    A FIELD AT A TIME, because the fields are different questions and a long
+    ROAD does not excuse a long TRAFFIC. Field names are found the same way
+    rio_prompts.split_sensor_reading finds them -- a word in caps followed by a
+    colon -- rather than imported, so this file keeps working on a teacher row
+    that has no sensor fields at all.
+    """
+    t = (text or "").strip()
+    if not t:
+        return 0
+    # Split into fields on "NAME:" where NAME is a bare word. Everything before
+    # the first one is a field too (a reading with no names at all).
+    parts = re.split(r"(?:^|[|\s])([A-Za-z][A-Za-z _]{2,20}):", t)
+    chunks = [parts[0]] + parts[2::2] if len(parts) > 1 else [t]
+    best = 0
+    for chunk in chunks:
+        chunk = (chunk or "").strip()
+        if not chunk:
+            continue
+        if _PLACE_RE.search(chunk):
+            continue                 # it says where things are: a scene
+        items = [i.strip() for i in _LIST_SPLIT.split(chunk) if i.strip()]
+        run = 0
+        for item in items:
+            if len(item.split()) <= LIST_ITEM_MAX_WORDS:
+                run += 1
+                best = max(best, run)
+            else:
+                run = 0
+    return best
+
+
+# A DELIMITED ITEM REPEATED, which is a loop that word_loop_run is deliberately
+# too generous to catch. Its floor is five because "very very very" is three
+# and prose does that on purpose. A BAR-SEPARATED FIELD DOES NOT: nothing
+# legitimate writes "cars|cars|cars", and that reading reached the card on
+# 2026-09-21 under a three-run that both loop checks passed.
+ITEM_LOOP_FLOOR = 3
+
+
+def item_loop_run(text: str) -> int:
+    """Longest run of one repeated list ITEM. -> count (0 when there is no list)."""
+    items = [_ITEM_NAME_RE.sub("", i.strip()).strip().lower()
+             for i in _LIST_SPLIT.split(text or "") if i.strip()]
+    items = [i for i in items if i]
+    if len(items) < 2:
+        return 0
+    best = run = 1
+    for i in range(1, len(items)):
+        run = run + 1 if items[i] == items[i - 1] else 1
+        best = max(best, run)
+    return best if best > 1 else 0
+
+
 def looks_canned(text: str) -> bool:
     return bool(markers(text))
 
@@ -178,6 +291,15 @@ def describe(text: str, repeats: int = 0) -> dict:
     wloop = word_loop_run(text)
     if wloop >= WORD_LOOP_FLOOR:
         out["word_loop"] = wloop
+    # ...and the same fault a third way: an item repeated inside a delimited
+    # list, where three is already impossible on purpose.
+    iloop = item_loop_run(text)
+    if iloop >= ITEM_LOOP_FLOOR:
+        out["item_loop"] = iloop
+    # ...and the model emptying a category instead of describing the picture.
+    lrun = list_run(text)
+    if lrun >= LIST_FLOOR:
+        out["catalogue"] = lrun
     if not out:
         return out
     # TWO STRENGTHS, AND THEY ARE NOT THE SAME CLAIM.
@@ -192,8 +314,18 @@ def describe(text: str, repeats: int = 0) -> dict:
     # small vocabulary of exactly that kind. Calling that "recited" would train
     # whoever reads this card to ignore the flag, which is the only way a flag
     # can fail.
-    out["strength"] = ("strong" if (m or out.get("loop") or out.get("word_loop"))
+    out["strength"] = ("strong" if (m or out.get("loop") or out.get("word_loop")
+                                    or out.get("item_loop") or out.get("catalogue"))
                        else "weak")
+    if out.get("catalogue") and not m:
+        out["why"] = (f"{out['catalogue']} bare categories in a row and no "
+                      f"sign of where any of them is — a vocabulary, not a "
+                      f"reading of this frame")
+        return out
+    if out.get("item_loop") and not m and not out.get("loop"):
+        out["why"] = (f"one list item repeats {out['item_loop']} times — a "
+                      f"decoding loop, not a reading")
+        return out
     if out.get("word_loop") and not m and not out.get("loop"):
         out["why"] = (f"one word repeats {out['word_loop']} times in a row — a "
                       f"decoding loop, not a reading")

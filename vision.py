@@ -47,7 +47,8 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 import config
 from rio_prompts import (OBSERVER_PROMPT, SENSOR_PROMPT,
                          SENSOR_PROMPT_TERSE, is_prompt_example,
-                         sensor_faults, strip_measurements)
+                         sensor_faults, strip_measurements,
+                         echoes_prompt)
 from teachers import canned
 
 MODEL_ID = config.local_vision_model_id()
@@ -321,6 +322,10 @@ _flags = {
     # frame cannot show a speed; a distance needs geometry. See
     # rio_prompts.strip_measurements.
     "invented_units": 0,
+    # the reading handed the prompt's own wording back as an answer
+    # (rio_prompts.echoes_prompt). A smaller relative of prompt_example: not
+    # the whole example, a phrase out of the instructions used as a value.
+    "prompt_echo": 0,
     # the reading hit the token cap mid-sentence and its last field is a
     # fragment. Counted apart from everything else because it is a BUDGET
     # fault, not a model fault -- the fix is a bigger cap or a shorter prompt,
@@ -531,6 +536,21 @@ def observe(image_bytes: bytes, max_side: int = None, frame_id=None) -> str:
         # them separately: an empty string is a thing every caller already
         # handles (it means "no observation"), and the honest slow path picks
         # it up. See rio_prompts.is_prompt_example for the measurement.
+        # ...AND THE SMALLER VERSION OF THE SAME THING. is_prompt_example
+        # below wants the whole example back; this catches a PHRASE out of the
+        # instructions used as a value, which is what the drive of 2026-09-21
+        # produced for a hundred and fifty readings: "vehicles that matter" in
+        # the TRAFFIC field, once as `vehicles_that_matter_and_where`. Derived
+        # from whichever prompt is in use, so it cannot fall behind a rewrite.
+        _echo = echoes_prompt(text, TEACHER_PROMPT)
+        if _echo:
+            _flags["prompt_echo"] += 1
+            if _flags["prompt_echo"] in (1, 10, 100):
+                print(f"[vision] reading refused -- it handed the prompt's own "
+                      f"words back {_echo}: {text[:100]!r} "
+                      f"({_flags['prompt_echo']} so far)", flush=True)
+            clear_holder()
+            return ""
         if is_prompt_example(text):
             global _parroted
             _parroted += 1

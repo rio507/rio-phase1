@@ -340,6 +340,90 @@ def main() -> int:
     ok("...and the refusal set is canned.py's own strength, not a copied list",
        'verdict.get("strength") == "strong"' in (REPO / "vision.py").read_text())
 
+    # -----------------------------------------------------------------------
+    # THE TWO MODES THE DRIVE OF 2026-09-21 FOUND, neither of which is a loop
+    # and neither of which was visible to anything above this line. 150
+    # readings, and a large share of them were one or the other.
+    DRIVE_CATALOGUES = [
+        ("a taxonomy of vehicle types",
+         "ROAD: two|four|asphalt|single|straight|no|no|no|no\nTRAFFIC: sedan|"
+         "truck|car|bus|van|minibus|taxi|ambulance|fire truck|pol"),
+        ("...and one of marques",
+         "ROAD: two|four|dry asphalt | TRAFFIC: cars|minivans|sedans|trucks|"
+         "jeeps|mazdas|xpo|bmws|hyundais|audi|volvos|chevys"),
+        ("...and one with the prompt's own phrase in it",
+         "ROAD: lanes, two, asphalt | LIGHT: red | TRAFFIC: cars, minivans, "
+         "sedans, hatchbacks, SUVs, trucks, vans, motorcycles, bicycles, "
+         "bicycles that matter, vehicles that matter, cars"),
+        ("a list item repeated three times, which both loop checks allow",
+         "ROAD: two|two|none|TRAFFIC: cars|cars|cars|RISK: none"),
+    ]
+    for why, text in DRIVE_CATALOGUES:
+        v = vis.reading_refused(text, 0)
+        ok(f"the LIVE PATH refuses {why}", bool(v),
+           (v or {}).get("why") or "NOT REFUSED — this reaches the card")
+    # ...and the place-word test is on WORD boundaries. As a substring, "back"
+    # is inside "hatchbacks", and the twelve-item catalogue above read as a
+    # scene that said where things were.
+    ok("...a catalogue is not excused by a place word inside another word",
+       canned.list_run("cars, minivans, hatchbacks, SUVs, trucks, vans, "
+                       "motorcycles, bicycles") >= canned.LIST_FLOOR)
+    for good in ("ROAD: five, two, single lane, asphalt, signalized | "
+                 "TRAFFIC: cars, truck | RISK: none detected",
+                 "ROAD: five lanes, asphalt | TRAFFIC: sedan on right lane, "
+                 "sedan on left lane, sedan ahead in center lane | RISK: none",
+                 "ROAD: unreadable | TRAFFIC: unreadable | RISK: no view"):
+        ok(f"...while a real reading is published ({good[:30]}…)",
+           vis.reading_refused(good, 0) is None)
+
+    # THE PROMPT, HANDED BACK AS AN ANSWER. Derived from whichever prompt is in
+    # use, so it cannot fall behind a rewrite -- which is the whole reason the
+    # last three versions of this guard went stale.
+    ok("a phrase from the live INSTRUCTIONS, used as a value, is refused",
+       bool(rp3.echoes_prompt("ROAD: how many lanes you can count | "
+                              "TRAFFIC: none | RISK: none",
+                              vis.TEACHER_PROMPT)))
+    ok("...including the rule that forbids a vocabulary, quoted back",
+       bool(rp3.echoes_prompt("ROAD: two | TRAFFIC: a list of vehicle types | "
+                              "RISK: none", vis.TEACHER_PROMPT)))
+    ok("...and the worked example, returned verbatim",
+       rp3.is_prompt_example(rp3.SENSOR_EXAMPLE))
+    ok("...and the worked example, half copied",
+       bool(rp3.echoes_prompt("ROAD: two lanes, dry | TRAFFIC: van braking "
+                              "ahead, cyclist on the left | RISK: none",
+                              vis.TEACHER_PROMPT)))
+    ok("...while a real reading echoes nothing",
+       not rp3.echoes_prompt("ROAD: five lanes, dry, day | TRAFFIC: sedan "
+                             "ahead, hatchback behind | RISK: none",
+                             vis.TEACHER_PROMPT))
+    # THE EXAMPLE IS A SENTENCE ABOUT A ROAD, so a real reading of a similar
+    # road resembles it and has copied nothing. Three words is coincidence
+    # against an example and proof against an instruction; hence two floors.
+    ok("...and a genuinely wet road at dusk is not an echo of the example",
+       not rp3.echoes_prompt("ROAD: six lanes, wet, dusk | TRAFFIC: lorry "
+                             "ahead in the next lane | RISK: none seen",
+                             vis.TEACHER_PROMPT),
+       "shares 'lanes wet dusk' with the example and nothing more")
+    ok("...nor is an n-gram of nothing but function words",
+       not rp3.echoes_prompt("ROAD: two lanes | TRAFFIC: car in the next "
+                             "lane | RISK: none seen", vis.TEACHER_PROMPT))
+    ok("...and it is counted as its own flag", "prompt_echo" in vis.flag_rate())
+
+    # AN INVENTED FIELD IS SURFACED, NOT SWALLOWED. "LIGHT: red" mid-reading
+    # used to become part of whatever field came before it.
+    _inv = rp3.split_sensor_reading(
+        "ROAD: lanes, two, asphalt | LIGHT: red | TRAFFIC: cars | RISK: none")
+    ok("a field the model invented is named rather than hidden",
+       _inv["unknown_fields"] == ["LIGHT"], str(_inv["unknown_fields"]))
+    ok("...and it is cut out of its neighbour's value",
+       _inv["fields"][0]["text"] == "lanes, two, asphalt",
+       repr(_inv["fields"][0]["text"]))
+    ok("...while what it said is kept, not dropped",
+       "LIGHT: red" in (_inv["extra"] or ""), repr(_inv["extra"]))
+    ok("...and a clean reading invents nothing",
+       rp3.split_sensor_reading("ROAD: four | TRAFFIC: none | RISK: none "
+                                "seen")["unknown_fields"] == [])
+
     vsrc = (REPO / "vision.py").read_text()
     ok("the canned guard runs on EVERY reading, not just teacher rows",
        "reading_refused(text, repeats)" in vsrc)
