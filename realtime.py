@@ -2470,22 +2470,30 @@ def look(question: str, session_key: str = "default",
                 # model's output, and she should know whose.
                 base["reading_from"] = (hit.get("model")
                                         or config.local_vision_label())
-                # ...AND THE SAME READING, SPLIT THE SAME WAY THE GLASS SPLITS
-                # IT. `answer` above is the whole string and stays the thing
-                # she composes from; this is that string through
-                # rio_prompts.split_sensor_reading, which is the one parser the
+                # ...AND THE SAME READING, SPLIT AND RECONCILED THE SAME WAY
+                # THE GLASS GETS IT. `answer` above is the whole string and
+                # stays the thing she composes from; this is that string
+                # through observer.reading(), which is the one builder the
                 # Perception card also goes through. Two consumers, one record,
-                # one parser -- so "what I read on the glass is what she infers
-                # from" is a property of the code rather than a hope about two
-                # code paths, and tools/sensor_card_selftest.py checks the two
-                # payloads are byte-identical on a running server.
+                # one builder -- so "what I read on the glass is what she
+                # infers from" is a property of the code rather than a hope
+                # about two code paths, and tools/sensor_card_selftest.py
+                # checks the two payloads match on a running server.
+                contested_rule = ""
                 try:
-                    import rio_prompts as _rp
-                    base["reading_fields"] = _rp.split_sensor_reading(
-                        hit["text"])["fields"]
-                except Exception:
-                    # A card decoration may never cost an answer.
-                    pass
+                    import reconcile as _rc
+                    _reading = observer.reading(session_key, hit)
+                    if _reading:
+                        base["reading_fields"] = _reading["fields"]
+                        base["contested"] = _reading.get("contested") or []
+                        base["detector"] = _reading.get("detector")
+                        contested_rule = _rc.rule_for({
+                            "contested": base["contested"],
+                            "detector": base["detector"]})
+                except Exception as e:
+                    # A reconciliation that fails may not cost an answer.
+                    print(f"[look] reading block failed: "
+                          f"{type(e).__name__}: {e}", flush=True)
                 sensor = not config.local_vision_speaks_directly()
                 base["rules"] = (
                     "This is what the camera is seeing right now — "
@@ -2501,6 +2509,11 @@ def look(question: str, session_key: str = "default",
                     "detail about one particular thing, ask this tool again "
                     "about that thing and it will look properly. This is a "
                     "passing scene, so do not offer to say more about it."
+                    # THE DETECTOR WINS ON EXISTENCE, and she is told so in the
+                    # same breath as the reading rather than left to weigh two
+                    # instruments she has no way of weighing. Empty unless they
+                    # actually disagree -- see reconcile.rule_for.
+                    + contested_rule
                 )
                 return base
 

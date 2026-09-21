@@ -89,10 +89,31 @@
     var row = el('div', 'teach-field');
     // Title case for the row label; the wire keeps the model's own casing.
     var name = f.name || '';
-    row.appendChild(el('div', 'teach-label',
-                       name.charAt(0) + name.slice(1).toLowerCase()));
+    var head = el('div', 'teach-label',
+                  name.charAt(0) + name.slice(1).toLowerCase());
+    /* THE DETECTOR DISAGREES, SAID ON THE ROW ITSELF.
+       Not on the card's header and not in a footnote: the contradiction is
+       about THIS field, and a driver reading "TRAFFIC  none" has to see the
+       correction in the same glance or the row is still lying to them. The
+       marker reuses the recited/repeating treatment, which already means "a
+       warning about this text, not about the card". */
+    if (f.contested) {
+      var warn = el('span', 'teach-recited', ' detector disagrees');
+      warn.title = f.why || 'the tracker holds road users the reading missed';
+      head.appendChild(warn);
+    }
+    row.appendChild(head);
     if (f.present) {
-      row.appendChild(el('div', 'teach-text', f.text));
+      row.appendChild(el('div', 'teach-text' + (f.contested ? ' contested' : ''),
+                         f.text));
+      /* WHAT IS ACTUALLY THERE, under the words that denied it. The reading is
+         left exactly as the model wrote it -- rewriting a model's output and
+         showing it as the model's output is how a card stops being evidence --
+         and the tracker's account goes beneath it as its own line. */
+      if (f.contested && f.detector) {
+        row.appendChild(el('div', 'teach-detector',
+                           'tracking ' + f.detector));
+      }
     } else {
       /* RULE 2. Not blank, and not "--": the sentence says which of the two
          things happened, because "the model did not report this" and "the

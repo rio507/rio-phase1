@@ -348,6 +348,55 @@ def cached(session_key: str) -> dict:
     return rec
 
 
+def reading(session_key: str, rec: dict = None) -> dict:
+    """The record, split into fields and checked against the detector. -> {}|dict
+
+    ONE BUILDER, TWO CONSUMERS, AND THAT IS THE POINT. /perceive calls this for
+    the Perception card and realtime.look() calls it for the live session. If
+    they built their own the card would eventually show a reading RIO was not
+    given, which is the one thing the card exists not to do --
+    tools/sensor_card_selftest.py compares the two payloads byte for byte on a
+    running server.
+
+    -> {raw, fields, extra, parsed, model, age_s, frame_id, frame_age_s,
+        speakable, fresh_s, contested, detector}
+
+    `fields` are RECONCILED: a TRAFFIC field claiming the road is empty while
+    the detector holds road users on it comes back marked, with the tracker's
+    account beside it. Nothing is rewritten -- see reconcile.py for why the
+    rule is asymmetric and why RISK is left alone.
+    """
+    import rio_prompts as _rp
+    import reconcile as _rc
+    from headway import census as _census
+
+    rec = cached(session_key) if rec is None else rec
+    if not isinstance(rec, dict) or not (rec.get("text") or "").strip():
+        return {}
+    out = _rp.split_sensor_reading(rec["text"])
+    out["model"] = rec.get("model") or config.local_vision_label()
+    out["age_s"] = rec.get("age_s")
+    out["frame_id"] = rec.get("frame_id")
+    out["frame_age_s"] = rec.get("frame_age_s")
+    # An instrument's reading is never spoken as hers. See _record above.
+    out["speakable"] = bool(rec.get("speakable"))
+    # The observer's own threshold, shipped rather than guessed at by a card.
+    out["fresh_s"] = float(getattr(config, "OBSERVER_FRESH_S", 2.0))
+    # THE DETECTOR, WHICH WINS ON EXISTENCE. Keyed by the visual key, which is
+    # the key this reading is filed under too -- see headway/census.py.
+    try:
+        checked = _rc.check(out["fields"], _census.current(session_key))
+        out["fields"] = checked["fields"]
+        out["contested"] = checked["contested"]
+        out["detector"] = checked["detector"]
+    except Exception as e:
+        # A reconciliation that fails may not cost the reading.
+        print(f"[observer] reconcile failed: {type(e).__name__}: {e}", flush=True)
+        out["contested"] = []
+        out["detector"] = None
+    return out
+
+
 def serve_to(rec: dict, session_key: str) -> bool:
     """May THIS session be told THIS observation? Two questions, both hard no.
 

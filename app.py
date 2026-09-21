@@ -78,6 +78,7 @@ except Exception as _teach_err:                       # pragma: no cover
 # headway.anchor at import time, so headway.live's anchor path finds a provider
 # already installed and never pulls a second copy of the weights.
 from headway import live as headway_live
+from headway import census as headway_census
 from headway import live_policy
 from headway import lanes as headway_lanes
 from headway import detect as headway_detect
@@ -533,33 +534,17 @@ def _visual_key(session_id, client_id: str = None):
     return f"client:{cid}" if cid else "default"
 
 
-def _reading_block(rec) -> dict:
-    """An observer record -> the block both the card and look() are given.
+def _reading_block(key, rec) -> dict:
+    """The block the Perception card is given. -> observer.reading(), or None.
 
-    One function so the two cannot drift. Everything in it comes off the record
-    the observer wrote when it described the frame: the text, the instrument's
-    own name, the age, and which frame it was. The fields are split here rather
-    than in the browser for the same reason -- a second parser is a second
-    opinion about what the model said.
+    A thin wrapper over the one builder, kept so the endpoint reads plainly and
+    so there is exactly one place that decides what the card is sent. See
+    observer.reading(): it splits the fields and reconciles them against the
+    detector's census, and realtime.look() calls the same function for RIO.
     """
-    if not isinstance(rec, dict) or not (rec.get("text") or "").strip():
-        return None
-    import rio_prompts as _rp
-    text = rec["text"]
-    out = _rp.split_sensor_reading(text)
-    out["model"] = rec.get("model") or config.local_vision_label()
-    out["age_s"] = rec.get("age_s")
-    out["frame_id"] = rec.get("frame_id")
-    out["frame_age_s"] = rec.get("frame_age_s")
-    # An instrument's reading is never spoken as hers; the card says so rather
-    # than letting a driver assume the words on the glass are the words she
-    # would use. See observer._record and config.local_vision_speaks_directly.
-    out["speakable"] = bool(rec.get("speakable"))
-    # The age at which the observer itself stops serving a reading as current
-    # (observer.fresh). Shipped rather than hard-coded in the browser, so the
-    # card's idea of stale and the answer path's idea of stale are one number.
-    out["fresh_s"] = float(getattr(config, "OBSERVER_FRESH_S", 2.0))
-    return out
+    import observer as _observer
+    out = _observer.reading(key, rec)
+    return out or None
 
 
 def _frame_origin(session_id, source):
@@ -1585,7 +1570,7 @@ async def perceive_endpoint(image: UploadFile = File(...), session_id: str = Que
         # infers from, and tools/sensor_card_selftest.py asserts the two are
         # byte-identical against a running server rather than leaving it here
         # as a claim.
-        result["reading"] = _reading_block(rec)
+        result["reading"] = _reading_block(vkey, rec)
     else:
         result = await run_in_threadpool(perceive.perceive, image_bytes, bool(debug))
         # Not the observer's reading: this branch runs perceive's own caption
@@ -1690,6 +1675,16 @@ async def headway_frame_endpoint(
     # here is inside the 250 ms frame budget, and outside the session lock,
     # which the frame no longer needs. The ring is RAM-only and six seconds
     # long — see framebuf.py.
+    # WHAT THE DETECTOR IS HOLDING, filed under the VISUAL key.
+    #
+    # headway_live keys its sessions `session_id or "default"`; frames, the
+    # observer and every visual answer are keyed by _visual_key(). Those differ
+    # for exactly the case this is for -- a clip playing with no drive started
+    # -- so the census is written here, by the one place that knows both, under
+    # the key the reading it will be compared against is filed under.
+    # See headway/census.py and reconcile.py.
+    headway_census.note(_visual_key(session_id), result.get("scene_objects"))
+
     if config.VISUAL_QA_ENABLED:
         try:
             _push_frame(_visual_key(session_id), image_bytes, result,
@@ -1949,6 +1944,11 @@ async def headway_ws_endpoint(ws: WebSocket, session_id: str = Query(default=Non
                 result["vision_busy_end"] = vision.busy()
             except Exception:
                 result["vision_busy_end"] = None
+
+            # The census, on the socket transport too. Both transports run the
+            # same loop and a reading must not be reconciled on one and not the
+            # other. See headway/census.py.
+            headway_census.note(vkey, result.get("scene_objects"))
 
             if config.VISUAL_QA_ENABLED:
                 try:

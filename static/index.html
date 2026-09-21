@@ -1692,6 +1692,20 @@
      are not clamped the way a four-hundred-word reasoning trace is. The raw
      row below them is, and keeps its Show all. */
   .teach-col.sensor-col .teach-field .teach-text { -webkit-line-clamp: 3; }
+  /* A FIELD THE DETECTOR HAS CONTRADICTED. The model's words are kept and
+     struck through rather than removed: what it said is evidence and belongs
+     on the record, and a row that silently showed the tracker's answer under
+     the model's label would be the card inventing a reading. */
+  .teach-col.sensor-col .teach-text.contested {
+    color: var(--t4); text-decoration: line-through;
+    text-decoration-color: var(--warn-text); text-decoration-thickness: 1px;
+  }
+  /* ...and what is actually there, in the warn colour, reading as the
+     correction it is. */
+  .teach-detector {
+    margin-top: 3px; font-size: var(--fs-body); line-height: 1.45;
+    color: var(--warn-text);
+  }
 
   .teach-name {
     font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;
