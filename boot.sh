@@ -906,6 +906,124 @@ tls_status() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# The label sidecar: a JSON grammar, so the eye's judgement cannot be malformed
+# ---------------------------------------------------------------------------
+# WHAT IT IS FOR. The eye reads a window of road as prose (the resident model,
+# in this process). It then labels that reading -- priority, should_speak,
+# why, about -- and the label is a JSON object. Asking a 2B model in prose for
+# a JSON object is measured to fail badly: a schema ANYWHERE in the reading
+# prompt returns the schema and answers nothing (0 chars of prose, twice, in
+# the A/B written up in eyeread.JUDGEMENT), and a schema asked for on its own
+# comes back well-formed-looking and invented.
+#
+# vLLM's guided decoding puts the schema in a GRAMMAR instead of in the
+# prompt, so a malformed or missing object becomes impossible rather than
+# unlikely. That is the whole reason this sidecar exists, and it is worth a
+# separate process only because of it.
+#
+# IT IS OPTIONAL, ON PURPOSE. eyejudge.available() is checked before every
+# label and falls back to the prompt backend when this is not up
+# (config.EYE_JUDGE_BACKEND). A drive with no sidecar gets worse labels and
+# loses nothing else: the reading, the measured state, the card, the drive
+# log and the deterministic warning path are all untouched by it. So a fresh
+# pod that never runs `boot.sh judge` still works.
+#
+# WHY ITS OWN VENV. vllm pulls torch 2.13/cu130; this repo's venv is torch
+# 2.11/cu128 with rfdetr, Depth Anything and the lane net built against it.
+# They cannot share an environment, which is what makes this a sidecar rather
+# than an import.
+#
+# TWO FLAGS THAT LOOK OPTIONAL AND ARE NOT:
+#
+#   TORCH_CUDA_ARCH_LIST=12.0   FlashInfer's JIT reads the target arch list
+#       and, given an empty one on this Blackwell card, raises "FlashInfer
+#       requires GPUs with sm75 or higher" -- on an sm120 GPU. Engine startup
+#       fails outright without this.
+#
+#   NO --reasoning-parser        qwen3's reasoning parser SILENTLY DEFEATS the
+#       grammar: it captures the whole completion as `reasoning`, leaves
+#       `content` empty, and the structured output never engages. The reading
+#       pass wants the trace separated; this pass wants the grammar, and it
+#       cannot have both.
+JUDGE_PORT=${RIO_JUDGE_PORT:-8899}
+JUDGE_VENV=${RIO_JUDGE_VENV:-/opt/vllm-venv}
+JUDGE_MODEL_DIR=${RIO_JUDGE_MODEL_DIR:-}
+JUDGE_LOG="$REPO/judge.log"
+
+# The same argv test every kill-by-pattern function in this file uses: ask
+# what a process IS, not what its command line mentions. See proc_argv_has.
+judge_pids() {
+    local pid
+    for pid in $(pgrep -f 'vllm' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        if proc_argv_has "$pid" serve; then
+            echo "$pid"
+        fi
+    done
+    return 0
+}
+
+judge_stop() {
+    local pids
+    pids=$(judge_pids)
+    [ -z "$pids" ] && return 0
+    echo "   stopping label sidecar: $(echo "$pids" | tr '\n' ' ')"
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    sleep 2
+}
+
+# The local snapshot, so a gated repo and an offline pod both work. The eye's
+# weights are already on the volume; resolving them here means the sidecar
+# never reaches the network for something this machine already has.
+judge_model_path() {
+    if [ -n "$JUDGE_MODEL_DIR" ]; then echo "$JUDGE_MODEL_DIR"; return 0; fi
+    local d
+    d=$(ls -d "${HF_HOME:-/workspace/.cache/huggingface}"/hub/models--nvidia--Cosmos-Reason2-2B/snapshots/*/ 2>/dev/null | head -1)
+    echo "${d%/}"
+}
+
+judge_start() {
+    local model
+    if [ ! -x "$JUDGE_VENV/bin/vllm" ]; then
+        echo "   no vllm venv at $JUDGE_VENV — label sidecar not started"
+        echo "   the eye falls back to the prompt backend; nothing else changes"
+        echo "   to install: python3 -m venv $JUDGE_VENV && $JUDGE_VENV/bin/pip install vllm"
+        return 0
+    fi
+    model=$(judge_model_path)
+    if [ -z "$model" ] || [ ! -d "$model" ]; then
+        echo "   no local Cosmos snapshot found — label sidecar not started"
+        return 0
+    fi
+    judge_stop
+    TORCH_CUDA_ARCH_LIST="12.0" VLLM_USE_FLASHINFER_SAMPLER=0 \
+    HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}" HF_HUB_OFFLINE=1 \
+    setsid nohup "$JUDGE_VENV/bin/vllm" serve "$model" \
+        --served-model-name nvidia/Cosmos-Reason2-2B \
+        --max-model-len 16384 \
+        --gpu-memory-utilization "${RIO_JUDGE_GPU_FRAC:-0.25}" \
+        --port "$JUDGE_PORT" \
+        > "$JUDGE_LOG" 2>&1 < /dev/null &
+    echo "   label sidecar starting on :$JUDGE_PORT (loads in ~2 min; $JUDGE_LOG)"
+    return 0
+}
+
+judge_status() {
+    local pids
+    pids=$(judge_pids)
+    if [ -z "$pids" ]; then
+        echo "   label sidecar: not running — the eye uses the prompt backend"
+        return 0
+    fi
+    if curl -sf -m 3 "http://127.0.0.1:$JUDGE_PORT/v1/models" > /dev/null 2>&1; then
+        echo "   label sidecar: $(echo "$pids" | tr '\n' ' ')  (:$JUDGE_PORT, answering)"
+    else
+        echo "   label sidecar: $(echo "$pids" | tr '\n' ' ')  (:$JUDGE_PORT, still loading)"
+    fi
+}
+
 rio_stop() {
     local pids i
     pids=$(rio_pidline)
@@ -1482,23 +1600,31 @@ case "${1-}" in
     restart) log "restarting uvicorn on :$PORT"; rio_stop; rio_start
              log "health check"; rio_wait_healthy; rc=$?
              log "https"; tls_start; exit $rc ;;
-    stop)    log "stopping uvicorn"; rio_stop; tls_stop; exit 0 ;;
+    stop)    log "stopping uvicorn"; rio_stop; tls_stop; judge_stop; exit 0 ;;
     start)   log "starting uvicorn on :$PORT"; rio_stop; rio_start
              log "health check"; rio_wait_healthy; rc=$?
              log "https"; tls_start; exit $rc ;;
     status)  log "RIO on :$PORT"; rio_status
              log "https"; tls_status
+             log "label sidecar (optional — guided decoding for the eye)"
+             judge_status
              log "teachers (shadow — not part of a drive)"; teachers_status
              log "volume vs container — what a fresh pod would still have"
              persistence_report; exit 0 ;;
     https)   log "starting tls proxy on :$HTTPS_PORT"; tls_start; exit $? ;;
     https-stop) log "stopping tls proxy"; tls_stop; exit 0 ;;
+    # NOT started by `start` or `restart`, and that is deliberate: it holds
+    # ~24 GiB of the card for as long as it runs, and a pod being brought up
+    # for a drive, a selftest or a bench should not silently pay that. The
+    # eye works without it. Ask for it when you want it.
+    judge)      log "starting label sidecar on :$JUDGE_PORT"; judge_start; exit $? ;;
+    judge-stop) log "stopping label sidecar"; judge_stop; exit 0 ;;
     cert)    shift; "$PY" -m tools.make_cert "$@"; exit $? ;;
     teachers)       teachers_start; exit $? ;;
     teachers-stop)  log "stopping teacher services"; teachers_stop; exit 0 ;;
     teachers-build) teachers_build; exit $? ;;
     "")      ;;
-    *)       echo "usage: bash boot.sh [bootstrap|storage|restart|stop|start|status|cert|https|https-stop|teachers|teachers-stop|teachers-build]" >&2
+    *)       echo "usage: bash boot.sh [bootstrap|storage|restart|stop|start|status|cert|https|https-stop|judge|judge-stop|teachers|teachers-stop|teachers-build]" >&2
              echo "       (no argument: the full provision, bootstrap included)" >&2; exit 2 ;;
 esac
 

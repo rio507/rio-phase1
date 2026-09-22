@@ -1520,15 +1520,22 @@ def read_window(window, state=None, grounded=True, max_new_tokens=None,
         import eyejudge
         judged, j_info = eyejudge.judge(clean, g_text)
         rec["judgement_timing"] = j_info
-        rec["judgement_backend"] = "guided" if judged else "guided:unavailable"
+        rec["judgement_backend"] = "guided" if judged else "guided:failed"
         if judged is None:
-            # The sidecar is down or refused. Fall through to the prompt
-            # backend rather than record no judgement at all.
+            # The sidecar is down, slow or refused. Fall through to the
+            # prompt backend rather than record no judgement at all -- and
+            # KEEP THE REASON. Without it the record says only "prompt", and
+            # "the sidecar is not running" and "the sidecar returned an
+            # error" become the same line in the log, which is how a
+            # degraded label backend stays invisible for a whole drive.
+            rec["judgement_fallback_reason"] = (j_info or {}).get("error") or "unknown"
             backend = "prompt"
         else:
             _bump("judged_guided"); _bump_arm(arm, "judged_guided")
     if judgement and judged is None and backend == "prompt":
-        rec["judgement_backend"] = "prompt"
+        rec["judgement_backend"] = ("prompt:after_guided_failed"
+                                    if rec.get("judgement_fallback_reason")
+                                    else "prompt")
         j_user = build_judgement_prompt(clean, g_text)
         j_raw, j_info = vision.generate_video(
             window.frames, window.metadata(), SYSTEM, j_user,
