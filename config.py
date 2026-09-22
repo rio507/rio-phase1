@@ -2447,6 +2447,59 @@ LOCAL_VISION_REPETITION_PENALTY = float(
 LOCAL_VISION_BLANK_STD = float(os.getenv("LOCAL_VISION_BLANK_STD", "8.0"))
 
 # ---------------------------------------------------------------------------
+# The eye's video window (eyewindow.py, eyeread.py)
+# ---------------------------------------------------------------------------
+# COSMOS-REASON2 IS A VIDEO MODEL AND WE WERE HANDING IT A STILL.
+#
+# Every video example in NVIDIA's cosmos-reason2 repo is `--videos <clip>
+# --fps 4`, and their own sample log records VisionConfig(fps=4.0,
+# total_pixels=3774873). Both numbers below are theirs. Ours to change, but
+# the default is the one the model was demonstrated at, and a value here that
+# is not NVIDIA's should come with a measurement.
+EYE_WINDOW_FPS = float(os.getenv("EYE_WINDOW_FPS", "4.0"))
+
+# HOW MUCH ROAD THE EYE READS AT ONCE, in seconds. Capped by RING_SECONDS --
+# there is no more road than the ring is holding -- and equal to it by
+# default, because six seconds at 13 m/s is about eighty metres, which is long
+# enough for a gap to visibly close and short enough that the near end is now.
+EYE_WINDOW_S = float(os.getenv("EYE_WINDOW_S", "6.0"))
+
+# The pixel budget for the WHOLE window, spread by the processor across every
+# frame in it. A longer window is therefore automatically a lower-resolution
+# one, which is the right way round: motion survives downscaling and a window
+# that overflowed the context would not be read at all.
+EYE_WINDOW_TOTAL_PIXELS = int(os.getenv("EYE_WINDOW_TOTAL_PIXELS", "3774873"))
+
+# Below this mean inter-frame luminance difference the picture is not moving:
+# a paused clip, a stalled transport, a parked car. LABELS a window, never
+# refuses one — "the view has not changed" is a reading, not an error, and a
+# guard that refused it would make that untestable.
+EYE_WINDOW_STATIC_FLOOR = float(os.getenv("EYE_WINDOW_STATIC_FLOOR", "0.8"))
+
+# THE TOKEN BUDGET, AND WHY IT IS NOT THE STILL PATH'S 512.
+#
+# NVIDIA runs Cosmos-Reason2 at max_tokens=4096 in every sample in their repo.
+# We ran it at 512 because the old prompt forbade a reasoning trace and a
+# three-field reading is short. The prompt now ASKS for a trace, NVIDIA's
+# format asks for one, and the trace shares the budget with the answer -- so
+# 512 truncates, which is a budget fault dressed up as a model fault. Measured
+# on this pod before this number was set: see tools/eye_video_gates.py.
+EYE_WINDOW_MAX_TOKENS = int(os.getenv("EYE_WINDOW_MAX_TOKENS", "1536"))
+
+# How often a live drive reads a window. The still path managed one reading
+# per ~10 s; this is what replaces that cadence, and the measurement behind
+# the number is in the gates harness output.
+EYE_WINDOW_PERIOD_S = float(os.getenv("EYE_WINDOW_PERIOD_S", "8.0"))
+
+# Whether a live drive reads windows at all. The reading goes to the card and
+# to the drive log and NOWHERE ELSE -- not to the arbiter, not to a band, not
+# into RIO's evidence -- so turning it off costs a card and changes no
+# behaviour. It is a switch rather than a constant because the video read is
+# the most expensive thing on the card and somebody profiling a drive will
+# want it gone for a run.
+EYE_WINDOW_ENABLED = os.getenv("EYE_WINDOW_ENABLED", "1") not in ("0", "false", "False")
+
+# ---------------------------------------------------------------------------
 # Place search (places.py) — what is actually around the car
 # ---------------------------------------------------------------------------
 # RIO answers "what's good round here" from Google Places, never from the

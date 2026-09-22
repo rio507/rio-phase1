@@ -290,12 +290,110 @@ def _session_id_of(key):
     return None
 
 
+def _tick_window(key, state):
+    """One grounded video reading, or nothing. Never raises into the loop.
+
+    THE SECOND CADENCE, RUNNING BESIDE THE FIRST AND NOT REPLACING IT.
+    ------------------------------------------------------------------
+    _tick above reads ONE FRAME and its record is what RIO is handed as
+    evidence and what reconcile.py checks against the detector. That contract
+    has a dozen callers and this does not touch it.
+
+    This reads a WINDOW -- six seconds of video and every number measured over
+    those same six seconds -- and its record goes to the card and nowhere else
+    yet. The spec that asked for it is explicit that whether Cosmos may trigger
+    speech is decided after the corroboration numbers are in, so the reading
+    deliberately has no route into the warning path, the arbiter, or RIO's
+    evidence. When those numbers justify it, the change is to give this record
+    a consumer; until then the cost of being wrong is a card that says
+    something odd.
+
+    CADENCE. Measured on this pod with the detector feeding at 4 fps on the
+    same card: a grounded read is 3.5-7 s of generate, p50 ~5.4 s, and one
+    outlier at 15 s where the reasoning trace filled its budget. So the period
+    is 8 s (config.EYE_WINDOW_PERIOD_S) rather than the still path's 10 s, and
+    a reading describes a window that ENDED 4-9 s ago. That is fine for a card
+    and is exactly why this is not wired to anything that has to be current.
+    """
+    import eyeread
+    import eyewindow
+    import grounding as _g
+
+    if state.get("hold", 0) > 0:
+        return False
+    window = eyewindow.from_ring(key)
+    if window is None:
+        return False
+    # THE SAME FRAME TWICE IS THE SAME READING TWICE, at the price of a
+    # five-second forward pass. A window whose last frame is one we have
+    # already read to the end is a window that has not moved.
+    last = state.get("window_record") or {}
+    ids = (window.to_meta() or {}).get("frame_ids") or []
+    if ids and last.get("last_frame_id") == ids[-1]:
+        return False
+    st = _g.window_state(window)
+    rec = eyeread.read_window(window, st, grounded=True)
+    rec["last_frame_id"] = ids[-1] if ids else None
+    with _lock:
+        state["window_record"] = rec
+        state["window_n"] = state.get("window_n", 0) + 1
+        if rec.get("refused"):
+            state["window_refused"] = state.get("window_refused", 0) + 1
+    try:
+        import sessions as _sessions
+        _sessions.log_live(_session_id_of(key), "eye_window", {
+            "ms": (rec.get("timing") or {}).get("gen_ms"),
+            "span_s": (rec.get("window") or {}).get("span_s"),
+            "n_frames": (rec.get("window") or {}).get("n_frames"),
+            "refused": rec.get("refused"),
+            "verdict": (rec.get("corroboration") or {}).get("verdict"),
+            "sourced": len(rec.get("sourced") or []),
+            "invented": len(rec.get("invented") or []),
+        })
+    except Exception:
+        pass
+    return True
+
+
+def window_reading(session_key: str) -> dict:
+    """The last grounded video reading for this session. -> {}|record."""
+    with _lock:
+        state = _sessions.get(session_key)
+        rec = dict(state.get("window_record") or {}) if state else {}
+    if rec:
+        # Re-age on the way out. The window's own end_age_s was computed when
+        # the record was built and a card polling every few seconds needs the
+        # age NOW, not the age at filing.
+        import time as _t
+        w = dict(rec.get("window") or {})
+        filed = rec.get("at")
+        if filed and w.get("end_age_s") is not None:
+            w["end_age_s"] = round(float(w["end_age_s"]) + (_t.time() - filed), 2)
+            w["start_age_s"] = round(float(w["end_age_s"]) + float(w.get("span_s") or 0), 2)
+        rec["window"] = w
+    return rec
+
+
 def _loop(key, state):
     period = float(config.OBSERVER_PERIOD_S)
+    # The video read is slower and rarer than the still read, so it is paced
+    # by its own clock rather than by a divisor of this loop's: a period that
+    # was "every Nth tick" would drift the moment a generate ran long.
+    win_period = float(getattr(config, "EYE_WINDOW_PERIOD_S", 8.0))
+    win_next = 0.0
     while not state["stop"].is_set():
         t0 = time.time()
         try:
             _tick(key, state)
+            if getattr(config, "EYE_WINDOW_ENABLED", True) and t0 >= win_next:
+                # Charged from the END of the read, not the start: a five
+                # second generate inside an eight second period would
+                # otherwise leave three seconds of gap and then run again
+                # immediately, which is not a cadence, it is a queue.
+                try:
+                    _tick_window(key, state)
+                finally:
+                    win_next = time.time() + win_period
         except Exception as e:
             # A failed observation costs a sentence, never the conversation.
             # Counted rather than printed every second: on a GPU that is out of

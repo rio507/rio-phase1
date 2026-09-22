@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Optional
 
 import config
+import grounding
 import scene as scene_mod
 
 PERSIST_DIR = Path("/workspace/rio-phase1/training_data/visual")
@@ -80,6 +81,14 @@ class RingFrame:
     objects: list                 # headway.live's `scene_objects` for this frame
     ego: dict
     quality: "scene_mod.FrameQuality"
+    # WHAT WAS MEASURED ON THIS FRAME, for the video window the eye reads.
+    #
+    # `ego` above is the conversation path's block and its builder promises to
+    # leave the warning state out of it (scene.ego_from_result). The eye needs
+    # exactly what that promise excludes -- band, TTC, the plausibility veto --
+    # so it gets its own dict rather than that promise being quietly broken for
+    # a second consumer. See grounding.measured_from_result.
+    measured: dict = field(default_factory=dict)
     # WHO TOOK THIS PICTURE. "<session key>:<source>" for a page that declared
     # itself, "api:<source>" for anything posting frames without one -- a
     # bench, a curl, an acceptance harness feeding a demo clip. It travels with
@@ -227,6 +236,7 @@ class FrameRing:
             objects=objects,
             ego=scene_mod.ego_from_result(result),
             quality=scene_mod.quality_from_result(result),
+            measured=grounding.measured_from_result(result),
             origin=origin,
             # Taken HERE, from the bytes that were just processed. push() is
             # called after the detector has run on exactly this buffer -- see

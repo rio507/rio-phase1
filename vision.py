@@ -906,3 +906,89 @@ def get_handles():
     with _lock:
         _ensure_loaded()
     return _processor, _model, _lock
+
+
+# ---------------------------------------------------------------------------
+# THE VIDEO PATH. A stretch of road, and the numbers measured over it.
+# ---------------------------------------------------------------------------
+# WHY THIS IS A SECOND ENTRY POINT AND NOT A FLAG ON observe().
+#
+# observe() is the still path and a dozen callers depend on its contract: one
+# JPEG in, one string out, "" means no reading. That contract is fine and it is
+# not the contract a grounded video read has. This one returns a RECORD --
+# reasoning, answer, what was checked, what was refused -- because NVIDIA's own
+# serving separates the trace from the answer (--reasoning-parser qwen3) and a
+# card that is meant to be recognisable to anyone who knows Cosmos has to be
+# given both halves rather than one string with the trace cut out of it.
+#
+# The still path stays exactly as it was. Nothing here changes what /observe
+# returns, and the deterministic warning path is untouched -- see the note in
+# eyeread.py about what this is and is not allowed to do.
+
+
+def generate_video(frames, video_metadata, system_text, user_text,
+                   processor_kwargs=None, max_new_tokens=None):
+    """One forward pass over a video window. -> (raw_text, info).
+
+    THE GPU-OWNING HALF ONLY. Every judgement about what came back -- the
+    trace, the numbers, the corroboration -- is eyeread.py's, because this
+    module already owns three models and a lock and does not also need to own
+    a reading contract.
+
+    `info` carries what only this function can know: whether the decode hit
+    its cap, how long the lock was waited for, and what the vision tower was
+    actually given after the processor had its say (the grid, which is the
+    only honest answer to "how much of my window did the model see").
+    """
+    global _last_lock_wait_ms
+    if not config.VISION_ENABLED:
+        return "", {"skipped": "vision_disabled"}
+    if not frames:
+        return "", {"skipped": "empty_window"}
+    t_wait = time.time()
+    with _lock:
+        note_holder("eye_window")
+        _last_lock_wait_ms = (time.time() - t_wait) * 1000.0
+        try:
+            _ensure_loaded()
+            msgs = [
+                {"role": "system", "content": [{"type": "text", "text": system_text}]},
+                {"role": "user", "content": [
+                    {"type": "video"},
+                    {"type": "text", "text": user_text},
+                ]},
+            ]
+            text = _processor.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True)
+            inputs = _processor(
+                text=[text], videos=[list(frames)],
+                video_metadata=video_metadata, return_tensors="pt",
+                **(processor_kwargs or {}),
+            ).to(_model.device)
+            gen_kw = _generate_kwargs()
+            if max_new_tokens:
+                gen_kw = dict(gen_kw, max_new_tokens=int(max_new_tokens))
+            t0 = time.time()
+            out = _model.generate(**inputs, **gen_kw)
+            gen_ms = (time.time() - t0) * 1000.0
+            raw = _processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            )[0].strip()
+            grid = inputs.get("video_grid_thw")
+            info = {
+                "gen_ms": round(gen_ms, 1),
+                "lock_wait_ms": round(_last_lock_wait_ms, 1),
+                "truncated": _reading_truncated(out, inputs, gen_kw),
+                "prompt_tokens": int(inputs["input_ids"].shape[1]),
+                "new_tokens": int(out.shape[1] - inputs["input_ids"].shape[1]),
+                "max_new_tokens": int(gen_kw.get("max_new_tokens") or 0),
+                # t, h, w in MERGED patches. t is the number of temporal groups
+                # the tower built, which is frames/temporal_patch_size -- so a
+                # window whose metadata was wrong shows up here as a t of 2
+                # rather than as a reading that is quietly about four frames.
+                "grid_thw": (grid[0].tolist() if grid is not None else None),
+                "model": config.local_vision_label(),
+            }
+            return raw, info
+        finally:
+            clear_holder()

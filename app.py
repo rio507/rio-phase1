@@ -1806,6 +1806,74 @@ async def headway_frame_endpoint(
     return result
 
 
+@app.post("/eye/window")
+async def eye_window(session_id: str = Query(default=None),
+                     seconds: float = Query(default=None),
+                     fps: float = Query(default=None),
+                     grounded: int = Query(default=1),
+                     max_new_tokens: int = Query(default=0)):
+    """One grounded reading of the last few seconds of road. -> the record.
+
+    A POST because it spends a forward pass on a shared GPU, not because it
+    changes anything: nothing here reaches the warning path, sets a band or
+    speaks. See eyeread.py's scope note.
+
+    `grounded=0` runs the identical window through the identical prompt with
+    the measured block left out. That is not a debug flag -- it is the only
+    way to answer "did grounding change what it says", and the acceptance
+    harness runs both arms over the same frames for exactly that reason.
+    """
+    import eyeread
+    import eyewindow
+    import grounding as _g
+
+    if not _warm_done.is_set():
+        return {"ok": False, "skipped": "warming"}
+    key = _visual_key(session_id)
+    window = await run_in_threadpool(
+        eyewindow.from_ring, key,
+        (None if not seconds else float(seconds)),
+        (None if not fps else float(fps)),
+    )
+    if window is None:
+        return {"ok": False, "skipped": "no_window",
+                "reason": "fewer than four verified frames in the ring"}
+    state = _g.window_state(window) if grounded else {}
+    rec = await run_in_threadpool(
+        eyeread.read_window, window, state, bool(grounded),
+        (int(max_new_tokens) or None),
+    )
+    rec["ok"] = True
+    return rec
+
+
+@app.get("/eye/latest")
+async def eye_latest(session_id: str = Query(default=None)):
+    """The last grounded video reading the observer took. -> {}|record.
+
+    A GET and a cache read: the card polls this, and a card that spent a
+    forward pass every time it repainted would be the most expensive thing on
+    the page. The reading is taken on the observer's own cadence -- see
+    observer._tick_window -- and this hands over whatever the last one was,
+    re-aged.
+    """
+    import observer as _obs
+    rec = _obs.window_reading(_visual_key(session_id))
+    if not rec:
+        return {"ok": False, "skipped": "no_reading"}
+    rec["ok"] = True
+    return rec
+
+
+@app.get("/eye/flags")
+async def eye_flags():
+    """The video path's own counters. Separate from the still path's -- see
+    the note on _flags in eyeread.py about why adding them would produce a
+    rate that means nothing."""
+    import eyeread
+    return eyeread.flags()
+
+
 # --- the live frame socket --------------------------------------------------
 #
 # WHY THIS EXISTS, in the drive log's own numbers. Session 06af3214, 607.8 s on

@@ -1743,6 +1743,80 @@
     color: var(--t4); font-style: italic;
   }
 
+  /* THE EYE'S CARD, IN NVIDIA'S SHAPE.
+     cosmos-reason2/assets/outputs/*.log prints four named blocks separated by
+     rules -- System, User, Reasoning, Assistant -- and this is that layout.
+     The rule above each label IS their separator line; keeping it means the
+     card reads as the CLI output it mirrors rather than as a list of fields
+     that happen to have those names. See static/rio_eye.js. */
+  .eye-col { gap: 0; }
+  .eye-col .teach-meta { margin-bottom: 9px; }
+  .eye-block { min-width: 0; padding: 9px 0 0; }
+  .eye-rule {
+    border-top: 1px solid var(--hairline); margin-bottom: 7px;
+  }
+  .eye-block.open .teach-text { -webkit-line-clamp: unset; overflow: auto;
+                                max-height: 300px; }
+  /* The trace is long by design and is not the headline: dimmer and smaller
+     than the answer, clamped tighter, one tap from all of it. The answer is
+     what a driver reads; the trace is what an engineer reads. */
+  .eye-reasoning .teach-text {
+    color: var(--t4); font-size: var(--fs-nano); line-height: 1.5;
+    -webkit-line-clamp: 3;
+  }
+  .eye-col .teach-text.prose { color: var(--t1); -webkit-line-clamp: 8; }
+
+  /* OURS. A left edge in the page's accent and a tag that says RIO, because a
+     reader who knows Cosmos must never have to wonder whether the model
+     produced these rows. Everything inside came from geometry or the ECU. */
+  .eye-ours {
+    margin-top: 10px; border-left: 2px solid var(--accent-line);
+    padding-left: 9px;
+  }
+  .eye-ours .eye-rule { display: none; }
+  .eye-ours-head {
+    display: flex; align-items: baseline; gap: var(--gap-2xs);
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5); margin-bottom: 6px;
+  }
+  .eye-ours-tag { color: var(--accent-text, var(--t2)); font-weight: 600; }
+
+  .eye-given {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+    gap: 7px 10px; margin-bottom: 8px;
+  }
+  .eye-cell-k {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase; color: var(--t5);
+  }
+  .eye-cell-v {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    color: var(--t2); overflow-wrap: anywhere;
+  }
+  /* EVERY VALUE CARRIES ITS SOURCE, on the card as in the prompt. A gap with
+     no instrument beside it is a number somebody has to go and look up. */
+  .eye-cell-s { font-size: 10px; color: var(--t5); line-height: 1.35; }
+
+  .eye-tracks { display: flex; flex-direction: column; gap: 3px; }
+  .eye-track {
+    display: flex; gap: var(--gap-2xs); font-family: var(--font-mono);
+    font-size: var(--fs-nano); color: var(--t3); overflow-wrap: anywhere;
+  }
+  .eye-track-id { color: var(--t5); flex: none; }
+
+  .eye-checks { display: flex; flex-direction: column; gap: 4px; }
+  .eye-check { font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+  .eye-check-k {
+    font-family: var(--font-mono); font-size: var(--fs-nano);
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5); margin-right: 6px;
+  }
+  .eye-check.ok   .eye-check-v { color: var(--t3); }
+  .eye-check.warn .eye-check-v { color: var(--t4); }
+  .eye-check.bad  .eye-check-k,
+  .eye-check.bad  .eye-check-v { color: var(--warn-text); }
+
   .teach-name {
     font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;
     display: flex; align-items: center; gap: var(--gap-2xs);
@@ -5017,6 +5091,58 @@ document.addEventListener('DOMContentLoaded', () => {
 </script>
 
 <script>
+/* THE EYE'S OWN POLL. It reads a window of video every eight seconds on the
+ * server (observer._tick_window) and this asks for whatever the last one was.
+ *
+ * A GET on a cached record, never a generate: the reading costs three to seven
+ * seconds of GPU and a card that triggered one every time it repainted would
+ * be the most expensive thing on this page. The cadence belongs to the
+ * observer; this only fetches.
+ *
+ * WHEN IT TAKES THE CARD, AND WHEN IT LEAVES IT ALONE. Only while a reading
+ * exists and its window ended recently. A still-frame /perceive on an uploaded
+ * image still paints the old card through RIO.sensor, and a stale window would
+ * otherwise sit on the glass over the top of a picture the driver just chose.
+ *
+ * Chained timeouts rather than setInterval — the same discipline as the
+ * perception, health and vehicle pollers, and for the same reason: a slow
+ * response must not be allowed to stack requests behind it.
+ */
+document.addEventListener('DOMContentLoaded', () => {
+  const PERIOD_MS = 4000;          /* half the server's read period: often
+                                      enough that a new reading lands within a
+                                      few seconds, rare enough to be free. */
+  const MAX_END_AGE_S = 20;        /* past this the window is history, and the
+                                      card says nothing rather than something
+                                      about a road the car has left. */
+  let timer = null;
+
+  async function tick() {
+    try {
+      const url = RIO.url('/eye/latest')
+                + (RIO.sessionId ? '?session_id=' + encodeURIComponent(RIO.sessionId) : '');
+      const r = await fetch(url);
+      const j = await r.json();
+      if (j && j.ok && window.RIOEye) {
+        const end = (j.window || {}).end_age_s;
+        if (typeof end !== 'number' || end <= MAX_END_AGE_S) RIOEye.render(j);
+      }
+    } catch (e) {
+      /* A card that cannot fetch is a card that keeps showing the last
+         reading, which is correct: the reading has not become untrue, and the
+         age on it is what says how much to trust it. */
+    }
+    timer = setTimeout(tick, PERIOD_MS);
+  }
+  tick();
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(timer); timer = null; }
+    else if (!timer) tick();
+  });
+});
+</script>
+
+<script>
 document.addEventListener('DOMContentLoaded', () => {
   const upload = document.getElementById('upload');
   const preview = document.getElementById('preview');
@@ -7466,6 +7592,7 @@ document.addEventListener('DOMContentLoaded', () => {
      RIO.sensor on every /perceive. It reads the response and writes the DOM:
      no fetch of its own, no parsing of its own, nothing that can speak. -->
 <script src="/static/rio_sensor.js"></script>
+<script src="/static/rio_eye.js"></script>
 <script src="/static/rio_frames.js"></script>
 <!-- THE ENCODER WORKER'S URL, STAMPED LIKE EVERY OTHER ASSET.
      `new Worker('/static/rio_frame_encoder.js')` is a fetch the page makes at
