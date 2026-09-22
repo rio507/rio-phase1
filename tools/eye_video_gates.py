@@ -201,22 +201,33 @@ def feed(key, frames, v_host=25.0):
     return results
 
 
-def read_both(key, budget=None, seconds=None, inject=None):
-    """One window, both arms. -> (grounded_rec, ungrounded_rec, window)."""
+def read_arms(key, arms, budget=None, seconds=None, inject=None):
+    """One window, every arm, grounded and not. -> ({arm: {g, u}}, window).
+
+    ONE WINDOW OBJECT FOR ALL SIX READINGS. The arms are a comparison of
+    QUESTIONS, so every other variable has to be nailed down: the same
+    pixels, the same timestamps, the same measured block. Rebuilding the
+    window per arm would compare three different stretches of road and
+    attribute the difference to the prompt.
+    """
     w = eyewindow.from_ring(key, seconds or WINDOW_S, FPS)
     if w is None:
-        return None, None, None
+        return None, None
     state = grounding.window_state(w)
     if inject:
         # Overwrites the measured headway block wholesale. The tracks and the
         # ego speed stay real; only the lead is invented, and only here.
         state["headway"] = dict(state["headway"], **inject)
-    g = eyeread.read_window(w, state, grounded=True, max_new_tokens=budget)
-    # The SAME window object, so the ungrounded arm is the same pixels, the
-    # same timestamps and the same prompt minus one block. Anything else is a
-    # comparison of two different things wearing the same label.
-    u = eyeread.read_window(w, {}, grounded=False, max_new_tokens=budget)
-    return g, u, w
+    out = {}
+    for arm in arms:
+        g = eyeread.read_window(w, state, grounded=True, arm=arm,
+                                max_new_tokens=budget)
+        # The same window minus one block, so a difference is the grounding
+        # and not the road.
+        u = eyeread.read_window(w, {}, grounded=False, arm=arm,
+                                max_new_tokens=budget)
+        out[arm] = {"grounded": g, "ungrounded": u}
+    return out, w
 
 
 def norm(text):
@@ -232,6 +243,8 @@ def run(args):
 
     situations = [s for s in SITUATIONS
                   if not args.only or s["id"] in args.only.split(",")]
+    arms = [a.strip().upper() for a in (args.arms or "A,B,C,D,E").split(",") if a.strip()]
+    print(f"arms: " + ", ".join(f"{a} = {eyeread.ARM_NAMES.get(a, a)}" for a in arms))
 
     for sit in situations:
         print(f"\n=== {sit['id']}: {sit['why']}")
@@ -250,30 +263,38 @@ def run(args):
         feed_ms = (time.time() - t_feed) * 1000.0
         print(f"  fed {len(results)}/{len(frames)} frames in {feed_ms:.0f} ms")
 
-        g, u, w = read_both(key, args.budget, secs,
-                            inject=(INJECTED_LEAD if sit.get("inject_lead") else None))
-        if g is None:
+        by_arm, w = read_arms(key, arms, args.budget, secs,
+                              inject=(INJECTED_LEAD if sit.get("inject_lead") else None))
+        if by_arm is None:
             print("  no window built")
             continue
-        rec = {"situation": sit, "grounded": g, "ungrounded": u,
-               "window": w.to_meta(),
+        first = by_arm[arms[0]]["grounded"]
+        st = first.get("state") or {}
+        rec = {"situation": sit, "arms": by_arm, "window": w.to_meta(),
                "detector": {
-                   "n_tracks": len((g.get("state") or {}).get("tracks") or []),
-                   "gap_m": ((g.get("state") or {}).get("headway") or {}).get("gap_m"),
-                   "band": ((g.get("state") or {}).get("headway") or {}).get("band"),
+                   "n_tracks": len(st.get("tracks") or []),
+                   "gap_m": (st.get("headway") or {}).get("gap_m"),
+                   "band": (st.get("headway") or {}).get("band"),
+                   "loop_spoke": (st.get("loop") or {}).get("spoke"),
                }}
         records.append(rec)
-        print(f"  window {w.to_meta()['n_frames']} frames / "
-              f"{w.to_meta()['span_s']} s, grid {g['window'].get('grid_thw')}, "
-              f"blank={w.to_meta()['blank']} static={w.to_meta()['static']}")
-        print(f"  grounded   {g['timing'].get('gen_ms')} ms  "
-              f"{len(g.get('answer') or '')} chars  "
-              f"sourced={len(g.get('sourced') or [])} "
-              f"invented={len(g.get('invented') or [])} "
-              f"verdict={(g.get('corroboration') or {}).get('verdict')}")
-        print(f"  ungrounded {u['timing'].get('gen_ms')} ms  "
-              f"{len(u.get('answer') or '')} chars  "
-              f"invented={len(u.get('invented') or [])}")
+        m = w.to_meta()
+        print(f"  window {m['n_frames']} frames / {m['span_s']} s, "
+              f"grid {first['window'].get('grid_thw')}, "
+              f"blank={m['blank']} static={m['static']}, "
+              f"loop_spoke={(st.get('loop') or {}).get('spoke')}")
+        for arm in arms:
+            for kind in ("grounded", "ungrounded"):
+                r = by_arm[arm][kind]
+                j = r.get("judgement") or {}
+                print(f"  {arm} {kind:10} {r['timing'].get('gen_ms'):>7.0f} ms  "
+                      f"{len(r.get('answer') or ''):>4} ch  "
+                      f"risk={j.get('risk') or r.get('judgement_problem') or '-':<9} "
+                      f"speak={str(j.get('should_speak')):<5} "
+                      f"out={(r.get('shadow') or {}).get('outcome') or '-':<12} "
+                      f"ctrl={len(r.get('control_decision') or [])} "
+                      f"inv={len(r.get('invented') or [])} "
+                      f"{('REFUSED:' + str(r.get('refused'))) if r.get('refused') else ''}")
 
     (out_dir / "records.json").write_text(json.dumps(records, indent=2, default=str))
     report(records, out_dir)
@@ -281,109 +302,161 @@ def run(args):
 
 
 def report(records, out_dir):
-    print("\n" + "=" * 72)
-    print("GATE 1  picture-changes")
-    print("=" * 72)
-    seen = {}
-    fail = []
-    for r in records:
-        sid = r["situation"]["id"]
-        ans = norm(r["grounded"].get("answer"))
-        h = hashlib.sha256(ans.encode()).hexdigest()[:12]
-        dup = [k for k, v in seen.items() if v == h]
-        seen[sid] = h
-        mark = "SAME AS " + dup[0] if dup else "distinct"
-        print(f"  {sid:16} {h}  {mark}")
-        if dup:
-            fail.append((sid, dup[0]))
-    for r in records:
-        sid = r["situation"]["id"]
-        if sid not in ("black", "frozen"):
-            continue
-        ans = (r["grounded"].get("answer") or "").lower()
-        says = any(p in ans for p in (
-            "cannot", "can't", "no view", "unusable", "black", "dark",
-            "nothing visible", "not visible", "obscured", "blank", "no image",
-            "static", "stationary", "not moving", "unchanged", "frozen",
-            "no motion", "does not change", "no change"))
-        print(f"  {sid:16} says-so={says}")
-        if not says:
-            fail.append((sid, "did not say the view was unusable/static"))
-    print(f"  -> {'FAIL' if fail else 'PASS'}  {fail if fail else ''}")
+    arms = sorted({a for r in records for a in r["arms"]})
 
     print("\n" + "=" * 72)
-    print("GATE 2  grounded vs ungrounded, verbatim")
+    print("GATE 1  picture-changes, per arm")
+    print("=" * 72)
+    fails = []
+    for arm in arms:
+        print(f"\n  --- arm {arm}: {eyeread.ARM_NAMES.get(arm, arm)}")
+        seen = {}
+        for r in records:
+            sid = r["situation"]["id"]
+            ans = norm(r["arms"][arm]["grounded"].get("answer"))
+            h = hashlib.sha256(ans.encode()).hexdigest()[:12]
+            dup = [k for k, v in seen.items() if v == h]
+            seen[sid] = h
+            print(f"    {sid:16} {h}  {'SAME AS ' + dup[0] if dup else 'distinct'}")
+            if dup:
+                fails.append((arm, sid, "identical to " + dup[0]))
+        # THE BLANK FRAME DECIDES IT. A prompt that tells the model it is a
+        # vehicle on a road is exactly the instruction that could make it
+        # describe a road when there is none, so this is checked per arm and
+        # a failure here outweighs anything the arm does on real footage.
+        for sid in ("black", "frozen"):
+            row = next((r for r in records if r["situation"]["id"] == sid), None)
+            if not row:
+                continue
+            rec = row["arms"][arm]["grounded"]
+            ans = (rec.get("answer") or "").lower()
+            says = bool(eyeread._SAYS_UNUSABLE.search(ans)) or any(
+                p in ans for p in ("static", "stationary", "not moving",
+                                   "unchanged", "frozen", "no motion",
+                                   "does not change", "no change"))
+            invents = bool(eyeread._ROAD_WORDS.search(ans)) and not says
+            print(f"    {sid:16} says-so={says}  invents-a-road={invents}")
+            if not says:
+                fails.append((arm, sid, "did not say the view was unusable/static"))
+    print(f"\n  -> {'FAIL' if fails else 'PASS'}")
+    for f in fails:
+        print(f"     arm {f[0]}  {f[1]}: {f[2]}")
+
+    print("\n" + "=" * 72)
+    print("GATE 2  grounded vs ungrounded, verbatim, per arm")
     print("=" * 72)
     for r in records:
         sid = r["situation"]["id"]
-        g, u = r["grounded"], r["ungrounded"]
-        print(f"\n--- {sid} :: {r['situation']['why']}")
-        st = (g.get("state") or {})
+        st = r["arms"][arms[0]]["grounded"].get("state") or {}
         hw = st.get("headway") or {}
+        print(f"\n--- {sid} :: {r['situation']['why']}")
         print(f"    measured: {len(st.get('tracks') or [])} tracks, "
               f"gap={hw.get('gap_m')} m, ttc={hw.get('ttc_s')} s, "
-              f"band={hw.get('band')}")
-        print(f"    GROUNDED   ({g['timing'].get('gen_ms')} ms): "
-              f"{g.get('answer') or '(refused: %s)' % g.get('refused')}")
-        print(f"    UNGROUNDED ({u['timing'].get('gen_ms')} ms): "
-              f"{u.get('answer') or '(refused: %s)' % u.get('refused')}")
+              f"band={hw.get('band')}, loop_spoke="
+              f"{(st.get('loop') or {}).get('spoke')}")
+        for arm in arms:
+            for kind in ("grounded", "ungrounded"):
+                rec = r["arms"][arm][kind]
+                j = rec.get("judgement") or {}
+                body = rec.get("answer") or ""
+                if rec.get("refused"):
+                    body = f"[REFUSED: {rec['refused']}] " + body[:200]
+                print(f"    {arm} {kind.upper():10} "
+                      f"({rec['timing'].get('gen_ms'):.0f} ms) "
+                      f"[risk={j.get('risk') or rec.get('judgement_problem')} "
+                      f"speak={j.get('should_speak')}]: {body}")
 
     print("\n" + "=" * 72)
-    print("GATE 3  corroboration")
+    print("GATE 3  corroboration and the four shadow counts, per arm")
     print("=" * 72)
-    tot = {"fab_g": 0, "fab_u": 0, "miss_g": 0, "miss_u": 0,
-           "inv_g": 0, "inv_u": 0, "src_g": 0, "cite_g": 0}
-    for r in records:
-        sid = r["situation"]["id"]
-        g, u = r["grounded"], r["ungrounded"]
-        cg = g.get("corroboration") or {}
-        # The ungrounded arm is scored against the SAME measured state it was
-        # not given. That is the only way the two counts are comparable: what
-        # is being asked is whether the reading matches the road, not whether
-        # it matches its own prompt.
-        cu = eyeread.corroborate(u.get("answer") or "", g.get("state") or {})
-        tot["fab_g"] += len(cg.get("fabricated") or [])
-        tot["fab_u"] += len(cu.get("fabricated") or [])
-        tot["miss_g"] += len(cg.get("missed") or [])
-        tot["miss_u"] += len(cu.get("missed") or [])
-        tot["inv_g"] += len(g.get("invented") or [])
-        tot["inv_u"] += len(u.get("invented") or [])
-        tot["src_g"] += len(g.get("sourced") or [])
-        tot["cite_g"] += len(cg.get("cited") or [])
-        print(f"  {sid:16} grounded: fab={len(cg.get('fabricated') or [])} "
-              f"miss={len(cg.get('missed') or [])} "
-              f"cited={cg.get('cited')} invented={len(g.get('invented') or [])} "
-              f"sourced={len(g.get('sourced') or [])} | "
-              f"ungrounded: fab={len(cu.get('fabricated') or [])} "
-              f"miss={len(cu.get('missed') or [])} "
-              f"invented={len(u.get('invented') or [])}")
-    print(f"\n  TOTALS  fabrications  grounded {tot['fab_g']}  "
-          f"ungrounded {tot['fab_u']}")
-    print(f"          missed tracks  grounded {tot['miss_g']}  "
-          f"ungrounded {tot['miss_u']}")
-    print(f"          invented nums  grounded {tot['inv_g']}  "
-          f"ungrounded {tot['inv_u']}")
-    print(f"          sourced nums   grounded {tot['src_g']}")
-    print(f"          track cites    grounded {tot['cite_g']}")
+    for arm in arms:
+        t = {k: 0 for k in ("fab", "contra", "inv", "src", "cite", "bad",
+                            "ctrl", "risk_unver", "urg_contra", "jmiss",
+                            "jmal", "refused", "agree_speak", "false_alarm",
+                            "miss", "agree_quiet", "refused_loop_spoke",
+                            "borrow", "example_echo", "elevated", "fp_viol")}
+        tu = {"fab": 0, "contra": 0, "inv": 0, "ctrl": 0}
+        for r in records:
+            g = r["arms"][arm]["grounded"]
+            u = r["arms"][arm]["ungrounded"]
+            c = g.get("corroboration") or {}
+            jf = g.get("judge_faults") or {}
+            t["fab"] += len(c.get("fabricated") or [])
+            t["contra"] += len(c.get("contradicts") or [])
+            t["inv"] += len(g.get("invented") or [])
+            t["src"] += len(g.get("sourced") or [])
+            t["cite"] += len(c.get("cited") or [])
+            t["bad"] += len(c.get("bad_cites") or [])
+            t["ctrl"] += len(g.get("control_decision") or [])
+            t["borrow"] += len(g.get("borrowed") or [])
+            t["example_echo"] += len(g.get("example_echo") or [])
+            t["elevated"] += 1 if (g.get("rubric") or {}).get("elevated") else 0
+            t["fp_viol"] += (g.get("rubric") or {}).get("n_violations") or 0
+            t["risk_unver"] += 1 if jf.get("risk_unverified") else 0
+            t["urg_contra"] += 1 if jf.get("urgent_contradicted") else 0
+            t["jmiss"] += 1 if g.get("judgement_problem") == "missing" else 0
+            t["jmal"] += 1 if g.get("judgement_problem") == "malformed" else 0
+            if g.get("refused"):
+                t["refused"] += 1
+            out = (g.get("shadow") or {}).get("outcome")
+            if out in t:
+                t[out] += 1
+            if out == "refused" and (g.get("shadow") or {}).get("loop_spoke"):
+                t["refused_loop_spoke"] += 1
+            # The ungrounded arm is scored against the SAME measured state it
+            # was not given: the question is whether it matches the road, not
+            # whether it matches its own prompt.
+            cu = eyeread.corroborate(u.get("answer") or "",
+                                     g.get("state") or {},
+                                     u.get("judgement"))
+            tu["fab"] += len(cu.get("fabricated") or [])
+            tu["contra"] += len(cu.get("contradicts") or [])
+            tu["inv"] += len(u.get("invented") or [])
+            tu["ctrl"] += len(u.get("control_decision") or [])
+            tu["borrow"] = tu.get("borrow", 0) + len(u.get("borrowed") or [])
+        n = len(records)
+        print(f"\n  arm {arm}  ({eyeread.ARM_NAMES.get(arm, arm)}), "
+              f"{n} grounded readings")
+        print(f"    fabrications      {t['fab']:>3}   (ungrounded {tu['fab']})")
+        print(f"    contradictions    {t['contra']:>3}   (ungrounded {tu['contra']})")
+        print(f"    invented numbers  {t['inv']:>3}   (ungrounded {tu['inv']})")
+        print(f"    control decisions {t['ctrl']:>3}   (ungrounded {tu['ctrl']})")
+        print(f"    sourced numbers   {t['src']:>3}")
+        print(f"    track citations   {t['cite']:>3}   bad cites {t['bad']}")
+        print(f"    judgement missing {t['jmiss']:>3}   malformed {t['jmal']}")
+        print(f"    risk unverified   {t['risk_unver']:>3}   "
+              f"urgent contradicted {t['urg_contra']}")
+        print(f"    readings refused  {t['refused']:>3}")
+        print(f"    PROMPT BORROWING  {t['borrow']:>3}   "
+              f"(ungrounded {tu.get('borrow', 0)})   "
+              f"worked-example echo {t['example_echo']}")
+        print(f"    RUBRIC   elevated {t['elevated']:>3}   "
+              f"false-positive-control violations {t['fp_viol']}")
+        print(f"    SHADOW  agreement(speak) {t['agree_speak']}  "
+              f"FALSE ALARM {t['false_alarm']}  miss {t['miss']}  "
+              f"agreement(quiet) {t['agree_quiet']}  "
+              f"[refused while loop spoke {t['refused_loop_spoke']}]")
 
     print("\n" + "=" * 72)
-    print("LATENCY")
+    print("LATENCY, per arm (grounded)")
     print("=" * 72)
-    for arm in ("grounded", "ungrounded"):
-        ms = [r[arm]["timing"].get("gen_ms") for r in records
-              if r[arm].get("timing", {}).get("gen_ms")]
-        pt = [r[arm]["timing"].get("prompt_tokens") for r in records
-              if r[arm].get("timing", {}).get("prompt_tokens")]
-        nt = [r[arm]["timing"].get("new_tokens") for r in records
-              if r[arm].get("timing", {}).get("new_tokens")]
+    for arm in arms:
+        ms = sorted(r["arms"][arm]["grounded"]["timing"].get("gen_ms")
+                    for r in records
+                    if r["arms"][arm]["grounded"]["timing"].get("gen_ms"))
+        pt = [r["arms"][arm]["grounded"]["timing"].get("prompt_tokens")
+              for r in records
+              if r["arms"][arm]["grounded"]["timing"].get("prompt_tokens")]
         if ms:
-            ms = sorted(ms)
-            print(f"  {arm:11} generate p50 {ms[len(ms)//2]:.0f} ms  "
-                  f"max {ms[-1]:.0f} ms   prompt tokens "
-                  f"{int(np.mean(pt)) if pt else 0}  new tokens "
-                  f"{int(np.mean(nt)) if nt else 0}")
-    print("\nflags:", json.dumps({k: v for k, v in eyeread.flags().items()
-                                  if k != "rate"}, indent=2))
+            print(f"  {arm}  p50 {ms[len(ms)//2]:.0f} ms   min {ms[0]:.0f}   "
+                  f"max {ms[-1]:.0f}   prompt {int(np.mean(pt)) if pt else 0} tokens")
+
+    print("\nflags (all arms pooled):",
+          json.dumps({k: v for k, v in eyeread.flags().items()
+                      if k not in ("rate",)}, indent=2))
+    print("\nflags per arm:",
+          json.dumps({a: {k: v for k, v in d.items() if k != "rate"}
+                      for a, d in eyeread.arm_flags().items()}, indent=2))
     print(f"\nrecords written to {out_dir}/records.json")
 
 
@@ -394,6 +467,8 @@ def main():
     ap.add_argument("--only", default=None, help="comma-separated situation ids")
     ap.add_argument("--budget", type=int, default=None,
                     help="max_new_tokens override")
+    ap.add_argument("--arms", default="A,B,C,D,E",
+                    help="which prompt arms to run (default all five)")
     args = ap.parse_args()
     if "/runs/" in str(args.clip) or str(args.clip).startswith("runs/"):
         raise SystemExit("refusing a clip from runs/: RIO's own overlay is "

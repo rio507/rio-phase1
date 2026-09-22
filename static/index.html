@@ -1817,6 +1817,47 @@
   .eye-check.bad  .eye-check-k,
   .eye-check.bad  .eye-check-v { color: var(--warn-text); }
 
+  /* THE JUDGEMENT STRIP. The one row on this card meant to be read without
+     reading — a risk word, a speak decision, and what the deterministic loop
+     actually did, side by side. The colours escalate; the SHADOW tag never
+     goes away, because a red URGENT that looked like an issued warning would
+     be the worst misreading this page could offer. */
+  .eye-judge .eye-rule { border-top-style: dashed; }
+  .eye-shadow-tag {
+    margin-left: 7px; font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: var(--ls-caps); text-transform: uppercase;
+    color: var(--t5); border: 1px solid var(--hairline);
+    border-radius: 3px; padding: 1px 4px;
+  }
+  .eye-risk-strip {
+    display: flex; align-items: center; flex-wrap: wrap;
+    gap: var(--gap-2xs) var(--gap-xs); margin: 5px 0 6px;
+  }
+  .eye-risk {
+    font-family: var(--font-mono); font-size: var(--fs-nano); font-weight: 600;
+    letter-spacing: var(--ls-caps); padding: 2px 7px; border-radius: 3px;
+    border: 1px solid currentColor;
+  }
+  .eye-risk-none   { color: var(--t4); }
+  .eye-risk-watch  { color: var(--t2); }
+  .eye-risk-advise { color: var(--warn-text); }
+  .eye-risk-urgent { color: var(--warn-text); background: var(--warn-bg, transparent); }
+  .eye-speak, .eye-loop {
+    font-family: var(--font-mono); font-size: var(--fs-nano); color: var(--t5);
+  }
+  .eye-speak.on, .eye-loop.on { color: var(--t2); }
+  .eye-vs { font-size: 10px; color: var(--t5); }
+  .eye-outcome {
+    font-family: var(--font-mono); font-size: 10px;
+    letter-spacing: var(--ls-caps); text-transform: uppercase; color: var(--t5);
+  }
+  /* The only one of the four that is a problem on its own. A miss and a
+     false alarm are both wrong, but a false alarm is the one that decides
+     whether this thing is ever allowed to speak. */
+  .eye-outcome-false_alarm { color: var(--warn-text); }
+  .eye-outcome-miss        { color: var(--warn-text); }
+  .eye-outcome-refused     { color: var(--t4); }
+
   .teach-name {
     font-size: var(--fs-body); font-weight: 600; letter-spacing: 0.01em;
     display: flex; align-items: center; gap: var(--gap-2xs);

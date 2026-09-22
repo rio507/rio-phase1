@@ -360,6 +360,107 @@ ok("the window record has no route into RIO's evidence",
    "window_record" in obs and "serve_to(state[\"window_record\"]" not in obs)
 
 
+# --- 8. the arms, the rubric and the borrowing check -------------------------
+section(8, "THE ARMS ARE A COMPARISON OF QUESTIONS")
+
+import rubric                                                     # noqa: E402
+
+ok("all five arms exist", set(eyeread.ARMS) == {"A", "B", "C", "D", "E"},
+   str(sorted(eyeread.ARMS)))
+ok("arm B is NVIDIA's embodied prompt with nothing added",
+   eyeread.ARM_B == "What can be the next immediate action?",
+   repr(eyeread.ARM_B))
+ok("arm D is the hazard engine and goes in the SYSTEM slot",
+   eyeread.system_for("D").startswith("SYSTEM ROLE"))
+ok("every other arm keeps NVIDIA's system prompt",
+   all(eyeread.system_for(a) == eyeread.SYSTEM for a in "ABCE"))
+ok("a system-slot arm still asks a question in the user turn",
+   eyeread.AV_COT in eyeread.build_prompt("", arm="D"))
+ok("arm E is much shorter than arm D",
+   len(eyeread.ARM_E) * 10 < len(eyeread.ARM_D),
+   f"{len(eyeread.ARM_E)} vs {len(eyeread.ARM_D)}")
+ok("arm E keeps the boundary rule",
+   "not the collision-warning system" in eyeread.ARM_E)
+ok("arm E keeps the silence default", "silent by default" in eyeread.ARM_E.lower())
+ok("arm E keeps the language rules",
+   all(w in eyeread.ARM_E for w in ("appears", "possible", "likely",
+                                    "developing", "partially obscured")))
+ok("arm E carries no worked example", not eyeread.ARM_EXAMPLES["E"])
+ok("arm D's worked examples are registered so they can be watched for",
+   len(eyeread.ARM_EXAMPLES["D"]) == 2)
+
+# THE RUBRIC IS READ OFF THE PROMPT, NOT TYPED OUT. A hand-copied rubric is
+# correct the day it is written and silently wrong the first time the prompt
+# changes -- and a silently wrong rubric scores every arm against rules
+# nobody is applying.
+ok("the false-positive list is parsed from the prompt file",
+   len(rubric.FALSE_POSITIVE_RULES) == 10,
+   str(len(rubric.FALSE_POSITIVE_RULES)))
+ok("...and it is the engine's own wording",
+   "cars safely traveling in adjacent lanes" in rubric.FALSE_POSITIVE_RULES)
+ok("the priority levels are parsed from the prompt file",
+   rubric.PRIORITY_LEVELS == ["NORMAL", "WATCH", "CAUTION", "HIGH",
+                              "CRITICAL-CANDIDATE"],
+   str(rubric.PRIORITY_LEVELS))
+ok("WATCH is silent and CAUTION is not, per the prompt's own wording",
+   not rubric.is_elevated("WATCH") and rubric.is_elevated("CAUTION"))
+ok("the two scales map both ways in one place",
+   rubric.to_engine("urgent") == "HIGH" and rubric.to_target("CAUTION") == "advise")
+
+_ST = {"tracks": [
+    {"id": 1, "label": "car", "side": "right of the ego lane",
+     "range_rate_ms": 2.0, "last_range_m": 30, "in_lane": False, "is_lead": False},
+    {"id": 2, "label": "car", "side": "in the ego lane", "range_rate_ms": -3.0,
+     "last_range_m": 20, "in_lane": True, "is_lead": True}]}
+ok("elevating a car measured beside us and not closing is a violation",
+   rubric.grade("", {"priority": "CAUTION", "about": [1]}, _ST)["n_violations"] >= 1)
+ok("elevating the closing in-lane lead is NOT a violation",
+   rubric.grade("", {"priority": "CAUTION", "about": [2]}, _ST)["n_violations"] == 0)
+ok("a WATCH elevates nothing, so it cannot violate",
+   rubric.grade("", {"priority": "WATCH", "about": [1]}, _ST)["n_violations"] == 0)
+ok("the four unmeasurable rules are named every time, not quietly dropped",
+   len(rubric.grade("", {"priority": "HIGH", "about": [2]}, _ST)["unchecked"]) == 4)
+
+# BORROWING IS DERIVED FROM THE PROMPT, for the same reason as the rubric.
+_demo = "Watch for a deer, a stroller, standing water and steel plates."
+ok("the hazard vocabulary is derived from the prompt text",
+   {"deer", "stroller"} <= eyeread.prompt_nouns(_demo))
+ok("a borrowed hazard with no track behind it is caught",
+   {b["term"] for b in eyeread.borrowed_terms(
+       "A deer may emerge.", _demo, _ST)} >= {"deer"})
+ok("naming a class the detector DOES hold is not borrowing",
+   not eyeread.borrowed_terms("A car is ahead.", "cars and deer", _ST))
+ok("arm D's hazard vocabulary is large enough to be worth watching",
+   len(eyeread.prompt_nouns(eyeread.ARM_D)) > 100,
+   str(len(eyeread.prompt_nouns(eyeread.ARM_D))))
+
+# THE SCHEMA IS A GRAMMAR, NOT A PARAGRAPH.
+sch = rubric.JUDGEMENT_SCHEMA
+ok("the schema pins priority to the engine's own enum",
+   sch["properties"]["priority"]["enum"] == rubric.PRIORITY_LEVELS)
+ok("the schema admits no extra fields", sch["additionalProperties"] is False)
+ok("the schema's only free text is one short line",
+   sch["properties"]["why"]["maxLength"] <= 200)
+ok("track ids are integers, so a name cannot arrive as a citation",
+   sch["properties"]["about"]["items"]["type"] == "integer")
+
+# THE GROUND TRUTH MUST NOT REACH THE MODEL.
+_gstate = dict(STATE, loop={"spoke": True, "reasons": ["closing"],
+                            "bands": ["UNSAFE"]})
+_rendered = grounding.render(_gstate)
+ok("the loop's speak decision is NEVER rendered into the prompt",
+   "spoke" not in _rendered and "closing\"" not in _rendered
+   and "loop" not in _rendered.lower().split(),
+   _rendered[:120])
+ok("...though the band, which is measured state, still is",
+   "GETTING_UNSAFE" in _rendered)
+for _arm in ("A", "B", "C", "D", "E"):
+    _p = eyeread.build_prompt(_rendered, arm=_arm) + eyeread.system_for(_arm)
+    ok(f"arm {_arm}'s prompt never contains the loop's decision",
+       "should_speak" not in _p.replace(eyeread.JUDGEMENT, "")
+       and "loop fired" not in _p)
+
+
 # --- verdict -----------------------------------------------------------------
 print(f"\n{len(_checks) - len(_fails)}/{len(_checks)} checks passed")
 if _fails:

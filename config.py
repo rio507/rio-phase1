@@ -2499,6 +2499,28 @@ EYE_WINDOW_PERIOD_S = float(os.getenv("EYE_WINDOW_PERIOD_S", "8.0"))
 # want it gone for a run.
 EYE_WINDOW_ENABLED = os.getenv("EYE_WINDOW_ENABLED", "1") not in ("0", "false", "False")
 
+# The LABEL pass's own budget. Short on purpose: it emits one small JSON
+# object, and the reasoning trace in front of it is the only thing that can
+# grow. Measured that a schema in the reading prompt destroys the reading
+# (see the note in eyeread.JUDGEMENT), so this is a second generate rather
+# than a longer first one, and it is kept cheap to pay for that.
+EYE_JUDGEMENT_MAX_TOKENS = int(os.getenv("EYE_JUDGEMENT_MAX_TOKENS", "512"))
+
+# WHERE THE STRUCTURED LABEL COMES FROM.
+#   "guided"  a vLLM sidecar with a JSON grammar (eyejudge.py). The schema is
+#             enforced by the decoder, so a malformed object is impossible.
+#   "prompt"  the schema asked for in prose, in a second generate on the
+#             resident model. Measured to work badly -- see eyeread.JUDGEMENT
+#             -- and kept because it needs no sidecar.
+#   "off"     no structured label at all.
+# "guided" falls back to "prompt" on its own when the sidecar is not up: a
+# label is worth having, and an eye that stops reading the road because a
+# sidecar is down is not.
+EYE_JUDGE_BACKEND = os.getenv("EYE_JUDGE_BACKEND", "guided")
+EYE_JUDGE_VLLM_URL = os.getenv("EYE_JUDGE_VLLM_URL", "http://127.0.0.1:8899/v1")
+EYE_JUDGE_VLLM_MODEL = os.getenv("EYE_JUDGE_VLLM_MODEL", "nvidia/Cosmos-Reason2-2B")
+EYE_JUDGE_TIMEOUT_S = float(os.getenv("EYE_JUDGE_TIMEOUT_S", "30"))
+
 # ---------------------------------------------------------------------------
 # Place search (places.py) — what is actually around the car
 # ---------------------------------------------------------------------------

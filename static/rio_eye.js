@@ -99,6 +99,10 @@
     if (rec.timing && rec.timing.gen_ms) {
       pair('generate', (rec.timing.gen_ms / 1000).toFixed(1) + ' s');
     }
+    /* WHICH QUESTION WAS ASKED. Three are in flight and they produce
+       genuinely different readings; a card that did not say which would make
+       two screenshots impossible to compare. */
+    if (rec.arm) pair('arm', rec.arm + (rec.grounded ? '' : ' · ungrounded'));
     if (w.dropped_unverified) {
       pair('dropped', w.dropped_unverified + ' unverified', true);
     }
@@ -276,6 +280,27 @@
       }).join(', ') + ' — the loop held these and the reading did not '
         + 'name them');
     }
+    /* RIO ADVISES; IT DOES NOT DRIVE. A reading that recommends a control
+       action is out of scope whatever else is right about it, and the count
+       is per arm because one of the three arms is NVIDIA's "what can be the
+       next immediate action?" asked as shipped. */
+    /* HAZARD WORDS THE PROMPT SUPPLIED AND THE FRAME DOES NOT SUPPORT. The
+       specific risk a richly-worded prompt carries: a model handed a list of
+       plausible hazards has a list of plausible hazards to report. */
+    if ((rec.borrowed || []).length) {
+      line('bad', 'from the prompt', rec.borrowed.map(function (b) {
+        return b.term;
+      }).join(', ') + ' \u2014 named in the prompt, not tracked in this window.');
+    }
+    if ((rec.example_echo || []).length) {
+      line('bad', 'worked example',
+           'the reading reproduces one of the prompt\u2019s own examples.');
+    }
+    if ((rec.control_decision || []).length) {
+      line('bad', 'control', rec.control_decision.join(', ')
+           + ' — a control recommendation. This system advises; it does '
+           + 'not steer, brake or accelerate.');
+    }
     if (rec.advisory && rec.advisory.length) {
       line('warn', 'advisory', rec.advisory.join(', ')
            + ' — an instruction to the driver, not an observation');
@@ -301,6 +326,128 @@
         + 'as an impression.'
         : 'Unverified — something in this reading does not match what was '
         + 'measured. The marked lines above say which.'));
+    return row;
+  }
+
+  /* THE JUDGEMENT, AND THE ONE THING ON THIS CARD READ AT A GLANCE.
+   *
+   * risk / should_speak / why / about. It sits between the Assistant block
+   * and the measured panel on purpose: it is the model's conclusion, so it
+   * belongs under the model's words, and it is checked against measurements,
+   * so it belongs above the measurements it is checked against. A driver or
+   * a reviewer scanning the card should be able to take the risk word and
+   * the speak decision without reading a sentence.
+   *
+   * IT IS MARKED SHADOW, EVERY TIME, WITHOUT EXCEPTION. Cosmos does not
+   * trigger speech: the arbiter and the headway loop are untouched and this
+   * is recorded to be scored, not acted on. A card that showed a red URGENT
+   * without saying so would be read as a warning the car had issued, which
+   * is the single most dangerous misreading available on this page.
+   */
+  function judgementBlock(rec) {
+    var j = rec.judgement;
+    var row = el('div', 'eye-block eye-judge');
+    row.appendChild(el('div', 'eye-rule'));
+    var head = el('div', 'teach-label', 'Judgement');
+    head.appendChild(el('span', 'eye-shadow-tag', 'shadow · not spoken'));
+    row.appendChild(head);
+
+    if (!j) {
+      row.appendChild(el('div', 'teach-text empty',
+        rec.judgement_problem === 'malformed'
+          ? 'the model returned a judgement object that could not be read'
+          : 'the model returned no judgement object'));
+      return row;
+    }
+
+    var strip = el('div', 'eye-risk-strip');
+    /* THE ENGINE'S SCALE IS THE ONE ON THE GLASS, because it is the one the
+       false-positive rubric grades against. The four-level post-training
+       scale rides along in a tooltip rather than as a second chip: two risk
+       words side by side is two things to read where the point is that there
+       should be one. */
+    var pri = String(j.priority || 'NORMAL').toUpperCase();
+    var chip = el('span', 'eye-risk eye-risk-' + pri.toLowerCase()
+                          .replace('critical-candidate', 'urgent')
+                          .replace('high', 'urgent')
+                          .replace('caution', 'advise')
+                          .replace('normal', 'none'), pri);
+    if (j.risk) chip.title = 'post-training scale: ' + j.risk;
+    strip.appendChild(chip);
+    /* WHERE THE LABEL CAME FROM. A grammar-constrained object and one the
+       model was talked into producing fail in different ways, and a card that
+       showed them identically would hide which. */
+    if (j.source === 'guided') {
+      strip.appendChild(el('span', 'eye-outcome', 'schema enforced'));
+    }
+    if (j.occluded) {
+      strip.appendChild(el('span', 'eye-speak on', 'occlusion noted'));
+    }
+    strip.appendChild(el('span', 'eye-speak' + (j.should_speak ? ' on' : ''),
+                         j.should_speak ? 'would speak' : 'would stay quiet'));
+    /* WHAT THE DETERMINISTIC LOOP ACTUALLY DID, beside it, always. This pair
+       is the whole experiment -- the four counts in the drive log are made of
+       exactly this comparison -- and showing the judgement without the truth
+       it is scored against would make the card a place to admire the prose. */
+    var sh = rec.shadow || {};
+    if (typeof sh.loop_spoke === 'boolean') {
+      strip.appendChild(el('span', 'eye-vs', 'vs'));
+      strip.appendChild(el('span', 'eye-loop' + (sh.loop_spoke ? ' on' : ''),
+                           sh.loop_spoke ? 'loop fired' : 'loop quiet'));
+      if (sh.outcome) {
+        strip.appendChild(el('span', 'eye-outcome eye-outcome-' + sh.outcome,
+                             sh.outcome.replace(/_/g, ' ')));
+      }
+    }
+    row.appendChild(strip);
+
+    if (j.why) row.appendChild(el('div', 'teach-text', j.why));
+
+    var about = el('div', 'eye-check-v');
+    if ((j.about || []).length) {
+      about.textContent = 'about ' + j.about.map(function (i) {
+        return '#' + i;
+      }).join(' ');
+    } else {
+      about.textContent = 'about no particular track';
+    }
+    row.appendChild(about);
+
+    /* The two judgement faults, in the same red the reading's faults use,
+       because they are the same kind of claim: the model said a thing the
+       geometry does not support. */
+    /* THE FALSE-POSITIVE RUBRIC, ANCHORED TO A TRACK EVERY TIME. The engine
+       prompt's own list of ten things that must not be elevated, applied to
+       whichever arm produced this reading -- including the arms that were
+       never shown the list. Each row names the track and what the geometry
+       says instead, because a violation count with no anchor is an opinion
+       with a number next to it. */
+    var rb = rec.rubric || {};
+    (rb.violations || []).forEach(function (v) {
+      var d = el('div', 'eye-check bad');
+      d.appendChild(el('span', 'eye-check-k', 'false positive'));
+      d.appendChild(el('span', 'eye-check-v',
+        'elevated ' + (v.track != null ? '#' + v.track : 'scenery')
+        + ' \u2014 "' + v.rule + '"; measured: ' + v.measured));
+      row.appendChild(d);
+    });
+    /* WHAT THIS SYSTEM CANNOT GRADE, said rather than left out. Four of the
+       engine's ten rules name things the detector does not track, so a clean
+       score is a clean score on six rules and not on ten. */
+    if (rb.elevated && (rb.unchecked || []).length) {
+      row.appendChild(el('div', 'teach-unverified',
+        'Not graded here: ' + rb.unchecked.join('; ')
+        + ' \u2014 nothing in this system measures them.'));
+    }
+
+    var jf = rec.judge_faults || {};
+    (jf.reasons || []).forEach(function (r) {
+      var d = el('div', 'eye-check bad');
+      d.appendChild(el('span', 'eye-check-k',
+                       jf.urgent_contradicted ? 'contradicts' : 'unverified'));
+      d.appendChild(el('span', 'eye-check-v', r));
+      row.appendChild(d);
+    });
     return row;
   }
 
@@ -374,6 +521,7 @@
       }));
 
       /* OURS. */
+      s.col.appendChild(judgementBlock(rec));
       if (rec.state && (rec.state.tracks || rec.state.headway)) {
         s.col.appendChild(givenBlock(rec.state));
       }

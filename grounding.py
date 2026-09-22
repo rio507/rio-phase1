@@ -106,6 +106,22 @@ def measured_from_result(result: dict) -> dict:
         "n_lanes_detected": len(result.get("lanes") or []),
         "lane_plausible": list(result.get("lane_plausible") or []),
         "lane_offset": result.get("lane_offset"),
+        # --- WHAT THE WARNING PATH ACTUALLY DID, AND IT IS NOT FOR THE MODEL.
+        #
+        # This is the ground truth the shadow scoring compares Cosmos's
+        # should_speak against: did the deterministic loop fire on this frame.
+        # It is stored here and it is NEVER RENDERED -- `render()` below must
+        # not print it, and tools/eye_window_selftest.py asserts that, because
+        # putting it in the prompt would hand the model the answer to the
+        # exact question being asked of it and every agreement number after
+        # that would be worthless.
+        #
+        # `band` IS rendered and that is deliberate and different: a band is a
+        # measured state of the world, the speak decision is a decision about
+        # it, and the model is being scored on whether it reaches that
+        # decision independently.
+        "spoke": bool(result.get("speak")),
+        "voice_reason": result.get("voice_reason"),
     }
 
 
@@ -259,6 +275,17 @@ def window_state(window) -> dict:
             "n_range_refused": last.get("n_range_refused"),
             "gap_first_m": first.get("gap_m"),
             "series": series,
+        },
+        # THE LOOP'S OWN DECISION OVER THIS WINDOW, for scoring only. Any
+        # frame firing counts as the loop having fired: a warning is an event,
+        # and a window that contains one is a window Cosmos should have had
+        # something to say about.
+        "loop": {
+            "spoke": any(m.get("spoke") for m in measured if m),
+            "reasons": sorted({m.get("voice_reason") for m in measured
+                               if m and m.get("spoke") and m.get("voice_reason")}),
+            "bands": sorted({m.get("band") for m in measured
+                             if m and m.get("band")}),
         },
         "ego": {
             "speed_ms": last.get("v_host_ms"),
