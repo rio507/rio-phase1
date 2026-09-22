@@ -923,31 +923,32 @@ EXAMPLE
 
 Scene:
 
-Ego vehicle traveling on a city street.
-SUV parked on right.
-Pedestrian partially visible between SUV and curb.
-Pedestrian appears oriented toward roadway.
+Ego vehicle on a single-track alpine road at night.
+Heavy falling snow.
+A gritter is stopped ahead, amber beacon rotating, blade lowered.
+The road bends sharply beyond it.
 
 Output concept:
 
 Priority: WATCH
 
 Current state:
-Pedestrian partially obscured behind parked SUV near curb.
+Gritter stationary in the carriageway, its bulk hiding the road beyond the bend.
 
 Likely next state:
-Pedestrian remains near sidewalk.
+Gritter remains stopped while working.
 
 Dangerous alternative:
-Pedestrian enters roadway from behind SUV.
+Oncoming traffic emerges from behind it on a road too narrow to pass.
 
 Evidence:
-Partial body visible.
-Body orientation toward roadway.
-Sight line blocked by parked SUV.
+Amber beacon rotating.
+Blade lowered onto the carriageway.
+Sight line into the bend blocked by the gritter.
+Falling snow reducing perception distance.
 
 Trigger to escalate:
-Forward body movement into roadway or continued emergence from behind SUV.
+Headlight glow on the snow beyond the gritter, or the gritter beginning to move.
 
 Driver alert:
 Not yet.
@@ -958,26 +959,27 @@ SECOND EXAMPLE
 
 Scene:
 
-Freeway traffic.
-Lead car moving normally.
-Several vehicles farther ahead suddenly illuminate brake lights.
+Ego vehicle on a single-track rural lane at dusk, in fog.
+A tractor is moving slowly ahead.
+Beyond the tractor, the lights of a level crossing have begun to flash.
 
 Output:
 
 Priority: CAUTION
 
 Observation:
-"Traffic appears to be compressing several vehicles ahead."
+"Level-crossing signals appear to be activating beyond the tractor ahead."
 
 Evidence:
-Multiple brake lights.
-Reduced spacing farther ahead.
+Flashing signals visible past the tractor.
+Fog reducing perception distance.
+No verge to pull onto.
 
 Likely next state:
-Lead vehicle may begin decelerating.
+Tractor slows and stops short of the crossing.
 
 System action:
-Track lead vehicle closing rate and TTC.
+Track the tractor's closing rate and TTC.
 
 Do NOT say:
 "Brake now."

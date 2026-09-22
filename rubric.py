@@ -69,6 +69,15 @@ def _bullets(body: str):
 # --- the false-positive control list, read off the prompt -------------------
 FALSE_POSITIVE_RULES = _bullets(_section("FALSE POSITIVE CONTROL"))
 
+# --- the worked examples, read off the prompt -------------------------------
+# PARSED, NOT TRANSCRIBED, for the reason everything else in this file is:
+# a copy goes stale the day somebody edits the prompt, and a stale copy here
+# means the echo detector is watching for examples that are no longer in the
+# prompt while the ones that are go unwatched. 23c3dcd is what that costs.
+WORKED_EXAMPLES = [t for t in (_section("EXAMPLE"), _section("SECOND EXAMPLE"))
+                   if t]
+
+
 # --- the priority levels, read off the prompt -------------------------------
 def _levels():
     body = _section("PRIORITY LEVELS")

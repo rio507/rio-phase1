@@ -187,22 +187,31 @@ except OSError:
     ARM_D = ""
 
 # THE TWO WORKED EXAMPLES AT THE END OF IT, pulled out so they can be watched
-# for coming back. Both are generic road scenes that could plausibly match
-# our footage -- a pedestrian behind a parked SUV, and brake lights
-# compressing ahead on a freeway -- which is exactly the condition under
-# which 23c3dcd saw a worked example returned verbatim as an observation.
-# Measured rather than removed, because the number is the thing worth having:
-# an arm that copies its examples is disqualified whatever else it does, and
-# an arm that does not has earned the richness.
-ARM_D_EXAMPLES = [
-    ("Pedestrian partially obscured behind parked SUV near curb. "
-     "Pedestrian remains near sidewalk. Pedestrian enters roadway from "
-     "behind SUV. Partial body visible. Body orientation toward roadway. "
-     "Sight line blocked by parked SUV."),
-    ("Traffic appears to be compressing several vehicles ahead. "
-     "Multiple brake lights. Reduced spacing farther ahead. "
-     "Lead vehicle may begin decelerating."),
-]
+# for coming back. READ FROM THE PROMPT rather than copied here, so editing
+# the prompt cannot leave this detector watching for examples that are no
+# longer in it.
+#
+# THEY WERE REPLACED, AND WHY. The originals were a pedestrian behind a parked
+# SUV and brake lights compressing ahead on a freeway -- both generic daylight
+# road scenes that could plausibly be true of our own footage, which makes a
+# copy indistinguishable from a correct reading. They were copied: on the
+# FROZEN window, where nothing moves at all, arm D reported "multiple brake
+# lights activating (Tracks 48 & 49)"; on the suburban window it reported a
+# "parked SUV" occluding a driveway and "potential emergence of
+# pedestrians/children" on a street holding nine tracks and no pedestrian.
+#
+# The replacements teach the same two lessons -- occlusion, and looking past
+# the lead -- in scenes that share no vocabulary with sunny multi-lane
+# California highway: a gritter stopped on a snowbound alpine road at night,
+# and a tractor ahead of a level crossing in fog at dusk. If either comes back
+# now it is unmistakable rather than plausible, which is the whole point of
+# the substitution.
+ARM_D_EXAMPLES = []
+try:
+    import rubric as _rubric_for_examples
+    ARM_D_EXAMPLES = list(_rubric_for_examples.WORKED_EXAMPLES)
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------
