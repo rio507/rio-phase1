@@ -1433,6 +1433,19 @@ async def realtime_tool_endpoint(request: Request, body: dict = Body(...),
     if result.get("results") is not None:
         logged["n_results"] = len(result.get("results") or [])
         logged["names"] = [r.get("name") for r in (result.get("results") or [])][:5]
+        # ...AND HOW FAR AWAY THEY WERE. Names alone made the 2026-09-24
+        # "nearby" fault unarguable from the record: five plausible coffee
+        # shops, no distances, and nothing saying the nearest was 9.5 km off.
+        # Names and distances are the same length of list and the second one
+        # is the one that shows the bug.
+        dists = [r.get("distance_m") for r in (result.get("results") or [])][:5]
+        if any(d is not None for d in dists):
+            logged["distances_m"] = dists
+    # WHERE THE SEARCH WAS ANCHORED, and under what kind of constraint. Lifted
+    # whole from places.find_places rather than rebuilt here, so the log says
+    # what the request said. See places._fix_meta.
+    if isinstance(result.get("fix"), dict):
+        logged["fix"] = result["fix"]
     if not result.get("ok"):
         logged["note"] = result.get("note")
     sessions.log_live(session_id, "tool_call", logged)

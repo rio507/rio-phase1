@@ -2626,8 +2626,51 @@ PLACES_ENABLED = True
 # billed request, since maxResultCount is sent.
 PLACES_MAX_RESULTS = 5
 
-# The bias circle for "near me". Wide enough that a quiet suburb still returns
-# somewhere to eat, tight enough that "near me" does not mean the next city.
+# THE HARD LIMIT ON "NEAR ME", AND WHY IT IS NO LONGER A BIAS.
+#
+# THE DRIVE, 2026-09-24, session 4989d12e. "What coffee shops are nearby",
+# asked from Pacific Palisades (34.0770, -118.5624) with a live fix. Five
+# results came back and every one of them was outside the 8 km bias:
+#
+#     Happy Days Cafe          13183 m   Sherman Oaks
+#     The Morning Mood         21197 m   Granada Hills
+#     LOKL HAUS                 9458 m   Santa Monica
+#     Urth Caffe Santa Monica  10725 m   Santa Monica
+#     Valley Grounds Coffee    13237 m   Sherman Oaks
+#
+# The nearest thing RIO offered was 9.5 km away and one of them was over the
+# mountains in a different valley. Meanwhile Cafe Mimosa was 3.5 km away and
+# Alfred Coffee was 4.8 km away, in the village the car was sitting in.
+#
+# A BIAS IS A SUGGESTION. `locationBias` tells Places where to prefer, and
+# Places is free to decide that relevance beats proximity -- which it did,
+# comprehensively and for every single result. Nothing was broken. We asked a
+# question that permits this answer.
+#
+# So the car's position is now a RESTRICTION, and the radius below is a wall
+# rather than a hint. See places.find_places: it also asks for
+# rankPreference=DISTANCE and sorts what comes back, because ranking was the
+# other half -- the old code returned Places' relevance order untouched, which
+# put the 21 km result second and the 9.5 km one third.
+#
+# WHY 5 KM. It is the radius that returned five genuine neighbours on the
+# drive above, and at PLACES_DRIVE_SPEED_MS it is about eight minutes -- which
+# is what "nearby" means to somebody already in a car. Wider stops meaning
+# nearby; tighter starts refusing real answers in a quiet suburb.
+#
+# WHAT HAPPENS WHEN NOTHING IS INSIDE IT: nothing. The search is not widened
+# and the wall is not moved. find_places returns `nothing_close` and RIO says
+# there is nothing close, because a far result relabelled as near is the fault
+# this whole constant exists to remove. The driver can then ask for somewhere
+# specific, which goes down the `near` path and is not restricted at all.
+PLACES_NEARBY_RADIUS_M = 5000.0
+
+# THE OLD BIAS RADIUS, still used for one thing: an area the driver NAMED.
+# "Coffee in Santa Monica" asked from downtown is a question about Santa
+# Monica, so the car's position must not restrict it -- see find_places, which
+# sends neither a bias nor a restriction on that path. Kept because removing a
+# knob that a config file elsewhere may still set is a worse failure than an
+# unused constant.
 PLACES_BIAS_RADIUS_M = 8000.0
 
 # A GPS fix older than this is not where the car is. Refused rather than used:

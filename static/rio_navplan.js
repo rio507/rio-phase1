@@ -417,7 +417,37 @@
         clip: (man.speech && man.speech.clips
                && man.speech.clips[callType]) || null,
         anchor_id: anchor ? anchor.anchor_id : null,
-        priority: (callType === CALL.IMMINENT) ? P.TURN_NEAR : P.NAV,
+        /* WHO MAY INTERRUPT HER, and this line was dead.
+         *
+         * It read `callType === CALL.IMMINENT`, and CALL has no IMMINENT --
+         * the enum is depart/far/far_mid/near/junction/arrival/arrived, and
+         * IMMINENT is a navcore MANEUVER STATE that never reaches this
+         * function. So the comparison was `callType === undefined`, never
+         * true, and P.TURN_NEAR -- the tier rio_speech.js describes as "the
+         * one nav line that is genuinely time-critical" -- was never assigned
+         * to anything. Every nav call ran at P.NAV.
+         *
+         * The junction call IS that line: 35 m out, the roadless "Turn left.",
+         * the only tier with a pre-rendered clip, and a 2.5 s TTL. It has to
+         * cut through, and it has to cut through precisely so everything else
+         * can stop doing so -- a patient junction call would sit behind a
+         * sentence, outlive its two and a half seconds and be dropped, which
+         * is the one nav failure that matters. */
+        priority: (callType === CALL.JUNCTION) ? P.TURN_NEAR : P.NAV,
+        /* ...AND EVERY OTHER TIER WAITS FOR HER TO FINISH.
+         *
+         * The route-start burst is the case that forced this: session
+         * 4989d12e started a route mid-sentence and the near call took the
+         * mouth 350 ms later, leaving her answer logged `orphan_silenced`.
+         * None of these tiers is time-critical at the scale of one sentence --
+         * depart describes a plan, far is half a mile out, near is 150 m
+         * (eleven seconds at 13 m/s), arrival is after the driving is done --
+         * and all of them are backstopped by the junction call above.
+         *
+         * `patient` is ordering-neutral: these still outrank conversation in
+         * the queue and still go first when the mouth frees. See
+         * rio_speech.js. */
+        patient: (callType !== CALL.JUNCTION),
         created_at: clock,
         expires_at: clock + (ttlMs(callType) / 1000)
       };
@@ -447,6 +477,7 @@
       var said = false;
       arbiter.say({
         priority: candidate.priority,
+        patient: candidate.patient,
         group: 'nav:' + man.id,
         id: 'nav:' + man.id + ':' + callType,
         text: text,

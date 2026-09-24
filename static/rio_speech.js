@@ -44,6 +44,25 @@
  *
  * Pre-empted and superseded items are never resumed. The mouth moves forward.
  *
+ * TWO LISTS, NOT ONE: WHO GOES FIRST, AND WHO MAY INTERRUPT
+ * ---------------------------------------------------------
+ * Priority used to answer both, and they are not the same question. A
+ * route-start line outranks a conversational answer for ORDER -- if both are
+ * waiting, the turn goes first -- and it has no business cutting her off,
+ * because the first maneuver is minutes away and her sentence is seconds from
+ * ending.
+ *
+ * THE DRIVE, 2026-09-24, session 4989d12e. A route starts while RIO is
+ * finishing a sentence. Within 350 ms the nav tier takes the mouth and her
+ * answer is logged `orphan_silenced`; the driver hears half a sentence and
+ * then a turn instruction over the top of it.
+ *
+ * So an item may set `patient: true`: it is inserted by priority and it never
+ * pre-empts. Safety and the junction call do not set it and still cut through
+ * anything. Nothing else about the ladder changes -- supersede-by-group,
+ * expiry and validity are all unchanged, so a patient line that waited past
+ * its window is dropped rather than said late.
+ *
  * Pure queue logic — no DOM. Items carry their own play()/stop(), which is what
  * lets tools/nav_selftest.js drive this file under node with fake items.
  */
@@ -186,7 +205,9 @@
       P: P,
 
       /* item: {priority, group, id, text, play():Promise, stop(), ttlMs, maxMs,
-                meta, valid(), onDone(reason)}
+                meta, valid(), onDone(reason), patient}
+         `patient` means "queue, never cut in" -- see the header. Absent is
+         falsy, so every existing caller keeps the behaviour it had.
          `valid` is optional and is asked at dequeue, not at creation — see
          admit(). Navigation supplies one; headway and conversation do not,
          because a warning about the road ahead is either current or expired
@@ -217,7 +238,7 @@
           return true;
         }
 
-        if (item.priority < current.item.priority) {
+        if (item.priority < current.item.priority && !item.patient) {
           // Strictly more urgent than what is speaking: cut in. The interrupted
           // line is gone for good — see the header.
           if (!admit(item)) return true;
@@ -225,6 +246,15 @@
           start(item);
           return true;
         }
+        /* PATIENT: outranks what is speaking for ORDER, but will not cut it
+           off. It goes to the front of the queue and waits for the mouth.
+
+           See the header's two-lists note. The wait ends when the current
+           item's play() promise settles, which for a conversational answer is
+           the end of the SOUND and not the end of generation — rio_realtime
+           holds that promise open across the audio tail. So "wait for her to
+           finish" needs no new clock here and cannot drift from the one the
+           mouth already uses. */
         insert(item);
         return true;
       },

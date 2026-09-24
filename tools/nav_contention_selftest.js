@@ -116,6 +116,12 @@ function session(opts) {
              unmute: () => { audio.muted = false; } },
     onEvent: (ev) => events.push(ev),
     bargeSustainMs: 4, bargeConfirmMs: 8,
+    /* THE TAIL, WHEN A TEST ASKS FOR IT. With this off, `response.done` and
+       the end of the sound are the same event and a test cannot tell which
+       one a gate is watching -- which is precisely the distinction the
+       route-start section below exists to pin down. */
+    holdTail: !!opts.holdTail,
+    tailFallbackMs: opts.tailFallbackMs || 15000,
   });
   let n = 0;
   const h = {
@@ -162,8 +168,13 @@ function navLine(h, o) {
     clipUrl: o.clipUrl || null, clipFirst: !!o.clipUrl,
     element: document.createElement('audio'),
   });
+  /* THE SAME TWO LINES rio_navplan.js USES, and they have to stay the same
+     two lines: the junction call is the one tier that may cut through, and
+     everything else is patient. A copy of that rule that drifts would let this
+     file pass while the car interrupts her. */
   h.arbiter.say({
     priority: o.callType === 'junction' ? h.arbiter.P.TURN_NEAR : h.arbiter.P.NAV,
+    patient: o.callType !== 'junction',
     group: 'nav:' + (o.maneuver || 'm0'),
     id: 'nav:' + (o.maneuver || 'm0') + ':' + o.callType,
     text: o.text, ttlMs: o.ttlMs || 12000,
@@ -301,6 +312,100 @@ function navLine(h, o) {
     ok(h.creates().some(e => e.response &&
                         /Turn left\./.test(e.response.instructions || '')),
        'the turn call itself is dictated');
+  }
+
+  section('a route start mid-sentence — the callout waits for the audio to end');
+  {
+    /* THE DRIVE, 2026-09-24, session 4989d12e. A route is started while RIO is
+       finishing a sentence. 325 ms later the route-start call takes the mouth;
+       her answer is logged `orphan_silenced` and the driver hears half of it.
+       The first maneuver was minutes of driving away.
+
+       THE GATE IS THE SOUND, NOT THE GENERATION, and that is why this runs
+       with holdTail on: `response.done` and the end of the audio are seconds
+       apart under a speaking backend, and a callout released at the first of
+       them still lands on top of her. */
+    const h = session({ holdTail: true });
+    RIO.speak.reset();
+
+    // An ordinary answer to the driver -- the closing sentence of a turn, which
+    // is what a route start lands on top of.
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+    await tick(5);
+    const answerId = h.respond();
+    h.controller.handle({ type: 'output_audio_buffer.started',
+                          response_id: answerId });
+    h.speaks(answerId, 'A red pickup, two cars ahead.');
+    ok(h.arbiter.state().speaking
+       && h.arbiter.state().speaking.priority === speech.P.CONVO,
+       'she has the mouth, out loud, at CONVO');
+
+    let departReason = null;
+    navLine(h, { text: 'Head east, then turn left onto Palisades Dr.',
+                 callType: 'depart',
+                 done: (r) => { departReason = r; } });
+
+    const speakingNow = h.arbiter.state().speaking;
+    ok(speakingNow && speakingNow.priority === speech.P.CONVO,
+       'the route-start call does NOT take the mouth — this is the assertion '
+       + 'that fails if a callout begins while audio is still playing');
+    ok(h.arbiter.state().queued.some(i => /:depart$/.test(i.id)),
+       'it is queued behind her instead');
+    ok(departReason === null, 'and it has not been dropped');
+    ok(!h.cancels().some(e => e.response_id === answerId),
+       'her answer is not cancelled — nothing pre-empted it');
+
+    // GENERATION ENDS. The sound has not.
+    h.done(answerId);
+    await tick(5);
+    const afterDone = h.arbiter.state().speaking;
+    ok(afterDone && afterDone.priority === speech.P.CONVO,
+       'response.done does not release the mouth — generation is over, the '
+       + 'sound is not');
+    ok(h.arbiter.state().queued.some(i => /:depart$/.test(i.id)),
+       '...so the callout is still waiting');
+
+    // ...and now it has.
+    h.controller.handle({ type: 'output_audio_buffer.stopped',
+                          response_id: answerId });
+    await tick(10);
+    const afterAudio = h.arbiter.state().speaking;
+    ok(afterAudio && /:depart$/.test(afterAudio.id),
+       'the route-start call begins when the AUDIO ends, on the same event '
+       + 'the mouth already waits for');
+  }
+
+  section('...and the junction call still cuts straight through her');
+  {
+    /* THE OTHER SIDE OF THE LINE, asserted in the same file so the two cannot
+       drift apart. A junction call is 35 m out with a 2.5 s TTL: made patient
+       it would wait behind a sentence, outlive its window and be dropped,
+       which is the one nav line that must never be lost. */
+    const h = session({ holdTail: true });
+    RIO.speak.reset();
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+    await tick(5);
+    const answerId = h.respond();
+    h.controller.handle({ type: 'output_audio_buffer.started',
+                          response_id: answerId });
+    h.speaks(answerId, 'A red pickup, two cars ahead.');
+
+    navLine(h, { text: 'Turn left.', callType: 'junction', maneuver: 'm2' });
+    const nowSpeaking = h.arbiter.state().speaking;
+    ok(nowSpeaking && /:junction$/.test(nowSpeaking.id),
+       'the junction call takes the mouth immediately, mid-sentence');
+    /* BARE, NOT BY ID, and that is right here: this answer IS the response the
+       session is generating, so `response.cancel` naming nothing cancels
+       exactly it. The by-id form belongs to the out-of-band direct line, which
+       the section above this one covers -- there the entry can already be over
+       and an unnamed cancel would land on its successor. */
+    ok(h.cancels().length > 0,
+       'and cancels the answer it pre-empted');
+    ok(h.sent.some(e => e.type === 'output_audio_buffer.clear'),
+       'and clears the audio already on its way, so she does not carry on '
+       + 'underneath it');
   }
 
   section('turn end to first audio — the number the drive log did not have');

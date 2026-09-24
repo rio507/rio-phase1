@@ -2768,9 +2768,12 @@ def run_tool(name: str, arguments, session_key: str = "default",
     thing RIO already knows how to handle, and a 500 is not.
 
     `where` is the car's last GPS fix, attached by the panel to every tool call.
-    Only find_places reads it, and only as a location bias -- the browser is the
-    one that knows where the car is, for the same reason nav_status is answered
-    there.
+    find_places and get_weather read it -- the browser is the one that knows
+    where the car is, for the same reason nav_status is answered there. In
+    find_places it is a location RESTRICTION rather than the bias it used to
+    be: a bias is a suggestion, and on 2026-09-24 Places declined it for all
+    five results and answered "what coffee shops are nearby" with one 21 km
+    away. See config.PLACES_NEARBY_RADIUS_M.
 
     `spoken` is the driver's own last transcript, attached the same way and for
     the same kind of reason: the panel is where Whisper's output lands, and the

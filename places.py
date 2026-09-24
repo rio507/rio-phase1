@@ -120,6 +120,54 @@ def drive_minutes(distance_m: float) -> float:
     return road_m / max(1.0, config.PLACES_DRIVE_SPEED_MS) / 60.0
 
 
+def _box(origin, radius_m: float) -> dict:
+    """The smallest lat/lng rectangle containing the circle. -> {low, high}
+
+    searchText restricts by rectangle and by nothing else, so a radius has to
+    become a box before it can be sent. The box is larger than the circle at
+    the corners; find_places filters the difference off by haversine, which is
+    the only way "within 5 km" means 5 km in every direction rather than 7.1 km
+    to the north-east.
+    """
+    lat, lng = float(origin[0]), float(origin[1])
+    dlat = radius_m / 111320.0
+    # Longitude degrees shrink toward the poles. Clamped because at a latitude
+    # where the cosine reaches zero this is a division by nothing, and a box of
+    # infinite width is not a restriction.
+    coslat = max(0.01, math.cos(math.radians(lat)))
+    dlng = radius_m / (111320.0 * coslat)
+    return {"low": {"latitude": lat - dlat, "longitude": lng - dlng},
+            "high": {"latitude": lat + dlat, "longitude": lng + dlng}}
+
+
+def _fix_meta(where, origin, radius_m: float) -> dict:
+    """Everything about the position this search used. -> dict
+
+    Provenance rather than a coordinate: "it was 9 km out" and "it was 9 km out
+    from a fix taken four minutes ago with 35 m of accuracy" are different
+    findings with different fixes, and only the second one can be read off a
+    log.
+    """
+    w = where if isinstance(where, dict) else {}
+    return {
+        "lat": origin[0] if origin else None,
+        "lng": origin[1] if origin else None,
+        # The browser's Geolocation watch is the only producer; named anyway,
+        # because "which fix" stops being obvious the moment there are two.
+        "source": "browser_geolocation" if origin else None,
+        "age_s": (round(float(w["age_s"]), 1)
+                  if isinstance(w.get("age_s"), (int, float)) else None),
+        "accuracy_m": (round(float(w["accuracy_m"]), 1)
+                       if isinstance(w.get("accuracy_m"), (int, float)) else None),
+        "max_age_s": float(config.PLACES_FIX_MAX_AGE_S),
+        # A WALL OR A HINT, said in the record rather than inferred from the
+        # radius. They are different requests and they were the whole bug.
+        "constraint": "restriction" if radius_m else ("none" if origin else None),
+        "radius_m": radius_m or None,
+        "rank": "DISTANCE" if radius_m else None,
+    }
+
+
 def _fix_of(where) -> tuple:
     """The browser's GPS fix -> (lat, lng) or None, with a reason when None.
 
@@ -222,6 +270,10 @@ def find_places(query: str, near: str = "", open_now: bool = False,
                          "from memory."}
 
     origin, fix_note = _fix_of(where)
+    # Set only on the restricted path. Zero means "no wall was applied", which
+    # is the correct state for a named area and the state the filter below
+    # reads.
+    radius_m = 0.0
     # A model can send "3", or "all", or nothing, whatever the schema says the
     # type is. An unreadable count is the default rather than an exception: the
     # driver asked a question, and failing it over an argument they never saw
@@ -242,10 +294,25 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         # from downtown is a question about Santa Monica.
         area = near
     elif origin:
+        # RESTRICTED TO THE CAR, NOT BIASED TOWARD IT. See
+        # config.PLACES_NEARBY_RADIUS_M for the drive that changed this: with a
+        # bias, all five results landed outside the radius and the nearest
+        # coffee RIO offered was 9.5 km away while there was one at 3.5 km.
+        #
+        # A RECTANGLE BECAUSE THE API TAKES NOTHING ELSE. searchText's
+        # `locationRestriction` accepts a rectangle only -- a circle is
+        # rejected outright (HTTP 400, "Unknown name \"circle\" at
+        # 'location_restriction'"), which is why this is a bounding box and why
+        # the haversine filter below is not belt-and-braces but the other half
+        # of the shape: the box's corners reach 1.41x the radius and those
+        # corners are the ones that read as "not nearby".
         area = "near the car"
-        body["locationBias"] = {"circle": {
-            "center": {"latitude": origin[0], "longitude": origin[1]},
-            "radius": float(config.PLACES_BIAS_RADIUS_M)}}
+        radius_m = float(config.PLACES_NEARBY_RADIUS_M)
+        body["locationRestriction"] = {"rectangle": _box(origin, radius_m)}
+        # ...AND NEAREST FIRST. The old code took Places' relevance order
+        # untouched and never sorted, so even within a good set the order was
+        # not the order a driver means by "nearby".
+        body["rankPreference"] = "DISTANCE"
     else:
         # Neither. Guessing a location here produces results that are real,
         # correct and useless, and they look exactly like good ones.
@@ -283,11 +350,82 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         }
 
     places = data.get("places") or []
-    results = [_shape(p, i + 1, origin) for i, p in enumerate(places)]
-    results = [r for r in results if r["name"]]
+    shaped = [_shape(p, i + 1, origin) for i, p in enumerate(places)]
+    shaped = [r for r in shaped if r["name"]]
+
+    # THE CORNERS OF THE BOX, CUT OFF. _box is the smallest rectangle around
+    # the circle, so a result can satisfy the restriction and still be 1.41x
+    # the radius away on a diagonal. Dropped rather than kept-and-labelled: the
+    # radius is what "nearby" means and a result outside it is the thing this
+    # whole path exists not to say.
+    too_far = []
+    if radius_m:
+        inside = []
+        for r in shaped:
+            d = r.get("distance_m")
+            if d is None or d <= radius_m:
+                inside.append(r)
+            else:
+                too_far.append(r)
+        shaped = inside
+
+    # NEAREST FIRST, HERE AS WELL AS IN THE REQUEST. rankPreference is the
+    # server's ordering and this is ours; they agree, and the one that has to
+    # be true is this one, because it is the order RIO reads them out in. A
+    # result with no coordinates sorts last rather than first -- unknown
+    # distance is not zero distance.
+    shaped.sort(key=lambda r: (r.get("distance_m") is None,
+                               r.get("distance_m") or 0))
+    for i, r in enumerate(shaped):
+        r["index"] = i + 1
+    results = shaped
     remember(session_key, body["textQuery"], results)
 
     if not results:
+        # NOTHING CLOSE IS AN ANSWER, AND IT IS NOT "nothing came back".
+        # Distinguished because the two need different sentences: one means the
+        # search found no such thing anywhere, the other means there is such a
+        # thing but not near the car, and only the second one invites "do you
+        # want me to look further out". The search is NOT re-run wider here --
+        # reaching further and still calling it nearby is the fault this path
+        # was rewritten to remove.
+        if radius_m:
+            # EMPTY UNDER A WALL IS "NOTHING CLOSE", WHICHEVER WAY IT GOT THERE.
+            # Two routes to no results and they must not be told apart in the
+            # answer: the API returned nothing inside the box (the usual case,
+            # because the restriction filters server-side), or it returned
+            # corners that the haversine cut. Only the second leaves anything
+            # behind to measure, so `nearest_outside_km` is a bonus and never a
+            # condition -- keying the branch on it is how the common case fell
+            # through to "nothing came back for that", which says the wrong
+            # thing: there ARE coffee shops, just not near the car.
+            #
+            # AND NO SECOND SEARCH. Finding out how far the nearest one really
+            # is would cost another billed call and would be the widening this
+            # path exists to refuse. She says there is nothing close, which is
+            # true and is the whole answer.
+            near_km = (round(min(r["distance_m"] for r in too_far) / 100.0) / 10.0
+                       if too_far else None)
+            out = {
+                "ok": True, "n": 0, "results": [], "query": query,
+                "area": area, "note": "nothing_close",
+                "searched_radius_m": radius_m,
+                "nearest_outside_km": near_km,
+                "open_now_filter": bool(open_now),
+                "fix": _fix_meta(where, origin, radius_m),
+                "took_ms": round((time.time() - t0) * 1000, 1),
+            }
+            out["rules"] = (
+                "There is nothing of that kind close to the car. Say that "
+                "plainly -- there is nothing nearby -- and do NOT read out "
+                "anything further away as though it were near, and do NOT "
+                "name a place from memory. Offer to look in a particular "
+                "area if they want one, and search again with `near` set to "
+                "whatever they say."
+                + (f" If it helps, the nearest one found was roughly "
+                   f"{near_km} km off." if near_km else "")
+            )
+            return out
         return {
             "ok": True, "n": 0, "results": [], "query": query, "area": area,
             "open_now_filter": bool(open_now),
@@ -304,6 +442,16 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         "area": area,
         "open_now_filter": bool(open_now),
         "distances_from": "the car" if origin else None,
+        # WHAT WAS ASKED, SO THE NEXT BAD ANSWER IS ARGUABLE FROM THE LOG.
+        #
+        # On 2026-09-24 the drive log recorded the query, the result count and
+        # five names -- and not the coordinate, its age, the radius, whether it
+        # was a bias or a wall, or how far any result was. So "why were those
+        # far away" could not be answered from the record at all; it took
+        # replaying the call against a coordinate recovered from a nav row
+        # logged twenty-three seconds later. That is the difference between a
+        # log and a receipt. app.py copies this block onto the tool_call row.
+        "fix": _fix_meta(where, origin, radius_m),
         "results": results,
         "took_ms": round((time.time() - t0) * 1000, 1),
         "attribution": "Powered by Google",

@@ -2928,9 +2928,12 @@ def run_places():
     section("I. places — real businesses, never remembered ones")
     real_http = places.httpx
     try:
-        # 1. "COFFEE NEAR ME, OPEN NOW." The car's fix biases the search, and
-        #    the open-now filter is passed to Google rather than applied by RIO
-        #    to a list she cannot see the hours of.
+        # 1. "COFFEE NEAR ME, OPEN NOW." The car's fix RESTRICTS the search --
+        #    it used to bias it, and on 2026-09-24 all five results came back
+        #    outside the bias radius, the nearest 9.5 km away, because a bias
+        #    is a suggestion Places may decline. The open-now filter is passed
+        #    to Google rather than applied by RIO to a list she cannot see the
+        #    hours of.
         fake = _FakeHTTP(TWO_COFFEES)
         places.httpx = fake
         r = realtime.run_tool(realtime.PLACES_TOOL_NAME,
@@ -2941,11 +2944,27 @@ def run_places():
         ok(len(fake.calls) == 1, "one Places call per question, not one per result")
         ok(req["json"]["openNow"] is True,
            "open-now is filtered by Google, which knows the hours")
-        bias = req["json"].get("locationBias", {}).get("circle", {})
-        ok(abs(bias.get("center", {}).get("latitude", 0) - SM_FIX["lat"]) < 1e-9,
-           "and biased to the car's own fix, so 'near me' means near the car")
-        ok(bias.get("radius") == config.PLACES_BIAS_RADIUS_M,
-           f"within {config.PLACES_BIAS_RADIUS_M:.0f} m")
+        ok("locationBias" not in req["json"],
+           "the car's fix is no longer a BIAS — that is what let a 21 km "
+           "result be called nearby")
+        rect = req["json"].get("locationRestriction", {}).get("rectangle", {})
+        lo = rect.get("low", {})
+        hi = rect.get("high", {})
+        ok(bool(rect), "it is a restriction, and searchText takes only a box")
+        ok(lo.get("latitude", 0) < SM_FIX["lat"] < hi.get("latitude", 0)
+           and lo.get("longitude", 0) < SM_FIX["lng"] < hi.get("longitude", 0),
+           "centred on the car's own fix, so 'near me' means near the car")
+        # The box's half-height against the radius it was built from. Checked
+        # here rather than only in places_nearby_selftest because this is the
+        # test that proves the LIVE TOOL PATH sends it, not just that the
+        # helper can build one.
+        half_m = places.haversine_m(hi.get("latitude", 0), SM_FIX["lng"],
+                                    SM_FIX["lat"], SM_FIX["lng"])
+        ok(abs(half_m - config.PLACES_NEARBY_RADIUS_M)
+           < config.PLACES_NEARBY_RADIUS_M * 0.02,
+           f"sized to {config.PLACES_NEARBY_RADIUS_M:.0f} m ({half_m:.0f} m)")
+        ok(req["json"].get("rankPreference") == "DISTANCE",
+           "and ranked nearest-first, which nothing used to do")
         ok("in" not in req["json"]["textQuery"],
            f"the text query stays the driver's words ({req['json']['textQuery']!r})")
 
@@ -2964,28 +2983,43 @@ def run_places():
         ok(req["json"]["maxResultCount"] <= config.PLACES_MAX_RESULTS,
            "and it asks for at most the number she can read out")
 
-        # 2. WHAT COMES BACK IS WHAT SHE CAN SAY.
-        first = r["results"][0]
-        ok(first["name"] == "Dogtown Coffee" and first["place_id"] == "p_dogtown",
+        # 2. NEAREST FIRST. The fixture lists Dogtown before Blue Bottle, the
+        #    way Places returns relevance order; Blue Bottle is the closer of
+        #    the two. The list RIO reads from is sorted, so the fixture's order
+        #    and the answer's order deliberately differ here -- that difference
+        #    IS the fix, and addressing results by index would hide it.
+        dists = [x["distance_m"] for x in r["results"]]
+        ok(dists == sorted(dists), f"results come back nearest first ({dists})")
+        ok(r["results"][0]["place_id"] == "p_bluebottle",
+           "...so the closer place leads, not the one Places happened to rank "
+           "first")
+        ok([x["index"] for x in r["results"]] == [1, 2],
+           "...renumbered, so 'the second one' means the second one she said")
+
+        # 3. WHAT COMES BACK IS WHAT SHE CAN SAY. By name, because the order is
+        #    now a property of the road rather than of the fixture.
+        by_id = {x["place_id"]: x for x in r["results"]}
+        dog = by_id.get("p_dogtown") or {}
+        ok(dog.get("name") == "Dogtown Coffee",
            "each result carries its name and its place_id")
-        ok(first["rating"] == 4.4 and first["ratings_count"] == 1900,
+        ok(dog.get("rating") == 4.4 and dog.get("ratings_count") == 1900,
            "the rating and how many people rated it — 4.2 from nine reviews is "
            "not 4.2 from nine hundred")
-        ok(first["price_level"] == 1 and first["open_now"] is True,
+        ok(dog.get("price_level") == 1 and dog.get("open_now") is True,
            "price and whether it is open now")
-        ok(first["distance_m"] is not None and 900 < first["distance_m"] < 1200,
-           f"and how far it is from the CAR ({first['distance_m']} m)")
-        ok(first["drive_minutes_est"] >= 1,
-           f"with a drive time (~{first['drive_minutes_est']} min)")
+        ok(dog.get("distance_m") is not None and 900 < dog["distance_m"] < 1200,
+           f"and how far it is from the CAR ({dog.get('distance_m')} m)")
+        ok(dog.get("drive_minutes_est", 0) >= 1,
+           f"with a drive time (~{dog.get('drive_minutes_est')} min)")
         ok("est" in "drive_minutes_est" and "estimate" in r["rules"].lower(),
            "named and described as an ESTIMATE — a routed time would be five "
            "more billed calls")
         ok("Answer ONLY from this list" in r["rules"],
            "and the result tells her the list is the whole of what she knows")
 
-        # 3. AN AREA WAS NAMED. The car's position is then irrelevant and must
-        #    not bias anything: "coffee in Santa Monica" from downtown is a
-        #    question about Santa Monica.
+        # 4. AN AREA WAS NAMED. The car's position is then irrelevant and must
+        #    not bias OR restrict anything: "coffee in Santa Monica" from
+        #    downtown is a question about Santa Monica.
         fake = _FakeHTTP(TWO_COFFEES)
         places.httpx = fake
         r2 = realtime.run_tool(realtime.PLACES_TOOL_NAME,
@@ -3042,8 +3076,19 @@ def run_places():
                               session_key="drive_1", where=SM_FIX)
         ok(r6["ok"] is True and r6["n"] == 0,
            "an empty result is a successful search that found nothing")
-        ok("Do NOT fill the silence" in r6["rules"],
+        # EMPTY UNDER A RESTRICTION IS A DIFFERENT SENTENCE. With a fix the
+        # search is walled to the car, so "nothing came back" means nothing
+        # came back NEAR -- which invites "shall I look further out" and the
+        # unrestricted branch does not. Asserted on the intent rather than on
+        # one phrase, because both branches have to forbid the same thing.
+        ok(r6.get("note") == "nothing_close",
+           "...and with a fix it says nothing CLOSE, not nothing at all")
+        ok("nothing nearby" in r6["rules"].lower(),
+           "with the words she should say")
+        ok("memory" in r6["rules"].lower() and "not" in r6["rules"].lower(),
            "and still not a cue to remember somewhere")
+        ok("further away" in r6["rules"].lower(),
+           "nor to read a far one out as though it were near")
 
         # 6. THE FOLLOW-THROUGH. "Take me to the second one" works because the
         #    results are still in session context and each one carries the id
@@ -3055,8 +3100,17 @@ def run_places():
         kept = places.last_results("drive_1")
         ok(len(kept.get("results") or []) == 2,
            "the list she just read is kept for the session")
-        ok(kept["results"][1]["place_id"] == "p_bluebottle",
-           "so 'the second one' has an id behind it")
+        # "THE SECOND ONE" IS THE SECOND ONE SHE SAID. Which is Dogtown, not
+        # Blue Bottle: the list is sorted nearest-first before she reads it,
+        # and what is remembered has to be in that same order or the phrase
+        # resolves to a place the driver did not point at. This assertion is
+        # the reason sorting had to happen in find_places rather than in the
+        # caller -- remember() stores what was returned.
+        ok(kept["results"][0]["place_id"] == "p_bluebottle",
+           "the nearest is what she read first")
+        ok(kept["results"][1]["place_id"] == "p_dogtown",
+           "so 'the second one' has an id behind it, and it is the one she "
+           "actually said second")
         ok(places.last_results("another_drive") == {},
            "and it is per session — one drive's list is not another's")
 
