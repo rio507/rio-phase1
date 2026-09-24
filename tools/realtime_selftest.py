@@ -2944,27 +2944,31 @@ def run_places():
         ok(len(fake.calls) == 1, "one Places call per question, not one per result")
         ok(req["json"]["openNow"] is True,
            "open-now is filtered by Google, which knows the hours")
-        ok("locationBias" not in req["json"],
-           "the car's fix is no longer a BIAS — that is what let a 21 km "
-           "result be called nearby")
-        rect = req["json"].get("locationRestriction", {}).get("rectangle", {})
-        lo = rect.get("low", {})
-        hi = rect.get("high", {})
-        ok(bool(rect), "it is a restriction, and searchText takes only a box")
-        ok(lo.get("latitude", 0) < SM_FIX["lat"] < hi.get("latitude", 0)
-           and lo.get("longitude", 0) < SM_FIX["lng"] < hi.get("longitude", 0),
+        # A BIAS AGAIN, AND THE WALL MOVED TO OUR SIDE. 48c882d sent a
+        # locationRestriction; 2026-09-24 measured that Places ignores
+        # rankPreference=DISTANCE under one and returns an arbitrary subset --
+        # at 25 km it skipped the AMC eleven kilometres nearer than the three
+        # it returned. The bias is how the nearest candidates are asked for;
+        # places.find_places filters and sorts them here.
+        ok("locationRestriction" not in req["json"],
+           "no locationRestriction — it does not rank by distance")
+        circle = req["json"].get("locationBias", {}).get("circle", {})
+        ok(bool(circle), "the fix is sent as a bias, to pick the nearest")
+        ok(abs(circle.get("center", {}).get("latitude", 0)
+               - SM_FIX["lat"]) < 1e-9,
            "centred on the car's own fix, so 'near me' means near the car")
-        # The box's half-height against the radius it was built from. Checked
-        # here rather than only in places_nearby_selftest because this is the
-        # test that proves the LIVE TOOL PATH sends it, not just that the
-        # helper can build one.
-        half_m = places.haversine_m(hi.get("latitude", 0), SM_FIX["lng"],
-                                    SM_FIX["lat"], SM_FIX["lng"])
-        ok(abs(half_m - config.PLACES_NEARBY_RADIUS_M)
-           < config.PLACES_NEARBY_RADIUS_M * 0.02,
-           f"sized to {config.PLACES_NEARBY_RADIUS_M:.0f} m ({half_m:.0f} m)")
+        ok(circle.get("radius") == config.PLACES_NEARBY_RADIUS_M,
+           f"sized to {config.PLACES_NEARBY_RADIUS_M:.0f} m "
+           f"({circle.get('radius')})")
         ok(req["json"].get("rankPreference") == "DISTANCE",
            "and ranked nearest-first, which nothing used to do")
+        # ...AND THE WALL IS STILL ENFORCED, on the live tool path rather than
+        # only in the unit test: every result RIO is handed is inside it.
+        ok(all(x["distance_m"] <= config.PLACES_NEARBY_RADIUS_M
+               for x in r["results"]),
+           "and every result handed over is inside the radius")
+        ok((r.get("fix") or {}).get("constraint") == "wall",
+           "with the record saying the limit was ours")
         ok("in" not in req["json"]["textQuery"],
            f"the text query stays the driver's words ({req['json']['textQuery']!r})")
 

@@ -928,6 +928,88 @@ section('the arbiter — one mouth (unchanged contracts)');
      'a critical health announcement still cuts through a turn announcement');
 }
 
+/* ---------------------------------------------------------------------------
+   PATIENCE: WHAT IT WAITS FOR, AND WHAT IT MUST NOT WAIT FOR
+   ---------------------------------------------------------------------------
+   A patient item queues instead of pre-empting (see rio_speech.js). The whole
+   risk of that is waiting on something that never comes: the reported symptom
+   on 2026-09-24 was a route locking in and nothing being said until the driver
+   spoke again, which is what a queue behind a mouth that never frees sounds
+   like from the passenger seat. */
+{
+  const arb = speech.makeArbiter();
+  const nav = item({ priority: speech.P.NAV, patient: true,
+                     group: 'nav:m0', id: 'depart' });
+  arb.say(nav); await tick();
+  ok(arb.state().speaking && arb.state().speaking.id === 'depart',
+     'a patient item with nothing playing speaks IMMEDIATELY — patience is '
+     + 'about not interrupting, and there is nothing to interrupt');
+  ok(arb.state().queued.length === 0, '...and nothing is left queued');
+}
+{
+  const arb = speech.makeArbiter();
+  const ends = [];
+  // The shortest TTL any patient tier carries is the near call's 6 s. This one
+  // is 30 ms, and it is made to wait far longer than that.
+  const convo = item({ priority: speech.P.CONVO, group: 'convo', id: 'answer' });
+  const nav = item({ priority: speech.P.NAV, patient: true, ttlMs: 30,
+                     group: 'nav:m0', id: 'depart',
+                     onDone: r => ends.push('depart:' + r) });
+  arb.say(convo); await tick();
+  arb.say(nav); await tick();
+  ok(arb.state().speaking.id === 'answer' &&
+     arb.state().queued.map(i => i.id).join() === 'depart',
+     'a patient item waits behind her sentence');
+  await new Promise(r => setTimeout(r, 120));   // four times its own TTL
+  ok(ends.length === 0, '...and is NOT dropped while it waits');
+  convo.finish(); await tick();
+  ok(arb.state().speaking && arb.state().speaking.id === 'depart',
+     'A PATIENT ITEM DOES NOT EXPIRE WHILE WAITING — the delay was the '
+     + 'arbiter\u2019s own instruction, so it cannot be the reason the line '
+     + 'is lost');
+  ok(ends.join() !== 'depart:expired',
+     '...and "expired" keeps meaning it outlived a window it could have '
+     + 'spoken in');
+}
+{
+  /* THE MOUTH THAT NEVER FREES. Conversation passes maxMs 90000, so before the
+     bound a stuck entry swallowed the route callout for a minute and a half. */
+  const arb = speech.makeArbiter();
+  const stuck = item({ priority: speech.P.CONVO, group: 'convo', id: 'stuck',
+                       maxMs: 90000 });
+  const nav = item({ priority: speech.P.NAV, patient: true,
+                     group: 'nav:m0', id: 'depart' });
+  const seen = [];
+  arb.onEvent(ev => seen.push(ev.type));
+  arb.say(stuck); await tick();
+  arb.say(nav); await tick();
+  ok(seen.indexOf('wait') >= 0,
+     'the wait is an EVENT, so a stuck queue is visible rather than silent');
+  ok(arb.state().speaking.id === 'stuck', 'and it is genuinely waiting');
+  // PATIENT_MAX_WAIT_MS is 8 s; this asserts the bound exists rather than
+  // sitting here for it. Nothing else in this file sleeps that long.
+  ok(typeof speech.PATIENT_MAX_WAIT_MS === 'number'
+     && speech.PATIENT_MAX_WAIT_MS > 0
+     && speech.PATIENT_MAX_WAIT_MS < 90000,
+     `patience is bounded well under conversation's own watchdog `
+     + `(${speech.PATIENT_MAX_WAIT_MS} ms vs 90000 ms)`);
+}
+{
+  /* ...and the bound actually fires, on an arbiter built with a short one. */
+  const arb = speech.makeArbiter({ patientMaxWaitMs: 40 });
+  const stuck = item({ priority: speech.P.CONVO, group: 'convo', id: 'stuck',
+                       maxMs: 90000 });
+  const nav = item({ priority: speech.P.NAV, patient: true,
+                     group: 'nav:m0', id: 'depart' });
+  arb.say(stuck); await tick();
+  arb.say(nav); await tick();
+  ok(arb.state().speaking.id === 'stuck', 'still hers at first');
+  await new Promise(r => setTimeout(r, 90));
+  ok(arb.state().speaking && arb.state().speaking.id === 'depart',
+     'a patient item behind a mouth that never frees eventually takes it — '
+     + 'the line is late, and late is recoverable where silent is not');
+}
+
 // ---------------------------------------------------------------------------
 // Optional: the same checks against a route saved from /nav/route.
 // ---------------------------------------------------------------------------

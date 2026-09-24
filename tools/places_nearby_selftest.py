@@ -23,17 +23,35 @@ what Google has indexed this morning. A test that needs the network to say
 whether we asked for a restriction is a test that goes red for the wrong
 reason. The live evidence lives in the commit message; this is the guard.
 
+AND THE INSTRUMENT CHANGED AGAIN ON 2026-09-24. 48c882d fixed this with a
+`locationRestriction`, which was the wrong tool for a second reason nobody had
+measured: Places does not honour `rankPreference=DISTANCE` under a restriction.
+Asked for a cinema within 25 km it returned three in Burbank at ~25.8 km and
+skipped the AMC eleven kilometres nearer; asked for coffee within 5 km it
+skipped the two nearest. `maxResultCount` is 5, so WHICH five come back is the
+whole answer.
+
+So the bias is back -- as the way to ask the API for the NEAREST candidates --
+and the wall is the haversine filter here, which is a true circle rather than a
+box whose corners reach 1.41x, and is ours rather than a shape a vendor is
+asked to honour. The original fault was a bias with no filter and no sort.
+
 WHAT IT ASSERTS
-    1. A fix means a RESTRICTION, never a bias, and nearest-first ranking.
-    2. The rectangle really contains the circle -- searchText refuses a circle
-       (HTTP 400), so the box is the only shape available and its corners have
-       to be cut off afterwards or "within 5 km" means 7.1 km diagonally.
-    3. Results come back sorted by distance, renumbered, corners dropped.
+    1. The request BIASES to the car and asks for distance ranking; the limit
+       is enforced here, not there.
+    2. The wall is a true circle: just inside is kept, just outside is dropped.
+    3. Results come back sorted by distance, renumbered, far ones dropped.
     4. Nothing inside the radius is `nothing_close` -- BOTH ways it can happen
-       -- and the search is never widened to fill the silence.
-    5. A NAMED AREA is not restricted at all: "coffee in Santa Monica" asked
+       -- the search is never widened to fill the silence, and she is pointed
+       at scope='wider' instead of left stuck.
+    5. A NAMED AREA is not constrained at all: "coffee in Santa Monica" asked
        from the Palisades is a question about Santa Monica.
     6. The result carries enough provenance to argue with it later.
+    7. A stale fix is refused.
+    8. SCOPE: nearby is a wall, wider is a bigger wall, anywhere has none --
+       and an unreadable scope is the NARROW one.
+    9. A category word that means a different category in plain English is
+       constrained by type.
 """
 import json
 import math
@@ -118,45 +136,50 @@ def stub(results):
 def main():
     radius = float(config.PLACES_NEARBY_RADIUS_M)
 
-    section(1, "A FIX IS A WALL, NOT A HINT")
+    section(1, "THE API CHOOSES THE NEAREST; WE ENFORCE THE LIMIT")
     stub([at(1000), at(2000)])
     r = places.find_places("coffee shops", where=WHERE)
     b = Sent.body
-    ok("the request carries a locationRestriction", "locationRestriction" in b)
-    ok("...and NOT a locationBias — the bias is what let every result out",
-       "locationBias" not in b)
-    ok("...as a rectangle, the only shape searchText accepts",
-       "rectangle" in (b.get("locationRestriction") or {}))
+    # A BIAS, AND THAT IS NOT A RETURN TO THE BUG. 48c882d replaced the bias
+    # with a locationRestriction and 2026-09-24 measured what that costs:
+    # Places does not honour rankPreference=DISTANCE under a restriction, so
+    # at 25 km it returned three Burbank cinemas and skipped the AMC eleven
+    # kilometres nearer, and at 5 km it skipped the two nearest coffees. The
+    # bias is how the API is asked for the NEAREST candidates; the wall is the
+    # haversine filter below, which is ours and is a true circle.
+    ok("the request carries a locationBias centred on the car",
+       "locationBias" in b
+       and abs((b["locationBias"]["circle"]["center"]["latitude"])
+               - ORIGIN[0]) < 1e-9)
+    ok("...and NOT a locationRestriction, which does not rank by distance",
+       "locationRestriction" not in b)
     ok("...and asks for the nearest first",
        b.get("rankPreference") == "DISTANCE", str(b.get("rankPreference")))
+    ok("...sized to the scope's radius",
+       b["locationBias"]["circle"]["radius"] == radius,
+       str(b["locationBias"]["circle"]["radius"]))
 
-    section(2, "THE RECTANGLE CONTAINS THE CIRCLE")
-    box = places._box(ORIGIN, radius)
-    lo, hi = box["low"], box["high"]
-    n = places.haversine_m(hi["latitude"], ORIGIN[1], ORIGIN[0], ORIGIN[1])
-    e = places.haversine_m(ORIGIN[0], hi["longitude"], ORIGIN[0], ORIGIN[1])
-    ok("the box reaches the radius due north", abs(n - radius) < radius * 0.02,
-       f"{n:.0f} m vs {radius:.0f} m")
-    ok("...and due east", abs(e - radius) < radius * 0.02,
-       f"{e:.0f} m vs {radius:.0f} m")
-    corner = places.haversine_m(hi["latitude"], hi["longitude"],
-                                ORIGIN[0], ORIGIN[1])
-    ok("...and OVERSHOOTS at the corner, which is why the filter exists",
-       corner > radius * 1.3, f"{corner:.0f} m")
-    ok("the box is centred on the car",
-       lo["latitude"] < ORIGIN[0] < hi["latitude"]
-       and lo["longitude"] < ORIGIN[1] < hi["longitude"])
+    section(2, "THE WALL IS OURS, AND IT IS A CIRCLE")
+    # A bias is a suggestion -- the whole finding of 48c882d -- so the only
+    # thing that can make "within 5 km" true is measuring it here.
+    stub([at(radius * 0.99, 45.0, name="just inside"),
+          at(radius * 1.01, 45.0, name="just outside")])
+    r = places.find_places("coffee shops", where=WHERE)
+    names = [x["name"] for x in r["results"]]
+    ok("a result inside the radius is kept", "just inside" in names, str(names))
+    ok("...and one just outside is dropped, whatever the bias let through",
+       "just outside" not in names, str(names))
+    ok("the wall is on the record as ours", r["fix"]["constraint"] == "wall",
+       str(r["fix"]["constraint"]))
 
-    section(3, "NEAREST FIRST, AND THE CORNERS CUT OFF")
-    # Deliberately out of order, and one of them is a corner the box admits
-    # and the radius does not.
-    stub([at(4000, name="four"), at(radius * 1.2, 45.0, name="corner"),
+    section(3, "NEAREST FIRST, AND THE FAR ONES CUT OFF")
+    stub([at(4000, name="four"), at(radius * 1.2, 45.0, name="far"),
           at(1000, name="one"), at(2500, name="two-five")])
     r = places.find_places("coffee shops", where=WHERE)
     names = [x["name"] for x in r["results"]]
     dists = [x["distance_m"] for x in r["results"]]
-    ok("the far corner is dropped though the rectangle admitted it",
-       "corner" not in names, str(names))
+    ok("the far one is dropped though the bias let it through",
+       "far" not in names, str(names))
     ok("...and everything inside the radius is kept", len(r["results"]) == 3,
        str(len(r["results"])))
     ok("results are sorted nearest first", dists == sorted(dists), str(dists))
@@ -191,11 +214,12 @@ def main():
        "further away" in r["rules"].lower())
     ok("...and from answering out of memory",
        "memory" in r["rules"].lower())
-    ok("THE SEARCH IS NOT WIDENED — one request, no retry at a bigger radius",
-       (Sent.body.get("locationRestriction") or {}).get("rectangle") is not None
-       and places.haversine_m(
-           Sent.body["locationRestriction"]["rectangle"]["high"]["latitude"],
-           ORIGIN[1], ORIGIN[0], ORIGIN[1]) <= radius * 1.02)
+    ok("THE SEARCH IS NOT WIDENED — one request, still at the near radius",
+       (Sent.body.get("locationBias") or {}).get("circle", {}).get("radius")
+       == radius,
+       str((Sent.body.get("locationBias") or {}).get("circle", {}).get("radius")))
+    ok("...and she is pointed at scope='wider' rather than left stuck",
+       "wider" in r["rules"], r["rules"][-90:])
 
     section(5, "A NAMED AREA IS THE DRIVER'S, NOT THE CAR'S")
     stub([at(20000, name="far but in the named place")])
@@ -221,8 +245,12 @@ def main():
     ok("...where it came from", f["source"] == "browser_geolocation")
     ok("...the staleness threshold it was judged against",
        f["max_age_s"] == float(config.PLACES_FIX_MAX_AGE_S))
-    ok("...whether it was a wall or a hint",
-       f["constraint"] == "restriction", str(f["constraint"]))
+    ok("...whether a wall was applied", f["constraint"] == "wall",
+       str(f["constraint"]))
+    ok("...how wide the driver asked to look", f["scope"] == "nearby",
+       str(f["scope"]))
+    ok("...and what kind of place the words were taken to mean",
+       "included_type" in f, str(f.get("included_type")))
     ok("...the radius", f["radius_m"] == radius, str(f["radius_m"]))
     ok("...and the ranking asked for", f["rank"] == "DISTANCE")
     ok("every result carries its distance",
@@ -236,6 +264,71 @@ def main():
        str(r.get("note")))
     ok("...and she is told to ask which area instead",
        bool(r.get("need_location")))
+
+    section(8, "SCOPE: THE WALL MOVES WHEN ASKED AND NEVER ON ITS OWN")
+    wider = float(config.PLACES_WIDER_RADIUS_M)
+    stub([at(1000), at(radius * 1.5, 90.0, name="mid"),
+          at(wider * 1.5, 90.0, name="miles off")])
+    r = places.find_places("cinema", where=WHERE)
+    ok("the default is nearby, and it is the narrow one",
+       r["fix"]["scope"] == "nearby" and r["fix"]["radius_m"] == radius,
+       f'{r["fix"]["scope"]} {r["fix"]["radius_m"]}')
+    ok("...so only the near one survives", [x["name"] for x in r["results"]]
+       == ["Cafe 1000m"], str([x["name"] for x in r["results"]]))
+
+    r = places.find_places("cinema", where=WHERE, scope="wider")
+    names = [x["name"] for x in r["results"]]
+    ok("scope='wider' raises the wall", r["fix"]["radius_m"] == wider,
+       str(r["fix"]["radius_m"]))
+    ok("...and reaches the one further out", "mid" in names, str(names))
+    ok("...but it is STILL A WALL — 'further out' is a bigger circle, not "
+       "the absence of one", "miles off" not in names, str(names))
+    ok("...and the bias sent is the wider one",
+       Sent.body["locationBias"]["circle"]["radius"] == wider)
+
+    r = places.find_places("cinema", where=WHERE, scope="anywhere")
+    names = [x["name"] for x in r["results"]]
+    ok("scope='anywhere' drops the wall", r["fix"]["radius_m"] is None
+       and r["fix"]["constraint"] == "none", str(r["fix"]["constraint"]))
+    ok("...and keeps everything", "miles off" in names, str(names))
+    ok("...still nearest-first, because 'anywhere' is not 'forget where I am'",
+       [x["distance_m"] for x in r["results"]]
+       == sorted(x["distance_m"] for x in r["results"]))
+
+    # THE ONE FAILURE MODE A SCOPE PARAMETER INTRODUCES.
+    r = places.find_places("cinema", where=WHERE, scope="ANYWHERE-ish")
+    ok("AN UNREADABLE SCOPE IS THE NARROW ONE — a model sending something "
+       "unexpected must not thereby widen a question asked about here",
+       r["fix"]["scope"] == "nearby" and r["fix"]["radius_m"] == radius,
+       f'{r["fix"]["scope"]} {r["fix"]["radius_m"]}')
+    r = places.find_places("cinema", where=WHERE, scope=None)
+    ok("...and so is no scope at all", r["fix"]["scope"] == "nearby")
+
+    section(9, "A CATEGORY WORD THAT MEANS ANOTHER CATEGORY")
+    # Measured on the drive: free text for "movie theater" returned Theatre
+    # Palisades, a playhouse. See places._CATEGORY_TYPES for the both-ways
+    # numbers behind every entry.
+    stub([at(1000)])
+    places.find_places("movie theater", where=WHERE)
+    ok("a movie theater is constrained to movie_theater",
+       Sent.body.get("includedType") == "movie_theater",
+       str(Sent.body.get("includedType")))
+    places.find_places("nearest cinema", where=WHERE)
+    ok("...and so is a cinema", Sent.body.get("includedType") == "movie_theater")
+    places.find_places("gas station", where=WHERE)
+    ok("a gas station is constrained to gas_station, which is what kept the "
+       "EV chargers out", Sent.body.get("includedType") == "gas_station",
+       str(Sent.body.get("includedType")))
+    places.find_places("coffee shops", where=WHERE)
+    ok("COFFEE IS DELIBERATELY NOT TYPED — measured, the type dropped the "
+       "nearest two", Sent.body.get("includedType") is None,
+       str(Sent.body.get("includedType")))
+    places.find_places("tacos", where=WHERE)
+    ok("...and neither is anything the words already say",
+       Sent.body.get("includedType") is None)
+    r = places.find_places("cinema", near="Santa Monica", where=WHERE)
+    ok("the type applies to a named area too — a playhouse in Santa Monica is "
+       "the same collision", Sent.body.get("includedType") == "movie_theater")
 
     print("\n" + "-" * 62)
     print(f"  {'PASS' if not failures else 'FAIL'}: "

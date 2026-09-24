@@ -107,7 +107,15 @@
     NEAR_TURN: 'NAV_NEAR_TURN',
     SPEECH_EXPIRED: 'NAV_SPEECH_EXPIRED',
     SPEECH_INVALIDATED: 'NAV_SPEECH_INVALIDATED',
-    SPEECH_SPOKEN: 'NAV_SPEECH_SPOKEN'
+    SPEECH_SPOKEN: 'NAV_SPEECH_SPOKEN',
+    /* QUEUED BEHIND SOMETHING, WHICH USED TO LOOK EXACTLY LIKE NOTHING.
+       A call emits ROUTE_START_CALL when it is created and SPEECH_SPOKEN when
+       it finishes, with the reason. Between those two there was no event at
+       all -- so a patient line waiting behind a mouth that never freed left a
+       created-call with no outcome, and the log could not tell that apart from
+       a line that was never generated. Those are different bugs with different
+       fixes and the record has to say which. */
+    SPEECH_WAITING: 'NAV_SPEECH_WAITING'
   };
 
   var DEFAULTS = {
@@ -520,6 +528,26 @@
          name of the near call whether or not it carried an anchor -- "how
          often was there context" is then a filter on anchor_id rather than a
          join across two event types. */
+      /* ...AND WHETHER IT GOT THE MOUTH OR IS HOLDING FOR IT. Asked of the
+         arbiter immediately after handing the item over, which is the only
+         moment the answer is free: `say` has already decided, and a line that
+         is queued rather than speaking is the state that had no name. */
+      try {
+        var st = arbiter.state ? arbiter.state() : null;
+        var mine = st && (st.queued || []).filter(function (q) {
+          return q.id === 'nav:' + man.id + ':' + callType; })[0];
+        if (mine) {
+          emit(EV.SPEECH_WAITING, {
+            maneuver_id: man.id, call_type: callType, text: text,
+            ttl_ms: ttlMs(callType),
+            patient: !!candidate.patient,
+            behind: st.speaking ? {
+              id: st.speaking.id, group: st.speaking.group,
+              priority: st.speaking.priority } : null,
+            queued_behind: (st.queued || []).length - 1
+          });
+        }
+      } catch (e) { /* a diagnostic may not cost the line */ }
       if (callType === CALL.DEPART) emit(EV.ROUTE_START_CALL, payload);
       else if (callType === CALL.FAR || callType === CALL.FAR_MID) emit(EV.FAR_GUIDANCE, payload);
       else if (callType === CALL.JUNCTION) emit(EV.JUNCTION_CALL, payload);

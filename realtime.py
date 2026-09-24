@@ -293,6 +293,20 @@ PLACES_SCHEMA = {
                     "at all — the car's own position is used then."
                 ),
             },
+            "scope": {
+                "type": "string",
+                "enum": ["nearby", "wider", "anywhere"],
+                "description": (
+                    "How far to look. Leave it out for 'nearby' — the "
+                    "default, a few minutes from the car; if nothing is there "
+                    "you say so and do NOT widen it yourself. 'wider' ONLY "
+                    "when they asked for further afield ('what about further "
+                    "out', yes to your offer) or named a chain to find the "
+                    "nearest branch of. 'anywhere' ONLY when they say "
+                    "distance does not matter. When in doubt, leave it out "
+                    "and offer."
+                ),
+            },
             "open_now": {
                 "type": "boolean",
                 "description": (
@@ -2858,6 +2872,11 @@ def run_tool(name: str, arguments, session_key: str = "default",
             near=str(arguments.get("near") or ""),
             open_now=bool(arguments.get("open_now")),
             count=arguments.get("count"),
+            # NARROW BY DEFAULT. An absent or unreadable scope is "nearby" --
+            # places._SCOPES enforces that too, on the grounds that a model
+            # sending something unexpected must not thereby widen a question
+            # the driver asked about here.
+            scope=str(arguments.get("scope") or "nearby"),
             where=where, session_key=session_key)
     q = str(arguments.get("question") or "")
     ctx = str(arguments.get("context") or "")

@@ -79,9 +79,37 @@
   // so every item is on a watchdog. Longer than any line RIO says.
   var MAX_ITEM_MS = 15000;
 
+  /* HOW LONG PATIENCE LASTS, AND WHY IT HAS TO END.
+   *
+   * A patient item waits for the current item's play() promise to settle. That
+   * is the right gate and it has one failure mode: a `current` whose promise
+   * never settles. Conversation passes maxMs 90000, so a conversational entry
+   * that is never resolved holds the mouth for a minute and a half -- and
+   * before patience existed nothing noticed, because a nav line simply
+   * pre-empted it. Patience turns an invisible stuck entry into a silence.
+   *
+   * So waiting is bounded. Past this, a patient item stops being patient and
+   * takes the mouth if it outranks what is holding it. Eight seconds is longer
+   * than any single answer in the drive logs and far short of the watchdog it
+   * is protecting against.
+   *
+   * IT IS ALSO WHAT MAKES "EXPIRED WHILE WAITING" IMPOSSIBLE. The shortest TTL
+   * on any patient tier is the near call's 6 s... which is under this, so the
+   * bound alone is not enough -- see `blockedMs` in admit(), which stops the
+   * expiry clock for exactly the time an item spent waiting for a mouth it was
+   * told not to take. A line that waited is never dropped FOR having waited;
+   * it speaks, or valid() says the road moved on, and those are the only two
+   * honest outcomes. */
+  var PATIENT_MAX_WAIT_MS = 8000;
+
   function now() { return Date.now(); }
 
-  function makeArbiter() {
+  /* `opts.patientMaxWaitMs` overrides the bound. Only the selftests pass it --
+     the production page builds the arbiter with no arguments -- and it exists
+     because the alternative is a test that sleeps for eight seconds to prove a
+     timer fires. */
+  function makeArbiter(opts) {
+    var patientMaxWaitMs = (opts && opts.patientMaxWaitMs) || PATIENT_MAX_WAIT_MS;
     var current = null;     // {item, stopped}
     var queue = [];
     var seq = 0;
@@ -115,7 +143,19 @@
       };
     }
 
+    function unblock(item) {
+      if (item && item.patienceTimer) {
+        clearTimeout(item.patienceTimer);
+        item.patienceTimer = null;
+      }
+      if (item && item.blockedAt) {
+        item.blockedMs = (item.blockedMs || 0) + (now() - item.blockedAt);
+        item.blockedAt = 0;
+      }
+    }
+
     function drop(item, reason) {
+      unblock(item);
       emit({ type: 'drop', reason: reason, item: publicItem(item) });
       if (typeof item.onDone === 'function') {
         try { item.onDone(reason); } catch (e) {}
@@ -130,6 +170,7 @@
     }
 
     function start(item) {
+      unblock(item);
       var entry = { item: item, done: false, watchdog: null };
       current = entry;
       emit({ type: 'start', item: publicItem(item) });
@@ -178,7 +219,16 @@
      * catches up.
      */
     function admit(item) {
-      if (item.expiresAt && now() > item.expiresAt) {
+      /* THE EXPIRY CLOCK DOES NOT RUN WHILE AN ITEM IS BLOCKED.
+         A patient item was told to wait; dropping it afterwards for having
+         waited would punish it for obeying, and the silence reads to a driver
+         exactly like the announcement never existing. Time spent queued behind
+         a mouth is credited back, so `expired` keeps meaning what it says --
+         the line outlived its own window while it COULD have been spoken --
+         and a line that could never have spoken is not expired, it is stuck,
+         which the patience bound above is what prevents. */
+      unblock(item);
+      if (item.expiresAt && now() > item.expiresAt + (item.blockedMs || 0)) {
         drop(item, 'expired');
         return false;
       }
@@ -254,8 +304,42 @@
            the end of the SOUND and not the end of generation — rio_realtime
            holds that promise open across the audio tail. So "wait for her to
            finish" needs no new clock here and cannot drift from the one the
-           mouth already uses. */
+           mouth already uses.
+
+           ...AND A BOUND ON IT, because that promise is somebody else's. See
+           PATIENT_MAX_WAIT_MS: a current item that never settles would
+           otherwise hold this one until its own watchdog, which for
+           conversation is ninety seconds. The bound is not a second gate on
+           the normal path — it never fires while anything is actually
+           speaking — it is the floor under the abnormal one. */
         insert(item);
+        /* ONLY AN ITEM THAT WAS TOLD TO WAIT GETS CREDITED FOR WAITING.
+           Everything else in this queue is here because something more urgent
+           is speaking, and "expire, never catch up" is the rule for those --
+           a far-guidance line stuck behind a collision warning has genuinely
+           outlived its window and must not be played late. Patience is the
+           one case where the delay is the arbiter's own instruction, so it is
+           the one case that cannot count against the line. */
+        if (!item.patient) return true;
+        item.blockedAt = now();
+        emit({ type: 'wait', item: publicItem(item),
+               behind: publicItem(current.item) });
+        item.patienceTimer = setTimeout(function () {
+          item.patienceTimer = null;
+          if (queue.indexOf(item) < 0) return;      // already spoken or dropped
+          if (!current) { pump(); return; }
+          if (item.priority >= current.item.priority) return;   // not ours to take
+          unblock(item);
+          if (!admit(item)) {
+            queue.splice(queue.indexOf(item), 1);
+            return;
+          }
+          queue.splice(queue.indexOf(item), 1);
+          emit({ type: 'impatient', item: publicItem(item),
+                 behind: publicItem(current.item), waited_ms: patientMaxWaitMs });
+          stopCurrent('preempted');
+          start(item);
+        }, patientMaxWaitMs);
         return true;
       },
 
@@ -287,8 +371,10 @@
   root.RIO = root.RIO || {};
   root.RIO.speech = root.RIO.speech || makeArbiter();
   root.RIO.speech.makeArbiter = makeArbiter;   // tests build their own
+  root.RIO.speech.PATIENT_MAX_WAIT_MS = PATIENT_MAX_WAIT_MS;
 
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { makeArbiter: makeArbiter, P: P };
+    module.exports = { makeArbiter: makeArbiter, P: P,
+                       PATIENT_MAX_WAIT_MS: PATIENT_MAX_WAIT_MS };
   }
 })(typeof window !== 'undefined' ? window : globalThis);

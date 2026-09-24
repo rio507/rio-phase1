@@ -120,27 +120,87 @@ def drive_minutes(distance_m: float) -> float:
     return road_m / max(1.0, config.PLACES_DRIVE_SPEED_MS) / 60.0
 
 
-def _box(origin, radius_m: float) -> dict:
-    """The smallest lat/lng rectangle containing the circle. -> {low, high}
+# WHEN A CATEGORY WORD IS NOT ENOUGH, AND ONLY THEN.
+#
+# Places text search matches the WORDS. Asked for a "movie theater" from
+# Pacific Palisades on 2026-09-24 it returned Theatre Palisades (a community
+# playhouse, 4.4 km) and an "Outdoor Theater" -- theatres, correctly, and not
+# cinemas. The API has an `includedType` that constrains by what a place IS
+# rather than by what it is called, and nothing here was sending one.
+#
+# ADDED PER CATEGORY, ON A MEASUREMENT, because a type is not free: it is a
+# filter, and a filter costs results. All six of these were run both ways on
+# the same frame of the same drive:
+#
+#   movie theater  free text -> Theatre Palisades, Outdoor Theater  (wrong kind)
+#                  typed     -> nothing within 5 km, which is TRUE: the nearest
+#                               cinema is Laemmle NoHo at 19.9 km
+#   cinema         free text -> "Uplifting Cinema Pvt. Ltd.", "Journey Cinema"
+#                               -- production companies
+#                  typed     -> nothing, again true
+#   gas station    free text -> ChargePoint, Tesla Supercharger, Electric
+#                               Circuit -- chargers, not fuel
+#                  typed     -> Conserv Fuel, Village 76, 76, Chevron
+#
+#   coffee shops   free text -> 5 results including Cafe Mimosa at 3.5 km
+#                  typed     -> 3, and CAFE MIMOSA IS GONE. The type is wrong
+#                               here and it costs the nearest answer.
+#   ev charging    identical both ways -- the words already say it
+#   restaurants    identical both ways
+#   hospital       free text -> Sunset Urgent Care; typed -> nothing. Arguable
+#                               either way, so it is not in the table.
+#
+# So the table holds the two collisions where a category word means a DIFFERENT
+# category in plain English, and nothing else. Anything added here should come
+# with the same two lines of evidence, because "it seems more precise" is how
+# coffee would have lost its nearest result.
+_CATEGORY_TYPES = (
+    (("movie theater", "movie theatre", "movie theaters", "movie theatres",
+      "cinema", "cinemas", "the movies", "a movie", "picture house",
+      "multiplex"), "movie_theater"),
+    (("gas station", "gas stations", "petrol station", "petrol stations",
+      "petrol", "fuel station", "filling station", "fill up"), "gas_station"),
+)
 
-    searchText restricts by rectangle and by nothing else, so a radius has to
-    become a box before it can be sent. The box is larger than the circle at
-    the corners; find_places filters the difference off by haversine, which is
-    the only way "within 5 km" means 5 km in every direction rather than 7.1 km
-    to the north-east.
+
+def _included_type(query: str):
+    """The Places type this query is unambiguously about. -> str|None
+
+    Substring rather than token match, so "nearest movie theater" and "a movie
+    theatre near me" both land. Longest phrases are listed first inside each
+    group for the same reason.
     """
-    lat, lng = float(origin[0]), float(origin[1])
-    dlat = radius_m / 111320.0
-    # Longitude degrees shrink toward the poles. Clamped because at a latitude
-    # where the cosine reaches zero this is a division by nothing, and a box of
-    # infinite width is not a restriction.
-    coslat = max(0.01, math.cos(math.radians(lat)))
-    dlng = radius_m / (111320.0 * coslat)
-    return {"low": {"latitude": lat - dlat, "longitude": lng - dlng},
-            "high": {"latitude": lat + dlat, "longitude": lng + dlng}}
+    q = " " + (query or "").lower().strip() + " "
+    for phrases, kind in _CATEGORY_TYPES:
+        for ph in phrases:
+            if ph in q:
+                return kind
+    return None
 
 
-def _fix_meta(where, origin, radius_m: float) -> dict:
+# HOW WIDE, AND WHO IS ALLOWED TO DECIDE.
+#
+# `nearby` is the default and is a wall. The other two exist because a wall
+# with no door made "what about further out" unanswerable -- see
+# config.PLACES_WIDER_RADIUS_M. The scope comes from the MODEL, which is the
+# only thing in the system that heard the driver say "further", and the tool
+# description is explicit that it may not widen a question that did not ask.
+# Whatever it chose is on the record (see _fix_meta) so a silent widening is a
+# thing somebody can find rather than a thing somebody suspects.
+_SCOPES = ("nearby", "wider", "anywhere")
+
+
+def _scope_radius(scope: str) -> float:
+    """-> the wall for this scope, or 0.0 for no wall."""
+    if scope == "wider":
+        return float(config.PLACES_WIDER_RADIUS_M)
+    if scope == "anywhere":
+        return 0.0
+    return float(config.PLACES_NEARBY_RADIUS_M)
+
+
+def _fix_meta(where, origin, radius_m: float, scope: str = "nearby",
+              kind: str = None) -> dict:
     """Everything about the position this search used. -> dict
 
     Provenance rather than a coordinate: "it was 9 km out" and "it was 9 km out
@@ -162,9 +222,21 @@ def _fix_meta(where, origin, radius_m: float) -> dict:
         "max_age_s": float(config.PLACES_FIX_MAX_AGE_S),
         # A WALL OR A HINT, said in the record rather than inferred from the
         # radius. They are different requests and they were the whole bug.
-        "constraint": "restriction" if radius_m else ("none" if origin else None),
+        # "wall" rather than "restriction": the limit is ours and is applied
+        # after the call, because the API's own restriction does not rank by
+        # distance and returned the wrong five. See the note in find_places.
+        "constraint": "wall" if radius_m else ("none" if origin else None),
         "radius_m": radius_m or None,
-        "rank": "DISTANCE" if radius_m else None,
+        "rank": "DISTANCE" if origin else None,
+        # HOW WIDE, AND WHETHER ANYBODY ASKED. `nearby` is the default and the
+        # wall; anything else means the model decided the driver asked to look
+        # further, and that decision belongs in the record -- a silent widening
+        # of "what's nearby" is the one failure mode this parameter introduces
+        # and the only way to catch it is to log what was chosen.
+        "scope": scope,
+        # ...and what kind of place the words were taken to mean. Null is the
+        # ordinary case: most queries need no type. See _CATEGORY_TYPES.
+        "included_type": kind,
     }
 
 
@@ -256,7 +328,8 @@ def last_results(session_key: str) -> dict:
 
 
 def find_places(query: str, near: str = "", open_now: bool = False,
-                count: int = None, where=None, session_key: str = "default") -> dict:
+                count: int = None, where=None, session_key: str = "default",
+                scope: str = "nearby") -> dict:
     """Text search, once, and shape the answer for speech."""
     t0 = time.time()
     query = (query or "").strip()
@@ -271,9 +344,15 @@ def find_places(query: str, near: str = "", open_now: bool = False,
 
     origin, fix_note = _fix_of(where)
     # Set only on the restricted path. Zero means "no wall was applied", which
-    # is the correct state for a named area and the state the filter below
-    # reads.
+    # is the correct state for a named area, for `anywhere`, and for the filter
+    # below.
     radius_m = 0.0
+    scope = str(scope or "nearby").strip().lower()
+    if scope not in _SCOPES:
+        # An unreadable scope is the NARROW one, never the wide one. A model
+        # that sends nonsense must not thereby widen a question the driver
+        # asked about here.
+        scope = "nearby"
     # A model can send "3", or "all", or nothing, whatever the schema says the
     # type is. An unreadable count is the default rather than an exception: the
     # driver asked a question, and failing it over an argument they never saw
@@ -288,6 +367,13 @@ def find_places(query: str, near: str = "", open_now: bool = False,
     }
     if open_now:
         body["openNow"] = True
+    # WHAT KIND OF PLACE, where the words alone get it wrong. See
+    # _CATEGORY_TYPES for the measurement behind each entry. Applied on the
+    # named-area path too: "a cinema in Santa Monica" has the same collision
+    # with playhouses that "a cinema near me" does.
+    kind = _included_type(query)
+    if kind:
+        body["includedType"] = kind
     if near:
         # An area was named, so the words carry the location and the car's
         # position must NOT bias the search: "coffee in Santa Monica" asked
@@ -306,9 +392,44 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         # the haversine filter below is not belt-and-braces but the other half
         # of the shape: the box's corners reach 1.41x the radius and those
         # corners are the ones that read as "not nearby".
-        area = "near the car"
-        radius_m = float(config.PLACES_NEARBY_RADIUS_M)
-        body["locationRestriction"] = {"rectangle": _box(origin, radius_m)}
+        radius_m = _scope_radius(scope)
+        area = {"nearby": "near the car",
+                "wider": "further out from the car",
+                "anywhere": "anywhere, nearest first"}[scope]
+        # A BIAS TO CHOOSE THE CANDIDATES, AND OUR OWN WALL TO ENFORCE THE
+        # LIMIT. This was a locationRestriction from 48c882d until 2026-09-24,
+        # and the restriction was the wrong instrument -- measured on the drive
+        # above, same frame, same query, five results each:
+        #
+        #   coffee, 5 km   restriction  Alfred 4759, Palisades Garden 4881,
+        #                               + two outside. MISSES Cafe Mimosa at
+        #                               3544 and Waterlily at 4050 -- the two
+        #                               nearest coffees in the set.
+        #                  bias         Cafe Mimosa 3544, Waterlily 4050,
+        #                               Alfred 4759, Palisades Garden 4881
+        #   cinema, 25 km  restriction  Burbank x3 at ~25.8 km, Universal
+        #                               20441, NoHo 19889
+        #                  bias         AMC Santa Monica 8973, Laemmle Monica
+        #                               9058, Town Center 10505, Royal 10672,
+        #                               Westwood 10720
+        #
+        # rankPreference=DISTANCE IS HONOURED WITH A BIAS AND NOT WITH A
+        # RESTRICTION. Under a restriction Places returns an arbitrary subset
+        # of what is inside the box -- at 25 km it handed back the three
+        # Burbank cinemas and skipped the AMC eleven kilometres closer, which
+        # is the AMC the driver was asking about. maxResultCount is 5, so WHICH
+        # five come back is the whole answer, and only the bias picks the
+        # nearest five.
+        #
+        # THE WALL DID NOT GO AWAY, IT MOVED HERE. The haversine filter below
+        # is what enforces the radius, and it is a stronger guarantee than the
+        # restriction ever was: a true circle rather than a box whose corners
+        # reach 1.41x, applied to coordinates we measured rather than to a
+        # shape we asked a vendor to honour. 48c882d's fault was a bias with
+        # NO filter and NO sort; this is a bias with both.
+        body["locationBias"] = {"circle": {
+            "center": {"latitude": origin[0], "longitude": origin[1]},
+            "radius": float(radius_m or config.PLACES_WIDER_RADIUS_M)}}
         # ...AND NEAREST FIRST. The old code took Places' relevance order
         # untouched and never sorted, so even within a good set the order was
         # not the order a driver means by "nearby".
@@ -412,18 +533,30 @@ def find_places(query: str, near: str = "", open_now: bool = False,
                 "searched_radius_m": radius_m,
                 "nearest_outside_km": near_km,
                 "open_now_filter": bool(open_now),
-                "fix": _fix_meta(where, origin, radius_m),
+                "fix": _fix_meta(where, origin, radius_m, scope, kind),
                 "took_ms": round((time.time() - t0) * 1000, 1),
             }
             out["rules"] = (
                 "There is nothing of that kind close to the car. Say that "
                 "plainly -- there is nothing nearby -- and do NOT read out "
                 "anything further away as though it were near, and do NOT "
-                "name a place from memory. Offer to look in a particular "
-                "area if they want one, and search again with `near` set to "
-                "whatever they say."
+                "name a place from memory."
                 + (f" If it helps, the nearest one found was roughly "
                    f"{near_km} km off." if near_km else "")
+                # THE DOOR IN THE WALL, NAMED. Without this she had no way to
+                # answer "what about further out" and simply could not: on
+                # 2026-09-24 a driver was correctly told there was no cinema
+                # close, asked about ones beyond, and got nothing back.
+                + " Then OFFER to look further out. If they say yes, or if "
+                  "they ask for somewhere further, call this again with "
+                  "scope='wider'. Do not do that on your own -- widening a "
+                  "question they asked about here is how a place half an hour "
+                  "away gets called nearby. They can also name an area, which "
+                  "goes in `near`."
+                if scope == "nearby" else
+                " They already asked you to look further out, so do not offer "
+                "to widen again. Offer a named area instead, which goes in "
+                "`near`."
             )
             return out
         return {
@@ -451,7 +584,7 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         # replaying the call against a coordinate recovered from a nav row
         # logged twenty-three seconds later. That is the difference between a
         # log and a receipt. app.py copies this block onto the tool_call row.
-        "fix": _fix_meta(where, origin, radius_m),
+        "fix": _fix_meta(where, origin, radius_m, scope, kind),
         "results": results,
         "took_ms": round((time.time() - t0) * 1000, 1),
         "attribution": "Powered by Google",

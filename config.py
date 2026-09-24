@@ -2665,6 +2665,29 @@ PLACES_MAX_RESULTS = 5
 # specific, which goes down the `near` path and is not restricted at all.
 PLACES_NEARBY_RADIUS_M = 5000.0
 
+# HOW FAR "FURTHER OUT" REACHES, when the driver asks for it in so many words.
+#
+# THE ASYMMETRY 67f8fa7 CREATED. "The search is never re-run wider" is right
+# for "what's nearby" and wrong for "what about further out" -- on 2026-09-24
+# a driver asked for a cinema, was correctly told there was nothing close (the
+# nearest is 19.9 km), asked about ones further away, and got nothing, because
+# the wall does not know the difference between a question about here and a
+# question about over there.
+#
+# So the wall MOVES WHEN ASKED AND NEVER ON ITS OWN. See find_places's `scope`:
+#
+#   nearby     PLACES_NEARBY_RADIUS_M, 5 km      the default, and a wall
+#   wider      this, 25 km                        still a wall, asked for
+#   anywhere   no wall at all, biased to the car  asked for, explicitly
+#
+# WHY 25 KM. It is the radius that reaches the actual answer to the drive's
+# question -- Laemmle NoHo at 19.9 km and Universal Cinema at 20.4 km are the
+# nearest real cinemas to Pacific Palisades -- and it is roughly half an hour,
+# which is as far as "further out" stretches before it means "anywhere". Still
+# a wall rather than a bias, because "further out" is a bigger circle and not
+# the absence of one.
+PLACES_WIDER_RADIUS_M = 25000.0
+
 # THE OLD BIAS RADIUS, still used for one thing: an area the driver NAMED.
 # "Coffee in Santa Monica" asked from downtown is a question about Santa
 # Monica, so the car's position must not restrict it -- see find_places, which
