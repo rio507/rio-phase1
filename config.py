@@ -2165,8 +2165,34 @@ VISION_ENABLED = True
 # a preference, and the losing one has to stay one env var away or the decision
 # cannot be revisited.
 #
-#   LOCAL_VISION_MODEL=cosmos   nvidia/Cosmos-Reason2-2B   (the default)
-#   LOCAL_VISION_MODEL=qwen     Qwen/Qwen3-VL-8B-Instruct  (the rollback)
+#   LOCAL_VISION_MODEL=qwen     Qwen/Qwen3-VL-8B-Instruct  (the default)
+#   LOCAL_VISION_MODEL=cosmos   nvidia/Cosmos-Reason2-2B   (the override)
+#
+# THE DEFAULT WENT BACK TO QWEN ON 2026-09-24, and the paragraphs below are
+# kept exactly as they were written for the swap TO Cosmos, because the case
+# they make is still the case -- what changed is what it costs on this card.
+#
+#   IT DOES NOT FIT BESIDE THE REST OF THE STACK. 4069 -> 16733 MiB resident,
+#   and the card also holds the detector, the depth model and the lane model:
+#   headroom on 24 GB goes from ~19 GB to 6.7 GB.
+#
+#   THE VIDEO WINDOW STOPS FITTING IN ITS OWN CADENCE. The grounded read is
+#   3.5-7 s on the 2B and 8.8-12.0 s on the 8B against an 8 s period, so it
+#   holds vision._lock continuously and starves the 1 Hz caption path --
+#   measured at p50 9.35 s against a 2 s freshness threshold. See
+#   EYE_WINDOW_ENABLED, whose default is asked of this role for that reason.
+#
+#   AND THE SENSOR ARGUMENT BELOW IS ABOUT THE PROMPT, NOT THE WEIGHTS. It
+#   says an instrument must not have a voice, and that stays true: it is
+#   enforced by local_vision_speaks_directly() and by the advisory guard in
+#   observer._record, both of which are properties of the role rather than of
+#   which checkpoint is loaded.
+#
+# So cosmos is one env var away and the decision is still revisitable, which is
+# the whole reason this is a role. Everything the sensor role needs -- the
+# prompt, the guards, the four-block card, the grounded video window -- is
+# still here and still tested; LOCAL_VISION_MODEL=cosmos turns all of it back
+# on together.
 #
 # WHAT CHANGED, AND WHY IT IS NOT A LIKE-FOR-LIKE SWAP. Qwen3-VL-8B was doing
 # two jobs at once: it was RIO's eyes AND, on the observer path, her voice --
@@ -2211,7 +2237,7 @@ VISION_ENABLED = True
 # describes worse is the correct trade only because description now happens
 # somewhere else. If it ever stops happening there, this decision changes with
 # it.
-LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "cosmos")
+LOCAL_VISION_MODEL = os.getenv("LOCAL_VISION_MODEL", "qwen")
 
 COSMOS_VISION_MODEL_ID = os.getenv("COSMOS_VISION_MODEL_ID",
                                    "nvidia/Cosmos-Reason2-2B")
@@ -2253,6 +2279,42 @@ def local_vision_speaks_directly() -> bool:
     a sensor.
     """
     return LOCAL_VISION_MODEL == "qwen"
+
+
+def local_vision_reasons() -> bool:
+    """Does this model think inside <think>...</think> before answering?
+
+    ITS OWN QUESTION, not a second reading of local_vision_speaks_directly().
+    Today the two happen to be exact opposites -- Cosmos-Reason2 reasons and
+    does not speak, Qwen speaks and does not reason -- and writing one in terms
+    of the other would make "may these words be spoken" and "does this model
+    emit a trace" the same fact. They are not, and the next model on this card
+    is as likely to be a reasoner that writes well as it is to be either of
+    these two.
+
+    WHAT IT DECIDES: whether a prompt may ask for NVIDIA's answer format.
+    Measured 2026-09-24, and this is the fault it exists to prevent. The video
+    path appended that instruction unconditionally --
+
+        Answer the question using the following format:
+
+        <think>
+        Your reasoning.
+        </think>
+
+        Write your final answer immediately after the </think> tag.
+
+    -- and Qwen3-VL-8B-Instruct, which has no trace to emit, did the only other
+    thing available to it: it COPIED THE PLACEHOLDER. "Your reasoning." was the
+    first line of all three window answers, the <think> tags never appeared, and
+    the card's Reasoning block read "the model returned no trace" while the
+    trace's stand-in sat at the top of the answer.
+
+    That is this repository's oldest fault in a new place: a template put in
+    front of a model is a thing to complete. The instruction is now asked of
+    the role -- see eyeread.answer_format().
+    """
+    return LOCAL_VISION_MODEL == "cosmos"
 
 
 # HOW MANY TOKENS A READING MAY BE — AND THE TAIL THIS NUMBER USED TO BE.

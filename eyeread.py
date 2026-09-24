@@ -87,6 +87,48 @@ COSMOS_FORMAT = ("Answer the question using the following format:\n\n<think>\n"
                  "Your reasoning.\n</think>\n\nWrite your final answer "
                  "immediately after the </think> tag.")
 
+# ...AND WHAT A MODEL WITH NO TRACE IS ASKED INSTEAD.
+#
+# THE FAULT THIS FIXES, measured 2026-09-24 on a live drive under
+# LOCAL_VISION_MODEL=qwen. The format above went into every video prompt
+# whatever was resident, and Qwen3-VL-8B-Instruct has no <think> trace to
+# emit. Asked for a shape it cannot produce, it produced the shape's CONTENTS:
+# "Your reasoning." was the first line of all three window answers, the tags
+# never appeared, and the card's Reasoning block said "the model returned no
+# trace" while the trace's placeholder sat at the top of the answer.
+#
+# A template put in front of a model is a thing to complete -- the same
+# sentence this repo has now written about a field template (23c3dcd), an
+# example list (108ad47) and a worked example (d3ffa27). This is that fault in
+# the one place it was still unconditional.
+#
+# DELIBERATELY NOT EMPTY. Measured on three windows with no instruction at all
+# and with this one: both are clean of the placeholder, and this one is
+# shorter and does not wander into headings. It is also worded so it does not
+# fight the JUDGEMENT tail, which asks for prose AND a JSON object after it --
+# "no preamble, no headings" is compatible with that; "prose only" would not
+# be.
+PLAIN_FORMAT = ("Write the answer directly. No preamble, no headings, and no "
+                "restatement of these instructions.")
+
+
+def answer_format() -> str:
+    """The answer-shape instruction this model may be given. -> str
+
+    ASKED OF THE ROLE, because "what shape should the answer be" has exactly
+    one correct answer per model and the wrong one is not inert -- it is
+    content the model will copy. See config.local_vision_reasons(), which is
+    its own predicate rather than a second reading of speaks_directly for the
+    reason given there.
+
+    The still path in vision.py reaches the same conclusion by a different
+    route: _messages() sends COSMOS_FORMAT only inside its sensor branch, so a
+    non-reasoner never sees it there. Same rule, stated twice, because the two
+    paths build their prompts independently.
+    """
+    return COSMOS_FORMAT if config.local_vision_reasons() else PLAIN_FORMAT
+
+
 SYSTEM = "You are a helpful assistant."
 
 
@@ -400,7 +442,7 @@ def build_prompt(grounding_text: str = "", arm: str = DEFAULT_ARM,
         parts.append(grounding_text)
     if judgement:
         parts.append(JUDGEMENT)
-    parts.append(COSMOS_FORMAT)
+    parts.append(answer_format())
     return "\n\n".join(parts)
 
 
@@ -413,7 +455,7 @@ def build_judgement_prompt(reading: str, grounding_text: str = "") -> str:
         parts.append(NUMBERS_RULE)
         parts.append(grounding_text)
     parts.append(JUDGEMENT)
-    parts.append(COSMOS_FORMAT)
+    parts.append(answer_format())
     return "\n\n".join(parts)
 
 
@@ -429,7 +471,7 @@ def instructions_only(grounding_text: str = "", arm: str = DEFAULT_ARM):
     on exactly the behaviour it was supposed to encourage.
     """
     body = ARM_QUESTION_FALLBACK if arm in ARM_SYSTEM else ARMS.get(arm, ARM_A)
-    return "\n\n".join([body, NUMBERS_RULE, JUDGEMENT, COSMOS_FORMAT])
+    return "\n\n".join([body, NUMBERS_RULE, JUDGEMENT, answer_format()])
 
 
 def system_for(arm: str) -> str:

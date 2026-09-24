@@ -278,14 +278,42 @@ section(5, "THE ECHO GUARD DOES NOT EAT THE GROUNDING")
 instr = eyeread.instructions_only(text)
 ok("the echo baseline excludes the measured block",
    "MEASURED STATE" not in instr and "track 18" not in instr)
+# THE FORMAT IS ASKED OF THE ROLE, so the guard's baseline has to be too.
+# This named COSMOS_FORMAT flat, which was a statement about which model
+# happened to be resident rather than about the echo guard: the baseline must
+# contain the instructions THAT WERE SENT, and under a non-reasoner those end
+# with PLAIN_FORMAT. A baseline that carried the other model's format would
+# have the guard watching for words the prompt never used while the words it
+# did use went unwatched -- the same fault d3ffa27 found in the worked-example
+# detector.
 ok("...and still includes every instruction",
    eyeread.AV_COT in instr and eyeread.ASKS in instr
-   and eyeread.NUMBERS_RULE in instr and eyeread.COSMOS_FORMAT in instr)
+   and eyeread.NUMBERS_RULE in instr
+   and eyeread.answer_format() in instr)
 
 prompt = eyeread.build_prompt(text)
 ok("the prompt is NVIDIA's question first", prompt.startswith(eyeread.AV_COT))
-ok("the prompt carries NVIDIA's answer format verbatim",
-   prompt.rstrip().endswith(eyeread.COSMOS_FORMAT))
+ok("the prompt carries the answer format for THIS role, last",
+   prompt.rstrip().endswith(eyeread.answer_format()))
+
+# ...AND THE RULE ITSELF, both ways, which is what the two checks above used to
+# imply and no longer can. A non-reasoner asked for NVIDIA's shape returns the
+# shape's CONTENTS: "Your reasoning." was the first line of all three window
+# answers on 2026-09-24 (config.local_vision_reasons).
+import importlib
+import config as _cfg
+_was = _cfg.LOCAL_VISION_MODEL
+try:
+    for _role, _want, _placeholder in (("cosmos", eyeread.COSMOS_FORMAT, True),
+                                       ("qwen", eyeread.PLAIN_FORMAT, False)):
+        _cfg.LOCAL_VISION_MODEL = _role
+        _fmt = eyeread.answer_format()
+        ok(f"...{_role} is asked for its own answer format", _fmt == _want)
+        ok(f"...and the <think> placeholder "
+           f"{'reaches' if _placeholder else 'never reaches'} it",
+           ("Your reasoning." in eyeread.build_prompt(text)) is _placeholder)
+finally:
+    _cfg.LOCAL_VISION_MODEL = _was
 ok("the prompt lets the model say nothing, for both questions",
    "it is a complete answer" in prompt and "nothing the driver needs" in prompt)
 ok("the prompt contains no field template",
