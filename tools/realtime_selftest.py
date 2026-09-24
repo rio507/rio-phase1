@@ -430,75 +430,75 @@ def run_text_session():
            "and with the directions section intact")
 
 
-# What the account actually has, per minute, for the realtime model. Not from
-# a doc: the live session reports it on every response in rate_limits.updated,
-# and tools/live_tool_turns.py prints the lowest it saw on a real drive.
+# What the OPENAI account has, per minute, for the realtime model -- and only
+# the OpenAI account. Not from a doc: an OpenAI session reports it on every
+# response in rate_limits.updated, and tools/live_tool_turns.py prints the
+# lowest it saw on a real drive (190,829 of 200,000 on 2026-09-10).
 #
-# 40,000 WAS TRUE AND STOPPED BEING TRUE. Every response on the live runs of
-# 2026-09-10 (tools/live_tool_turns.py --script nav, both passes) reported
-# `200,000`, and the lowest the budget got over a whole drive was 190,829 of
-# 200,000. The number below is measured, and the day it changes again a drive
-# will say so in one line.
+# IT DOES NOT DESCRIBE THE DRIVE SESSION ANY MORE. The default backend is
+# xai_voice, and xAI's speech-to-speech endpoint has no token-per-minute limit
+# at all: grok-voice-think-fast-2.0 is limited by CONCURRENT SESSIONS alone
+# (10 to 200 by tier, docs.x.ai/developers/rate-limits), sends no
+# rate_limits.updated, puts no rate-limit header on the mint or the socket, and
+# returns `usage: {}` on every response.done (checked 2026-09-24). TPM is kept
+# because openai_realtime and gpt_live are still selectable fallbacks, and on
+# those it is still the ceiling a drive runs into.
 TPM = 200_000
 
-# ...and therefore what one response may cost. Four tool turns a minute is
-# eight responses; see run_session_cost for why that is the cadence to size to.
+# THE PER-RESPONSE CEILING, DERIVED FROM WHAT A BIGGER PROMPT COSTS ON EACH
+# BACKEND -- not re-sat at today's cost plus a margin.
 #
-# NOT TPM // 8, and the reason is that TPM // 8 is 25,000 -- nearly four times
-# today's prompt, which makes that a guard that can never fire. The purpose of
-# this one was never the economics; it was to catch the prompt growing by a
-# paragraph at a time until a drive goes quiet. So the ceiling is a GROWTH
-# ALARM: a little over today's cost, tight enough that the next section added
-# without a corresponding cut trips it, and far under what the minute can
-# actually afford.
+# IT WAS 7,100, and 7,100 was the wrong number whatever the prompt weighed. It
+# was "today's cost plus a section" on the reasoning that a paragraph at a time
+# would eventually exhaust 200,000 TPM -- the OpenAI budget. When the drive
+# moved to xAI nobody re-derived it, so it went on guarding a limit the drive
+# session no longer has. It fired on 2026-09-24 at 7,442, on a section that had
+# been measured to make her better (see 2d5df61).
 #
-# RE-DERIVED 2026-09-17, and the arithmetic belongs next to the number.
+# WHAT SIZE COSTS, per backend, measured or published:
 #
-# It was 5,200, and it fired -- correctly. Weather and local news added a tool
-# schema and an instruction section each, and 5,200 was a number chosen when
-# RIO had seven tools. A canary sized for a smaller bird goes off when the bird
-# grows, which is what it is for; the answer is to check the cage is still big
-# enough and then re-sit the canary, not to keep trimming the bird.
+#   xai_voice         tokens/min    none -- concurrent sessions only
+#   (the default)     money         $0.08 per audio minute, flat; the session
+#                                   reports no usage, so a token costs nothing
+#                                   visible (the "$0.004 / text input" on the
+#                                   pricing page gives no unit)
+#                     latency       tools/prompt_latency.py, n=12 per cell, p50,
+#                                   first turn / second turn of a session:
 #
-#   the real limit        200,000 TPM, measured (see TPM above; the lowest a
-#                         whole drive got to was 190,829 of 200,000)
-#   design cadence        4 tool turns a minute = 8 responses
-#   affordable/response   200,000 / 8            = 25,000
-#   actual/response       6,903  (7,248 while a route is live)
-#   actual capacity       ~14 tool turns a minute at today's cost,
-#                         ~12 if every answer ran to the 1,200-token ceiling
-#   headroom              14 / 4 = 3.5x the cadence this was sized for
+#       per response     first audio        tool call
+#          7,296          752 /  716 ms     384 / 369 ms   <- today
+#         10,317          884 /  690 ms     381 / 426 ms
+#         15,319          791 /  736 ms     413 / 427 ms
+#         25,329          749 /  776 ms     386 / 418 ms
 #
-# So the economics are not close, and the check that measures them
-# (AFFORDABLE_PER_RESPONSE) passes with 3.6x to spare.
+#                                   (7,296 is the xai session as minted;
+#                                   run_session_cost's 7,442 is the elevenlabs
+#                                   assembly, which adds the voice-tag
+#                                   paragraph.)
+#                                   Flat. 3.4x the prompt is inside the noise
+#                                   of n=12, on the first turn and after it.
+#                                   Beyond 25,329 is unmeasured.
 #
-# THE MARGIN, AND WHAT IT DOES AND DOES NOT CATCH -- stated exactly, because
-# the comment this replaced overclaimed and that is what made it misleading.
-# Sections in the addendum run 126 to 304 tokens (deep_dive 126, nav 198,
-# directions 213, places 304). The margin is ~200, so:
+#   openai_realtime   tokens/min    200,000 (TPM above)
+#   gpt_live          at 4 tool turns a minute = 8 responses:
+#                     200,000 / 8 = 25,000 per response
 #
-#   a section at the median or larger      TRIPS IT      (what it is for)
-#   a small section, ~130 tokens           does not      (accepted)
-#   rewording a paragraph, +/-50 tokens    does not      (deliberate: an alarm
-#                                                        that fires on editing
-#                                                        is one that gets
-#                                                        raised without being
-#                                                        read, which is how the
-#                                                        stale 40,000 survived)
+# So the ceiling is the lower of the two edges: 25,000 -- the OpenAI fallback's
+# affordable response, and just under the largest prompt measured to cost the
+# xAI drive nothing. Past it, either a fallback drive starts running out of
+# minute, or the xAI drive is in territory nobody has timed. Either way: run
+# tools/prompt_latency.py again before moving this.
 #
-# Perfect fidelity -- every section trips it -- needs a margin under 126, and
-# at that width ordinary wording changes fire it. This is the trade, made
-# deliberately rather than by rounding.
-#
-# WHAT WOULD MAKE THIS THE WRONG CALL, written down so it is checkable: if the
-# cadence assumption is wrong -- a driver who asks something every four seconds
-# rather than every fifteen -- 14 tool turns a minute stops being 3.5x and
-# starts being the limit. The number to watch is not this one; it is TPM, and a
-# drive reports it on every response.
-#
-# Both numbers are printed by run_session_cost, so the real headroom is still
-# visible next to the alarm rather than replaced by it.
-PER_RESPONSE_CEILING = 7_100
+# WHAT THIS NO LONGER DOES is catch the prompt creeping by a paragraph. It
+# never measured the thing that matters about a paragraph, which is whether
+# she is better for it -- and more prompt is more text to copy: every copy the
+# 2026-09-24 work caught ("Hey. What's up.", "Okay, navigation off.", "What's
+# good round here?") was a line from her own prompt said back. That check is
+# behavioural and lives where it can be measured: a section added to use this
+# room runs through `python -m tools.companion_bench --gate` first, which fails
+# it on any invented place, distance or ETA, on "Want me to..." opening more
+# than 14 of 51 statement replies, or on any request not acted on at once.
+PER_RESPONSE_CEILING = 25_000
 AFFORDABLE_PER_RESPONSE = TPM // 8
 
 
@@ -563,23 +563,25 @@ def run_session_cost():
 
     # THE BUDGET, AS A TEST RATHER THAN AS A NOTE.
     #
-    # THE NUMBER TO READ IS `TPM`, WHICH IS 200,000 AND MEASURED. This comment
-    # used to say 40,000 and derive a 5,000-token response budget from it, long
-    # after TPM itself had been corrected to 200,000 twenty lines above -- so
-    # the file contained both the right number and an argument from the wrong
-    # one, and the argument is what gets read when an alarm fires. It cost an
-    # afternoon of trimming a prompt that was never the problem.
+    # THE NUMBERS TO READ ARE THE TABLE ABOVE PER_RESPONSE_CEILING. This
+    # comment once derived a budget from a TPM that had already been corrected
+    # twenty lines up, and later a 7,100 alarm went on guarding the OpenAI
+    # budget after the drive moved to xAI -- both times the argument next to
+    # the check was what got read when it fired, and both times it was stale.
     #
     # Two checks, and they measure different things:
-    #   PER_RESPONSE_CEILING     a GROWTH ALARM, re-sat at today's cost plus a
-    #                            section. Fires on creep, not on cost.
-    #   AFFORDABLE_PER_RESPONSE  the economics, TPM // 8. This is the one that
-    #                            means a drive goes quiet if it is breached.
+    #   PER_RESPONSE_CEILING     the size measured to cost the xAI drive nothing
+    #                            and still affordable on the OpenAI fallback.
+    #                            Past it, re-run tools/prompt_latency.py.
+    #   AFFORDABLE_PER_RESPONSE  the OpenAI fallback's economics, TPM // 8:
+    #                            breached, a fallback drive goes quiet.
+    # Whether a section EARNS its tokens is not asked here; it is
+    # tools/companion_bench.py --gate.
     #
     # A response that is refused fails SILENTLY -- nothing is said and nothing
     # is logged in the cabin -- which is why either is worth asserting at all.
     ok(floor <= PER_RESPONSE_CEILING,
-       f"one response stays under the growth alarm: {floor:,} tokens against "
+       f"one response stays under the derived ceiling: {floor:,} tokens against "
        f"{PER_RESPONSE_CEILING:,} ({PER_RESPONSE_CEILING - floor:,} to spare)")
     ok(floor <= AFFORDABLE_PER_RESPONSE,
        f"...and well under what the minute can actually afford "

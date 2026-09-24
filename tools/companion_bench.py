@@ -250,6 +250,8 @@ def score(recs):
     out["unsourced_claims"] = (sum(is_unsourced(r["said"]) for r in recs),
                                len(recs))
     said = [r["said"] for r in st if r["said"]]
+    out["opens_want_me"] = (sum(opening(s, 2) == "want me" for s in said),
+                            len(said))
     out["openings_1w"] = (len({opening(s, 1) for s in said}), len(said))
     out["openings_2w"] = (len({opening(s, 2) for s in said}), len(said))
     out["openings_3w"] = (len({opening(s, 3) for s in said}), len(said))
@@ -280,6 +282,41 @@ async def run(trials, conc):
     return instructions, recs, time.time() - t0
 
 
+# THE GATE A NEW SECTION HAS TO PASS before it spends the room the per-response
+# ceiling leaves (tools/realtime_selftest.py, PER_RESPONSE_CEILING). Set from
+# arm I, 2d5df61, pooled over two runs -- the prompt as it stood when the room
+# was opened. More prompt is more text to copy, so the bar is that nothing
+# measured here gets worse:
+#
+#   invented place / distance / ETA     0            it was 0/180
+#   "Want me to..." openings            <= 14 of 51  the one shape she already
+#                                                    repeats; as a rate, because
+#                                                    the count of statement
+#                                                    replies varies by run
+#   requests acted on at once           all of them  it was 90/90, and asking
+#                                                    "do you want me to look?"
+#                                                    after "find me coffee" is
+#                                                    worse than any statement
+#                                                    miss
+GATE_WANT_ME = (14, 51)
+
+
+def gate(score):
+    """[(check, passed, detail)] for the three bars above."""
+    u, _ = score["unsourced_claims"]
+    wm, n = score["opens_want_me"]
+    ra, rn = score["request_acted"]
+    ask, _ = score["request_asked_first"]
+    limit = GATE_WANT_ME[0] / GATE_WANT_ME[1]
+    return [
+        ("no invented place, distance or ETA", u == 0, f"{u} found"),
+        ("'Want me to...' openings no higher", n == 0 or wm / n <= limit,
+         f"{wm}/{n} against {GATE_WANT_ME[0]}/{GATE_WANT_ME[1]}"),
+        ("every request acted on at once", ra == rn and ask == 0,
+         f"{ra}/{rn} acted, {ask} asked first"),
+    ]
+
+
 def show(res):
     s = res["score"]
     f = lambda p: f"{p[0]}/{p[1]}"
@@ -304,6 +341,9 @@ def main() -> int:
     ap.add_argument("--only", help="substring filter on the utterance text")
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
+    ap.add_argument("--gate", action="store_true",
+                    help="exit non-zero unless the run passes the gate for a "
+                         "new prompt section (see GATE_WANT_ME)")
     a = ap.parse_args()
     if a.compare:
         compare(*(json.load(open(p)) for p in a.compare))
@@ -332,6 +372,12 @@ def main() -> int:
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1))
         print(f"   wrote {a.out}")
+    if a.gate:
+        checks = gate(res["score"])
+        print("\n   GATE")
+        for name, passed, detail in checks:
+            print(f"   {'pass' if passed else 'FAIL'}  {name:<38} {detail}")
+        return 0 if all(p for _, p, _ in checks) else 1
     return 0
 
 
