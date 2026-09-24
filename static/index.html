@@ -3629,6 +3629,13 @@ const LIVE_REPORTED = {
      of it. */
   LIVE_TOOL_CALL: 'tool_call_started',
   LIVE_TOOL_RESULT: 'tool_result',
+  /* WHAT WAS ACTUALLY SAID, both ways, every turn. The log used to hold the
+     driver's words only when the gate refused them and hers only as a
+     length, so no conversational change could be read against a drive.
+     driver_said is every transcript (`text`, `item_id`); rio_said is every
+     response's words (`text`, `response_id`, `channel`). */
+  LIVE_TRANSCRIPT: 'driver_said',
+  LIVE_REPLY_TEXT: 'rio_said',
   /* A CLAIM ON THE NEXT UNCLAIMED RESPONSE THAT WENT STALE. Non-zero here and
      an answer the driver never heard are the same event seen from two ends. */
   LIVE_ORPHAN_CLAIM_EXPIRED: 'orphan_claim_expired',

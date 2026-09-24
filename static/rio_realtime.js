@@ -767,6 +767,7 @@
         utter[rid] = { response_id: rid, turn_kind: kind || 'conversation',
                        created_at: Date.now(), audio_started_at: 0,
                        audio_ended_at: 0, generated_chars: 0, transcript_done: false,
+                       text: '', text_logged: false,
                        status: null, status_reason: null, cancel_reason: null,
                        muted_ms: 0, mute_reasons: {}, muted_at_end: false,
                        ended_by: null, reported: false, done: false };
@@ -2034,6 +2035,33 @@
       for (var i = 0; i < listeners.length; i++) {
         try { listeners[i](ev); } catch (e) { /* never let a listener mute RIO */ }
       }
+    }
+
+    /* WHAT SHE SAID, word for word, for the drive log (rio_said).
+     *
+     * Until 2026-09-24 the log held her reply LENGTH (generated_chars) and
+     * never the words, and the driver's words only when the gate refused them
+     * -- so "what did she say when I said I was hungry" could not be answered
+     * from a drive, and no conversational change could be checked against one.
+     *
+     * The model's own transcript of the whole response, generated rather than
+     * heard: a reply cut off after three words still logs all of it, and the
+     * utterance_end row with the same response_id says how much was heard.
+     * `channel` separates her conversation from the lines dictated through her
+     * (a nav call, a warning) and the vetted direct lines. */
+    function replyText(responseId, text, partialOnly) {
+      if (!text) return;
+      var u = utter[responseId];
+      if (u) {
+        if (u.text_logged) return;
+        u.text_logged = true;
+      }
+      var channel = (dictation && dictation.responseId === responseId) ? 'dictation'
+        : (directSpeech && directSpeech.realId === responseId) ? 'direct'
+        : 'conversation';
+      emit('LIVE_REPLY_TEXT', { response_id: responseId || null,
+                                text: text, channel: channel,
+                                reason: partialOnly ? 'cut_before_final' : null });
     }
 
     /* One answer stopped early, and why. Recorded once per cut-off, at the
@@ -3878,6 +3906,9 @@
                 var det1 = (ev.response && ev.response.status_details) || {};
                 u1.done = true;
                 u1.status = (ev.response && ev.response.status) || null;
+                /* CANCELLED BEFORE ITS TRANSCRIPT WAS FINAL: the words that
+                   streamed are all there will be, so they are what is logged. */
+                if (!u1.text_logged && u1.text) replyText(rid1, u1.text, true);
                 u1.status_reason = det1.reason || det1.type || null;
                 if (u1.status === 'cancelled') {
                   u1.ended_by = 'cancelled:' + (u1.cancel_reason || 'server');
@@ -3998,6 +4029,7 @@
             // What the model says it wrote. Kept for the log and for the
             // panel; the resume still carries what was HEARD, not this.
             if (sink && ev.text) generated = ev.text;
+            if (sink) replyText(ev.response_id, ev.text);
             break;
           case 'response.output_audio_transcript.delta':
             // What she is saying, as she says it. The only record of how far
@@ -4018,7 +4050,10 @@
             noteFirstAudio(ev.response_id);
             (function () {
               var u3 = utter[ev.response_id];
-              if (u3 && !u3.transcript_done) u3.generated_chars += (ev.delta || '').length;
+              if (u3 && !u3.transcript_done) {
+                u3.generated_chars += (ev.delta || '').length;
+                u3.text += (ev.delta || '');
+              }
               // The earliest evidence audio is on its way; on a transport
               // that never sends output_audio_buffer.started, the only one.
               if (u3 && !u3.audio_started_at) {
@@ -4069,6 +4104,7 @@
             } else if (ev.transcript) {
               partial = ev.transcript;
             }
+            replyText(ev.response_id, ev.transcript);
             break;
           case 'input_audio_buffer.speech_started':
             // Whatever was last transcribed is about the turn before this one.
@@ -4086,7 +4122,12 @@
             break;
           case 'conversation.item.input_audio_transcription.completed':
             lastTranscript = ev.transcript || '';
-            emit('LIVE_TRANSCRIPT', { transcript: lastTranscript, role: 'driver' });
+            /* `text` and `item_id` are for the drive log (driver_said): every
+               transcript, including the ones the gate goes on to refuse --
+               those also get a turn_phantom row, and the item id joins them. */
+            emit('LIVE_TRANSCRIPT', { transcript: lastTranscript, role: 'driver',
+                                      text: lastTranscript,
+                                      item_id: ev.item_id || null });
             transcriptArrived(lastTranscript, ev.item_id || null);
             break;
           case 'conversation.item.input_audio_transcription.failed':
