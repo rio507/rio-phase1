@@ -2674,9 +2674,32 @@ PLACES_NEARBY_RADIUS_M = 5000.0
 PLACES_BIAS_RADIUS_M = 8000.0
 
 # A GPS fix older than this is not where the car is. Refused rather than used:
-# "near me" answered from a ten-minute-old position is wrong in the one way the
-# driver cannot detect. RIO asks for an area instead.
-PLACES_FIX_MAX_AGE_S = 600.0
+# "near me" answered from a stale position is wrong in the one way the driver
+# cannot detect. RIO asks for an area instead.
+#
+# SIXTY SECONDS, AND IT WAS SIX HUNDRED. The comment above this line used to
+# say "a ten-minute-old position is a different neighbourhood" directly above a
+# threshold of ten minutes, which is a rule stating the case against itself.
+#
+# THE NUMBER HAS TO BE SMALL AGAINST THE RADIUS, which is the part that was
+# never reasoned about. PLACES_NEARBY_RADIUS_M is now a wall at 5 km, and the
+# wall is built around wherever the fix says the car is:
+#
+#     at 13 m/s (urban)     600 s = 7.8 km        60 s = 780 m
+#     at 30 m/s (highway)   600 s = 18 km         60 s = 1.8 km
+#
+# At ten minutes the car can be three times the whole radius away from the
+# point the search was centred on, and every result inside that circle is then
+# "nearby" something the driver has long since left -- a restriction enforced
+# against the wrong centre, which is worse than no restriction, because it
+# looks rigorous. At sixty seconds the error is a fraction of the radius even
+# on a motorway.
+#
+# WHAT IT COSTS: a fix that has gone quiet for a minute stops answering "near
+# me" and RIO asks which area instead. That is the honest failure -- see
+# _fix_of, which returns `stale_fix` and `need_location` rather than searching
+# anyway.
+PLACES_FIX_MAX_AGE_S = 60.0
 
 # The drive-time ESTIMATE (places.drive_minutes). Not a routed time — that
 # would be a Routes call per result, five billed requests to decorate one
@@ -2765,8 +2788,20 @@ WEATHER_TIMEOUT_S = 6.0
 
 # A GPS fix older than this is not where the car is, and weather fetched for it
 # is a forecast for somewhere else wearing this drive's name. Matched to the
-# honesty limits above rather than to PLACES_FIX_MAX_AGE_S: a restaurant 600 s
-# behind you is still a restaurant, and a rain band is not.
+# honesty limits above rather than to PLACES_FIX_MAX_AGE_S.
+#
+# THIS USED TO BE THE TIGHTER OF THE TWO and is now the looser, and the reason
+# is worth keeping rather than quietly reversing. It argued that a restaurant
+# ten minutes behind you is still a restaurant while a rain band is not -- true
+# about the PLACES, and it was never the places that went stale: it was the
+# CENTRE the search was built around. Once "near me" became a hard 5 km wall
+# (PLACES_NEARBY_RADIUS_M) the position had to be current to a fraction of
+# that, so places dropped to 60 s and went past this one.
+#
+# Three minutes is still right here for the original reason. Weather is a field
+# that varies over kilometres, not a wall with things inside it, so a fix a
+# couple of minutes old names the same weather; it just must not name the next
+# valley's.
 WEATHER_MAX_FIX_AGE_S = 180.0
 
 
