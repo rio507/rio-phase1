@@ -843,6 +843,34 @@ rio_health_body() {
 HTTPS_PORT=${RIO_HTTPS_PORT:-8443}
 CERT_FILE="$REPO/cert/rio-cert.pem"
 
+# THE KEY THE PROXY READS IS A COPY, AND THE COPY IS OFF THE VOLUME. /workspace
+# is RunPod's network volume (MooseFS over FUSE), and it does not keep a mode:
+# `chmod 600 cert/rio-key.pem` there says it succeeded and the file still reads
+# 0666. That was found on 2026-09-24, when `status` flagged the key as
+# readable by others and the chmod it suggested did nothing.
+#
+# So the volume keeps the master -- it has to, a rebuilt pod needs it back --
+# and every start stages a copy on the container's own disk, which does honour
+# 0600. The copy is re-made whenever it differs from the master, so
+# `make_cert --add` followed by a restart serves the new key, and a fresh pod
+# gets its copy on the first `boot.sh`.
+KEY_FILE="$REPO/cert/rio-key.pem"
+KEY_DIR=${RIO_TLS_KEY_DIR:-/root/.rio}
+KEY_LOCAL="$KEY_DIR/rio-key.pem"
+
+tls_stage_key() {
+    [ -f "$KEY_FILE" ] || return 1
+    if [ -f "$KEY_LOCAL" ] && cmp -s "$KEY_FILE" "$KEY_LOCAL"; then
+        chmod 600 "$KEY_LOCAL"
+        return 0
+    fi
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR" || return 1
+    # umask in a subshell, so there is no moment the copy exists with the
+    # volume's 0666 before the chmod reaches it.
+    ( umask 077 && cp "$KEY_FILE" "$KEY_LOCAL.tmp" ) || return 1
+    chmod 600 "$KEY_LOCAL.tmp" && mv -f "$KEY_LOCAL.tmp" "$KEY_LOCAL"
+}
+
 # AND THE SAME TEST HERE, because this function is how the lesson above got
 # re-learned. On 2026-09-18 `boot.sh restart` killed the shell that ran it: a
 # bare `pgrep -f tools.tls_proxy` handed tls_stop the pid of the caller's own
@@ -877,8 +905,13 @@ tls_start() {
         echo "   for a phone: python -m tools.make_cert --add <the address you will type>"
         return 0
     fi
+    if ! tls_stage_key; then
+        echo "   !! could not stage the private key at $KEY_LOCAL — https not started"
+        return 1
+    fi
     tls_stop
     setsid nohup "$PY" -m tools.tls_proxy --listen "$HTTPS_PORT" --to "$PORT" \
+        --key "$KEY_LOCAL" \
         > "$REPO/tls.log" 2>&1 < /dev/null &
     sleep 1
     if [ -z "$(tls_pids)" ]; then
@@ -900,7 +933,11 @@ tls_status() {
         echo "   tls proxy: $(echo "$pids" | tr '\n' ' ')  (:$HTTPS_PORT)"
     fi
     if [ -f "$CERT_FILE" ]; then
-        "$PY" -m tools.tls_proxy --check 2>&1 | sed 's/^/   /'
+        # Check the copy the proxy serves, not the volume master: the master
+        # always reads 0666 and always would, so it can only cry wolf.
+        tls_stage_key || echo "   !! could not stage the private key at $KEY_LOCAL"
+        "$PY" -m tools.tls_proxy --check --key "$KEY_LOCAL" 2>&1 | sed 's/^/   /'
+        echo "   (master copy on the volume: $KEY_FILE — the volume keeps no modes)"
     else
         echo "   certificate: none (python -m tools.make_cert)"
     fi
