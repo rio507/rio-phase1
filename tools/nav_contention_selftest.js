@@ -122,6 +122,9 @@ function session(opts) {
        route-start section below exists to pin down. */
     holdTail: !!opts.holdTail,
     tailFallbackMs: opts.tailFallbackMs || 15000,
+    /* How long a claim on the next unclaimed response stays live. Shortened by
+       the orphan section so the test does not sit here for the real 1.5 s. */
+    orphanClaimMs: opts.orphanClaimMs || 1500,
   });
   let n = 0;
   const h = {
@@ -406,6 +409,93 @@ function navLine(h, o) {
     ok(h.sent.some(e => e.type === 'output_audio_buffer.clear'),
        'and clears the audio already on its way, so she does not carry on '
        + 'underneath it');
+  }
+
+  section('a tool result must ask for an answer, and say so in the log');
+  {
+    /* THE DRIVE, 2026-09-24, session 1fd4de92. A route locks in and the
+       session sits in listening; the driver says "hello" and she continues.
+       The drive log could not say whether a response was ever created after
+       the tool result, because start_navigation is answered in the PAGE and
+       produced no row at all — no call, no result, no create. */
+    const h = session({ holdTail: true });
+    RIO.speak.reset();
+    const before = h.creates().length;
+    // Driven the way the session drives it: the model finishes its arguments
+    // and the controller runs the tool. `tool` in this harness resolves ok,
+    // standing in for the page answering start_navigation locally.
+    h.controller.handle({
+      type: 'response.function_call_arguments.done',
+      name: 'start_navigation', call_id: 'call_1',
+      arguments: JSON.stringify({ destination: 'the airport' }) });
+    await tick(20);
+
+    const res = h.ev('LIVE_TOOL_RESULT')[0];
+    ok(!!res, 'the tool result is an EVENT now, not a silence');
+    const st = res && res.session_state;
+    ok(res && res.response_requested === true,
+       'A TOOL RESULT MUST ASK FOR A SPOKEN ANSWER — without it the model has '
+       + 'the result and no reason to say anything, which is a session sitting '
+       + 'in listening'
+       + (st ? ` [session_state: speaking=${st.speaking_response_id} `
+             + `dictation=${st.dictation} bound=${st.dictation_bound} `
+             + `orphan_claims=${st.orphan_claims} `
+             + `arbiter=${st.arbiter_speaking}]` : ' [no session_state]'));
+    ok(h.creates().length > before,
+       'and the create is actually on the wire, not merely reported');
+    ok(!!st, 'the session state is named, so a create that goes nowhere can '
+             + 'be told from one that was never sent');
+    ok(st && 'orphan_claims' in st && 'dictation_bound' in st
+       && 'arbiter_speaking' in st,
+       'including the three things that decide whether anything comes of it');
+  }
+
+  section('an orphan claim expires instead of eating the next answer');
+  {
+    /* THE MECHANISM BEHIND THE SILENCE. `orphanOutOfBand` is a counter with no
+       identity: it says "the next unclaimed response is the one I gave up on",
+       which is true with one create in flight and false with three. At a route
+       start there are three inside a quarter second — the depart dictation,
+       the near call that supersedes it, and the conversational answer to the
+       tool result — and the claim takes whichever the server creates next.
+
+       In the drive the orphan fired 3.1 s after the dictation was abandoned,
+       which is not a response that was already on its way. */
+    const h = session({ holdTail: true, orphanClaimMs: 60 });
+    RIO.speak.reset();
+
+    // A dictation abandoned before it is bound to a response arms the claim.
+    // The promise rejects when the line is cancelled; that IS the scenario.
+    h.controller.speak('Head east, then turn left onto Palisades Dr.',
+                       { channel: 'nav', callType: 'depart' }).catch(() => {});
+    h.controller.cancelSpeak(null, 'superseded');
+    await tick(5);
+
+    // Inside the window it still does its job: this response IS the orphan.
+    h.controller.handle({ type: 'response.created',
+                          response: { id: 'resp_orphan' } });
+    await tick(5);
+    ok(h.ev('LIVE_ORPHAN_SILENCED').length === 1,
+       'a response arriving straight after the abandoned create is silenced, '
+       + 'which is what stops two voices on one junction');
+
+    // ...and past it, the claim lapses rather than waiting to eat an answer.
+    const h2 = session({ holdTail: true, orphanClaimMs: 40 });
+    RIO.speak.reset();
+    h2.controller.speak('Head east, then turn left onto Palisades Dr.',
+                        { channel: 'nav', callType: 'depart' }).catch(() => {});
+    h2.controller.cancelSpeak(null, 'superseded');
+    await new Promise(r => setTimeout(r, 120));
+    h2.controller.handle({ type: 'response.created',
+                           response: { id: 'resp_answer' } });
+    await tick(10);
+    ok(h2.ev('LIVE_ORPHAN_CLAIM_EXPIRED').length === 1,
+       'past the window the claim expires, and says so');
+    ok(h2.ev('LIVE_ORPHAN_SILENCED').length === 0,
+       'AND THE ANSWER IS NOT SILENCED — a claim armed by a turn call must '
+       + 'not eat the conversational answer to a tool result');
+    ok(!h2.cancels().some(e => e.response_id === 'resp_answer'),
+       '...nor cancelled by id');
   }
 
   section('turn end to first audio — the number the drive log did not have');

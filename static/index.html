@@ -3618,6 +3618,20 @@ const LIVE_REPORTED = {
   LIVE_NOISE_SILENCED: 'noise_silenced',
   LIVE_TOOL_ABORTED: 'tool_aborted',
   LIVE_TOOL_RESULT_DISCARDED: 'tool_result_discarded',
+  /* EVERY TOOL CALL AND ITS RESULT, because a tool answered in the PAGE left
+     no trace anywhere. start_navigation, nav_status, nav_directions,
+     stop_navigation and reroute never reach /realtime/tool, so the drive log
+     had no row for the call, none for the result, and nothing saying whether a
+     spoken answer was asked for — which is exactly where a route that locks in
+     silence hides. On 2026-09-24 (session 1fd4de92) "was a response created
+     after the tool result" was unanswerable from the record; LIVE_TOOL_RESULT
+     carries `response_requested` and the session state that decides what comes
+     of it. */
+  LIVE_TOOL_CALL: 'tool_call_started',
+  LIVE_TOOL_RESULT: 'tool_result',
+  /* A CLAIM ON THE NEXT UNCLAIMED RESPONSE THAT WENT STALE. Non-zero here and
+     an answer the driver never heard are the same event seen from two ends. */
+  LIVE_ORPHAN_CLAIM_EXPIRED: 'orphan_claim_expired',
   LIVE_DRIVER_COMMAND: 'driver_command',
   LIVE_COMMAND_DONE: 'command_done',
   LIVE_RESUME: 'resumed',
@@ -3825,6 +3839,13 @@ function reportLive(ev) {
           now_turn: ev.now_turn === undefined ? null : ev.now_turn,
           tool: ev.tool || null,
           call_id: ev.call_id || null,
+          /* WAS A SPOKEN ANSWER ASKED FOR, and what was in the way. The two
+             fields the browser-answered tools had nowhere to put. */
+          response_requested: ev.response_requested === undefined
+            ? null : ev.response_requested,
+          session_state: ev.session_state || null,
+          spoke_directly: ev.spoke_directly === undefined
+            ? null : ev.spoke_directly,
           tools_aborted: ev.tools_aborted === undefined ? null : ev.tools_aborted,
           took_ms: ev.took_ms === undefined ? null : ev.took_ms,
           age_ms: ev.age_ms === undefined ? null : ev.age_ms,

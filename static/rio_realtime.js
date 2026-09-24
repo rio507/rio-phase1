@@ -373,19 +373,48 @@
         // this result means the confirmation RIO speaks needs no second call
         // and cannot race anything: it is the route she just started, as the
         // provider described it.
+        /* ONE TURN, AND IT IS NOT A LIST.
+         *
+         * This handed over the first THREE maneuvers as `first_steps`, with a
+         * rule underneath saying not to read them out. On 2026-09-24 (session
+         * 1fd4de92) she read them out: the route locked and she recited the
+         * directions for twenty-one seconds.
+         *
+         * A rule against using what you were given loses to the thing you were
+         * given. Three numbered steps with instructions, road names and
+         * landmarks IS a list of directions, and an instruction not to read a
+         * list of directions is an instruction to ignore most of the payload.
+         * So the payload changes: the confirmation needs where they are going
+         * and what the first turn is, and that is all it now contains.
+         *
+         * A SINGLE OBJECT RATHER THAN A ONE-ELEMENT ARRAY, deliberately. An
+         * array of one is still an array and reads as the start of an
+         * enumeration; `first_turn` has nothing after it to enumerate.
+         *
+         * Every subsequent turn goes out on the route engine's own cadence --
+         * far, far_mid, near, junction, arrival -- in her voice, at the moment
+         * it matters. That is rio_navplan's job and it has never needed the
+         * model's help with it. */
         var mans = route.maneuvers || [];
-        var first = mans.slice(0, 3).map(function (m, i) {
-          var step = {
-            step: i + 1, instruction: m.instruction, road_name: m.road_name,
-            maneuver_type: m.type, direction: m.direction,
-            // From the START of the route here, not from the car: this is the
-            // route as loaded, before anyone has driven any of it.
-            distance_from_start_m: Math.round(m.route_distance_position || 0),
+        var m0 = null;
+        for (var mi = 0; mi < mans.length; mi++) {
+          if (mans[mi].type !== 'ARRIVE' && mans[mi].type !== 'DEPART') {
+            m0 = mans[mi]; break;
+          }
+        }
+        if (!m0) m0 = mans[0] || null;
+        var firstTurn = null;
+        if (m0) {
+          firstTurn = {
+            instruction: m0.instruction, road_name: m0.road_name,
+            maneuver_type: m0.type, direction: m0.direction,
+            // From the START of the route, not from the car: this is the route
+            // as loaded, before anyone has driven any of it.
+            distance_from_start_m: Math.round(m0.route_distance_position || 0),
           };
-          var lm = landmarkOf(m);
-          if (lm) step.landmark = lm;
-          return step;
-        });
+          var lm0 = landmarkOf(m0);
+          if (lm0) firstTurn.landmark = lm0;
+        }
         return {
           ok: true, routing: true, status: 'routed',
           // The provider's own spelling of the place, not the driver's and
@@ -397,18 +426,20 @@
             ? Math.round(route.total_distance_m / 100) / 10 : null,
           eta_epoch: route.eta_epoch || null,
           total_maneuvers: mans.length,
-          first_steps: first,
+          first_turn: firstTurn,
           rules: 'The route is live and you are taking them there now. ' +
-                 'Confirm it once, briefly, in your own words and in the ' +
+                 'Confirm it in ONE SENTENCE, in your own words and in the ' +
                  'FIRST PERSON — "I\'ve got it, about eighteen minutes" — ' +
-                 'using this destination name exactly as spelled here. Do ' +
-                 'NOT tell the driver to set it themselves; it is set. Do ' +
-                 'not read the turns out now: confirming is one line. If ' +
-                 'they ASK for the directions, call nav_directions and read ' +
-                 'them — that is answering. What you never do is call a turn ' +
-                 'early; each one goes out in your voice at the moment it ' +
-                 'matters, and if the driver asks who is calling them the ' +
-                 'answer is you: "I\'ll call each turn as we get there."',
+                 'using this destination name exactly as spelled here. You ' +
+                 'may name the first turn and nothing after it. There is only ' +
+                 'one turn here because one is all a confirmation carries; ' +
+                 'the rest are not withheld, they go out in your voice as the ' +
+                 'car reaches them. Do NOT tell the driver to set it ' +
+                 'themselves; it is set. If they ASK for the directions, call ' +
+                 'nav_directions and read them — that is answering. What you ' +
+                 'never do is call a turn early; if the driver asks who is ' +
+                 'calling them the answer is you: "I\'ll call each turn as we ' +
+                 'get there."',
         };
       }
       if (out.status === 'ambiguous') {
@@ -870,6 +901,7 @@
                         that must be equal to `dictation_failures` from the
                         timeout branch: every disowned line accounted for. */
                      orphans_silenced: 0,
+                     orphan_claims_expired: 0,
                      /* ROAD NOISE, and the four numbers that say what it cost.
                         Session 738fbb82 had twenty of these transcripts and
                         four of them inside ten milliseconds; each committed
@@ -1881,12 +1913,63 @@
      * the abandoned line -- and the recovery response asked for immediately
      * after it is the conversation and must still claim the mouth normally. */
     var orphanOutOfBand = 0;
+    /* ...AND THE CLAIM EXPIRES, which it did not, and that is a fault measured
+     * on 2026-09-24 (session 1fd4de92).
+     *
+     * This is a COUNTER WITH NO IDENTITY. It says "the next unclaimed response
+     * is the one I gave up on" -- true when exactly one create is in flight,
+     * and false the moment a second one is. At a route start there are three
+     * within a quarter of a second: the depart dictation, the near dictation
+     * that supersedes it, and the CONVERSATIONAL ANSWER to the
+     * start_navigation tool result. The depart line is abandoned before it has
+     * a response id, so the claim is armed -- and then it takes whichever
+     * response the server happens to create next.
+     *
+     * In that session the driver got the turn call and then silence until they
+     * said "hello", which started a new turn and produced a response nothing
+     * was waiting to eat. Reproduced in tools/nav_contention_selftest.js: three
+     * creates, and the one silenced by id is the second, not the abandoned
+     * one.
+     *
+     * A deadline is the cheap half of the fix and the one that does not
+     * require guessing which response is which. The create being given up on
+     * was ALREADY IN FLIGHT when it was abandoned, so its response arrives in
+     * the time a round trip takes. In the drive the orphan fired 3.1 s after
+     * the dictation was abandoned, which is not a response that was already on
+     * its way; it is a different response entirely. Past this, the claim
+     * lapses and a response claims the mouth the ordinary way -- which costs,
+     * at worst, a turn call said twice (the arbiter supersedes by group) and
+     * saves, at best, every conversational answer that lands in the window. */
+    var ORPHAN_CLAIM_MS = cfg.orphanClaimMs || 1500;
+    var orphanClaims = [];        // arm times, oldest first
     /* ...and whether that orphan must also be SILENCED rather than merely not
        counted. An abandoned dictation has already been replaced by another
        voice saying the same words; an abandoned direct line has not, and its
        audio is the answer. Same mechanism, opposite conclusion about the
        speaker, so they are two flags and not one. */
     var silenceOrphan = false;
+
+    /* Arm a claim, and drop any that have gone stale. */
+    function armOrphan(silence) {
+      orphanClaims.push(now());
+      orphanOutOfBand++;
+      if (silence) silenceOrphan = true;
+    }
+
+    /* Is there still a live claim? Expires the stale ones on the way past, so
+       a claim armed and never used cannot sit there waiting to eat an answer
+       ten seconds later. */
+    function orphanClaimLive() {
+      var t = now();
+      while (orphanClaims.length && (t - orphanClaims[0]) > ORPHAN_CLAIM_MS) {
+        orphanClaims.shift();
+        orphanOutOfBand--;
+        counters.orphan_claims_expired++;
+        emit('LIVE_ORPHAN_CLAIM_EXPIRED', { after_ms: ORPHAN_CLAIM_MS });
+      }
+      if (orphanOutOfBand <= 0) { silenceOrphan = false; return false; }
+      return true;
+    }
     var verbatimInstruction = cfg.verbatimInstruction ||
       'Read the text below out loud, exactly as written, word for word. ' +
       'Add nothing. Remove nothing. Do not rephrase.\n\nTEXT:\n';
@@ -2171,9 +2254,10 @@
         emit('LIVE_NOISE_SILENCED', { response_id: responseId });
         return;
       }
-      if (orphanOutOfBand > 0
+      if (orphanClaimLive()
           && String(responseId || '').indexOf('direct:') !== 0) {
         orphanOutOfBand--;
+        orphanClaims.shift();
         markOutOfBand(responseId);
         if (silenceOrphan) {
           /* The line this response was going to read is already being read by
@@ -3399,7 +3483,7 @@
             // Given up on before it was ever bound to a response? Then the
             // response is still on its way and is nobody's. See
             // orphanOutOfBand.
-            if (!d.realId) orphanOutOfBand++;
+            if (!d.realId) armOrphan(false);
             counters.direct_speech_failures++;
             emit('LIVE_DIRECT_SPEECH_FAILED', { text: line, reason: why });
             /* A LAST TRY, rather than a silent turn. The tool result is
@@ -3479,6 +3563,38 @@
         release();
         return Promise.resolve(false);
       }
+    }
+
+    /* WHAT THE SESSION WAS DOING WHEN A TOOL RESULT WENT BACK.
+     *
+     * A tool answered in the PAGE leaves no server row at all -- no call, no
+     * result, no response.create -- so on 2026-09-24 the question "was a
+     * response created after start_navigation returned" could not be answered
+     * from the drive log, which is where a route that locks in silence hides.
+     * This is the answer, attached to LIVE_TOOL_RESULT: whether the create was
+     * sent, and the four pieces of state that decide whether anything comes of
+     * it. */
+    function sessionState() {
+      var st = null;
+      try { st = arbiter && arbiter.state ? arbiter.state() : null; }
+      catch (e) { st = null; }
+      return {
+        // The realtime entry holding the mouth, if any. A response.create sent
+        // while one of these is open is a response that may never claim.
+        speaking_response_id: speaking ? speaking.responseId : null,
+        speaking_finishing: speaking ? !!speaking.finishing : null,
+        // A deterministic line mid-flight. The one that abandons unbound is
+        // what arms an orphan claim.
+        dictation: dictation ? (dictation.text || '').slice(0, 40) : null,
+        dictation_bound: dictation ? !!dictation.responseId : null,
+        // Outstanding claims on the next unclaimed response. Non-zero here
+        // means a response created next may be cancelled on sight.
+        orphan_claims: orphanOutOfBand,
+        // What the mouth is actually doing, from the arbiter rather than from
+        // this file's opinion of it.
+        arbiter_speaking: st && st.speaking ? st.speaking.id : null,
+        arbiter_queued: st ? st.queued.map(function (q) { return q.id; }) : null,
+      };
     }
 
     function toolCall(name, callId, argsJson) {
@@ -3614,7 +3730,11 @@
               emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
                                          ok: true, path: result.path,
                                          took_ms: result.took_ms || null,
-                                         spoke_directly: true });
+                                         spoke_directly: true,
+                                         // No create, and that is correct: the
+                                         // line has already been spoken.
+                                         response_requested: false,
+                                         session_state: sessionState() });
               return result;
             }
             counters.direct_deferred++;
@@ -3645,11 +3765,20 @@
           if (name === 'look' && lookAnswerMaxTokens) {
             ask.response = { max_output_tokens: lookAnswerMaxTokens };
           }
-          send(ask);
+          var asked = true;
+          try { send(ask); } catch (e) { asked = false; }
           emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
                                      ok: !!result.ok, path: result.path || null,
                                      took_ms: result.took_ms || null,
                                      spoke_directly: false,
+                                     /* THE QUESTION THE DRIVE LOG COULD NOT
+                                        ANSWER. True means the words went back
+                                        AND a spoken answer was asked for;
+                                        anything the driver then fails to hear
+                                        happened after this line, and
+                                        session_state says what was in the way. */
+                                     response_requested: asked,
+                                     session_state: sessionState(),
                                      note: result.note || null });
           return result;
         });
@@ -4079,10 +4208,7 @@
              * unclaimed response is recorded as this one's, cancelled by id
              * the moment it exists, and muted until it is gone. Exactly one
              * mouth per utterance, and it is the one that got there. */
-            if (dictation && !dictation.responseId) {
-              orphanOutOfBand++;
-              silenceOrphan = true;
-            }
+            if (dictation && !dictation.responseId) armOrphan(true);
             try { send({ type: 'response.cancel' }); } catch (e) {}
             finishDictation('timeout');
           }, opts.timeoutMs || speakTimeoutMs);
@@ -4136,7 +4262,7 @@
         if (!dictation) return false;
         if (token && dictation.token !== token) return false;
         var rid = dictation.responseId;
-        if (!rid) { silenceOrphan = true; orphanOutOfBand++; }
+        if (!rid) armOrphan(true);
         try {
           send(rid ? { type: 'response.cancel', response_id: rid }
                    : { type: 'response.cancel' });

@@ -1087,6 +1087,18 @@ _cutoffs: dict = {"tally": {c: 0 for c in _CUTOFF_CAUSES},
 # so adding one is an edit in a single place.
 _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                "tool_result_discarded", "driver_command", "command_done",
+               # EVERY TOOL CALL AND RESULT, INCLUDING THE ONES THE PAGE
+               # ANSWERS. start_navigation and the other four LOCAL_TOOLS never
+               # reach /realtime/tool, so until 2026-09-24 they produced no row
+               # anywhere -- and "was a response created after the tool result"
+               # was therefore unanswerable about a route that locked in
+               # silence. `tool_result` carries response_requested and the
+               # session state that decides what comes of it.
+               "tool_call_started", "tool_result",
+               # A claim on the next unclaimed response that was never used.
+               # Non-zero here and an answer nobody heard are two ends of one
+               # event -- see ORPHAN_CLAIM_MS in rio_realtime.js.
+               "orphan_claim_expired",
                # A transcript that was not a driver turn: her own voice back
                # through the speaker, or speech the barge gate never confirmed.
                # The number that says whether the echo loop is closed.
@@ -1240,6 +1252,11 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # RIO simply being slow.
                              "turn", "now_turn", "tool", "call_id",
                              "tools_aborted", "took_ms", "age_ms", "gap_ms",
+                             # WAS A SPOKEN ANSWER ASKED FOR, and what was in
+                             # the way when it was. The two fields a
+                             # page-answered tool had nowhere to put.
+                             "response_requested", "session_state",
+                             "spoke_directly", "after_ms",
                              "command", "superseded",
                              # phantom transcripts and output-bus health
                              "why", "text", "speaking", "since_audio_ms",
