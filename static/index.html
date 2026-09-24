@@ -5164,7 +5164,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 + (RIO.sessionId ? '?session_id=' + encodeURIComponent(RIO.sessionId) : '');
       const r = await fetch(url);
       const j = await r.json();
-      if (j && j.ok && window.RIOEye) {
+      /* ONLY FOR A SENSOR EYE. `speaks_directly` is the server's own answer
+         (config.local_vision_speaks_directly, sent on the record) and it
+         decides whether this card belongs on the glass at all.
+
+         Under the observer role the resident model is asked for a caption --
+         one sentence about what is out of the windscreen. It returns no
+         <think> trace, no judgement object and no risk level, so the four
+         NVIDIA blocks would render three empty panels and a risk chip with
+         nothing behind it, and a driver would read the empty panels as "no
+         risk found" rather than as "nothing was ever asked". An absent
+         judgement drawn in the furniture of a judgement is the one failure
+         this card must not have.
+
+         So under qwen this poller renders nothing and leaves #sensorcard to
+         RIO.sensor, which paints the caption. Nothing here is deleted: flip
+         LOCAL_VISION_MODEL back to cosmos and the record says so and the
+         blocks come back. */
+      if (j && j.ok && j.speaks_directly !== true && window.RIOEye) {
         const end = (j.window || {}).end_age_s;
         if (typeof end !== 'number' || end <= MAX_END_AGE_S) RIOEye.render(j);
       }

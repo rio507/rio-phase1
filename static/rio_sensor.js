@@ -87,10 +87,27 @@
       pair('model took', (age - reading.filed_age_s).toFixed(1) + ' s');
     }
     if (reading.frame_id) pair('frame', reading.frame_id);
-    /* An instrument's reading is never spoken in her voice. Said on the card
-       so nobody reads these words as words RIO would use -- she is given them
-       as evidence and composes her own sentence. See observer._record. */
-    pair('role', reading.speakable ? 'her words' : 'sensor · she rephrases');
+    /* WHAT THE CAMERA WAS LOOKING THROUGH. "camera" and "clip" are different
+       answers to "what is this a caption of", and a caption of an uploaded
+       clip sitting on the glass during a drive is the one case where the
+       words can be perfectly true and still describe the wrong road. The
+       server already resolves it off the frame's origin (observer.reading);
+       it was simply never shown. */
+    if (reading.source) pair('source', reading.source);
+    /* WHOSE WORDS THESE ARE, AND WHY THEY ARE NOT HERS WHEN THEY ARE NOT.
+       An instrument's reading is never spoken in her voice, so under the
+       sensor role the answer is fixed and the card says so.
+
+       Under the OBSERVER role it is per-line, and the reason matters: the
+       ordinary case is that the caption went to the speaker word for word,
+       but a caption that failed persona.lint() -- or that told the driver
+       what to do, which observer._record now holds as an advisory fault --
+       is kept and rephrased instead. Calling that "sensor" would name the
+       wrong model; it is the same eye, on the slow path. */
+    pair('role', reading.speaks_directly
+                   ? (reading.speakable ? 'her words'
+                                        : 'held · she rephrases')
+                   : 'sensor · she rephrases');
     return m;
   }
 
@@ -197,6 +214,40 @@
     return row;
   }
 
+  /* THE CAPTION, WHICH IS ALL THE OBSERVER ROLE PRODUCES.
+   *
+   * Under LOCAL_VISION_MODEL=qwen the resident model is asked OBSERVER_PROMPT
+   * -- one sentence about what is out of the windscreen -- and that is the
+   * whole of what comes back. No fields, no risk level, no judgement, and
+   * nothing measured.
+   *
+   * SO THE CARD SAYS THREE THINGS AND STOPS: the sentence, how old it is, and
+   * what it is a caption of. The sensor furniture is deliberately absent
+   * rather than empty -- proseRow's "unverified impression ... ranges and road
+   * users come from the tracker" is a caveat about a model that volunteers
+   * makes, lane counts and distances, and printing it under twelve words about
+   * dry hills would be the card inventing a hazard the model never claimed.
+   * An empty risk panel reads as "no risk", which is a judgement, and this
+   * model was never asked for one.
+   *
+   * WHAT IS KEPT is anything that is a fact about the sentence rather than a
+   * verdict on the road: a stripped measurement and a truncation both still
+   * render, from the caller below, because those say the text is not what the
+   * model wrote and that is true whichever model wrote it. */
+  function captionRow(reading) {
+    var row = el('div', 'teach-field');
+    row.appendChild(el('div', 'teach-label', 'Caption'));
+    row.appendChild(el('div', 'teach-text prose',
+                       reading.extra || reading.raw || ''));
+    /* Named, not characterised. The driver is told which model wrote the line
+       and that a line is all it is -- not how much to believe it, which is a
+       judgement this card is in no position to make either. */
+    row.appendChild(el('div', 'teach-hint',
+                       'what the camera model says it sees \u2014 a caption of '
+                       + 'one frame, not a measurement and not a warning'));
+    return row;
+  }
+
   function shell(nameText, freshClass) {
     var cols = el('div', 'teach-cols');
     var col = el('div', 'teach-col sensor-col' + (freshClass ? ' is-fresh' : ''));
@@ -272,6 +323,10 @@
           ex.appendChild(el('div', 'teach-text', reading.extra));
           s.col.appendChild(ex);
         }
+      } else if (reading.speaks_directly) {
+        /* The observer role: a caption, and the card says only what a caption
+           can support. See captionRow. */
+        s.col.appendChild(captionRow(reading));
       } else {
         s.col.appendChild(proseRow(reading));
       }

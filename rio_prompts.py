@@ -51,16 +51,49 @@ import persona   # noqa: E402  (the banned-word list, and the lint that enforces
 # pointed at a desk was told "open freeway, light traffic, dry hills", and
 # because that line passes persona.lint() it was spoken directly, as her.
 #
-# So the examples are now shown as PAIRS -- what was out of the windscreen, and
+# So the examples are shown as PAIRS -- what was out of the windscreen, and
 # what she said about it -- which cannot be copied into an answer without
 # copying something obviously wrong with it. And they are exported, so
 # is_prompt_example() can refuse any observation that comes back as one anyway.
 # The prompt is the fix; the guard is what makes it a rule rather than a hope.
+#
+# ...AND THE SCENES ARE ONES OUR FOOTAGE CANNOT CONTAIN, which is the half that
+# was still wrong on 2026-09-24 and is d3ffa27's lesson applied here.
+#
+# The four examples above this line were an open freeway with dry hills, a wet
+# town street, a residential road of parked cars and a dusk carriageway. Our
+# road is a sunny multi-lane Californian highway with dry hills either side --
+# so example one IS a correct caption of it, and a model that describes that
+# road accurately lands on the example's exact words by agreeing with it.
+# Measured, 20 real road frames:
+#
+#                            copied   bleed   distinct   adversarial (copied/
+#                                                         honest/fabricated)
+#   our-road examples         4/20    0/20      16/20        0/4  3/3  0/3
+#   unreachable scenes        0/20    0/20      15/20        0/4  3/3  0/3
+#
+# THOSE FOUR WERE NOT PARROTING. Swapping the examples for scenes this camera
+# cannot see -- alpine snow, fog, a flooded causeway, a harbour -- the same
+# four frames come back as "Empty highway ahead — hills rise on both sides
+# under clear blue sky": the same observation, the model's own words, nothing
+# copied and no alien vocabulary anywhere in twenty readings.
+#
+# The cost of leaving it was NOT a fabrication reaching the driver -- it was
+# the opposite. is_prompt_example is a REFUSAL at vision.observe, so one
+# caption in five was being thrown away on the road this car drives most, for
+# agreeing with the prompt. A guard that refuses a true caption is a guard
+# that makes the eye blind at a rate nobody was measuring.
+#
+# The adversarial columns are why the refusal STAYS rather than becoming a
+# flag: on a black frame, grey frame and noise the unreachable examples are
+# exactly as safe as the old ones -- nothing copied, three honest "can't make
+# much out", nothing invented -- so the guard loses no protection by no longer
+# firing on agreement. It now fires only on copying, which is what it is for.
 OBSERVER_EXAMPLES = (
-    "Open freeway, light traffic — dry hills both sides",
-    "Two lanes into town, wet road, brake lights ahead",
-    "Quiet street, parked cars both sides, nobody about",
-    "Motorway opening out, sun low behind the ridge",
+    "Gritter stopped in the snow — single lane, no way past",
+    "Tractor crawling in the fog — crossing lights just beyond",
+    "Water right across the causeway — depth hard to judge",
+    "Cobbles along the harbour — crates stacked tight on the left",
 )
 
 OBSERVER_PROMPT = """You are the eyes of RIO, an in-car assistant, and what you write is SPOKEN ALOUD to the driver as her own words. Write the one sentence she would say about WHAT IS IN THIS FRAME.
@@ -73,10 +106,10 @@ She is looking through a windscreen, not describing a photograph. Never write "I
 
 Name what is actually there and what matters about it — the road, the traffic, the light, the land. Specific beats general, and a dash between two halves is her rhythm. Four frames and what she said about each:
 
-  frame: three lanes, hills either side, few cars -> Open freeway, light traffic — dry hills both sides
-  frame: town street in rain, queue of cars -> Two lanes into town, wet road, brake lights ahead
-  frame: residential road, cars at the kerb, empty -> Quiet street, parked cars both sides, nobody about
-  frame: dual carriageway at dusk, ridge ahead -> Motorway opening out, sun low behind the ridge
+  frame: single-track alpine lane at night, heavy snow, gritter stopped -> Gritter stopped in the snow — single lane, no way past
+  frame: fog at dusk, tractor ahead, level crossing beyond -> Tractor crawling in the fog — crossing lights just beyond
+  frame: flooded causeway at dawn, water over the tarmac -> Water right across the causeway — depth hard to judge
+  frame: cobbled harbour front at night, crates stacked, gulls -> Cobbles along the harbour — crates stacked tight on the left
 
 Those are four other frames. They are not answers to this one, and none of their words may appear in yours unless they are in the frame you were given.
 

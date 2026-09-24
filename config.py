@@ -2497,7 +2497,37 @@ EYE_WINDOW_PERIOD_S = float(os.getenv("EYE_WINDOW_PERIOD_S", "8.0"))
 # behaviour. It is a switch rather than a constant because the video read is
 # the most expensive thing on the card and somebody profiling a drive will
 # want it gone for a run.
-EYE_WINDOW_ENABLED = os.getenv("EYE_WINDOW_ENABLED", "1") not in ("0", "false", "False")
+#
+# AND THE DEFAULT IS ASKED OF THE ROLE, because under the observer role this
+# read has no consumer and no budget.
+#
+#   NO CONSUMER. The four-block card is the only thing that ever showed a
+#   window reading, and it is NVIDIA's layout for a reasoning sensor -- a
+#   trace, a judgement, a risk level. Qwen is asked for a caption and produces
+#   none of those, so the card stands down (see rio_eye.js and the eye poller
+#   in index.html) and the reading is generated for nobody.
+#
+#   NO BUDGET. Measured on this pod, 2026-09-24, same clip and same feed:
+#
+#                        window generate      caption age (p50/p90/max)   stale
+#     cosmos (2B)        3.5-7 s, p50 5.4        --                        --
+#     qwen (8B), on      8.8-12.0 s, p50 9.6     9.35 / 21.8 / 25.6 s      31/39
+#     qwen (8B), off     --                      1.21 / 1.68 / 2.66 s       1/39
+#
+#   The 8B read OVERRUNS ITS OWN PERIOD -- 9.6 s of generate inside an 8 s
+#   cadence -- so it holds vision._lock essentially continuously and starves
+#   the 1 Hz caption path that is the only thing the card now shows. A caption
+#   card whose age reads 9 seconds is a card describing a road the car has
+#   left, and "stale" there is measured against the observer's own 2 s
+#   threshold (OBSERVER_FRESH_S).
+#
+# Set the env var explicitly to override in either direction: EYE_WINDOW_ENABLED=1
+# under qwen is a legitimate thing to want for a run that is gathering the
+# grounded corroboration counts, and it costs the caption exactly what the
+# table says it costs.
+_EYE_WINDOW_DEFAULT = "0" if LOCAL_VISION_MODEL == "qwen" else "1"
+EYE_WINDOW_ENABLED = (os.getenv("EYE_WINDOW_ENABLED", _EYE_WINDOW_DEFAULT)
+                      not in ("0", "false", "False"))
 
 # The LABEL pass's own budget. Short on purpose: it emits one small JSON
 # object, and the reasoning trace in front of it is the only thing that can

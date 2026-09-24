@@ -1862,6 +1862,18 @@ async def eye_latest(session_id: str = Query(default=None)):
     if not rec:
         return {"ok": False, "skipped": "no_reading"}
     rec["ok"] = True
+    # WHICH EYE THIS READING CAME OUT OF, on the record rather than fetched
+    # separately by the card. The four-block card is NVIDIA's layout for a
+    # reasoning sensor -- a judgement, a risk level, the measured state it was
+    # given -- and under the observer role none of those exist: Qwen is asked
+    # for a caption and a caption has no judgement to show. The card reads
+    # this and stands down rather than framing a caption as an assessment.
+    #
+    # Sent from here, with the reading, so there is no second request to race
+    # against and no window in which the page renders one model's output in
+    # the other model's furniture.
+    rec["role"] = config.LOCAL_VISION_MODEL
+    rec["speaks_directly"] = config.local_vision_speaks_directly()
     return rec
 
 

@@ -129,8 +129,28 @@ def main():
        f"{r.get('age_s')} s")
     ok("...and the freshness threshold the observer itself uses",
        isinstance(r.get("fresh_s"), (int, float)), f"{r.get('fresh_s')} s")
-    ok("...and says it is a sensor's reading, not her words",
-       r.get("speakable") is False)
+    # WHOSE WORDS THESE ARE, ASKED OF THE ROLE RATHER THAN ASSUMED.
+    #
+    # This used to assert `speakable is False` flat, which was true for as long
+    # as the resident eye was Cosmos and is a statement about the ROLE rather
+    # than about the card. Under LOCAL_VISION_MODEL=qwen the model is asked
+    # OBSERVER_PROMPT, the line is written in her register, and a line that
+    # passes persona.lint() is speakable BY DESIGN -- that is the whole of what
+    # the rollback is for. A test that fails on the supported configuration is
+    # a test that trains people to ignore it.
+    #
+    # So both roles are checked, and each is checked for the thing that would
+    # actually be wrong: a sensor reading that claims to be her words, or a
+    # caption whose card still dresses it as an instrument.
+    speaks = bool((r or {}).get("speaks_directly"))
+    if speaks:
+        ok("...and the card knows the eye speaks in her voice (observer role)",
+           r.get("speaks_directly") is True
+           and isinstance(r.get("speakable"), bool),
+           f"speakable={r.get('speakable')}")
+    else:
+        ok("...and says it is a sensor's reading, not her words",
+           r.get("speakable") is False)
 
     ok("the live session took the observer path for this question",
        look.get("path") in ("observer_composed", "observer_direct"),
@@ -139,9 +159,27 @@ def main():
         ok("THE GLASS AND THE SESSION CARRY THE SAME BYTES",
            (look.get("answer") or "").strip() == r["raw"].strip(),
            f"card {r['raw'][:44]!r} vs session {str(look.get('answer'))[:44]!r}")
-        ok("...and the session is given the same fields the card draws",
-           [f["text"] for f in (look.get("reading_fields") or [])]
-           == [f["text"] for f in r["fields"]])
+        # THE EVIDENCE BLOCK EXISTS ONLY WHERE SHE COMPOSES FROM IT.
+        #
+        # On `observer_direct` the sentence has already been spoken to the
+        # driver verbatim as hers, and look() returns before it builds a
+        # reading block -- correctly: there is nothing for her to infer from,
+        # because there is nothing left for her to say. Demanding
+        # `reading_fields` there was demanding that the composed path's payload
+        # appear on the path that exists to skip composing.
+        #
+        # What still has to hold on BOTH paths is the line above: the glass and
+        # the session carry the same bytes. That is the claim this file is
+        # named for and it is checked unconditionally.
+        if look.get("path") == "observer_composed":
+            ok("...and the session is given the same fields the card draws",
+               [f["text"] for f in (look.get("reading_fields") or [])]
+               == [f["text"] for f in r["fields"]])
+        else:
+            ok("...and the direct path carries no evidence block, because she "
+               "composes nothing from it",
+               look.get("reading_fields") is None,
+               f"path={look.get('path')}")
 
     # ---- WHAT MAY NOT REACH HER AT ALL --------------------------------------
     # A measurement in a reading did not come from the road: a single frame has

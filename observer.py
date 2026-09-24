@@ -120,6 +120,7 @@ def _record(text, frame, key=None, meta=None):
     # This is what makes "the local model never speaks as her" a property of the
     # code rather than a property of how the prompt happens to read today.
     import config as _config
+    import rio_prompts as _rp
     if not _config.local_vision_speaks_directly():
         return {
             "text": text,
@@ -139,6 +140,36 @@ def _record(text, frame, key=None, meta=None):
             "stripped": list(meta.get("stripped") or []),
         }
     faults = persona.lint(text)
+    # AN OBSERVER MAY DESCRIBE THE ROAD. IT MAY NOT TELL THE DRIVER WHAT TO DO.
+    #
+    # persona.lint() asks "does this sound like RIO", and the honest answer for
+    # "Brake now -- traffic stopped dead ahead" is YES: it is twelve words, one
+    # sentence, her rhythm, no caption tell, no first person. Measured
+    # 2026-09-24 -- that line and four like it pass lint with nothing flagged,
+    # and under the observer role a line that passes lint is spoken to the
+    # driver VERBATIM as hers (realtime.look's observer_direct branch).
+    #
+    # That is a driving instruction issued from ONE FRAME, with no geometry, no
+    # band and no lead behind it -- the thing the deterministic warning path
+    # exists to own and the one authority a caption must never borrow. The
+    # advisory guard already existed for exactly this and was reachable only
+    # under the sensor role (vision.py's sensor_faults call), so the rollback
+    # to qwen opened it.
+    #
+    # A FAULT, NOT A REFUSAL, AND THE DIFFERENCE IS DELIBERATE. Under a sensor
+    # model an advisory reading is void -- an instrument that advises has
+    # malfunctioned -- and vision.observe throws it away. Under an observer
+    # model the OBSERVATION is usually fine and only the register is wrong:
+    # "traffic stopped dead ahead" is a true and useful thing to have seen, and
+    # throwing the whole line away to punish "Brake now" would cost the road.
+    #
+    # So the line is kept and marked unspeakable, which is a state this record
+    # already has and every caller already handles: look() drops to
+    # `observer_composed`, grok is handed the words as evidence, and RIO says
+    # what she makes of it in her own register without the instruction.
+    advisory = _rp.sensor_faults(text)
+    if advisory:
+        faults = list(faults) + [f"advisory: {a!r}" for a in advisory]
     return {
         "text": text,
         "speakable": not faults,
@@ -536,6 +567,14 @@ def reading(session_key: str, rec: dict = None) -> dict:
     out["frame_age_s"] = rec.get("frame_age_s")
     # An instrument's reading is never spoken as hers. See _record above.
     out["speakable"] = bool(rec.get("speakable"))
+    # WHICH ROLE WROTE IT, which is not the same question as whether THIS line
+    # is speakable. A Qwen caption that fails persona.lint() has speakable
+    # False and is still a caption; a Cosmos reading is unspeakable even when
+    # it happens to read like one. The card picks its whole layout off this --
+    # a caption gets a caption, a sensor reading gets the instrument panel --
+    # and picking it off `speakable` would flip the card's shape on a lint
+    # failure, which is a fact about one sentence and not about the eye.
+    out["speaks_directly"] = bool(config.local_vision_speaks_directly())
     # The observer's own threshold, shipped rather than guessed at by a card.
     out["fresh_s"] = float(getattr(config, "OBSERVER_FRESH_S", 2.0))
     # WHAT WAS WRONG WITH THIS READING THAT ITS WORDS DO NOT SHOW.
