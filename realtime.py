@@ -1154,7 +1154,14 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                "audio_resumed", "mic_state",
                # EVERY ANSWER'S AUDIO: generated against heard, and who ended
                # it. The row that answers "did she stop mid-sentence".
-               "utterance_end", "tail_timeout")
+               "utterance_end", "tail_timeout",
+               # THE OUTPUT BUS LEFT THE LOOPBACK, and came back. On 2026-09-28
+               # (4ae33786) the loopback carried nothing for 227 s and every
+               # row upstream of it said she spoke. A fallback trades the echo
+               # canceller for being heard; these say when that trade was made,
+               # why, and what the barge gate did while it lasted.
+               "bus_fallback", "bus_restored", "bus_restore_failed",
+               "bus_loopback_failed")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1329,6 +1336,17 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              "ended_by", "cancel_reason", "status",
                              "status_reason", "mute_reasons", "muted_at_end",
                              "audio_started", "early", "after_ms",
+                             # WHERE THE SOUND IS. heard_ms and out_peak_db are
+                             # the bus, upstream of the loopback; these are what
+                             # arrived at the sink, and by which path
+                             # (loopback | direct | none | not_on_bus).
+                             "sink_heard_ms", "sink_peak_db", "sink_path",
+                             "sink_ticks", "bus_path",
+                             # A fallback: the two meters when it fired, the
+                             # link it left, how long it lasted, and what the
+                             # barge gate did while the canceller was bypassed.
+                             "bus_db", "sink_db", "link_age_s",
+                             "total_samples", "down_ms", "fallback_window",
                              # Where the car was on its route at the time, so
                              # "do cut-offs cluster around maneuvers" is a
                              # query rather than two streams and a wall clock.

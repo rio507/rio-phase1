@@ -770,7 +770,9 @@
                        text: '', text_logged: false,
                        status: null, status_reason: null, cancel_reason: null,
                        muted_ms: 0, mute_reasons: {}, muted_at_end: false,
-                       ended_by: null, reported: false, done: false };
+                       ended_by: null, reported: false, done: false,
+                       sink_ms: 0, sink_peak: null, sink_ticks: 0,
+                       sink_bus_loud: 0, sink_paths: {} };
         utterOrder.push(rid);
         while (utterOrder.length > 24) delete utter[utterOrder.shift()];
       } else if (kind && utter[rid].turn_kind === 'conversation') {
@@ -785,6 +787,68 @@
       var u = rid ? utter[rid] : null;
       if (u && !u.cancel_reason) u.cancel_reason = why || 'unspecified';
     }
+    /* ---- WHERE THE SOUND IS, per utterance ---------------------------
+     *
+     * Everything above is measured upstream of the speaker: audio_ms is the
+     * playout's clock, muted_ms is our own mute, and the census reads the
+     * bus. On 2026-09-28 (4ae33786) all of them said four answers were heard
+     * in full while the loopback carried nothing -- three drives running.
+     *
+     * So while she is streaming, RIO.output.sinkLevel() is read every tick:
+     * the level AFTER the loopback (path 'loopback'), or the bus itself when
+     * the bus is wired straight to the device (path 'direct', a fallback), and
+     * the bus level beside it. Reported on utterance_end as
+     *
+     *   sink_heard_ms   time the sink was above the floor
+     *   sink_peak_db    the loudest the sink got
+     *   sink_path       loopback | direct | none -- or not_on_bus when the bus
+     *                   never carried a sound during it (her voice took
+     *                   another path, and this measure cannot see it)
+     *
+     * A dead link now reads heard_ms 2462 beside sink_heard_ms 0. */
+    var sinkTimer = null;
+    var sinkLastAt = 0;
+    function sinkTick() {
+      var o = root.RIO && root.RIO.output;
+      var u = streamingId ? utter[streamingId] : null;
+      if (stopped || !u || !o || !o.sinkLevel) { stopSinkWatch(); return; }
+      var at = Date.now();
+      var dt = Math.min(250, Math.max(0, at - (sinkLastAt || at)));
+      sinkLastAt = at;
+      var r;
+      try { r = o.sinkLevel(); } catch (e) { return; }
+      if (!r) return;
+      u.sink_ticks++;
+      u.sink_paths[r.path] = (u.sink_paths[r.path] || 0) + 1;
+      if (r.bus_db > bargeEchoFloorDb) u.sink_bus_loud++;
+      if (r.db !== null && r.db !== undefined) {
+        if (u.sink_peak === null || r.db > u.sink_peak) u.sink_peak = r.db;
+        if (r.db > bargeEchoFloorDb) u.sink_ms += dt;
+      }
+    }
+    function startSinkWatch() {
+      if (sinkTimer) return;
+      sinkLastAt = Date.now();
+      sinkTimer = setInterval(sinkTick, CENSUS_SAMPLE_MS);
+    }
+    function stopSinkWatch() {
+      if (sinkTimer) { clearInterval(sinkTimer); sinkTimer = null; }
+    }
+    function sinkSummary(u) {
+      if (!u.sink_ticks) return { sink_path: null, sink_heard_ms: null,
+                                  sink_peak_db: null, sink_ticks: 0 };
+      if (!u.sink_bus_loud) return { sink_path: 'not_on_bus', sink_heard_ms: null,
+                                     sink_peak_db: null, sink_ticks: u.sink_ticks };
+      var best = null;
+      for (var k in u.sink_paths) {
+        if (best === null || u.sink_paths[k] > u.sink_paths[best]) best = k;
+      }
+      return { sink_path: best, sink_heard_ms: Math.round(u.sink_ms),
+               sink_peak_db: u.sink_peak === null ? null
+                             : Math.round(u.sink_peak * 10) / 10,
+               sink_ticks: u.sink_ticks };
+    }
+
     function utteranceEnded(rid, how) {
       var u = utter[rid];
       if (!u || u.reported) return;
@@ -806,6 +870,7 @@
       counters.utterances++;
       var early = ended !== 'completed' || frac < 0.98;
       if (early) counters.utterances_early++;
+      var sink = sinkSummary(u);
       emit('LIVE_UTTERANCE_END', {
         response_id: rid, turn_kind: u.turn_kind,
         generated_chars: u.generated_chars, status: u.status,
@@ -818,6 +883,8 @@
         // The driver's share of the words, by time. An ESTIMATE: audio is
         // not evenly worded, and the log says so by the name.
         heard_chars_est: Math.round(u.generated_chars * frac),
+        sink_heard_ms: sink.sink_heard_ms, sink_peak_db: sink.sink_peak_db,
+        sink_path: sink.sink_path, sink_ticks: sink.sink_ticks,
       });
     }
     /* RIO's mouth, when it is not the model's own. Nullable, and null is the
@@ -3852,6 +3919,7 @@
               var u0 = utterFor(ev.response_id);
               if (u0 && !u0.audio_started_at) u0.audio_started_at = now0;
               streamingId = ev.response_id;
+              startSinkWatch();
               if (u0 && muted && muteReason) {
                 u0.mute_reasons[muteReason] = (u0.mute_reasons[muteReason] || 0) + 1;
               }
@@ -4059,6 +4127,7 @@
               if (u3 && !u3.audio_started_at) {
                 u3.audio_started_at = Date.now();
                 if (!streamingId) streamingId = ev.response_id;
+                startSinkWatch();
               }
               /* A response cancelled on sight, speaking anyway. Muted NOW,
                  on its own first words, and not a moment earlier -- see the

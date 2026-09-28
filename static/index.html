@@ -3711,6 +3711,13 @@ const LIVE_REPORTED = {
    *                   able in the log from a refused barge-in.
    */
   LIVE_BARGE_IN: 'barge_detected',
+  /* THE BUS LEFT THE LOOPBACK. See rio_output.js fallBack(): the loopback
+     died, her voice went straight to ctx.destination -- heard, but outside
+     the echo canceller -- until a rebuilt loopback proved itself. */
+  LIVE_BUS_FALLBACK: 'bus_fallback',
+  LIVE_BUS_RESTORED: 'bus_restored',
+  LIVE_BUS_RESTORE_FAILED: 'bus_restore_failed',
+  LIVE_BUS_LOOPBACK_FAILED: 'bus_loopback_failed',
   LIVE_BARGE_DEFERRED: 'barge_deferred',
   LIVE_BARGE_MISSED: 'barge_missed',
   LIVE_TURN_SELF: 'turn_self',
@@ -3814,9 +3821,81 @@ function navContext() {
   } catch (e) { return null; }
 }
 
+/* ---- what the barge gate does while the canceller is bypassed ----------
+ *
+ * A bus fallback puts her voice on ctx.destination, which the echo canceller
+ * has no reference for, so her own words can reach the microphone again. The
+ * fallback is taken anyway -- silent is worse than echo-prone -- and this is
+ * the account of what it cost: every barge the detector fired, every echo the
+ * gate suppressed, every phantom transcript and every cut-off, counted from
+ * the fallback to the restore. Reported on the bus_restored row, and on every
+ * bus_health row while it is still open. */
+let busFallbackWin = null;
+
+function noteFallbackWindow(kind, ev) {
+  const w = busFallbackWin;
+  if (!w) return;
+  if (kind === 'barge_detected' || kind === 'echo_suppressed'
+      || kind === 'turn_phantom' || kind === 'blips_absorbed'
+      || kind === 'barge_missed' || kind === 'utterance_end') {
+    w[kind] = (w[kind] || 0) + 1;
+  } else if (kind === 'cutoff') {
+    const c = ev.cause || 'other';
+    w.cutoffs[c] = (w.cutoffs[c] || 0) + 1;
+  }
+}
+
+function fallbackWindowNow() {
+  const w = busFallbackWin;
+  if (!w) return null;
+  return Object.assign({}, w, { cutoffs: Object.assign({}, w.cutoffs),
+                                for_s: Math.round((performance.now() - w.t0) / 100) / 10,
+                                t0: undefined });
+}
+
+let busEventsWired = false;
+/* At load, not at the first conversation: the loopback is built by the Start
+   Drive tap, and a link that is dead from birth is refused THEN -- before any
+   live session exists to start the bus watch. rio_output.js is a plain script
+   further down the page, so it has run by DOMContentLoaded. */
+window.addEventListener('DOMContentLoaded', () => { try { wireBusEvents(); } catch (e) {} });
+function wireBusEvents() {
+  if (busEventsWired || !(window.RIO && RIO.output && RIO.output.onEvent)) return;
+  busEventsWired = true;
+  RIO.output.onEvent((kind, d) => {
+    d = d || {};
+    if (kind === 'fallback') {
+      busFallbackWin = { why: d.why || null, t0: performance.now(),
+                         barge_detected: 0, echo_suppressed: 0,
+                         turn_phantom: 0, blips_absorbed: 0, barge_missed: 0,
+                         utterance_end: 0, cutoffs: {} };
+      reportLive({ type: 'LIVE_BUS_FALLBACK', why: d.why, bus_db: d.bus_db,
+                   sink_db: d.sink_db, link_age_s: d.link_age_s,
+                   total_samples: d.total_samples, fallbacks: d.bus_fallbacks });
+    } else if (kind === 'restored') {
+      const win = fallbackWindowNow();
+      busFallbackWin = null;
+      reportLive({ type: 'LIVE_BUS_RESTORED', why: d.why, down_ms: d.down_ms,
+                   fallback_window: win });
+    } else if (kind === 'restore_failed') {
+      reportLive({ type: 'LIVE_BUS_RESTORE_FAILED', why: d.why,
+                   after_ms: d.next_ms, fallback_window: fallbackWindowNow() });
+    } else if (kind === 'loopback_failed') {
+      reportLive({ type: 'LIVE_BUS_LOOPBACK_FAILED', step: d.at || null,
+                   error: d.error || null });
+    }
+  });
+}
+
 function reportLive(ev) {
   const kind = ev && LIVE_REPORTED[ev.type];
   if (!kind) return;
+  try { noteFallbackWindow(kind, ev); } catch (e) {}
+  /* WHICH PATH HER VOICE WAS ON when this happened: loopback (cancelled),
+     direct (a fallback: heard, not cancelled) or none. On every row, so a
+     barge_detected or echo_suppressed can be read against it directly. */
+  let busPath = null;
+  try { if (window.RIO && RIO.output && RIO.output.path) busPath = RIO.output.path(); } catch (e) {}
   try {
     fetch(RIO.url('/realtime/cutoff'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3957,6 +4036,20 @@ function reportLive(ev) {
           // The loopback's own numbers: concealment, jitter depth, clock drift.
           audio: ev.audio || null,
           by: ev.by || ev.second || null,
+          bus_path: busPath,
+          /* Where the sound is: the sink side of the loopback. See the
+             utterance ledger in rio_realtime.js. */
+          sink_heard_ms: ev.sink_heard_ms === undefined ? null : ev.sink_heard_ms,
+          sink_peak_db: ev.sink_peak_db === undefined ? null : ev.sink_peak_db,
+          sink_path: ev.sink_path || null,
+          sink_ticks: ev.sink_ticks === undefined ? null : ev.sink_ticks,
+          // A bus fallback, and what the barge gate did while it lasted.
+          bus_db: ev.bus_db === undefined ? null : ev.bus_db,
+          sink_db: ev.sink_db === undefined ? null : ev.sink_db,
+          link_age_s: ev.link_age_s === undefined ? null : ev.link_age_s,
+          total_samples: ev.total_samples === undefined ? null : ev.total_samples,
+          down_ms: ev.down_ms === undefined ? null : ev.down_ms,
+          fallback_window: ev.fallback_window || null,
         },
       }),
     }).catch(() => {});
@@ -4008,6 +4101,7 @@ function busHealth(force) {
   const h = st.health || {};
   const key = [st.covered, st.ready, st.context, st.to_destination,
                (st.stats || {}).bus_failures, (st.stats || {}).fallbacks,
+               (st.stats || {}).bus_fallbacks, (st.stats || {}).restores,
                h.resyncs, h.resync_failures, h.resync_backoff_ms].join('|');
   const due = (performance.now() - busLastAt) >= BUS_HEARTBEAT_MS;
   if (!force && key === busLast && !due) return;
@@ -4020,6 +4114,9 @@ function busHealth(force) {
     to_destination: !!st.to_destination,
     bus_failures: (st.stats || {}).bus_failures || 0,
     fallbacks: (st.stats || {}).fallbacks || 0,
+    /* An open bus fallback: why, how long, and what the barge gate has done
+       since the canceller was bypassed. Null while the loopback holds. */
+    fallback_window: fallbackWindowNow(),
     // ...and what the loopback is actually doing to her voice.
     audio: {
       sample_rate: h.sample_rate, jitter_ms: h.jitter_ms,
@@ -4034,11 +4131,15 @@ function busHealth(force) {
       resyncs: h.resyncs, resync_failures: h.resync_failures,
       resync_backoff_ms: h.resync_backoff_ms,
       since_s: h.since_s, samples: h.samples,
+      bus_fallbacks: (st.stats || {}).bus_fallbacks || 0,
+      restores: (st.stats || {}).restores || 0,
+      restore_failures: (st.stats || {}).restore_failures || 0,
     },
   });
 }
 
 function startBusWatch() {
+  wireBusEvents();
   if (busWatch !== null) return;
   busLast = '';
   busLastAt = 0;

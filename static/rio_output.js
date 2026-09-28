@@ -123,8 +123,18 @@
   var building = null;
   var buffers = {};           // url -> decoded AudioBuffer
   var stats = { plays: 0, decoded: 0, fallbacks: 0, bus_failures: 0,
-                resyncs: 0, resync_failures: 0 };
+                resyncs: 0, resync_failures: 0,
+                bus_fallbacks: 0, restores: 0, restore_failures: 0 };
   var scratch = null;         // reused Float32Array for the meter
+  var sinkScratch = null;     // ...and for the sink meter
+  /* THE BUS LEFT THE LOOPBACK FOR ctx.destination, and why. Null while the
+     loopback is carrying her voice. See fallBack(). */
+  var fallback = null;
+  var lastFallback = null;
+  var rebuildTimer = null;
+  var rebuildGapMs = 0;
+  /* Consecutive watch ticks on which the link looked dead, per test. */
+  var stallTicks = 0, muteTicks = 0, lastSamples = -1;
   /* HOW MANY SOURCES ARE ATTACHED TO THE BUS RIGHT NOW, and it exists for one
      reason: a resync while she is mid-sentence would put a seam in the middle
      of the sentence, which is the fault being fixed arriving from the other
@@ -250,6 +260,29 @@
     return new Promise(function (resolve) {
       try {
         l.dest = c.createMediaStreamDestination();
+        /* SOMETHING TO CARRY WHILE IT IS PROVED. The bus is not connected to
+           a link until the link is proved (connecting it earlier would play
+           her twice, once here and once on ctx.destination), and a
+           MediaStreamDestination with nothing feeding it sends nothing -- so
+           without this a healthy link fails its proof. Zeroes: inaudible,
+           and still samples the receiver has to count.
+
+           AND KEPT FOR THE LIFE OF THE LINK. Stopping it once the proof was
+           in put a seam in the stream at the moment the bus took over, and
+           the 60 s soak paid for it: drift 400 ms against 100, the jitter
+           buffer moving 330 ms against 17. Left running, the same soak
+           measured 4-25 ms of drift, under 3 ms of jitter movement, and
+           needed no resync at all. It also means a live link always carries
+           samples, which is what the no_samples watchdog counts on. Stopped
+           in dropLink. */
+        try {
+          if (c.createConstantSource) {
+            l.probe = c.createConstantSource();
+            l.probe.offset.value = 0;
+            l.probe.connect(l.dest);
+            l.probe.start();
+          }
+        } catch (e) { l.probe = null; }
         l.pcA = new root.RTCPeerConnection();
         l.pcB = new root.RTCPeerConnection();
         l.pcA.onicecandidate = function (e) {
@@ -283,8 +316,23 @@
             return settled(l.el);
           })
           .then(function (ok) {
-            if (!ok) { fail(l, null, 'sink_never_played'); resolve(null); return; }
+            if (!ok) { fail(l, null, 'sink_never_played'); return false; }
+            /* ...AND PROVED CARRYING. An element that is playing is not an
+               element that is being fed: on 2026-09-28 (4ae33786), and before
+               it on f7d708af and 3f219de7, the loopback negotiated, the sink
+               played, `covered` went true -- and the receiver took in ZERO
+               samples for the whole drive. Every answer she gave went into it
+               and nothing came out. So the receiver has to count samples
+               arriving before the bus moves. */
+            return flowing(l).then(function (flows) {
+              if (!flows) { fail(l, null, 'no_samples'); return false; }
+              return true;
+            });
+          })
+          .then(function (ok) {
+            if (!ok) { resolve(null); return; }
             l.since = nowMs();
+            attachSinkMeter(l);
             resolve(l);
           })
           .catch(function (err) { fail(l, err, 'negotiate'); resolve(null); });
@@ -331,8 +379,74 @@
     });
   }
 
+  /* DOES THE RECEIVER COUNT SAMPLES ARRIVING, and keep counting? The bus
+     renders continuously -- silence is still samples -- so a healthy link
+     shows totalSamplesReceived climbing within a few hundred milliseconds of
+     negotiating, and a dead one shows it at zero forever. Two readings that
+     go UP, not one that is non-zero, so a link that carried a burst and then
+     stopped is not mistaken for a live one. */
+  function receivedSamples(pc) {
+    if (!pc || !pc.getStats) return Promise.resolve(null);
+    return pc.getStats().then(function (report) {
+      var n = null;
+      report.forEach(function (r) {
+        if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+          n = (n || 0) + (r.totalSamplesReceived || 0);
+        }
+      });
+      return n;
+    }, function () { return null; });
+  }
+
+  function flowing(l) {
+    return new Promise(function (resolve) {
+      var start = nowMs();
+      var first = null;
+      var check = function () {
+        receivedSamples(l.pcB).then(function (n) {
+          if (n !== null && n > 0) {
+            if (first === null) first = n;
+            else if (n > first) { resolve(true); return; }
+          }
+          if (nowMs() - start > limits.proof_ms) { resolve(false); return; }
+          root.setTimeout(check, 100);
+        });
+      };
+      check();
+    });
+  }
+
+  /* THE SINK METER: what the loopback DELIVERS, measured after the encode,
+     the transport and the decode -- where the sound is, rather than where it
+     was put. level() reads the bus, upstream of every one of those, and that
+     is why three dead links in a row produced logs that said she spoke.
+
+     An analyser on the received stream, not connected to anything: it is
+     pulled for measurement only and renders nothing. */
+  function attachSinkMeter(l) {
+    var c = context();
+    try {
+      var stream = l.el && l.el.srcObject;
+      if (!c || !stream || !c.createMediaStreamSource) return;
+      l.meterSrc = c.createMediaStreamSource(stream);
+      l.meter = c.createAnalyser();
+      l.meter.fftSize = 1024;
+      l.meter.smoothingTimeConstant = 0.2;
+      l.meterSrc.connect(l.meter);
+    } catch (e) { l.meter = null; l.meterSrc = null; }
+  }
+
+  function stopProbe(l) {
+    if (!l || !l.probe) return;
+    try { l.probe.stop(); } catch (e) {}
+    try { l.probe.disconnect(); } catch (e) {}
+    l.probe = null;
+  }
+
   function dropLink(l) {
     if (!l) return;
+    stopProbe(l);
+    try { if (l.meterSrc) l.meterSrc.disconnect(); } catch (e) {}
     try { if (l.pcA) l.pcA.close(); } catch (e) {}
     try { if (l.pcB) l.pcB.close(); } catch (e) {}
     try { if (l.el) { l.el.pause(); l.el.srcObject = null; } } catch (e) {}
@@ -357,6 +471,7 @@
         covered = true;
         baseline = null;                 // a new loopback is a new zero
         health.jitter_ms_at_start = null;
+        stallTicks = 0; muteTicks = 0; lastSamples = -1;
         startWatch();
       } catch (e) { dropLink(l); covered = false; }
       return covered;
@@ -396,6 +511,7 @@
         bus.disconnect(old.dest);
         link = l;
         activeSink = 1 - activeSink;
+        stallTicks = 0; muteTicks = 0; lastSamples = -1;
         stats.resyncs++;
         // The old connection's counters go into the running totals before its
         // stats object stops existing.
@@ -485,9 +601,12 @@
     }
 
     if (!link.pcB || !link.pcB.getStats) return Promise.resolve(health);
+    var sampled = link;
     return link.pcB.getStats().then(function (report) {
+      var seen = null;
       report.forEach(function (r) {
         if (r.type !== 'inbound-rtp' || r.kind !== 'audio') return;
+        seen = (seen || 0) + (r.totalSamplesReceived || 0);
         /* CONCEALMENT IS THE CRACKLE, and `silentConcealedSamples` is the part
            of it nobody can hear: a buffer running dry during silence is
            covered by more silence. Subtracting it is the difference between
@@ -524,9 +643,141 @@
             Math.round((health.jitter_ms - health.jitter_ms_at_start) * 10) / 10;
         }
       });
-      maybeResync();
+      if (sampled === link) watchdog(seen);
+      if (covered) maybeResync();
       return health;
-    }, function () { return health; });
+    }, function () {
+      if (sampled === link) watchdog(null);
+      return health;
+    });
+  }
+
+  /* ---- the watchdog: a dead link is not left carrying her voice ----------
+   *
+   * Three ways a loopback that was proved at build time can die afterwards,
+   * each counted on the one-second watch and each needing several ticks in a
+   * row, because one bad reading is a hiccup and a fallback costs the echo
+   * canceller:
+   *
+   *   no_samples    the receiver stopped counting samples arriving. The bus
+   *                 renders silence continuously, so a live link never stops.
+   *   sink_paused   the sink element was paused or lost its stream -- iOS does
+   *                 this under an audio-session interruption.
+   *   sink_silent   SOUND IN, NO SOUND OUT. The bus is rendering her voice and
+   *                 the sink meter reads the floor. This is the one that
+   *                 catches a link whose transport is up and whose content is
+   *                 gone, which no counter can see.
+   *
+   * Only while the context is running and the page is visible: a suspended
+   * context stops rendering, which stops the samples, which is not a dead
+   * link. */
+  function visible() {
+    var d = root.document;
+    return !(d && d.visibilityState && d.visibilityState !== 'visible');
+  }
+
+  function watchdog(seen) {
+    if (!covered || !link) return;
+    var c = ctx;
+    if (!c || c.state !== 'running' || !visible()) {
+      stallTicks = 0; muteTicks = 0; lastSamples = -1;
+      return;
+    }
+    if (seen === null || seen <= lastSamples) stallTicks++;
+    else stallTicks = 0;
+    if (seen !== null) lastSamples = seen;
+
+    var el = link.el;
+    var paused = !el || !el.srcObject || el.paused;
+
+    var busDb = level();
+    var sinkDb = sinkRaw();
+    if (busDb > limits.sound_db) {
+      if (sinkDb !== null && sinkDb < limits.sink_floor_db) muteTicks++;
+      else muteTicks = 0;
+    }
+
+    var why = null;
+    if (stallTicks >= limits.stall_ticks) why = 'no_samples';
+    else if (paused) why = 'sink_paused';
+    else if (muteTicks >= limits.mute_ticks) why = 'sink_silent';
+    if (why) fallBack(why, { bus_db: Math.round(busDb * 10) / 10,
+                             sink_db: sinkDb === null ? null
+                                      : Math.round(sinkDb * 10) / 10 });
+  }
+
+  /* ---- the fallback: SILENT IS WORSE THAN ECHO-PRONE ---------------------
+   *
+   * The bus goes straight to ctx.destination -- audible, and outside the echo
+   * canceller, so while it lasts her own voice can reach the microphone again
+   * and the barge gate is the only thing between it and a false barge-in.
+   * That trade is taken every time, immediately, even mid-sentence: a seam in
+   * a sentence is heard, a sentence into a dead link is not.
+   *
+   * Every fallback is an event, and so is every restore. index.html reports
+   * both and counts what the barge gate did in between. */
+  function fallBack(why, detail) {
+    if (!covered || !bus) return false;
+    var c = context();
+    var old = link;
+    try {
+      bus.connect(c.destination);
+      toDestination = true;
+    } catch (e) {
+      stats.bus_failures++;
+      return false;
+    }
+    try { if (old && old.dest) bus.disconnect(old.dest); } catch (e) {}
+    covered = false;
+    link = null;
+    stats.bus_fallbacks++;
+    fallback = { why: why, at: nowMs(),
+                 total_samples: health.total_samples,
+                 link_age_s: health.since_s };
+    lastFallback = fallback;
+    var d = { why: why, total_samples: health.total_samples,
+              link_age_s: health.since_s, bus_fallbacks: stats.bus_fallbacks,
+              playing: playing };
+    for (var k in (detail || {})) d[k] = detail[k];
+    emit('fallback', d);
+    dropLink(old);
+    stallTicks = 0; muteTicks = 0; lastSamples = -1;
+    scheduleRebuild();
+    return true;
+  }
+
+  /* ...AND BACK, when a new loopback proves itself. Built on the OTHER sink,
+     in case the element was the part that died, and retried with a doubling
+     gap so a device that cannot hold a loopback is not rebuilding one every
+     ten seconds for the rest of the drive. */
+  function scheduleRebuild() {
+    if (rebuildTimer !== null || !root.setTimeout) return;
+    rebuildGapMs = rebuildGapMs
+      ? Math.min(rebuildGapMs * 2, limits.rebuild_max_ms)
+      : limits.rebuild_ms;
+    rebuildTimer = root.setTimeout(function () {
+      rebuildTimer = null;
+      if (covered || !fallback) return;
+      var c = ctx;
+      if (!c || c.state !== 'running') { scheduleRebuild(); return; }
+      if (sinks[1 - activeSink]) activeSink = 1 - activeSink;
+      startLoopback().then(function (ok) {
+        if (!ok) {
+          stats.restore_failures++;
+          emit('restore_failed', { why: fallback ? fallback.why : null,
+                                   next_ms: Math.round(rebuildGapMs * 2) });
+          scheduleRebuild();
+          return;
+        }
+        stats.restores++;
+        var was = fallback;
+        fallback = null;
+        rebuildGapMs = 0;
+        emit('restored', { why: was ? was.why : null,
+                           down_ms: was ? Math.round(nowMs() - was.at) : null,
+                           restores: stats.restores });
+      });
+    }, rebuildGapMs);
   }
 
   /* WHEN A REBUILD IS WORTH ITS SEAM. Two triggers, and both are cumulative
@@ -539,7 +790,15 @@
                  jitter_growth_ms: 120,        // buffer moved this far
                  drift_ms: 150,                // clocks this far apart
                  min_gap_ms: 30000,            // never more often than this
-                 max_gap_ms: 600000 };         // ...and eventually, not at all
+                 max_gap_ms: 600000,           // ...and eventually, not at all
+                 // The dead-link proof and watchdog. See flowing(), watchdog().
+                 proof_ms: 3000,               // samples must arrive by then
+                 stall_ticks: 3,               // seconds of no new samples
+                 mute_ticks: 3,                // loud ticks with a silent sink
+                 sound_db: -50,                // the bus is making a sound
+                 sink_floor_db: -75,           // ...and the sink is not
+                 rebuild_ms: 10000,            // first retry after a fallback
+                 rebuild_max_ms: 300000 };
   var lastResyncAt = 0;
   var backoffMs = 0;
   var lastConcealRate = null;
@@ -691,6 +950,7 @@
     lastResyncAt = 0;                 // a resync is allowed immediately
     backoffMs = 0;                    // ...and the backoff starts again: this
     lastConcealRate = null;           // is a different audio route
+    stallTicks = 0; muteTicks = 0; lastSamples = -1;
 
     emit('reclock', { why: why || 'wake' });
   }
@@ -852,6 +1112,55 @@
     return db < -100 ? -100 : db;
   }
 
+  function rmsDb(an, buf) {
+    try { an.getFloatTimeDomainData(buf); } catch (e) { return -100; }
+    var sum = 0;
+    for (var i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    var rms = Math.sqrt(sum / buf.length);
+    if (!(rms > 0)) return -100;
+    var db = 20 * Math.log10(rms);
+    return db < -100 ? -100 : db;
+  }
+
+  /* The loopback's delivered level in dBFS, or null when there is no meter
+     on it. A paused sink delivers nothing, whatever the stream carries. */
+  function sinkRaw() {
+    var l = link;
+    if (!l || !l.meter || !l.meter.getFloatTimeDomainData) return null;
+    if (!l.el || l.el.paused || !l.el.srcObject) return -100;
+    var n = l.meter.fftSize;
+    if (!sinkScratch || sinkScratch.length !== n) sinkScratch = new Float32Array(n);
+    return rmsDb(l.meter, sinkScratch);
+  }
+
+  /* WHERE THE SOUND IS, for anything that wants to say she spoke.
+   *
+   *   path 'loopback'  db is the sink meter: after the peer connection.
+   *   path 'direct'    the bus is wired to ctx.destination, which IS the
+   *                    device; there is nothing further downstream this page
+   *                    can observe, so db is the bus level, and the path says
+   *                    so rather than dressing it up as a sink reading.
+   *   path 'none'      no bus, or a loopback with no meter: nothing to read.
+   *
+   * bus_db rides along so a caller can tell "she was silent" (bus at the
+   * floor) from "she spoke and it did not arrive" (bus loud, sink not). */
+  function sinkLevel() {
+    var busDb = level();
+    if (covered && link) {
+      var s = sinkRaw();
+      if (s === null) return { path: 'none', db: null, bus_db: busDb };
+      return { path: 'loopback', db: s, bus_db: busDb };
+    }
+    if (bus && toDestination) return { path: 'direct', db: busDb, bus_db: busDb };
+    return { path: 'none', db: null, bus_db: busDb };
+  }
+
+  function path() {
+    if (covered) return 'loopback';
+    if (toDestination) return 'direct';
+    return 'none';
+  }
+
   root.RIO = root.RIO || {};
   root.RIO.output = {
     unlock: unlock,
@@ -865,12 +1174,23 @@
     playUrl: playUrl,
     playBlob: playBlob,
     level: level,
+    /* What arrived at the speaker side, and by which path. See sinkLevel. */
+    sinkLevel: sinkLevel,
+    path: path,
     stats: function () { return stats; },
     noteFallback: function () { stats.fallbacks++; },
     state: function () {
       return { covered: covered, ready: ready(),
                context: ctx ? ctx.state : 'none',
                to_destination: toDestination,
+               path: path(),
+               /* Non-null while the bus is on ctx.destination because the
+                  loopback died: why, and since when. */
+               fallback: fallback ? { why: fallback.why,
+                                      for_s: Math.round((nowMs() - fallback.at) / 100) / 10,
+                                      total_samples: fallback.total_samples,
+                                      link_age_s: fallback.link_age_s } : null,
+               last_fallback: lastFallback ? { why: lastFallback.why } : null,
                last_failure: lastFailure,
                decoded: Object.keys(buffers).length,
                stats: stats,
@@ -927,10 +1247,14 @@
       sinks = [null, null]; activeSink = 0;
       covered = false; toDestination = false; building = null; buffers = {};
       playing = 0; baseline = null; lastResyncAt = 0; listeners = [];
+      if (rebuildTimer !== null) { root.clearTimeout(rebuildTimer); rebuildTimer = null; }
+      fallback = null; lastFallback = null; rebuildGapMs = 0;
+      stallTicks = 0; muteTicks = 0; lastSamples = -1;
       backoffMs = 0; lastConcealRate = null;
       carried = { concealed: 0, concealment_events: 0, inserted: 0, removed: 0 };
       stats = { plays: 0, decoded: 0, fallbacks: 0, bus_failures: 0,
-                resyncs: 0, resync_failures: 0 };
+                resyncs: 0, resync_failures: 0,
+                bus_fallbacks: 0, restores: 0, restore_failures: 0 };
       health = { sample_rate: null, base_latency_ms: null,
                  output_latency_ms: null, concealed: 0, concealment_events: 0,
                  inserted: 0, removed: 0, total_samples: 0, packets_lost: 0,

@@ -249,6 +249,57 @@ function session(opts) {
     ok(h.ev('LIVE_TAIL_TIMEOUT').length === 1, 'and the timeout is an event');
   }
 
+  /* WHERE THE SOUND IS. The drive of 2026-09-28 (4ae33786) logged four
+     answers at heard_frac 1 into a loopback that carried nothing: every field
+     above is measured upstream of it. sink_* is read from
+     RIO.output.sinkLevel(), downstream -- stubbed here as the three states a
+     drive can be in. */
+  section('she spoke: measured at the sink, not at the bus');
+  {
+    const saved = globalThis.RIO;
+    const speak = async (sinkLevel) => {
+      globalThis.RIO = { output: { sinkLevel } };
+      const h = session();
+      const id = h.created();
+      h.audioStart(id);
+      h.delta(id, 'Loud and clear. You good?');
+      await tick(450);
+      h.transcriptDone(id, 'Loud and clear. You good?');
+      h.done(id, 'completed');
+      h.audioStop(id);
+      return h.ends()[0] || {};
+    };
+    try {
+      const dead = await speak(() => ({ path: 'loopback', db: -100, bus_db: -14 }));
+      ok(dead.heard_frac === 1 && dead.heard_ms >= 400,
+         `a dead link: the upstream ledger still says heard in full (heard_ms ${dead.heard_ms})`);
+      ok(dead.sink_path === 'loopback' && dead.sink_heard_ms === 0,
+         `...and the sink says nothing arrived (sink_heard_ms ${dead.sink_heard_ms}, path ${dead.sink_path})`);
+      ok(dead.sink_ticks >= 3 && dead.sink_peak_db === -100,
+         `measured, not defaulted (${dead.sink_ticks} ticks, peak ${dead.sink_peak_db})`);
+
+      const live = await speak(() => ({ path: 'loopback', db: -16, bus_db: -14 }));
+      ok(live.sink_path === 'loopback' && live.sink_heard_ms >= 300,
+         `a live link: the sink heard it (sink_heard_ms ${live.sink_heard_ms})`);
+      ok(live.sink_peak_db === -16, `at the sink's level (${live.sink_peak_db})`);
+
+      const direct = await speak(() => ({ path: 'direct', db: -14, bus_db: -14 }));
+      ok(direct.sink_path === 'direct' && direct.sink_heard_ms >= 300,
+         `a fallback says so: path direct (sink_heard_ms ${direct.sink_heard_ms})`);
+
+      const other = await speak(() => ({ path: 'loopback', db: -100, bus_db: -100 }));
+      ok(other.sink_path === 'not_on_bus' && other.sink_heard_ms === null,
+         `her voice never on the bus is not reported as silence (path ${other.sink_path}, ${other.sink_heard_ms})`);
+
+      delete globalThis.RIO;
+      const none = await speak(undefined);
+      ok(none.sink_path === null && none.sink_heard_ms === null,
+         `no output module, no claim (path ${none.sink_path})`);
+    } finally {
+      if (saved === undefined) delete globalThis.RIO; else globalThis.RIO = saved;
+    }
+  }
+
   console.log(failures ? `\nFAILED ${failures}/${checks} checks`
                        : `\nPASSED ${checks} checks`);
   process.exit(failures ? 1 : 0);
