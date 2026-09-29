@@ -498,10 +498,27 @@
           stats.spoke_this_response = true;
         }
         expectingHeard();
+        /* A STRAGGLER FROM A RESPONSE ALREADY CALLED OVER IS NOT PLAYED.
+           A barge-in or a turn call flushes her locally, at once; the cancel
+           reaches the server a round trip later, and xAI streams at about five
+           times real time, so up to a second of the cancelled answer can still
+           arrive -- and was being scheduled, audible under the driver or under
+           the turn call. The queue already refused it; the speaker now does
+           too. By the delta's own response_id where it has one, because by
+           then `expecting` may already be the turn call's response. */
+        var rid = ev.response_id || expecting;
+        if (playout && playout.isEnded && rid && playout.isEnded(rid)) {
+          stats.stragglers_dropped = (stats.stragglers_dropped || 0) + 1;
+          return;
+        }
         /* THE LEDGER FIRST, THEN THE SOUND. The queue is what the controller's
            tail waits on, so it must know about this chunk before anything can
            ask whether the audio is over. */
-        if (playout) playout.push(expecting, bytes.length);
+        var row = playout ? playout.push(expecting, bytes.length) : null;
+        if (row && row.ended) {
+          stats.stragglers_dropped = (stats.stragglers_dropped || 0) + 1;
+          return;
+        }
         if (speaker) speaker.play(bytes);
         /* AND THE CONTROLLER IS TOLD AUDIO STARTED, in its own vocabulary: on
            WebRTC output_audio_buffer.started said so, and nothing here will. */
@@ -886,6 +903,16 @@
          ninety seconds of the first drive. */
       levels: o.levels || function () { return null; },
       provider: prov,
+      /* HOW MUCH OF HER IS STILL QUEUED, for the controller's tail. xAI
+         generates about five times faster than real time, so response.done can
+         arrive with minutes of a long answer still to play; the queue knows to
+         the millisecond when it ends, and nothing else does. Null while it
+         cannot say (still generating). */
+      audioRemainingMs: function () {
+        var p = sess && sess.playout;
+        var left = p ? p.untilIdle() : null;
+        return (left === null || !isFinite(left)) ? null : left * 1000;
+      },
       send: function (obj) { sess.send(obj); },
       url: o.url || function (p) { return p; },
       transcript: function () {

@@ -256,6 +256,13 @@
       return worst;
     }
 
+    /* Has this response been called over -- drained, or flushed by a barge-in
+       or a pre-emption? Audio that arrives for it afterwards is a straggler. */
+    function isEnded(rid) {
+      var r = live[rid];
+      return !!(r && r.ended);
+    }
+
     function state() {
       var rows = {};
       for (var i = 0; i < order.length; i++) {
@@ -289,6 +296,7 @@
       },
       tick: tick,
       flush: flush,
+      isEnded: isEnded,
       drained: drained,
       idle: idle,
       untilIdle: untilIdle,

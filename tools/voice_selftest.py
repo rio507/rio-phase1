@@ -419,10 +419,12 @@ def run_scene_gate():
     # short clause, and nowhere near an essay. Raised from 300 with the cap
     # itself (240 -> 360, see config.py) after a normal two-sentence answer was
     # cut off mid-thought and filed as a token_cap cutoff.
-    ok(cap and cap <= 400,
-       f"a camera answer is capped at {cap} "
-       "tokens — measured at 23 words median and 44 at p95 against "
-       "instructions asking for one sentence")
+    # Since 2026-09-28 the cap is the API's maximum, not a length: a camera
+    # answer is kept short by the look() rules and the character, and on
+    # xai_voice max_output_tokens is ignored outright (measured).
+    ok(cap == 4096,
+       f"a camera answer's cap is the realtime API's maximum ({cap}), so it "
+       "can only stop a runaway, never cut an answer mid-clause")
     ok("max_output_tokens: lookAnswerMaxTokens" in js,
        "and the cap is applied to the follow-up response, where the answer is "
        "actually composed")

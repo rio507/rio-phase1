@@ -1164,8 +1164,9 @@ def run_nav_voice():
     low = instr.lower()
     ok("you call the turns" in low,
        "...and they say plainly that the turn calls are hers")
-    ok("i'll call each turn as we get there" in low,
-       "...with the sentence to use when a driver asks who is calling them")
+    ok("you will call each turn yourself" in re.sub(r"\s+", " ", low),
+       "...and what to say when a driver asks who is calling them -- described, "
+       "not given as a line to copy")
     # The internal boundary is architecture and must not have been softened to
     # make room for the voice change.
     ok("you answer. you do not announce." in low,

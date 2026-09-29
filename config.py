@@ -609,7 +609,13 @@ DEPTH_WINDOW_S = 120.0
 # What a spoken deep answer may run to. The reasoning model will happily write
 # an essay, and an essay read aloud in a car is a monologue nobody can
 # interrupt politely. Three or four sentences, then an offer to go on.
-DEEP_ANSWER_MAX_TOKENS = 320
+#
+# 320 -> 2,000 on 2026-09-28. "Tell me everything" has to be answerable, and
+# with DEEP_ANSWER_MAX_CHARS below enforcing the length by REFUSAL, a thorough
+# research answer was not shortened -- it was thrown away and she said she could
+# not find out. The tool's `rules` still ask her to keep a first answer to a few
+# sentences and offer more; this only stops a real answer being discarded.
+DEEP_ANSWER_MAX_TOKENS = 2000
 
 # ...AND WHAT IT MAY SPEND THINKING BEFORE IT WRITES THEM, because the API
 # takes ONE number for both and this is the second time that has cost an
@@ -662,7 +668,11 @@ DEEP_REASONING_MAX_TOKENS = 1200
 # handed. It is REFUSED, the same way a timeout or an empty answer is refused,
 # and RIO carries on in her own words. A refusal she can absorb beats a
 # paragraph she cannot stop.
-DEEP_ANSWER_MAX_CHARS = int(os.getenv("DEEP_ANSWER_MAX_CHARS", "1600"))
+#
+# 1,600 -> 8,000 on 2026-09-28, with DEEP_ANSWER_MAX_TOKENS: ~4 characters a
+# token, so the refusal now fires only past the answer budget itself -- a
+# runaway, not a thorough answer.
+DEEP_ANSWER_MAX_CHARS = int(os.getenv("DEEP_ANSWER_MAX_CHARS", "8000"))
 
 # Where the same question is asked of the SEARCH count rather than the length.
 # The instruction asks for at most NEWS_MAX_QUERIES_PER_QUESTION searches and
@@ -751,8 +761,28 @@ DEEP_ANSWER_TIMEOUT_S = 45.0
 # about 1,830, and 1,200 sits comfortably inside it rather than against it --
 # 37,194 of 40,000 in the pessimistic reading where every answer runs the whole
 # way to the ceiling.
-REALTIME_MAX_RESPONSE_TEXT_TOKENS = 300
-REALTIME_MAX_RESPONSE_AUDIO_TOKENS = 1200
+#
+# 4,096 BOTH WAYS, 2026-09-28: LENGTH IS THE CHARACTER'S, NOT THE CAP'S.
+#
+# Everything above sized the cap as "the longest a driver should sit through",
+# which made it a length -- and a length the driver hears as her being cut off.
+# The character now governs length ("match their pace": a quick question gets a
+# quick answer, "tell me everything" gets a real one), so the cap goes to the
+# most the API and the budget allow, and exists only to stop a runaway.
+#
+#   xai_voice (default)  NO CAP EXISTS. Measured 2026-09-28: max_output_tokens
+#                        is ignored on the session AND on response.create --
+#                        asked for 50, she spoke 267 s and 323 s, status
+#                        completed, status_details "unimplemented"; the session
+#                        never echoes the field. Nothing here reaches that
+#                        backend, and nothing needs to.
+#   openai fallbacks     4,096 is the largest integer the realtime API accepts
+#                        ("inf" is the only thing above it, and "inf" cannot be
+#                        budgeted). At 200,000 TPM a response at the full 4,096
+#                        plus today's ~7,400 floor still leaves ~8 tool turns a
+#                        minute against the 4 the budget is designed for.
+REALTIME_MAX_RESPONSE_TEXT_TOKENS = 4096
+REALTIME_MAX_RESPONSE_AUDIO_TOKENS = 4096
 
 
 def max_response_tokens() -> int:
@@ -815,7 +845,7 @@ REALTIME_MAX_RESPONSE_TOKENS = REALTIME_MAX_RESPONSE_TEXT_TOKENS
 # Named as two constants and a function rather than one number, because the
 # number is wrong for one of the two backends whichever value it holds, and a
 # single constant is how it was wrong in the first place.
-REALTIME_LOOK_ANSWER_TEXT_TOKENS = 60
+REALTIME_LOOK_ANSWER_TEXT_TOKENS = 4096
 # 240 -> 360, and the measurement that moved it. On the acceptance pass of
 # 2026-09-09 a normal two-sentence visual answer --
 #
@@ -840,7 +870,13 @@ REALTIME_LOOK_ANSWER_TEXT_TOKENS = 60
 # it is that a camera answer is one or two sentences and not an essay, and that
 # is enforced by the rules in the look() result, not by cutting her off
 # mid-clause. A ceiling should be the thing that never happens.
-REALTIME_LOOK_ANSWER_AUDIO_TOKENS = 360
+#
+# ...AND BOTH RAISED TO 4,096 on 2026-09-28, for the reason given at
+# REALTIME_MAX_RESPONSE_AUDIO_TOKENS: a camera answer is kept short by the look()
+# rules and by the character, not by a ceiling that cuts it mid-clause. On
+# xai_voice this cap is sent and ignored (measured); on the fallbacks it is now
+# the API's own maximum.
+REALTIME_LOOK_ANSWER_AUDIO_TOKENS = 4096
 
 
 def look_answer_max_tokens() -> int:

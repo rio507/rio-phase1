@@ -269,7 +269,7 @@ def run_instructions():
             ("the measurement wins", "the measured state outranks a teacher"),
             ("do not contradict", "never contradicts a running warning"),
             ("NEVER A COMMAND", "observation and suggestion only"),
-            ("I can't see your left", "the field-of-view sentence"),
+            ("cannot see beside or behind the car", "the field-of-view rule"),
             ("Do not fill it in", "and what is absent she does not invent"),
             ("MIND THE AGE ON EACH ONE", "the age discipline is stated"),
             ("about five seconds", "with the threshold in it"),

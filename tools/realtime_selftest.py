@@ -263,11 +263,12 @@ def run_text_session():
        and cap_audio == config.REALTIME_MAX_RESPONSE_AUDIO_TOKENS,
        f"the answer ceiling is stated in the units each mouth is billed in "
        f"({cap_text} text / {cap_audio} audio)")
-    ok(abs(cap_text / 8 - cap_audio / 35) < 10,
-       f"...and it is the SAME LENGTH either way — {cap_text / 8:.0f}s "
-       f"against {cap_audio / 35:.0f}s of speech — which is the thing the "
-       f"number is a proxy for and the thing that must not change with the "
-       f"voice")
+    # 4,096 BOTH WAYS since 2026-09-28: the cap is the API's largest integer,
+    # not a length. Length is the character's ("match their pace"); the cap
+    # only stops a runaway, so it no longer has to mean the same number of
+    # seconds under each voice.
+    ok(cap_text == cap_audio == 4096,
+       f"...and both are the realtime API's maximum ({cap_text} / {cap_audio})")
 
     # The instructions differ by the audio-tag paragraph and nothing else,
     # because tags are only reachable on the backend that can speak them.
@@ -323,26 +324,26 @@ def run_text_session():
             ("# Decision framework", "the framework for judging an "
                                      "observation nothing here provides"),
             ("# Pacing — silence is your default state",
-             "the pacing advice against answering"),
-            ("## Scenario 2 — Hazard", "her speaking first about a hazard"),
-            ("## Scenario 3 — Cool car spotted", "...or about a car she spotted"),
-            ("## Scenario 4 — Breaking long silence",
-             "...or to break a silence nobody asked her to break"),
-            ("## Scenario 6 — Vehicle health, nothing wrong",
-             "or the health dialogues, which travel with the health rules"),
-            ("## Scenario 7 — Vehicle health, something to say",
-             "...both of them")):
+             "the pacing advice against answering")):
         ok(gone not in instr, f"the live session is not sent {why}")
         ok(gone in config.SYSTEM_PROMPT,
            f"...while /talk, which needs it, still is ({gone})")
 
     # ...and her character is all still there. This is the half that would
     # make a saving into a regression.
-    for kept in ("You are RIO.", "# How you talk", "# Banned words",
-                 "# Your four tonal modes",
-                 "# Hard boundaries — you never", "## Scenario 1 — Greeting",
-                 "## Scenario 5 — Navigation question"):
+    for kept in ("You are RIO, a voice companion riding in the passenger seat.",
+                 "The car is where you are, not what you talk about.",
+                 "Match their pace.", "# Small talk",
+                 "# Being told, and being asked", "# Banned words",
+                 "# Hard boundaries — you never"):
         ok(kept in instr, f"and who she is survives it: {kept!r}")
+
+    # NO EXAMPLE LINES OF HERS, IN EITHER ASSEMBLY. Every example this prompt
+    # carried came back out of her word for word, so what she should say is
+    # described and never shown. The sample dialogues are gone from /talk too.
+    for prompt, name in ((config.SYSTEM_PROMPT, "/talk"), (instr, "live")):
+        ok("# Sample dialogues" not in prompt and "RIO: \"" not in prompt,
+           f"no sample dialogue or RIO: line in the {name} prompt")
 
     # THE HEALTH REGISTER IS NOT DROPPED, IT IS DELIVERED LATER. It applies to
     # the turns that ask about the car and to no others, and those turns carry
@@ -892,7 +893,7 @@ def run_failure():
            "the budget sent covers the reasoning AND the answer "
            f"({sent['max_output_tokens']} = {config.DEEP_ANSWER_MAX_TOKENS} "
            f"+ {config.DEEP_REASONING_MAX_TOKENS})")
-        ok(config.DEEP_REASONING_MAX_TOKENS >= 2 * config.DEEP_ANSWER_MAX_TOKENS,
+        ok(config.DEEP_REASONING_MAX_TOKENS >= 2 * 530,
            "and the thinking half is the generous one — a news question spent "
            "530 reasoning tokens across two searches before writing a word")
         ok(any(t.get("type") == "web_search" for t in (sent.get("tools") or [])),
@@ -1505,8 +1506,10 @@ def run_awareness():
        "announcing")
     ok(realtime.NAV_DIRECTIONS_TOOL_NAME in instr,
        "and names the tool that does it")
-    ok("there should be a Shell" in instr,
-       "the landmark phrasing is given as a sentence, not as a principle")
+    ok("say there should be one there, never that there" in flat_instr,
+       "the landmark rule is stated -- described, not given as a line to copy")
+    ok("there should be a Shell" not in instr,
+       "...and no example sentence of hers is carried for it")
     ok(all(p in instr for p in ("Round the distances", "not the way a screen "
                                 "lists them")),
        "and it asks for directions spoken the way a person gives them")
@@ -3451,12 +3454,21 @@ def run_two_tier():
     # answers long enough to matter. 35 is the median of that.
     per_s = 8 if config.VOICE_BACKEND == "elevenlabs" else 35
     seconds = cap / per_s
-    ok(seconds <= 40,
-       f"and it is short enough to be a limit rather than a formality "
+    # NOT A LENGTH ANY MORE. This asserted the cap stayed under 40 s of speech
+    # and asked for a raise to be argued for. It was, on 2026-09-28: the
+    # character governs length, the cap only stops a runaway, and on the
+    # default xai_voice backend max_output_tokens is ignored outright
+    # (measured: asked for 50, spoke 267 s). What is asserted now is that the
+    # fallbacks get the API's maximum, and that it is still a finite number the
+    # TPM arithmetic in run_session_cost can bound.
+    ok(cap == 4096,
+       f"the cap is the realtime API's largest integer, not a length "
        f"({cap} tokens, ~{seconds:.0f}s of speech under "
        f"{config.VOICE_BACKEND})")
-    ok(config.DEEP_ANSWER_MAX_TOKENS <= 400,
-       f"a deep answer is capped for speech too ({config.DEEP_ANSWER_MAX_TOKENS})")
+    ok(config.DEEP_ANSWER_MAX_CHARS >= 4 * config.DEEP_ANSWER_MAX_TOKENS,
+       f"a deep answer is refused only past its own budget, not for being "
+       f"thorough ({config.DEEP_ANSWER_MAX_CHARS} chars against "
+       f"{config.DEEP_ANSWER_MAX_TOKENS} tokens)")
 
     # 7. THE INSTRUCTIONS SAY THE SAME THING THE CODE ENFORCES.
     instr = re.sub(r"\s+", " ", cfg["instructions"])
@@ -3464,8 +3476,10 @@ def run_two_tier():
        "the two-tier policy is stated in the instructions")
     ok("THEN OFFER, DON'T DELIVER." in instr,
        "with the offer as its own rule")
-    ok("want to know more about it?" in instr,
-       "and the offer given as words rather than as a principle")
+    ok("offering to tell them more" in instr,
+       "and the offer described rather than given as words to copy")
+    ok("want to know more about it?" not in instr,
+       "...with no example line of hers in its place")
     ok("ONLY WHEN THEY ASK." in instr and "three or four sentences" in instr,
        "and depth gated on being asked, capped when it happens")
 

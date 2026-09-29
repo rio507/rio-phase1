@@ -784,6 +784,10 @@ section('health is answerable at any moment');
 finished = true;
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) { console.log(`${failures} FAILED`); process.exit(1); }
+/* EXIT ON THE SUMMARY. The arbiter's watchdog on an answer is ten minutes
+   now (it was 90 s), and a pending timer keeps node alive: this suite used to
+   linger ninety seconds after passing and would now linger ten minutes. */
+process.exit(0);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

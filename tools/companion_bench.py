@@ -15,7 +15,7 @@ THE RULE UNDER TEST: a statement is not a request.
   chat        "Do you like movies?" No tool, and no offer required: there is
               nothing to help with.
 
-THREE NUMBERS, per arm:
+THE NUMBERS, per arm:
 
   statements  no tool on the first turn AND an offer in the reply; and, as a
               second line, whether a bare "Yeah." then produces the tool call
@@ -23,6 +23,9 @@ THREE NUMBERS, per arm:
   openings    across every statement reply, how many DISTINCT first-two-word
               openings. A prompt that carries an example gets copied, and a
               copy shows up here as the same opening every time.
+  drive       chat and statement replies that talk about the drive, the trip,
+              the road or the journey when the driver's line did not. The car
+              is where she is, not what she talks about.
 
 ONE SESSION PER TRIAL, so nothing a previous utterance said can shape the next
 one, and the openings count measures the prompt rather than the conversation.
@@ -88,6 +91,7 @@ SET = [
     ("request", "What's that building?", "brief"),
     # --- statements: answer the person, offer, act on yes -------------------
     ("statement", "I'm feeling kinda hungry.", "brief"),
+    ("statement", "I'm kinda hungry.", "brief 2026-09-28"),
     ("statement", "I'm tired.", "brief"),
     ("statement", "This traffic is killing me.", "brief"),
     ("statement", "I could really use a coffee right now.", "written"),
@@ -101,8 +105,18 @@ SET = [
     ("chat", "I like comedy.", "log turn_phantom"),
     ("chat", "Do you like movies?", "log talk.transcript"),
     ("chat", "Hey, what's up", "log talk.transcript"),
+    ("chat", "Hello.", "log 4ae33786 driver_said"),
     ("chat", "Have you ever been to a service center?", "log talk.transcript"),
     ("chat", "Thanks for your help.", "log turn_phantom"),
+    # --- conversations: more than one line, in one session ------------------
+    # The complaint was never the first reply. On 4ae33786 "Hello." got "Hey.
+    # What's on your mind?" and the SECOND "Hello." got "Yeah, I'm here. How's
+    # the drive going?" -- small talk runs out on the second turn, and the trip
+    # is what is left. Lines separated by " | ", every reply scored.
+    ("convo", "Hello. | Hello.", "log 4ae33786 driver_said"),
+    ("convo", "Hello? | Can you hear me? | Hello?", "log 4ae33786 driver_said"),
+    ("convo", "Hey, what's up | Not much, you?", "written"),
+    ("convo", "Hello. | Nothing really. | Yeah.", "written"),
 ]
 
 YES = "Yeah."
@@ -138,6 +152,23 @@ _UNSOURCED = re.compile(
     r"coming up|(?:^|[.!?]\s+)there'?s an? |right (?:up|down) the|"
     r"just (?:up|down) the",
     re.I)
+
+
+# THE DRIVE AS SMALL TALK. "How's the drive going?", "just enjoying the
+# drive" -- the trip itself as her topic, which is what a service says. Counted
+# on chat and statement replies only, and only where the driver's own line did
+# not bring any of it up: "My back is killing me from this drive" invites the
+# word, "Hello." does not.
+_DRIVE_TALK = re.compile(
+    r"\b(?:drive|drives|driving|drove|trip|trips|road|roads|"
+    r"journey|journeys|"
+    # ...and the same habit in other words, seen in both arms: "Hey. Just
+    # cruising with you.", "Not much, just riding along."
+    r"cruise|cruising|ride|rides|riding)\b", re.I)
+
+
+def mentions_drive(text: str) -> bool:
+    return bool(_DRIVE_TALK.search(text or ""))
 
 
 def is_unsourced(text: str) -> bool:
@@ -219,6 +250,15 @@ async def one(kind, text, instructions, tools):
             if ev.get("type") == "error":
                 raise RuntimeError("session refused: " + str(ev.get("error"))[:300])
 
+        if kind == "convo":
+            lines = [x.strip() for x in text.split("|")]
+            turns = []
+            for line in lines:
+                c, s = await _turn(ws, line)
+                turns.append({"text": line, "calls": c, "said": s})
+            return {"kind": kind, "text": text, "turns": turns,
+                    "calls": [c for t in turns for c in t["calls"]],
+                    "said": " / ".join(t["said"] for t in turns)}
         calls, said = await _turn(ws, text)
         rec = {"kind": kind, "text": text, "calls": calls, "said": said}
         # THE SECOND HALF OF THE RULE: an offer is only right if "yeah" then
@@ -249,6 +289,26 @@ def score(recs):
     out["chat_no_tool"] = (sum(not r["calls"] for r in ch), len(ch))
     out["unsourced_claims"] = (sum(is_unsourced(r["said"]) for r in recs),
                                len(recs))
+    unprompted = [r for r in st + ch
+                  if r["said"] and not mentions_drive(r["text"])]
+    out["drive_mentions"] = (sum(mentions_drive(r["said"]) for r in unprompted),
+                             len(unprompted))
+    # Every reply in a conversation, each against everything the driver had
+    # said up to it.
+    cv, hits = [], 0
+    for r in recs:
+        if r["kind"] != "convo":
+            continue
+        heard = ""
+        for t in r.get("turns") or []:
+            heard += " " + t["text"]
+            if t["said"] and not mentions_drive(heard):
+                cv.append(t)
+                hits += mentions_drive(t["said"])
+    out["convo_drive_mentions"] = (hits, len(cv))
+    out["convo_no_tool"] = (sum(not r["calls"] for r in recs
+                                if r["kind"] == "convo"),
+                            sum(r["kind"] == "convo" for r in recs))
     said = [r["said"] for r in st if r["said"]]
     out["opens_want_me"] = (sum(opening(s, 2) == "want me" for s in said),
                             len(said))
@@ -329,8 +389,9 @@ def show(res):
 def compare(a, b):
     sa, sb = a["score"], b["score"]
     print(f"\n{'':<24} {a['label']:>12} {b['label']:>12}")
-    for k in sa:
-        print(f"{k:<24} {sa[k][0]:>7}/{sa[k][1]:<4} {sb[k][0]:>7}/{sb[k][1]:<4}")
+    for k in dict.fromkeys(list(sa) + list(sb)):
+        f = lambda s: f"{s[k][0]:>7}/{s[k][1]:<4}" if k in s else f"{'-':>12}"
+        print(f"{k:<24} {f(sa)} {f(sb)}")
 
 
 def main() -> int:
@@ -341,10 +402,20 @@ def main() -> int:
     ap.add_argument("--only", help="substring filter on the utterance text")
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
+    ap.add_argument("--rescore", nargs="+",
+                    help="recompute the score of saved runs with this file's "
+                         "scorer, in place")
     ap.add_argument("--gate", action="store_true",
                     help="exit non-zero unless the run passes the gate for a "
                          "new prompt section (see GATE_WANT_ME)")
     a = ap.parse_args()
+    if a.rescore:
+        for p in a.rescore:
+            res = json.load(open(p))
+            res["score"] = score(res["records"])
+            Path(p).write_text(json.dumps(res, indent=1))
+            show(res)
+        return 0
     if a.compare:
         compare(*(json.load(open(p)) for p in a.compare))
         return 0

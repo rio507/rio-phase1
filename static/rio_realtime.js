@@ -2064,19 +2064,46 @@
        there is no provider, which is every existing test. */
     var holdTail = provider ? provider.holdTail() : !!cfg.holdTail;
     var tailFallbackMs = cfg.tailFallbackMs || 15000;
+    /* FROM THE END OF THE SOUND, WHERE THE WIRE CAN SAY WHEN THAT IS.
+       tailFallbackMs was sized for an answer whose audio ends a moment after
+       its generation. On xAI a long answer is generated at about five times
+       real time, so response.done can arrive with minutes still queued -- and
+       a fallback counted from response.done gave the mouth back mid-answer,
+       letting the next turn call start on top of her. A wire that knows how
+       much is queued (rio_xai_session's playout) says so, and the fallback
+       starts after it. Null or absent: the old behaviour, unchanged. */
+    var audioRemainingMs = (typeof cfg.audioRemainingMs === 'function')
+      ? cfg.audioRemainingMs : null;
     var tailTimer = null;
     function armTail(rid) {
       if (tailTimer) clearTimeout(tailTimer);
+      var queued = 0;
+      if (audioRemainingMs) {
+        try {
+          var q = audioRemainingMs();
+          if (typeof q === 'number' && isFinite(q) && q > 0) queued = q;
+        } catch (e) { queued = 0; }
+      }
+      var after = tailFallbackMs + queued;
       tailTimer = setTimeout(function () {
         tailTimer = null;
         // The end of the audio never arrived. The mouth is not held forever
         // for it: give it back and say so.
         if (speaking && speaking.responseId === rid) {
-          emit('LIVE_TAIL_TIMEOUT', { response_id: rid, after_ms: tailFallbackMs });
+          emit('LIVE_TAIL_TIMEOUT', { response_id: rid, after_ms: Math.round(after),
+                                      queued_ms: Math.round(queued) });
           endResponse(rid);
         }
-      }, tailFallbackMs);
+      }, after);
     }
+    /* THE ARBITER'S WATCHDOG ON AN ANSWER, which is there for an entry whose
+       promise never settles -- not as a length. It was 90 s, and an answer
+       longer than that was stopped mid-sentence: muted, cancelled, gone. The
+       character governs length now and the xAI session measured 143-323 s for
+       "tell me everything", so this sits above the longest measured. It holds
+       up nothing that matters while it runs: warnings and turn calls outrank
+       conversation and cut through, and a newer answer supersedes this one. */
+    var answerWatchdogMs = cfg.answerWatchdogMs || 600000;
     /* A vetted answer read into the session is injected the same way a warning
        is, and waits a different length of time for it. See injectDirect. */
     var directSpeechTimeoutMs = cfg.directSpeechTimeoutMs || 2500;
@@ -2444,9 +2471,9 @@
         text: opts.text || '',
         meta: { source: 'realtime', response_id: responseId },
         // No TTL: an answer does not expire on a clock the way a turn does.
-        // The watchdog is long because a considered answer can run to several
-        // sentences, and longer still while a tool is running.
-        maxMs: 90000,
+        // The watchdog is for an entry that never settles, not a length; see
+        // answerWatchdogMs.
+        maxMs: answerWatchdogMs,
         play: function () {
           return new Promise(function (resolve) { entry.resolve = resolve; });
         },
@@ -4548,6 +4575,8 @@
           voice_backend: sink ? 'elevenlabs'
                               : ((provider && provider.name) || 'openai_realtime'),
           speaking_directly: !!(speaking && speaking.direct),
+          // The arbiter's watchdog on an answer. Not a length; see its note.
+          answer_watchdog_ms: answerWatchdogMs,
           voice: sink && sink.state ? sink.state() : null,
           generated: generated,
           response_id: speaking ? speaking.responseId : null,
@@ -4837,6 +4866,8 @@
           speakTimeoutMs: session.speak_timeout_ms,
           directSpeechTimeoutMs: session.direct_speech_timeout_ms,
           lookAnswerMaxTokens: session.look_answer_max_tokens,
+          // How much of her the wire still has queued; see armTail.
+          audioRemainingMs: w.audioRemainingMs || null,
           // Interruption policy, decided in config.py and carried here with
           // the session exactly as the dictation policy is. The browser holds
           // no numbers of its own to drift from the ones the tests check.
