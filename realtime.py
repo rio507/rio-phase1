@@ -949,9 +949,15 @@ VERBATIM_INSTRUCTION = (
 #
 # `instructions` on a response REPLACES the session's, so this has to be
 # self-contained: it says who she is, what happened, and how much of it to say.
-# Deliberately short. This is a continuation of a sentence, not a fresh turn,
-# and the failure to avoid is her restarting the whole answer -- which is what
-# the driver was doing by hand before this existed.
+# This is a continuation, not a fresh turn, and the failure to avoid is her
+# restarting the whole answer -- which is what the driver was doing by hand
+# before this existed.
+#
+# THE WHOLE REST OF IT, since 2026-09-28. This used to say "one or two short
+# sentences", which was right while every answer was one or two sentences. Once
+# the character let answers run long ("tell me everything"), a turn call thirty
+# seconds into a two-minute explanation meant the other ninety seconds were
+# replaced by a two-sentence wrap-up. Cut off is not the same as finished.
 #
 # Written here rather than in the browser for the same reason the verbatim
 # instruction is: what RIO is told to say is decided in one place, and the page
@@ -961,7 +967,8 @@ RESUME_INSTRUCTION = (
     "You were part-way through an answer and were cut off -- by background "
     "noise or by a safety announcement, NOT by the driver. Nobody asked you to "
     "stop and nobody has asked you anything new.\n"
-    "Finish that answer now, in one or two short sentences. Begin with "
+    "Finish that answer now -- all of the rest of it, at the length it "
+    "needs, as you would have if nothing had cut in. Begin with "
     "\"As I was saying\".\n"
     "Do NOT start the answer again, do not greet, do not apologise, and do not "
     "repeat what you already said -- carry on from where the text below "
