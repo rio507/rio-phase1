@@ -1184,7 +1184,10 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                # what, and what it jumped), every one taken back before it went,
                # every one the server never answered, and a hold that ran out.
                "create_waited", "create_withdrawn", "create_unanswered",
-               "gate_timeout")
+               "gate_timeout",
+               # ...and a HELD dictation checked again at release: dropped as
+               # no longer true, or re-read for where the car is now.
+               "dictation_dropped", "dictation_regenerated")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1357,6 +1360,7 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # tier, past how many that were there first.
                              "waited_ms", "wait_reasons", "priority",
                              "passed_over", "queue_depth",
+                             "revalidated", "held_ms", "new_text",
                              # Peer / element / microphone state, and whether
                              # the page was hidden when it changed.
                              "state", "ice", "was", "grace_ms", "expired",

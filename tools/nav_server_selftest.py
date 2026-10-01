@@ -845,6 +845,38 @@ def run_cadence():
            short, lambda m: "far" not in m.speech)
 
 
+def run_far_variants():
+    section("G1d. a held far call can be re-read for where the car is, never re-written")
+    from navigation import model as M, speech as S
+    for road_class, leg in (("SURFACE", 2000.0), ("HIGHWAY", 6000.0)):
+        man = M.CanonicalManeuver(
+            id="m1", sequence=1, type=M.TURN, direction=M.RIGHT,
+            road_name="Ocean Ave", latitude=0.0, longitude=0.0,
+            route_distance_position=leg, polyline_index=0, road_class=road_class)
+        sp = S.build(man, leg_m=leg)
+        near_at = next(t["at_m"] for t in sp["tiers"] if t["call"] == S.NEAR)
+        for tier in (t for t in sp["tiers"] if t["call"] in (S.FAR, S.FAR_MID)):
+            call, at_m = tier["call"], tier["at_m"]
+            rows = (sp.get("far_variants") or {}).get(call)
+            ok(bool(rows), f"{road_class} {call}: the route carries far_variants")
+            if not rows:
+                continue
+            ok(rows[0][0] == near_at,
+               f"{road_class} {call}: they start at the near call ({rows[0][0]} m), "
+               "inside which the far call is false whatever it says")
+            ok(all(rows[i][1] == rows[i + 1][0] for i in range(len(rows) - 1)),
+               f"{road_class} {call}: contiguous — every distance has one sentence")
+            ok(rows[-1][1] >= at_m,
+               f"{road_class} {call}: and they reach past the tier ({rows[-1][1]} m "
+               f">= {at_m} m)")
+            own = [r for r in rows if r[0] < at_m <= r[1]]
+            ok(own and own[0][2] == sp[call],
+               f"{road_class} {call}: the row at the tier IS the tier's sentence")
+            ok(all(r[2] == S.far_text(man, (r[0] + r[1]) / 2) for r in rows),
+               f"{road_class} {call}: every row is far_text()'s own words — one "
+               "writer, so a re-read can never say what the route would not")
+
+
 def run_distance_phrasing():
     section("G1c. distance — the closed set of phrases, and the roundings")
     from navigation import distance as dist_mod
@@ -1671,6 +1703,7 @@ def main():
     run_speech()
     run_cadence()
     run_distance_phrasing()
+    run_far_variants()
     run_nav_voice()
     run_variation()
     run_preferences()

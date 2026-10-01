@@ -108,6 +108,7 @@
     SPEECH_EXPIRED: 'NAV_SPEECH_EXPIRED',
     SPEECH_INVALIDATED: 'NAV_SPEECH_INVALIDATED',
     SPEECH_SPOKEN: 'NAV_SPEECH_SPOKEN',
+    SPEECH_REVALIDATED: 'NAV_SPEECH_REVALIDATED',
     /* QUEUED BEHIND SOMETHING, WHICH USED TO LOOK EXACTLY LIKE NOTHING.
        A call emits ROUTE_START_CALL when it is created and SPEECH_SPOKEN when
        it finishes, with the reason. Between those two there was no event at
@@ -204,6 +205,9 @@
     var perMan = {};              // maneuver_id -> bookkeeping
     var lastSpoken = {};          // text -> seconds, for duplicate suppression
     var clock = 0;                // tracker clock, seconds
+    // Where the car last was, against which maneuver. A held line is checked
+    // against THIS when it is released (see recheck in speak()).
+    var lastProgress = null;
     var stopped = false;
     var started = false;          // has the route-start line gone out?
     var counters = { candidates: 0, spoken: 0, invalidated: 0, expired: 0,
@@ -481,6 +485,80 @@
         return true;
       }
 
+      /* ...AND CHECKED AGAIN WHEN A HELD LINE IS RELEASED.
+       *
+       * valid() runs at dequeue, when the arbiter gives this line the mouth.
+       * On xAI the line can then be HELD before it reaches the server -- one
+       * response at a time (static/rio_xai_session.js) -- and a distance said
+       * after that hold can be an instruction for road already driven. So the
+       * transport asks, through the controller and rio_speak, at the instant
+       * it would send:
+       *
+       *   still valid, words still true      -> {ok: true}
+       *   a far call whose distance moved,   -> {ok: true, text}: the route's
+       *     maneuver still ahead                own sentence for where the car
+       *                                         is now, read from far_variants
+       *   a far call the car is now inside   -> dropped: the near call is the
+       *     the near call of                    instruction from here
+       *   route changed / maneuver passed /  -> dropped, with why
+       *     not the active maneuver / expired
+       *
+       * Every other tier is distance-free ("Turn right onto Ocean Ave.") and
+       * is true for as long as valid() is. Logged either way, so a drive shows
+       * which lines waited and what became of them. */
+      function why() {
+        if (stopped) return 'route_stopped';
+        if (candidate.route_generation !== activeGeneration()) return 'route_changed';
+        if (clock > candidate.expires_at) return 'expired';
+        if (o.arrival || !tracker) return null;
+        var active = tracker.maneuver ? tracker.maneuver() : null;
+        if (tracker.isPassed && tracker.isPassed(candidate.maneuver_id)) return 'maneuver_passed';
+        if (!active || active.id !== candidate.maneuver_id) return 'maneuver_not_active';
+        return null;
+      }
+      candidate.recheck = function () {
+        var dist = (lastProgress && lastProgress.maneuver_id === man.id)
+          ? lastProgress.dist : null;
+        var verdict;
+        var bad = why();
+        if (bad) {
+          verdict = { ok: false, why: bad };
+        } else if ((callType === CALL.FAR || callType === CALL.FAR_MID)
+                   && dist !== null && dist !== undefined) {
+          var nearAt = 0, tq = tiersOf(man);
+          for (var q = 0; q < tq.length; q++) if (tq[q].call === CALL.NEAR) nearAt = tq[q].at_m;
+          var rows = (man.speech && man.speech.far_variants
+                      && man.speech.far_variants[callType]) || null;
+          if (dist <= nearAt) {
+            verdict = { ok: false, why: 'inside_near_call' };
+          } else if (!rows) {
+            verdict = { ok: true };      // an older route: no table to read
+          } else {
+            var row = null;
+            for (var r = 0; r < rows.length; r++) {
+              if (dist > rows[r][0] && dist <= rows[r][1]) { row = rows[r]; break; }
+            }
+            if (!row) verdict = { ok: false, why: 'no_sentence_for_distance' };
+            else if (row[2] === candidate.text) verdict = { ok: true };
+            else verdict = { ok: true, text: row[2], regenerated: true };
+          }
+        } else {
+          verdict = { ok: true };
+        }
+        emit(EV.SPEECH_REVALIDATED, {
+          maneuver_id: man.id, call_type: callType,
+          verdict: !verdict.ok ? 'dropped'
+                   : (verdict.regenerated ? 'regenerated' : 'kept'),
+          why: verdict.why || null, text: candidate.text,
+          new_text: verdict.text || null,
+          to_maneuver_m: dist === null || dist === undefined ? null
+                         : Math.round(dist),
+          held_s: Math.round((clock - candidate.created_at) * 10) / 10
+        });
+        if (verdict.regenerated) candidate.text = verdict.text;
+        return verdict;
+      };
+
       var item = audio ? audio(candidate) : { play: function () { return Promise.resolve(); } };
       var said = false;
       arbiter.say({
@@ -652,6 +730,7 @@
         gps_state: ev.gps_state, speed_ms: ev.speed_ms
       };
       var dist = ev.to_maneuver_m;
+      lastProgress = { maneuver_id: man.id, dist: dist, t: clock };
       var speedMs = Math.max(0, ev.speed_ms || 0);
       var extra = biasM(speedMs);
       var stationary = speedMs < opt.stationary_speed_ms;

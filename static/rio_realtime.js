@@ -4395,7 +4395,9 @@
           if (typeof opts.onToken === 'function') {
             try { opts.onToken(token); } catch (e) {}
           }
-          dictation.timer = setTimeout(function () {
+          /* THE BUDGET, as a function, because a line HELD by the transport
+             starts it again at release. See releaseCheck. */
+          dictation.onBudget = function () {
             /* NEVER HEARD IT START -- AND IT IS STILL COMING.
              *
              * This is the two-voices bug. The budget expires, this gives up,
@@ -4418,10 +4420,14 @@
               try { send({ type: 'response.cancel' }); } catch (e) {}
             }
             finishDictation('timeout');
-          }, opts.timeoutMs || speakTimeoutMs);
+          };
+          dictation.budgetMs = opts.timeoutMs || speakTimeoutMs;
+          dictation.revalidate = (typeof opts.revalidate === 'function')
+            ? opts.revalidate : null;
+          dictation.timer = setTimeout(dictation.onBudget, dictation.budgetMs);
           try {
             audio.unmute();
-            send({
+            var sent = send({
               type: 'response.create',
               response: {
                 conversation: 'none',
@@ -4431,10 +4437,65 @@
                             rio_priority: String(createTier(line)) },
               },
             });
+            /* HELD, NOT LATE. The budget exists to notice a session that has
+               gone quiet; a line the transport is deliberately holding
+               behind another response is not that. If its owner can say at
+               release whether it is still true (nav can: position and route
+               generation), the budget stops here and starts again at release,
+               and the release check -- not a longer timeout -- is what keeps
+               a stale line off the speaker. A line with no such check keeps
+               its budget running through the hold, exactly as before. */
+            if (sent === 'held' && dictation && dictation.token === token
+                && dictation.revalidate) {
+              clearTimeout(dictation.timer);
+              dictation.timer = null;
+              dictation.held = true;
+            }
           } catch (e) {
             finishDictation('send_failed');
           }
         });
+      },
+
+      /* A HELD CREATE IS ABOUT TO BE SENT: is it still true?
+       *
+       * Called by the transport (rio_xai_session.js) at the instant it would
+       * release a create it held. Only a held DICTATION with an owner's check
+       * is asked; everything else goes as it is (null). The answer:
+       *
+       *   null                      not a line that can be checked: send it
+       *   {keep: true}              checked, still true: send it unchanged
+       *   {instructions, text}      send it with these words instead -- a far
+       *                             call re-read for where the car is now
+       *   {drop: true, why}         do not send it; the line is finished as
+       *                             'dropped:<why>' and rio_speak stays silent
+       *
+       * A line that goes is given its budget again from now: it waited on
+       * purpose, and the budget is about the session, not the wait. */
+      releaseCheck: function (tag) {
+        var d = dictation;
+        if (!d || d.tag !== tag || d.responseId || !d.revalidate) return null;
+        var v = null;
+        try { v = d.revalidate(); } catch (e) { v = null; }
+        var heldMs = Math.round(Date.now() - d.at);
+        if (v && v.ok === false) {
+          counters.dictation_dropped_stale = (counters.dictation_dropped_stale || 0) + 1;
+          emit('LIVE_DICTATION_DROPPED', { text: d.text, why: v.why || 'stale',
+                                           held_ms: heldMs, channel: d.channel });
+          finishDictation('dropped:' + (v.why || 'stale'));
+          return { drop: true, why: v.why || 'stale' };
+        }
+        if (d.held) {
+          d.held = false;
+          d.timer = setTimeout(d.onBudget, d.budgetMs);
+        }
+        if (v && v.text && v.text !== d.text) {
+          emit('LIVE_DICTATION_REGENERATED', { text: d.text, new_text: v.text,
+                                               held_ms: heldMs, channel: d.channel });
+          d.text = v.text;
+          return { instructions: verbatimInstruction + v.text, text: v.text };
+        }
+        return { keep: true };
       },
 
       /* GIVE THE MOUTH BACK, NOW — the other half of speak().

@@ -284,6 +284,9 @@
         // junction cannot be late; the far call, half a mile out, can.
         // Already on the candidate — it is the /nav/voice address above.
         callType: candidate.call_type,
+        // Asked again at the instant a HELD line is released -- see recheck
+        // in rio_navplan.js. Position and route generation, not the clock.
+        revalidate: candidate.recheck || null,
         /* NO ttsUrl. The synthesiser tier is gone: on 2026-09-16 it read
            these very turn calls out in the ElevenLabs voice underneath RIO
            while she was still speaking. A turn call with no clip is now

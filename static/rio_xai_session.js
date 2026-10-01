@@ -400,10 +400,10 @@
                  priority: entry.prio, reason: why || 'queue',
                  wait_s: wait === Infinity ? null : wait });
           pending.push(entry);
-          return;
+          return 'held';
         }
         launch(entry);
-        return;
+        return 'sent';
       }
       try { ws.send(JSON.stringify(out)); } catch (e) {}
     }
@@ -525,6 +525,19 @@
         }
       }
       pending.splice(i, 1);
+      /* STILL TRUE? Asked of the line's owner at the instant it would go -- a
+         held turn call can be about road already driven. Dropped, re-worded,
+         or sent as it is; see releaseCheck in rio_realtime.js. */
+      var verdict = null;
+      if (entry.tag && typeof opts.releaseCheck === 'function') {
+        try { verdict = opts.releaseCheck(entry.tag); } catch (e) { verdict = null; }
+      }
+      var outcome = 'kept';
+      if (verdict && verdict.drop) outcome = 'dropped';
+      else if (verdict && verdict.instructions) {
+        outcome = 'regenerated';
+        entry.ev.response.instructions = verdict.instructions;
+      }
       var passed = 0;
       for (var k = 0; k < pending.length; k++) if (pending[k].seq < entry.seq) passed++;
       stats.creates_waited++;
@@ -532,7 +545,10 @@
              priority: entry.prio,
              waited_ms: Math.round((now() - entry.at) * 1000),
              wait_reasons: Object.keys(entry.reasons).join(','),
-             passed_over: passed, queue_depth: pending.length });
+             passed_over: passed, queue_depth: pending.length,
+             revalidated: verdict ? outcome : null,
+             why: (verdict && verdict.why) || null });
+      if (outcome === 'dropped') { stats.creates_dropped_stale = (stats.creates_dropped_stale || 0) + 1; return; }
       launch(entry);
     }
 
@@ -1026,6 +1042,12 @@
     var sess = open({
       mint: session, controller: proxy, provider: prov,
       ctx: ctx, destination: gain, mic: o.mic,
+      /* A held create is checked with its owner at release. The controller
+         does not exist yet; by the time anything is released it does. */
+      releaseCheck: function (tag) {
+        return (controller && controller.releaseCheck)
+          ? controller.releaseCheck(tag) : null;
+      },
       /* The node suite's seams, passed straight through: the socket, the clock,
          the ticker and the queue library. All undefined in a browser, which is
          what makes them seams rather than configuration. */
@@ -1071,7 +1093,7 @@
         var left = p ? p.untilIdle() : null;
         return (left === null || !isFinite(left)) ? null : left * 1000;
       },
-      send: function (obj) { sess.send(obj); },
+      send: function (obj) { return sess.send(obj); },
       withdraw: function (tag) { return sess.withdraw(tag); },
       url: o.url || function (p) { return p; },
       transcript: function () {

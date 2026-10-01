@@ -3640,6 +3640,8 @@ const LIVE_REPORTED = {
      an answer the driver never heard are the same event seen from two ends. */
   LIVE_ORPHAN_CLAIM_EXPIRED: 'orphan_claim_expired',
   XAI_REQUEST_RELEASED: 'create_waited',
+  LIVE_DICTATION_DROPPED: 'dictation_dropped',
+  LIVE_DICTATION_REGENERATED: 'dictation_regenerated',
   XAI_REQUEST_WITHDRAWN: 'create_withdrawn',
   XAI_CREATE_UNANSWERED: 'create_unanswered',
   XAI_GATE_TIMEOUT: 'gate_timeout',
@@ -4004,6 +4006,9 @@ function reportLive(ev) {
           priority: ev.priority === undefined ? null : ev.priority,
           passed_over: ev.passed_over === undefined ? null : ev.passed_over,
           queue_depth: ev.queue_depth === undefined ? null : ev.queue_depth,
+          revalidated: ev.revalidated || null,
+          held_ms: ev.held_ms === undefined ? null : ev.held_ms,
+          new_text: ev.new_text || null,
           during: ev.during || null,
           yielded: ev.yielded === undefined ? null : ev.yielded,
           /* Peer, element and microphone state, and whether the page was

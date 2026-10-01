@@ -42,6 +42,9 @@ REROUTE_FAILED = "NAV_REROUTE_FAILED"
 SPEECH_EXPIRED = "NAV_SPEECH_EXPIRED"
 SPEECH_INVALIDATED = "NAV_SPEECH_INVALIDATED"
 SPEECH_SPOKEN = "NAV_SPEECH_SPOKEN"
+# A line held before it reached the session, checked again at release:
+# kept, regenerated (a far call re-read for the car's position) or dropped.
+SPEECH_REVALIDATED = "NAV_SPEECH_REVALIDATED"
 ARRIVED = "NAV_ARRIVED"
 
 ALL = tuple(v for k, v in sorted(globals().items())

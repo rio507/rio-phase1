@@ -262,7 +262,10 @@
                onToken: noteDictationToken,
                // Which channel this line belongs to, so the drive log can say
                // whether a nav line or a warning was the one that was slow.
-               channel: opts.channel || null, callType: opts.callType || null };
+               channel: opts.channel || null, callType: opts.callType || null,
+               // The owner's own check, run if this line is held before it is
+               // sent and then released (xAI's one-response gate).
+               revalidate: opts.revalidate || null };
     }
 
     function text() { return (opts.text || '').trim(); }
@@ -314,6 +317,14 @@
 
     function fallback(reason) {
       if (stopped) return Promise.resolve();
+      /* DROPPED AT RELEASE BY ITS OWNER: held behind another response, then
+         found false when it could finally be sent -- a turn already passed, a
+         route replaced. A clip of the same instruction is just as false, so
+         there is no fallback: silence, with the reason. */
+      if (/^dropped:/.test(String(reason || ''))) {
+        silent(reason, 'dropped_at_release');
+        return Promise.resolve();
+      }
       /* THE ONE CASE THIS MUST REFUSE. Dictation that never started can be
          replaced; dictation that HAS started is already coming out of the
          speaker, and synthesising the same sentence underneath it is the

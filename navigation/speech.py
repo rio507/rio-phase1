@@ -254,6 +254,38 @@ def far_text(maneuver: "M.CanonicalManeuver", at_m: float,
     return f"{D.in_phrase(at_m, units)}, {action_phrase(maneuver)}."
 
 
+def far_variants(maneuver: "M.CanonicalManeuver", at_m: float, near_at_m: float,
+                 units: str = D.IMPERIAL, step_m: float = 5.0) -> List[list]:
+    """[[from_m, to_m, sentence], ...] for every distance a far call could be
+    RELEASED at, nearest first.
+
+    WHY. A far call is fired at its tier and spoken when the mouth is free.
+    On xAI a dictated line can be held while a response finishes generating
+    (static/rio_xai_session.js, the single-response gate), and "In half a
+    mile" released 300 m later is an instruction for a different stretch of
+    road. So at release the browser re-reads the sentence for where the car IS
+    -- and it reads it, it does not write it: every phrase the car could be in,
+    from just outside the near call out to well past the tier, is written here
+    at route load by far_text(), the same function that wrote the original.
+    Nothing formats language while the car is moving (§23).
+
+    Contiguous runs of one sentence collapse into one row; `from_m` is
+    exclusive of the near call's distance, because inside it the far call is
+    false whatever it says and the near call is the instruction.
+    """
+    rows: List[list] = []
+    hi = max(float(at_m), 0.0) * 1.5 + step_m
+    d = float(near_at_m) + step_m
+    while d <= hi:
+        text = far_text(maneuver, d, units)
+        if rows and rows[-1][2] == text:
+            rows[-1][1] = round(d, 1)
+        else:
+            rows.append([round(d - step_m, 1), round(d, 1), text])
+        d += step_m
+    return rows
+
+
 def near_text(maneuver: "M.CanonicalManeuver",
               chained: Optional["M.CanonicalManeuver"] = None) -> str:
     """"Turn right onto Ocean Ave." — or with the next move chained on.
@@ -647,10 +679,14 @@ def build(maneuver: "M.CanonicalManeuver", destination_name: str = "",
 
     tiers = tiers_for(maneuver, leg_m)
     out: dict = {"tiers": tiers}
+    near_at = next((t["at_m"] for t in tiers if t["call"] == NEAR), 0.0)
     for tier in tiers:
         call, at_m = tier["call"], tier["at_m"]
         if call in (FAR, FAR_MID):
             out[call] = far_text(maneuver, at_m, units)
+            # The same call's sentence for wherever it might be RELEASED.
+            out.setdefault("far_variants", {})[call] = far_variants(
+                maneuver, at_m, near_at, units)
         elif call == NEAR:
             out[NEAR] = near_text(maneuver, chained)
         elif call == JUNCTION:
@@ -721,7 +757,8 @@ def text_for(route: "M.CanonicalRoute", maneuver_id: str, call_type: str,
             if a.get("anchor_id") == anchor_id:
                 return a.get("speech") or man.speech.get(NEAR)
         return None      # an anchor that is not on this route is not a sentence
-    # `clips` and `tiers` live in the same dict and are not sentences.
+    # `clips`, `tiers` and `far_variants` live in the same dict and are not
+    # sentences.
     # CALL_TYPES is closed so no caller can ask for them, but a lookup that
     # would return a dict to a text endpoint is worth refusing by name.
     if call_type not in CALL_TYPES:
