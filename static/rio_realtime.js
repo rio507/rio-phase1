@@ -361,60 +361,25 @@
       if (out.status === 'routed') {
         var route = out.route || {};
         var dest = out.destination || route.destination || {};
-        // The first turns, taken from the ROUTE THIS CALL JUST LOADED rather
-        // than from the tracker.
-        //
-        // The tracker is already attached by the time this resolves — setRoute
-        // calls attach() before it returns — so a nav_status or a
-        // nav_directions in the same turn does see the route. But "already
-        // attached" and "has had a GPS fix" are different things, and until
-        // the first fix lands the tracker's distances are measured from the
-        // start of the route rather than from the car. Carrying the summary in
-        // this result means the confirmation RIO speaks needs no second call
-        // and cannot race anything: it is the route she just started, as the
-        // provider described it.
-        /* ONE TURN, AND IT IS NOT A LIST.
+        /* NO TURNS AT ALL, and this is the second time the payload has
+         * been cut for the same reason.
          *
-         * This handed over the first THREE maneuvers as `first_steps`, with a
-         * rule underneath saying not to read them out. On 2026-09-24 (session
-         * 1fd4de92) she read them out: the route locked and she recited the
-         * directions for twenty-one seconds.
+         * It used to carry the first THREE maneuvers, and on 2026-09-24
+         * (session 1fd4de92) she recited them for twenty-one seconds. It was
+         * cut to ONE, `first_turn`, with a rule saying she "may name the first
+         * turn". On 2026-10-01 (drive 3d69ebaa) she did: the route engine
+         * called "Turn right." at 00:31:27.8, her confirmation was eaten by an
+         * orphan claim, and when the driver next spoke it came out fourteen
+         * seconds late -- "First turn's right toward Palisades Drive. Want the
+         * full turns?" -- about a turn already being made, already called, and
+         * with an offer to read the rest.
          *
-         * A rule against using what you were given loses to the thing you were
-         * given. Three numbered steps with instructions, road names and
-         * landmarks IS a list of directions, and an instruction not to read a
-         * list of directions is an instruction to ignore most of the payload.
-         * So the payload changes: the confirmation needs where they are going
-         * and what the first turn is, and that is all it now contains.
-         *
-         * A SINGLE OBJECT RATHER THAN A ONE-ELEMENT ARRAY, deliberately. An
-         * array of one is still an array and reads as the start of an
-         * enumeration; `first_turn` has nothing after it to enumerate.
-         *
-         * Every subsequent turn goes out on the route engine's own cadence --
-         * far, far_mid, near, junction, arrival -- in her voice, at the moment
-         * it matters. That is rio_navplan's job and it has never needed the
-         * model's help with it. */
-        var mans = route.maneuvers || [];
-        var m0 = null;
-        for (var mi = 0; mi < mans.length; mi++) {
-          if (mans[mi].type !== 'ARRIVE' && mans[mi].type !== 'DEPART') {
-            m0 = mans[mi]; break;
-          }
-        }
-        if (!m0) m0 = mans[0] || null;
-        var firstTurn = null;
-        if (m0) {
-          firstTurn = {
-            instruction: m0.instruction, road_name: m0.road_name,
-            maneuver_type: m0.type, direction: m0.direction,
-            // From the START of the route, not from the car: this is the route
-            // as loaded, before anyone has driven any of it.
-            distance_from_start_m: Math.round(m0.route_distance_position || 0),
-          };
-          var lm0 = landmarkOf(m0);
-          if (lm0) firstTurn.landmark = lm0;
-        }
+         * The first turn is never hers to say at route start: the engine's
+         * depart call says it, in her voice, the moment the route locks. So
+         * anything she says about it is that turn said twice, and a turn in the
+         * payload is an invitation to. The confirmation is where and how long;
+         * every turn goes out on the route engine's cadence, and a driver who
+         * wants one ASKS -- nav_status, nav_directions -- which is answering. */
         return {
           ok: true, routing: true, status: 'routed',
           // The provider's own spelling of the place, not the driver's and
@@ -425,21 +390,20 @@
           distance_km: route.total_distance_m
             ? Math.round(route.total_distance_m / 100) / 10 : null,
           eta_epoch: route.eta_epoch || null,
-          total_maneuvers: mans.length,
-          first_turn: firstTurn,
           rules: 'The route is live and you are taking them there now. ' +
                  'Confirm it in ONE SENTENCE, in your own words and in the ' +
-                 'FIRST PERSON — "I\'ve got it, about eighteen minutes" — ' +
-                 'using this destination name exactly as spelled here. You ' +
-                 'may name the first turn and nothing after it. There is only ' +
-                 'one turn here because one is all a confirmation carries; ' +
-                 'the rest are not withheld, they go out in your voice as the ' +
-                 'car reaches them. Do NOT tell the driver to set it ' +
-                 'themselves; it is set. If they ASK for the directions, call ' +
-                 'nav_directions and read them — that is answering. What you ' +
-                 'never do is call a turn early; if the driver asks who is ' +
-                 'calling them the answer is you: "I\'ll call each turn as we ' +
-                 'get there."',
+                 'first person: where you are taking them, by this destination ' +
+                 'name exactly as spelled here, and roughly how long it takes. ' +
+                 'NO TURNS: not the first one, not how many, and no offer to ' +
+                 'read them. The first turn has already been called in your ' +
+                 'voice as the route started, and each one after it goes out ' +
+                 'the same way as the car reaches it. Do NOT tell the driver ' +
+                 'to set it themselves; it is set. If they ASK for the ' +
+                 'directions or the next turn, that is a question: call ' +
+                 'nav_directions or nav_status and answer it. What you never ' +
+                 'do is call a turn early, or read turns nobody asked for. ' +
+                 'Asked who is calling the turns, the answer is you, in the ' +
+                 'first person.',
         };
       }
       if (out.status === 'ambiguous') {

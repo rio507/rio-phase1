@@ -1693,70 +1693,54 @@ function panelTools() {
      + ' minutes)');
   ok(/do NOT tell the driver to set it themselves/i.test(out.rules || ''),
      'and the result itself closes the door on the old behaviour');
-  ok(/If they ASK for the directions, call nav_directions/i.test(out.rules || ''),
-     'and points her at the tool for when they ask for the turns — reading '
-     + 'them is answering');
   ok(/never do is call a turn early/i.test(out.rules || ''),
      'while leaving the TIMING exactly where it was: not hers');
-  ok(/I'll call each turn as we get there/i.test(out.rules || ''),
-     '...and giving her the sentence for when the driver asks who is');
-  /* ONE TURN, AND NOT A LIST OF THEM. This asserted three `first_steps`, and
-     on 2026-09-24 she read all three out: the route locked and she recited
-     directions for twenty-one seconds. A rule against using the payload loses
-     to the payload. */
-  ok(out.first_steps === undefined,
-     'NO step list is handed over at route start — three numbered steps with '
-     + 'road names IS a list of directions, whatever the rules say about it');
-  ok(out.first_turn && !Array.isArray(out.first_turn),
-     'the first turn is a single object, not an array of one — an array of '
-     + 'one still reads as the start of an enumeration');
-  ok(out.total_maneuvers === 3,
-     'the COUNT is still there, because "about eighteen minutes and a few '
-     + 'turns" is a confirmation (' + out.total_maneuvers + ')');
-  ok(out.first_turn.road_name === 'Lincoln Boulevard'
-     && out.first_turn.distance_from_start_m === 400,
-     'with a real road name and a real distance (' + out.first_turn.road_name
-     + ' at ' + out.first_turn.distance_from_start_m + ' m)');
-  ok(/ONE SENTENCE/.test(out.rules || '')
-     && /first turn and nothing after it/i.test(out.rules || ''),
-     'and the rules say one sentence and one turn');
+  ok(/first person/i.test(out.rules || '') && !/["\u201c\u201d]/.test(out.rules || ''),
+     '...and saying who calls the turns is described, not quoted — every '
+     + 'quoted line in a prompt has come back word for word ("I\'ve got it —" '
+     + 'on drive 3d69ebaa)');
+  /* NO TURNS AT ALL. Three `first_steps` became a twenty-one-second recitation
+     on 2026-09-24; one `first_turn` became "First turn's right toward
+     Palisades Drive. Want the full turns?" on 2026-10-01, fourteen seconds
+     after the route engine had already called that turn. The engine's depart
+     call says the first turn at route start, so a turn in this payload can only
+     ever be the same turn twice. */
+  ok(out.first_steps === undefined && out.first_turn === undefined
+     && out.total_maneuvers === undefined,
+     'no turn, no step list and no turn count is handed over at route start');
+  const payload = JSON.stringify(out);
+  ok(!/Lincoln|Sepulveda|Century|Ocean Park/.test(payload),
+     'and no road from the route appears anywhere in the result');
+  ok(/ONE SENTENCE/.test(out.rules || '') && /NO TURNS/.test(out.rules || '')
+     && /no offer to read them/i.test(out.rules || ''),
+     'the rules say one sentence, no turns, and no offer to read them');
+  ok(/ASK for the directions or the next turn/i.test(out.rules || '')
+     && /nav_directions or nav_status/.test(out.rules || ''),
+     'while a driver who ASKS still gets an answer — a request is not narration');
   ok(out.eta_epoch === 1787790000,
      'and the ETA, which is the other half of a confirmation');
   ok(h.types().indexOf('response.create') >= 0,
      'she is then asked to say so out loud — the driver hears a confirmation, '
      + 'not silence');
 
-  /* A ROUTE-START UTTERANCE WITH MORE THAN ONE MANEUVER IN IT IS A FAILURE.
+  /* A ROUTE-START UTTERANCE THAT NAMES A TURN IS A FAILURE.
    *
-   * The payload checks above stop the model being HANDED a list. This is the
-   * other end: what a confirmation may contain. On 2026-09-24 she recited the
-   * directions for twenty-one seconds at route lock, and a test that only
-   * looked at the payload would have called that a pass the day somebody put
-   * the steps back.
-   *
-   * Counted on the turn verbs rather than on length, because "about eighteen
-   * minutes, first left onto Lincoln" is a good confirmation and a long one,
-   * while "turn left, then right, then merge" is a short list. */
-  const MANEUVER = /\b(turn (?:left|right)|bear (?:left|right)|keep (?:left|right)|head (?:north|south|east|west)|continue onto|merge onto|take (?:the )?exit|take the ramp|at the roundabout|make a u-turn)\b/gi;
-  const maneuversIn = (t) => ((t || '').match(MANEUVER) || []).length;
-
-  const goodLine = "I've got it — LAX, about eighteen minutes. First turn "
-                 + 'left onto Lincoln Boulevard.';
+   * The payload checks above stop the model being HANDED a turn. This is the
+   * other end: what a confirmation may contain, so a test that only looked at
+   * the payload cannot call it a pass the day somebody puts a turn back. */
+  const TURN_TALK = /\b(turns?(?:'s)? (?:left|right)|first turn|next turn|full turns|the turns|bear (?:left|right)|keep (?:left|right)|head (?:north|south|east|west)\w*|continue onto|merge onto|take (?:the )?exit|at the roundabout|make a u-turn)\b/i;
+  const goodLine = 'Taking you to Los Angeles International Airport, about '
+                 + 'eighteen minutes.';
+  const driveLine = "I've got it — Laemmle Monica Film Center, about twenty "
+                  + "minutes. First turn's right toward Palisades Drive. Want "
+                  + 'the full turns?';
   const recitation = 'Head east on Ocean Park, then turn left onto Lincoln '
-                   + 'Boulevard, then continue onto Sepulveda, then take the '
-                   + 'exit for Century Boulevard, then bear right at the '
-                   + 'terminal loop.';
-  ok(maneuversIn(goodLine) === 1,
-     `a confirmation names ONE turn (${maneuversIn(goodLine)})`);
-  ok(maneuversIn(recitation) > 1,
-     'and the drive\'s recitation is caught — ' + maneuversIn(recitation)
-     + ' maneuvers in one route-start utterance is a list, not a '
-     + 'confirmation');
-  // The payload is what decides which of those two she can produce.
-  const turnsAvailable = out.first_turn ? 1 : 0;
-  ok(turnsAvailable <= 1,
-     'and the result can only support the first of them — ' + turnsAvailable
-     + ' turn in the payload, so a list has nothing to be built from');
+                   + 'Boulevard, then continue onto Sepulveda.';
+  ok(!TURN_TALK.test(goodLine), 'a confirmation is where and how long');
+  ok(TURN_TALK.test(driveLine),
+     "drive 3d69ebaa's line is caught — one turn, re-read after the engine "
+     + 'called it, and an offer of the rest');
+  ok(TURN_TALK.test(recitation), "and so is 2026-09-24's recitation");
 
   // ROUTE ACTIVE, checked the way the driver would check it: by asking.
   const st = rt.navStatus();
