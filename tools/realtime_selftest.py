@@ -3497,6 +3497,45 @@ def run_two_tier():
 
 
 # ---------------------------------------------------------------------------
+# B1b. The slow tool speaks first; the instant ones do not
+# ---------------------------------------------------------------------------
+# Drive 3d69ebaa (2026-10-01): deep_dive took 15.9 s and the calling response
+# said 0 characters -- 18.2 s of nothing. The schema's "say a short natural line
+# before calling it" was cut in a token trim on 2026-09-05; the addendum kept a
+# rule, last in the prompt, after four "nothing goes before it"s, and with its
+# example line taken out. tools/holding_line_bench.py, 5 trials x 6 slow
+# questions, one fresh xAI session each:
+#
+#                          before     after (two runs)
+#   slow spoke first       2/25       30/30, 30/30
+#   distinct lines         1          13/30, 9/30
+#   instant tools silent   20/20      20/20, 20/20
+#
+# This pins the text that did it: the instruction is ON THE TOOL, says the
+# order, and gives no words to copy -- and the instant tools keep theirs.
+def run_holding_line():
+    section("deep_dive speaks first, in its own words; instant tools do not")
+    tools = {t["name"]: t for t in realtime.session_config()["tools"]}
+    dd = re.sub(r"\s+", " ", tools[realtime.TOOL_NAME]["description"])
+    ok("SPEAK FIRST" in dd and "before the call" in dd,
+       "deep_dive's own description says to speak, and before the call")
+    ok("in your own words" in dd and not re.search(r"['\"‘“][A-Z][^'\"’”]{6,}['\"’”]", dd.replace("'one second'", "")),
+       "described, not quoted: no line of hers to copy")
+    instr = re.sub(r"\s+", " ", realtime.instructions())
+    ok("It is the one tool you speak BEFORE." in instr
+       and "The words first, the call after them." in instr,
+       "the addendum makes it the one exception, with the order stated")
+    ok("never the same stock phrase" in instr,
+       "and asks for the line to vary with the question")
+    ok("nothing goes before it" in instr
+       and "Both are instant, so just call them — no holding line." in instr,
+       "while find_places, nav_status and vehicle_status keep their silence")
+    look = re.sub(r"\s+", " ", tools[realtime.LOOK_TOOL_NAME]["description"])
+    ok("with nothing said in front of it" in look,
+       "and so does look")
+
+
+# ---------------------------------------------------------------------------
 # B2. The backend flip — one voice, everywhere, and where it came from
 # ---------------------------------------------------------------------------
 def run_backend(live: bool = False):
@@ -4028,6 +4067,7 @@ def main():
     run_places()
     run_fast_path()
     run_two_tier()
+    run_holding_line()
     if args.live:
         run_live()
         run_verbatim()
