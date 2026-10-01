@@ -280,7 +280,9 @@
       for (var i = 0; i < list.length; i++) {
         if (list[i].speech && list[i].speech.chained_to === man.id) {
           var b = perMan[list[i].id];
-          return !!(b && b.called[CALL.NEAR]);
+          // ...and only if that sentence was HEARD. A chained near call that
+          // went silent announced nothing, so this maneuver gets its own.
+          return !!(b && b.called[CALL.NEAR] && !b.nearSilent);
         }
       }
       return false;
@@ -561,6 +563,19 @@
 
       var item = audio ? audio(candidate) : { play: function () { return Promise.resolve(); } };
       var said = false;
+      /* WAS IT HEARD? The arbiter calls an item `spoken` when its play()
+         resolves -- and rio_speak resolves for a line dropped at release, and
+         rejects for one that fell to silence with no clip. Neither was heard.
+         So the result is read here, and a caller that needs "heard", not
+         "queued", is told which (o.onHeard / o.onSilent). */
+      var heard = false;
+      var play = function () {
+        var p;
+        try { p = item.play(); } catch (e) { heard = false; throw e; }
+        if (!p || typeof p.then !== 'function') { heard = true; return p; }
+        return p.then(function (r) { heard = !(r && r.heard === false); return r; },
+                      function (e) { heard = false; throw e; });
+      };
       arbiter.say({
         priority: candidate.priority,
         patient: candidate.patient,
@@ -572,11 +587,16 @@
                 anchor_id: candidate.anchor_id,
                 route_generation: candidate.route_generation },
         valid: valid,
-        play: item.play,
+        play: play,
         stop: item.stop,
         onDone: function (reason) {
           if (said) return;
           said = true;
+          if (reason === 'spoken' && heard) {
+            if (o.onHeard) { try { o.onHeard(); } catch (e) {} }
+          } else if (o.onSilent) {
+            try { o.onSilent(reason); } catch (e) {}
+          }
           if (reason === 'spoken') counters.spoken++;
           else if (reason === 'invalid') counters.invalidated++;
           else if (reason === 'expired') counters.expired++;
@@ -841,24 +861,58 @@
             if (!text) anchor = null;
           }
           if (!text) text = man.speech && man.speech[CALL.NEAR];
-          if (speak(man, CALL.NEAR, text, anchor, snapshot, { at_m: atM })) {
-            b.nearSpokenAt = clock;
-            /* A CHAINED SENTENCE IS THE NEXT MANEUVER'S NEAR CALL TOO.
-               "...then turn right onto Fell Street" is when the driver was
-               told about m1, so it is the instant m1's junction call measures
-               its ten seconds from. Without this the chained maneuver looks
-               like one that was never instructed, and its confirmation is
-               dropped as `no_near_call` -- the one turn on the route that most
-               needs confirming, because its instruction arrived early and
-               attached to something else. */
-            var chainId = man.speech && man.speech.chained_to;
-            if (chainId) book(chainId).nearSpokenAt = clock;
+          /* SAID MEANS HEARD, NOT QUEUED. nearSpokenAt used to be set the
+             moment this line was handed to the arbiter. The junction call is
+             suppressed within ten seconds of it, and from 150 m to 35 m takes
+             under ten seconds above ~26 mph -- so a near call that then went
+             silent (a dictation with no clip, a line dropped at release) took
+             the junction call down with it, and the turn got no instruction
+             at all. Now the clock starts when the driver heard it, and a near
+             call that was not heard leaves the junction call as the whole
+             instruction, exactly as when there was no room for one. */
+          var chainId = man.speech && man.speech.chained_to;
+          var nearOpts = {
+            at_m: atM,
+            onHeard: function () {
+              b.nearPending = false;
+              b.nearSpokenAt = clock;
+              /* A CHAINED SENTENCE IS THE NEXT MANEUVER'S NEAR CALL TOO.
+                 "...then turn right onto Fell Street" is when the driver was
+                 told about m1, so it is the instant m1's junction call
+                 measures its ten seconds from. Without this the chained
+                 maneuver looks like one that was never instructed, and its
+                 confirmation is dropped as `no_near_call` -- the one turn on
+                 the route that most needs confirming, because its instruction
+                 arrived early and attached to something else. */
+              if (chainId) book(chainId).nearSpokenAt = clock;
+            },
+            onSilent: function (why) {
+              b.nearPending = false;
+              b.nearSilent = true;
+              if (chainId) book(chainId).nearSilent = true;
+              emit(EV.CONTEXTUAL_CALL, {
+                maneuver_id: man.id, call_type: CALL.NEAR, text: text,
+                skipped: 'not_heard', why: why || null,
+                road_class: man.road_class || null
+              });
+            }
+          };
+          if (speak(man, CALL.NEAR, text, anchor, snapshot, nearOpts)) {
+            b.nearPending = true;
             if (anchor) b.context = CTX.CALLED;
           }
           continue;
         }
 
         if (call === CALL.JUNCTION) {
+          /* THE NEAR CALL IS STILL ON ITS WAY -- queued, held, or speaking.
+             Not decided yet: it may be heard (then the ten-second rule
+             applies) or go silent (then this line is the instruction). Asked
+             again on the next tick rather than settled now, so a near call
+             that fails late still leaves room for this one. */
+          if (b.nearPending && b.nearSpokenAt === undefined && !b.nearSilent) {
+            continue;
+          }
           b.called[call] = true;
           /* ...AND ONLY IF THE NEAR CALL WAS LONG ENOUGH AGO.
              The near call already named the road. This one exists to catch the
@@ -869,9 +923,10 @@
              an instruction. */
           var gap = (b.nearSpokenAt === undefined)
             ? null : (clock - b.nearSpokenAt);
-          // ...unless there was no room for a near call at all, in which case
-          // this two-word line is the whole instruction and must go out.
-          if (b.nearTooLate) gap = Infinity;
+          // ...unless there was no room for a near call at all, or it was
+          // never heard: then this two-word line is the whole instruction and
+          // must go out.
+          if (b.nearTooLate || b.nearSilent) gap = Infinity;
           if (gap === null || gap < opt.junction_min_gap_s) {
             emit(EV.JUNCTION_CALL, {
               maneuver_id: man.id, call_type: CALL.JUNCTION, text: null,

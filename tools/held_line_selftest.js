@@ -103,6 +103,19 @@ function fakeCtx() {
   };
 }
 
+function clipElement(played) {
+  const el = {
+    src: '', style: {}, muted: false, onended: null, onerror: null,
+    pause() {}, addEventListener() {}, removeEventListener() {},
+    play() {
+      if (el.src) played.push(el.src);
+      setTimeout(() => { if (el.onended) el.onended(); }, 0);
+      return Promise.resolve();
+    },
+  };
+  return el;
+}
+
 /* One car, one route, one session -- wired the way attach() wires them. */
 async function rig(opts) {
   opts = opts || {};
@@ -141,6 +154,7 @@ async function rig(opts) {
     speakTimeout: () => opts.budgetMs || 300,
   }) };
 
+  const clipsPlayed = [];
   const car = { active: 'm1', passed: {}, generation: 1 };
   const r = route();
   const tracker = {
@@ -152,10 +166,15 @@ async function rig(opts) {
   const planner = navplan.create({
     tracker, arbiter, route: r,
     activeGeneration: () => car.generation,
+    /* As rio_nav.audioFor builds it: the junction call plays its clip FIRST
+       (dictation is its contingency), every other tier is dictated. The
+       element ends the way a real one does, and the clip is counted. */
     audio: (candidate) => RIO.speak.provider({
       text: candidate.text, channel: 'nav', callType: candidate.call_type,
       revalidate: opts.noRevalidate ? null : candidate.recheck,
-      element: document.createElement('audio'),
+      clipUrl: candidate.clip ? '/static/audio/eve/' + candidate.clip + '.mp3' : null,
+      clipFirst: !!candidate.clip,
+      element: clipElement(clipsPlayed),
     }),
   });
   planner.onEvent((e) => navEvents.push(e));
@@ -163,7 +182,17 @@ async function rig(opts) {
   const creates = () => WS.sent.filter(e => e.type === 'response.create');
   return {
     s, WS, ctx, arbiter, controller, planner, car, tevents, cevents, navEvents,
-    silences, creates,
+    silences, creates, clipsPlayed,
+    /* The server reads the most recent dictation out, start to finish. */
+    hear: () => {
+      const c = creates()[creates().length - 1];
+      s._onMessage(JSON.stringify({ type: 'response.created',
+        response: { id: 'r_dict', metadata: c.response.metadata } }));
+      s._onMessage(JSON.stringify({ type: 'response.output_audio_transcript.delta',
+        response_id: 'r_dict', delta: 'Turn right onto Ocean Ave.' }));
+      s._onMessage(JSON.stringify({ type: 'response.done',
+        response: { id: 'r_dict', status: 'completed' } }));
+    },
     at: (t, m, dist, speed) => planner.onProgress({
       type: 'NAV_PROGRESS', t, maneuver_id: m, to_maneuver_m: dist,
       tta_s: dist / (speed || 25), speed_ms: speed || 25, gps_state: 'GPS_OK' }),
@@ -333,6 +362,55 @@ async function rig(opts) {
     h2.free();
     await sleep(5);
     ok(h2.creates().length === 1, '...and is withdrawn, never sent late');
+  }
+
+  section('a near call that goes silent above 26 mph still leaves the junction clip');
+  {
+    /* 15 m/s is 34 mph: 150 m to 35 m takes ~7.7 s, inside the ten-second
+       junction rule. nearSpokenAt used to be set when the near call was
+       QUEUED, so a near call that then went silent suppressed the junction
+       call too, and the turn had no instruction at all. */
+    const drive = async (h) => {
+      for (let t = 11, d = 148 - 15; d > 0; t++, d -= 15) {
+        h.at(t, 'm1', d, 15);
+        await sleep(5);
+      }
+    };
+    const h = await rig({ budgetMs: 150 });
+    h.at(10, 'm1', 148, 15);              // the near call fires at 34 mph
+    await sleep(5);
+    ok(h.creates().length === 1, 'the near call is dictated');
+    await sleep(300);                     // ...and the session never starts it
+    ok(h.silences.some(x => x.callType === 'near' || /near/.test(x.text || '')
+                            || /no_clip/.test(x.detail || '')),
+       'it falls to silence: a near call names a road and has no clip');
+    ok(h.navEvents.some(e => e.call_type === 'near' && e.skipped === 'not_heard'),
+       'and the planner is told it was NOT heard');
+    await drive(h);
+    const j = h.navEvents.filter(e => e.type === 'NAV_JUNCTION_CALL');
+    ok(j.some(e => e.text === 'Turn right.'),
+       'THE JUNCTION CALL GOES OUT — it is now the whole instruction ('
+       + (j.map(e => e.text || e.skipped).join(', ') || 'no junction event') + ')');
+    ok(h.clipsPlayed.some(u => /turn_right\.mp3$/.test(u)),
+       `and it is the CLIP that plays (${h.clipsPlayed.join(', ') || 'none'})`);
+    ok(h.navEvents.some(e => e.type === 'NAV_SPEECH_SPOKEN' && e.call_type === 'junction'
+                             && e.reason === 'spoken'),
+       'spoken, at the junction');
+  }
+
+  section('...and a near call that WAS heard still suppresses it (the ten-second rule)');
+  {
+    const h = await rig({ budgetMs: 2000 });
+    h.at(10, 'm1', 148, 15);
+    await sleep(5);
+    h.hear();                             // the driver hears "Turn right onto Ocean Ave."
+    await sleep(5);
+    ok(!h.navEvents.some(e => e.skipped === 'not_heard'), 'the near call was heard');
+    for (let t = 11, d = 133; d > 0; t++, d -= 15) { h.at(t, 'm1', d, 15); await sleep(5); }
+    const j = h.navEvents.filter(e => e.type === 'NAV_JUNCTION_CALL');
+    ok(j.length === 1 && j[0].skipped === 'near_call_too_recent',
+       `the junction call is skipped as too soon after it (${j.map(e => e.text || e.skipped).join(', ')})`);
+    ok(!h.clipsPlayed.length, 'and no clip plays — one instruction, not two');
   }
 
   console.log(failures ? `\nFAILED ${failures}/${checks} checks`

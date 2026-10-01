@@ -323,7 +323,9 @@
          there is no fallback: silence, with the reason. */
       if (/^dropped:/.test(String(reason || ''))) {
         silent(reason, 'dropped_at_release');
-        return Promise.resolve();
+        // Resolved -- nothing failed -- but NOT HEARD, and the caller may
+        // need to know: a near call that went silent must not count as said.
+        return Promise.resolve({ heard: false, dropped: true });
       }
       /* THE ONE CASE THIS MUST REFUSE. Dictation that never started can be
          replaced; dictation that HAS started is already coming out of the
