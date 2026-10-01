@@ -356,6 +356,13 @@
            on OpenAI. Anything that acts on it has to be idempotent, and the only
            reason ours is, is that the item_id binding recognises the repeats. */
         transcriptionCompletedRepeats: 3,
+        /* response.created ECHOES the create's response.metadata. Measured
+           2026-10-01: two creates sent back to back with {rio: "dict-1"} and
+           {rio: "conv-2"} were created in that order, each carrying its own;
+           and a create cancelled bare in the same tick still arrived created,
+           with its name. The client event_id is not echoed. This is what an
+           orphan claim binds to -- see takeOrphanClaim in rio_realtime.js. */
+        responseMetadataEcho: true,
         // Documented as not emitted. The handler that files a barge-in as
         // transcription_failed goes dead; those turns fall through the
         // bargeConfirmMs timer and land as false_barge_in instead. Same

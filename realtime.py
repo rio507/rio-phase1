@@ -1341,6 +1341,10 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              "required_db", "guard_ms", "holding_ms",
                              "since_suppress_ms", "item_id", "during",
                              "yielded",
+                             # Which create an orphan claim was for, and whether
+                             # the response was matched to it by that name or
+                             # only by order (drive 3d69ebaa could say neither).
+                             "create_tag", "bound_by",
                              # Peer / element / microphone state, and whether
                              # the page was hidden when it changed.
                              "state", "ice", "was", "grace_ms", "expired",

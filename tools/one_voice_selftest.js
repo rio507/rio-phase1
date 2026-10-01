@@ -434,8 +434,10 @@ section('F. the invariant, stated where it can be checked at runtime');
   ok(/doubled\+\+/.test(src),
      'and counts it if that ever happens, rather than playing it');
   const rtSrc = fs.readFileSync(path.join(STATIC, 'rio_realtime.js'), 'utf8');
-  ok(/silenceOrphan/.test(rtSrc) && /response_id: responseId/.test(rtSrc),
+  ok(/claim\.silence/.test(rtSrc) && /response_id: responseId/.test(rtSrc),
      'the controller cancels a disowned dictation by id');
+  ok(/takeOrphanClaim\(tag\)/.test(rtSrc) && /rio_create/.test(rtSrc),
+     '...and only the response its own create was named for (drive 3d69ebaa)');
   ok(/orphans_silenced/.test(rtSrc), 'and counts what it silenced');
 }
 

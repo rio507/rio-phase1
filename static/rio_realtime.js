@@ -650,7 +650,47 @@
       ? provider.normalise
       : function (ev) { return ev; };
     var arbiter = cfg.arbiter;
-    var send = cfg.send || function () {};
+    var rawSend = cfg.send || function () {};
+    /* EVERY CREATE CARRIES A NAME, AND THE SERVER HANDS IT BACK.
+     *
+     * Every correlation in this file used to be ordinal -- "the next
+     * response.created is the one I asked for" -- which is true with one create
+     * in flight and false at a route start, where there are three. Drive
+     * 3d69ebaa (2026-10-01) lost her route confirmation to it: a claim armed
+     * for an abandoned depart line took the first response created, and that
+     * was the confirmation.
+     *
+     * `response.metadata` is set on the create and ECHOED on response.created
+     * (and response.done). Measured on xAI, 2026-10-01: two creates sent back
+     * to back with {rio: "dict-1"} and {rio: "conv-2"} came back created in
+     * that order, each carrying its own. The client `event_id` is NOT echoed,
+     * so it cannot be the key. OpenAI's realtime API documents the same
+     * metadata field on both.
+     *
+     * A create that arrives already named keeps its name; the dictation and
+     * direct paths name theirs before sending, because they must know it. */
+    var createSeq = 0;
+    function nameCreate(kind) { return kind + ':' + (++createSeq); }
+    function createTag(obj) {
+      var m = obj && obj.response && obj.response.metadata;
+      return (m && m.rio_create) || null;
+    }
+    var send = function (obj) {
+      if (obj && obj.type === 'response.create' && !createTag(obj)) {
+        obj.response = obj.response || {};
+        obj.response.metadata = obj.response.metadata || {};
+        obj.response.metadata.rio_create = nameCreate('answer');
+      }
+      return rawSend(obj);
+    };
+    /* DOES THIS SERVER ECHO THE NAME? Declared by the provider where it was
+       measured, and LEARNED from the first response.created that carries one
+       otherwise. Until it is known, an unnamed response might still be one of
+       ours, and the old ordinal binding is all there is; once it is known, an
+       unnamed response is one the SERVER made -- a turn from its own VAD --
+       and it is never anybody's dictation, direct line or orphan. */
+    var echoKnown = !!(provider && provider.capability
+                       && provider.capability('responseMetadataEcho') === true);
     var runTool = cfg.tool || function () { return Promise.resolve({ ok: false }); };
     var rawAudio = cfg.audio || { mute: function () {}, unmute: function () {} };
     /* THE MOUTH, WITH A LEDGER.
@@ -1944,7 +1984,6 @@
      * as an ordinary answer and be counted as one. Exactly one is expected --
      * the abandoned line -- and the recovery response asked for immediately
      * after it is the conversation and must still claim the mouth normally. */
-    var orphanOutOfBand = 0;
     /* ...AND THE CLAIM EXPIRES, which it did not, and that is a fault measured
      * on 2026-09-24 (session 1fd4de92).
      *
@@ -1973,34 +2012,59 @@
      * at worst, a turn call said twice (the arbiter supersedes by group) and
      * saves, at best, every conversational answer that lands in the window. */
     var ORPHAN_CLAIM_MS = cfg.orphanClaimMs || 1500;
-    var orphanClaims = [];        // arm times, oldest first
-    /* ...and whether that orphan must also be SILENCED rather than merely not
-       counted. An abandoned dictation has already been replaced by another
-       voice saying the same words; an abandoned direct line has not, and its
-       audio is the answer. Same mechanism, opposite conclusion about the
-       speaker, so they are two flags and not one. */
-    var silenceOrphan = false;
+    /* ...AND NOW IT HAS ONE. Drive 3d69ebaa (2026-10-01): the depart line was
+     * abandoned unbound, the claim was armed, and the first response created
+     * was her route confirmation -- inside the 1.5 s, so the deadline did not
+     * help. It was silenced, and came out twelve seconds later on the
+     * driver's next turn. The deadline bounded the damage; it never could tell
+     * which response was which.
+     *
+     * So a claim names the create it abandons (see nameCreate) and can only
+     * ever take the response that carries that name. A confirmation, a tool
+     * answer or the driver's own turn passes straight by it. The deadline
+     * stays, as housekeeping: a create the server never answers leaves a claim
+     * that would otherwise sit here for the drive.
+     *
+     * Where the server has not (yet) shown that it echoes the name, an unnamed
+     * response falls back to the oldest claim -- the old behaviour, and still
+     * bounded by the deadline -- because there is nothing else to go on. */
+    var orphanClaims = [];        // {at, tag, silence}, oldest first
 
-    /* Arm a claim, and drop any that have gone stale. */
-    function armOrphan(silence) {
-      orphanClaims.push(now());
-      orphanOutOfBand++;
-      if (silence) silenceOrphan = true;
+    /* Arm a claim on the create named `tag`. */
+    function armOrphan(silence, tag) {
+      orphanClaims.push({ at: now(), tag: tag || null, silence: !!silence });
     }
 
-    /* Is there still a live claim? Expires the stale ones on the way past, so
-       a claim armed and never used cannot sit there waiting to eat an answer
-       ten seconds later. */
-    function orphanClaimLive() {
+    /* Drop the claims that have gone stale, saying so. */
+    function expireOrphans() {
       var t = now();
-      while (orphanClaims.length && (t - orphanClaims[0]) > ORPHAN_CLAIM_MS) {
-        orphanClaims.shift();
-        orphanOutOfBand--;
+      orphanClaims = orphanClaims.filter(function (c) {
+        if ((t - c.at) <= ORPHAN_CLAIM_MS) return true;
         counters.orphan_claims_expired++;
-        emit('LIVE_ORPHAN_CLAIM_EXPIRED', { after_ms: ORPHAN_CLAIM_MS });
+        emit('LIVE_ORPHAN_CLAIM_EXPIRED', { after_ms: ORPHAN_CLAIM_MS,
+                                            create_tag: c.tag });
+        return false;
+      });
+    }
+
+    /* The claim this response answers, removed -- or null. By name when the
+       response carries one; by order only while echo is unproven. */
+    function takeOrphanClaim(tag) {
+      expireOrphans();
+      for (var i = 0; i < orphanClaims.length; i++) {
+        var c = orphanClaims[i];
+        if (tag ? c.tag === tag : (!echoKnown || !c.tag)) {
+          orphanClaims.splice(i, 1);
+          return c;
+        }
       }
-      if (orphanOutOfBand <= 0) { silenceOrphan = false; return false; }
-      return true;
+      return null;
+    }
+
+    /* Is this response the create `want` -- by name, or by order where names
+       are not echoed? */
+    function isCreate(tag, want) {
+      return tag ? tag === want : !echoKnown;
     }
     var verbatimInstruction = cfg.verbatimInstruction ||
       'Read the text below out loud, exactly as written, word for word. ' +
@@ -2170,9 +2234,9 @@
         var oobId = oob ? oob.realId : null;
         /* Not yet bound to a response: the create is still in flight and the
            response that lands belongs to nobody. Marked so it is silenced on
-           sight rather than claiming the mouth. `orphanOutOfBand` is
-           incremented by finish() below, which owns that bookkeeping. */
-        if (oob && !oobId) silenceOrphan = true;
+           sight rather than claiming the mouth. The claim itself is armed
+           by finish() below, which owns that bookkeeping. */
+        if (oob && !oobId) oob.silence = true;
         try {
           send(oobId ? { type: 'response.cancel', response_id: oobId }
                      : { type: 'response.cancel' });
@@ -2293,11 +2357,12 @@
     function beginResponse(responseId, opts) {
       if (stopped) return;
       opts = opts || {};
+      var tag = opts.tag || null;
       /* The first response after a dictation was sent IS that dictation. It
          gets bound here rather than claiming the mouth: a warning arriving as
          a conversation-priority item would be a warning that yields to
          navigation, which is upside down. */
-      if (dictation && !dictation.responseId) {
+      if (dictation && !dictation.responseId && isCreate(tag, dictation.tag)) {
         dictation.responseId = responseId;
         markOutOfBand(responseId);
         utterFor(responseId, 'dictation');
@@ -2309,7 +2374,7 @@
          mouth: a dictated warning claims the mouth at its caller's priority,
          while a direct line has ALREADY claimed it, at CONVO, in speakDirect.
          Either way this response must not claim it a second time. */
-      if (directSpeech && !directSpeech.realId
+      if (directSpeech && !directSpeech.realId && isCreate(tag, directSpeech.tag)
           && String(responseId || '').indexOf('direct:') !== 0) {
         directSpeech.realId = responseId;
         markOutOfBand(responseId);
@@ -2319,7 +2384,9 @@
       /* A RESPONSE THE SERVER CREATED FOR A FRAGMENT. It is an answer to road
          noise; it never claims the mouth and it is cancelled by id, which is
          the same pair of moves the orphan path below makes. */
-      if (silenceResponses > 0
+      /* Server-made only: a response carrying one of OUR names answers a
+         create we sent, and is never the server's reply to road noise. */
+      if (silenceResponses > 0 && !tag
           && String(responseId || '').indexOf('direct:') !== 0) {
         silenceResponses--;
         markOutOfBand(responseId);
@@ -2340,19 +2407,17 @@
         emit('LIVE_NOISE_SILENCED', { response_id: responseId });
         return;
       }
-      if (orphanClaimLive()
-          && String(responseId || '').indexOf('direct:') !== 0) {
-        orphanOutOfBand--;
-        orphanClaims.shift();
+      var claim = String(responseId || '').indexOf('direct:') !== 0
+        ? takeOrphanClaim(tag) : null;
+      if (claim) {
         markOutOfBand(responseId);
-        if (silenceOrphan) {
+        if (claim.silence) {
           /* The line this response was going to read is already being read by
              something else. Cancel it BY ID -- the bare cancel that ran when
              it was abandoned had no response to name -- and mute what is
              already in flight, which is the same pair of moves a barge-in
              makes and for the same reason: what has left the speaker cannot be
              recalled, but the next 20 ms can. */
-          silenceOrphan = false;
           counters.orphans_silenced++;
           try { send({ type: 'response.cancel', response_id: responseId }); }
           catch (e) {}
@@ -2360,7 +2425,9 @@
           silencedIds[responseId] = 1;
           noteCancel(responseId, 'orphan_silenced');
           utterFor(responseId, 'orphan');
-          emit('LIVE_ORPHAN_SILENCED', { response_id: responseId });
+          emit('LIVE_ORPHAN_SILENCED', { response_id: responseId,
+                                         create_tag: claim.tag,
+                                         bound_by: tag ? 'name' : 'order' });
         }
         return;
       }
@@ -3560,7 +3627,8 @@
     function injectDirect(line, release, onSpoken) {
       return new Promise(function (resolve) {
         var d = { line: line, realId: null, started: false, timer: null,
-                  onSpoken: onSpoken, at: Date.now() };
+                  onSpoken: onSpoken, at: Date.now(),
+                  tag: nameCreate('direct'), silence: false };
         d.finish = function (okay, why) {
           if (directSpeech !== d) return;
           directSpeech = null;
@@ -3568,8 +3636,8 @@
           if (!okay) {
             // Given up on before it was ever bound to a response? Then the
             // response is still on its way and is nobody's. See
-            // orphanOutOfBand.
-            if (!d.realId) armOrphan(false);
+            // armOrphan.
+            if (!d.realId) armOrphan(!!d.silence, d.tag);
             counters.direct_speech_failures++;
             emit('LIVE_DIRECT_SPEECH_FAILED', { text: line, reason: why });
             /* A LAST TRY, rather than a silent turn. The tool result is
@@ -3613,6 +3681,7 @@
               conversation: 'none',
               output_modalities: ['audio'],
               instructions: verbatimInstruction + line,
+              metadata: { rio_create: d.tag },
             },
           });
         } catch (e) {
@@ -3675,7 +3744,7 @@
         dictation_bound: dictation ? !!dictation.responseId : null,
         // Outstanding claims on the next unclaimed response. Non-zero here
         // means a response created next may be cancelled on sight.
-        orphan_claims: orphanOutOfBand,
+        orphan_claims: orphanClaims.length,
         // What the mouth is actually doing, from the arbiter rather than from
         // this file's opinion of it.
         arbiter_speaking: st && st.speaking ? st.speaking.id : null,
@@ -3891,7 +3960,12 @@
                lets a late transcript for that same utterance be recognised as
                the question already being answered rather than a new one. */
             answeringItemId = committedItemId;
-            beginResponse((ev.response && ev.response.id) || ev.response_id);
+            (function () {
+              var tag = createTag(ev);
+              if (tag) echoKnown = true;
+              beginResponse((ev.response && ev.response.id) || ev.response_id,
+                            { tag: tag });
+            })();
             break;
           case 'input_audio_buffer.committed':
             // The turn's audio is closed and handed to the model. Its item_id
@@ -4280,11 +4354,13 @@
            item that started THIS line cancel it without any chance of
            cancelling the line that replaced it. */
         var token = ++dictationSeq;
+        var tag = nameCreate('dictation');
         return new Promise(function (resolve, reject) {
           dictation = {
             text: line, resolve: resolve, reject: reject, started: false,
             responseId: null, transcript: '', onStart: opts.onStart, timer: null,
             token: token, at: Date.now(), channel: opts.channel || null,
+            tag: tag,
           };
           /* Handed over synchronously, inside the executor, because the
              arbiter can supersede this line in the same tick it started it --
@@ -4309,7 +4385,7 @@
              * unclaimed response is recorded as this one's, cancelled by id
              * the moment it exists, and muted until it is gone. Exactly one
              * mouth per utterance, and it is the one that got there. */
-            if (dictation && !dictation.responseId) armOrphan(true);
+            if (dictation && !dictation.responseId) armOrphan(true, dictation.tag);
             try { send({ type: 'response.cancel' }); } catch (e) {}
             finishDictation('timeout');
           }, opts.timeoutMs || speakTimeoutMs);
@@ -4321,6 +4397,7 @@
                 conversation: 'none',
                 output_modalities: ['audio'],
                 instructions: verbatimInstruction + line,
+                metadata: { rio_create: tag },
               },
             });
           } catch (e) {
@@ -4363,7 +4440,7 @@
         if (!dictation) return false;
         if (token && dictation.token !== token) return false;
         var rid = dictation.responseId;
-        if (!rid) armOrphan(true);
+        if (!rid) armOrphan(true, dictation.tag);
         try {
           send(rid ? { type: 'response.cancel', response_id: rid }
                    : { type: 'response.cancel' });

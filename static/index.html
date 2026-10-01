@@ -3993,6 +3993,8 @@ function reportLive(ev) {
           since_suppress_ms: ev.since_suppress_ms === undefined
                              ? null : ev.since_suppress_ms,
           item_id: ev.item_id || null,
+          create_tag: ev.create_tag || null,
+          bound_by: ev.bound_by || null,
           during: ev.during || null,
           yielded: ev.yielded === undefined ? null : ev.yielded,
           /* Peer, element and microphone state, and whether the page was

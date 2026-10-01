@@ -498,6 +498,134 @@ function navLine(h, o) {
        '...nor cancelled by id');
   }
 
+  section('drive 3d69ebaa — the claim takes only the create it abandoned');
+  {
+    /* THE DRIVE, 2026-10-01, 00:31:21 – 00:31:41, replayed in order:
+     *
+     *   00:31:21.9  driver: "Um, yeah let's just get..." -> start_navigation
+     *   00:31:26.7  depart call dictated, then superseded in the same breath by
+     *               the junction call "Turn right." -- a clip. The depart create
+     *               is unbound: the claim is armed.
+     *   00:31:26.7  tool result -> response.create for her confirmation
+     *   00:31:26.8  ONE response.created arrives -> orphan_silenced
+     *   00:31:38.7  the driver speaks
+     *   00:31:41.8  the confirmation finally comes out, on the driver's turn,
+     *               after the engine has called the turn.
+     *
+     * The claim had no identity, so it took the first response created. Here
+     * the server does what xAI does (measured: response.created echoes the
+     * create's response.metadata) and answers the CONFIRMATION first. A claim
+     * bound to the depart create must leave it alone, and take the depart's
+     * own response when that arrives. */
+    const h = session({ holdTail: true });
+    RIO.speak.reset();
+
+    /* The server: answers a given create, echoing what it was sent with. */
+    let n = 0;
+    const created = (create) => {
+      const id = 'resp_' + (++n);
+      const meta = create && create.response && create.response.metadata;
+      h.controller.handle({ type: 'response.created',
+        response: Object.assign({ id: id }, meta ? { metadata: meta } : {}) });
+      return id;
+    };
+
+    // Route start: the depart call takes the mouth and is dictated...
+    navLine(h, { text: 'Head northwest, then turn right.', callType: 'depart' });
+    await tick(5);
+    const departCreate = h.creates()[h.creates().length - 1];
+    // ...and the junction call for the same maneuver supersedes it, from a clip.
+    navLine(h, { text: 'Turn right.', callType: 'junction',
+                 clipUrl: '/static/audio/eve/turn_right.mp3' });
+    await tick(5);
+    ok(h.controller.state && true, 'route start: depart dictated, then superseded');
+
+    // The tool result asks for her confirmation.
+    h.controller.handle({
+      type: 'response.function_call_arguments.done',
+      name: 'start_navigation', call_id: 'call_nav',
+      arguments: JSON.stringify({ destination: 'Laemmle Monica Film Center' }) });
+    await tick(20);
+    const answerCreate = h.creates()[h.creates().length - 1];
+    ok(answerCreate !== departCreate,
+       'two creates on the wire: the abandoned depart line and the confirmation');
+
+    // 00:31:26.8 — the server creates the CONFIRMATION first.
+    const answerId = created(answerCreate);
+    await tick(5);
+    ok(!h.ev('LIVE_ORPHAN_SILENCED').some(e => e.response_id === answerId),
+       'THE CONFIRMATION IS NOT SILENCED — the claim belongs to the depart '
+       + 'create, and this is a different one');
+    ok(!h.cancels().some(e => e.response_id === answerId),
+       '...nor cancelled by id');
+
+    // ...and the depart line's own response, when it lands, is the one taken.
+    const departId = created(departCreate);
+    await tick(5);
+    ok(h.ev('LIVE_ORPHAN_SILENCED').some(e => e.response_id === departId),
+       'the abandoned depart response is silenced when it does arrive — still '
+       + 'one voice on the junction');
+    ok(h.cancels().some(e => e.response_id === departId),
+       'cancelled by its own id');
+
+    // The confirmation is said, once the turn call has the mouth back.
+    h.speaks(answerId, 'Taking you to the Laemmle Monica Film Center.');
+    h.done(answerId);
+    await tick(5);
+    const began = h.ev('LIVE_RESPONSE_START').filter(e => e.response_id === answerId);
+    const spoke = h.ev('LIVE_SPOKE').filter(e => e.response_id === answerId);
+    ok(began.length === 1 && spoke.length === 1
+       && spoke[0].turn_kind === 'conversation',
+       'and it takes the mouth and is spoken as her answer to the tool — not '
+       + 'held until the driver next speaks (started ' + began.length
+       + ', spoke ' + (spoke[0] ? spoke[0].turn_kind : 'never') + ')');
+
+    // 00:31:38.7 — the driver speaks; the server's own response (no metadata,
+    // the server made it) is an ordinary answer and nobody's orphan.
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+    await tick(20);
+    const turnId = created(null);
+    await tick(5);
+    ok(!h.ev('LIVE_ORPHAN_SILENCED').some(e => e.response_id === turnId)
+       && !h.cancels().some(e => e.response_id === turnId),
+       'the response to the driver speaking is theirs, not eaten either');
+    ok(h.ev('LIVE_ORPHAN_SILENCED').length === 1,
+       `exactly one response silenced in the whole sequence `
+       + `(${h.ev('LIVE_ORPHAN_SILENCED').length})`);
+  }
+
+  section('a claim whose create never arrives eats nothing at all');
+  {
+    /* The other shape the drive allows: the depart create is never answered
+       (xAI drops a response it cancelled before creating). The old claim then
+       took the next response whatever it was -- inside 1.5 s, the confirmation.
+       Bound to its create, it waits for that create, takes nothing else, and
+       lapses. */
+    const h = session({ holdTail: true, orphanClaimMs: 60 });
+    RIO.speak.reset();
+    h.controller.speak('Head northwest, then turn right.',
+                       { channel: 'nav', callType: 'depart' }).catch(() => {});
+    h.controller.cancelSpeak(null, 'superseded');
+    h.controller.handle({
+      type: 'response.function_call_arguments.done',
+      name: 'start_navigation', call_id: 'call_nav2',
+      arguments: JSON.stringify({ destination: 'LAX' }) });
+    await tick(20);
+    const c = h.creates()[h.creates().length - 1];
+    h.controller.handle({ type: 'response.created',
+      response: { id: 'resp_conf', metadata: (c.response || {}).metadata } });
+    await tick(5);
+    ok(h.ev('LIVE_ORPHAN_SILENCED').length === 0
+       && !h.cancels().some(e => e.response_id === 'resp_conf'),
+       'inside the window, the confirmation is still not taken');
+    await new Promise(r => setTimeout(r, 120));
+    h.controller.handle({ type: 'response.created', response: { id: 'resp_late' } });
+    await tick(5);
+    ok(h.ev('LIVE_ORPHAN_CLAIM_EXPIRED').length === 1,
+       'and the unanswered claim lapses, and says so');
+  }
+
   section('turn end to first audio — the number the drive log did not have');
   {
     const h = session();
