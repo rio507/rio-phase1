@@ -331,6 +331,76 @@ def run_bus_watch(page, errors):
 
 
 # ---------------------------------------------------------------------------
+# A concealment is dated to the second
+# ---------------------------------------------------------------------------
+# Drive 3d69ebaa (2026-10-01): a beep the driver heard, and one concealment
+# event on the loopback that the log could place only within a minute, because
+# bus_health posted on its booleans and a 60 s heartbeat. A new concealment
+# event is now a change in its own right. Asserted with RIO.output.state()
+# replaced by a hand-driven one, after the opening row, so the heartbeat cannot
+# be what posts: a bump in inserted samples alone posts nothing, a bump in
+# concealment events posts a row within the watch's second, carrying the count.
+CAPTURE_REPORTS = """
+() => {
+  window.__reports = [];
+  const real = window.fetch;
+  window.fetch = function (u, opts) {
+    if (String(u).indexOf('/realtime/cutoff') !== -1) {
+      try { window.__reports.push(JSON.parse(opts.body)); } catch (e) {}
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }
+    return real.apply(this, arguments);
+  };
+  window.__fakeHealth = { concealment_events_total: 0, concealed_total: 0,
+                          concealed: 0, inserted: 0, removed: 0 };
+  RIO.output.state = function () {
+    return { covered: true, ready: true, context: 'running',
+             to_destination: false, stats: {}, health: window.__fakeHealth };
+  };
+  return true;
+}
+"""
+
+BUS_ROWS = """
+() => (window.__reports || []).filter(r => r.kind === 'bus_health')
+"""
+
+
+def run_concealment_dated(page, errors):
+    section("a concealment event posts its own bus_health row")
+    if not page.evaluate(SESSION_STUB):
+        ok(False, "RIO.realtime.connect exists to be stubbed")
+        return
+    ok(page.evaluate(CAPTURE_REPORTS), "bus state and report capture stubbed")
+    page.click("#mic")
+    page.wait_for_timeout(1500)
+    opening = len(page.evaluate(BUS_ROWS))
+    ok(opening >= 1, f"the opening state is recorded ({opening} rows)")
+
+    page.evaluate("() => { window.__fakeHealth.inserted = 480; }")
+    page.wait_for_timeout(2200)
+    n = len(page.evaluate(BUS_ROWS))
+    ok(n == opening,
+       f"time-stretch alone posts nothing: it never stops moving ({n - opening} rows)")
+
+    page.evaluate("() => { window.__fakeHealth.concealment_events_total = 1;"
+                  " window.__fakeHealth.concealed_total = 2076; }")
+    page.wait_for_timeout(1500)
+    rows = page.evaluate(BUS_ROWS)
+    new = rows[n:]
+    ok(len(new) == 1,
+       f"one concealment event posts one row within the second ({len(new)} rows)")
+    if new:
+        audio = (new[0].get("detail") or new[0]).get("audio") or {}
+        ok(audio.get("concealment_events") == 1 and audio.get("concealed") == 2076,
+           f"and the row carries it ({audio.get('concealment_events')} events, "
+           f"{audio.get('concealed')} samples)")
+
+    page.click("#mic")
+    page.wait_for_timeout(300)
+
+
+# ---------------------------------------------------------------------------
 # Cancelling a connect
 # ---------------------------------------------------------------------------
 # toggleLive() used to open with `if (liveBusy) return;`, which made the talk
@@ -814,6 +884,15 @@ def main():
         run_unlock(page)
         run_bus_watch(page, errors)
         run_connect_cancel(page, errors)
+        # Its own page: it replaces RIO.output.state(), and the soak below
+        # needs the real one.
+        page2 = browser.new_page(viewport={"width": 390, "height": 844},
+                                 is_mobile=True, has_touch=True)
+        page2.on("pageerror", lambda e: errors.append(str(e)))
+        page2.goto(args.url, wait_until="domcontentloaded", timeout=20000)
+        page2.wait_for_timeout(700)
+        run_concealment_dated(page2, errors)
+        page2.close()
         # THE SOAK IS OPTIONAL AND USED TO BE SILENT. --soak-s defaults to 0, so
         # by default this suite printed "49/49 checks passed" with the whole
         # loopback section -- drift, jitter, concealment, coverage, the resync

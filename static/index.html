@@ -4097,12 +4097,22 @@ function busHealth(force) {
    * So: still on change for the booleans, and ALSO on a slow heartbeat, so a
    * drive carries a series rather than a single frame. A minute apart is
    * nothing next to a drive and is enough to see a drift trend, which is the
-   * only shape this fault has. */
+   * only shape this fault has.
+   *
+   * AND A CONCEALMENT IS A CHANGE. Drive 3d69ebaa (2026-10-01): the driver
+   * heard a beep, and the only fault the drive recorded was one concealment
+   * event on the loopback -- 2,076 samples, 43 ms of invented audio -- that
+   * could be placed only somewhere in the minute between two heartbeats, across
+   * five of her answers. A new event now posts within the second it is read,
+   * so "the beep at 00:29:40" is a row with a time on it. Inserted / removed
+   * samples stay off the key: the receiver stretches a little all the time,
+   * and keying on them would turn this into a one-second stream. */
   const h = st.health || {};
   const key = [st.covered, st.ready, st.context, st.to_destination,
                (st.stats || {}).bus_failures, (st.stats || {}).fallbacks,
                (st.stats || {}).bus_fallbacks, (st.stats || {}).restores,
-               h.resyncs, h.resync_failures, h.resync_backoff_ms].join('|');
+               h.resyncs, h.resync_failures, h.resync_backoff_ms,
+               h.concealment_events_total].join('|');
   const due = (performance.now() - busLastAt) >= BUS_HEARTBEAT_MS;
   if (!force && key === busLast && !due) return;
   busLast = key;
