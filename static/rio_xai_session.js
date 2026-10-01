@@ -604,10 +604,51 @@
     var gateMaxHoldMs = opts.gateMaxHoldMs === undefined ? 4000
                                                          : opts.gateMaxHoldMs;
 
+    /* ---- THE CLOCK, WHERE THE CAR IS ----------------------------------
+     *
+     * She had no time of day at all: nothing in the instructions, nothing in
+     * any context. So "it's almost lunch" could only ever be a guess, and a
+     * guess about the time is a made-up fact. The browser's clock and time
+     * zone ARE where the car is, so the line is written here: appended to the
+     * instructions the mint handed us, sent with the session, and refreshed
+     * by an instructions-only session.update when the minute changes --
+     * measured on xAI (2026-10-01): applied, and audio unaffected, 3/3. Never
+     * while a response is in flight; it waits for the next quiet tick.
+     *
+     * Time and weekday only. Given the IANA zone name she read it out
+     * ("America/Los_Angeles"), which no person says. */
+    var baseInstructions = (opts.mint && opts.mint.session
+                            && typeof opts.mint.session.instructions === 'string')
+      ? opts.mint.session.instructions : null;
+    var clockSent = null;
+    var nowDate = opts.nowDate || function () { return new Date(); };
+    function clockLine(d) {
+      var time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+      var day = d.toLocaleDateString('en-US', { weekday: 'long' });
+      return 'THE CLOCK: it is ' + time + ' on ' + day + ' where the car is. '
+           + 'This is the real local time, kept current through the drive, and '
+           + 'the only source for the time of day.';
+    }
+    function withClock() {
+      return baseInstructions === null ? null
+        : baseInstructions + '\n\n' + clockLine(nowDate());
+    }
+    function refreshClock() {
+      if (baseInstructions === null || closed || !ws) return;
+      var line = clockLine(nowDate());
+      if (line === clockSent || inFlight || pending.length) return;
+      clockSent = line;
+      try {
+        ws.send(JSON.stringify({ type: 'session.update',
+                                 session: { instructions: baseInstructions + '\n\n' + line } }));
+      } catch (e) {}
+    }
+
     function tick() {
       if (closed) return;
       if (playout) playout.tick();
       flushPending();
+      refreshClock();
     }
 
     function startTicker() {
@@ -913,8 +954,14 @@
              fields are the difference between a working session and a silent
              one and none of them should be assembled twice. */
           try {
-            sock.send(JSON.stringify({ type: 'session.update',
-                                       session: mint.session }));
+            var sess0 = mint.session;
+            if (baseInstructions !== null) {
+              sess0 = {};
+              for (var k in mint.session) sess0[k] = mint.session[k];
+              sess0.instructions = withClock();
+              clockSent = clockLine(nowDate());
+            }
+            sock.send(JSON.stringify({ type: 'session.update', session: sess0 }));
           } catch (e) {}
           if (opts.mic) pumpFrom(opts.mic);
           startTicker();

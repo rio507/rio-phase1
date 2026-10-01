@@ -331,7 +331,10 @@ def run_text_session():
 
     # ...and her character is all still there. This is the half that would
     # make a saving into a regression.
-    for kept in ("You are RIO, a voice companion riding in the passenger seat.",
+    # No seat in it: "riding in the passenger seat" and then "sitting beside
+    # the driver" were each where "along for the ride" came from -- the A/B of
+    # 2026-10-01 measured 9/61 drive mentions with the seat, 2/61 without.
+    for kept in ("You are RIO, a voice companion.",
                  "The car is where you are, not what you talk about.",
                  "Match their pace.", "# Small talk",
                  "# Being told, and being asked", "# Banned words",

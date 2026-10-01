@@ -433,6 +433,54 @@ section('ONE RESPONSE AT A TIME — xAI drops or cancels a second, silently');
 }
 
 // ---------------------------------------------------------------------------
+section('THE CLOCK — she knows the local time, and it stays current');
+// ---------------------------------------------------------------------------
+{
+  /* She had no time of day at all, so any remark about lunch or the evening
+     was a guess. The browser's clock is the car's: the line goes out with the
+     session and is refreshed when the minute changes -- never mid-response. */
+  let now = new Date(2026, 9, 1, 15, 12, 30);         // Thursday, 3:12 PM local
+  const base = 'You are RIO.';
+  // A mint that carries instructions, as xai_voice.session_policy() does.
+  const h2 = (() => {
+    const WS = fakeWS();
+    const ctx = fakeCtx();
+    const armed = [];
+    const s = session.open({
+      mint: { ws_url: 'wss://example.test/v1/realtime?model=m',
+              ws_subprotocol: 'xai-client-secret.tok',
+              session: { type: 'realtime', instructions: base,
+                         output_modalities: ['audio'], audio: { output: { voice: 'Eve' } } } },
+      controller: { handle() {} }, provider: provider.create('xai_voice'), ctx,
+      tailGraceS: 0, playoutLib: playoutMod, WebSocketImpl: WS,
+      setIntervalImpl: (fn, ms) => { armed.push(fn); return 1; },
+      clearIntervalImpl: () => {}, nowDate: () => now, onEvent: () => {},
+    });
+    return { s, WS, pump: () => armed.forEach(f => f()) };
+  })();
+  await h2.s.connect();
+  const ups = () => h2.WS.sent.filter(e => e.type === 'session.update');
+  const first = ups()[0].session;
+  ok(/^You are RIO\.\n\nTHE CLOCK: it is 3:12 PM on Thursday where the car is\./
+       .test(first.instructions || ''),
+     `the session goes out with the local time on it (${(first.instructions || '').split('\n').pop().slice(0, 50)})`);
+  ok(first.output_modalities && first.audio && first.audio.output.voice === 'Eve',
+     '...and still everything else the mint said — modalities and voice included');
+  ok(!/America\//.test(first.instructions), 'time and weekday only: no zone name for her to read out');
+  h2.pump();
+  ok(ups().length === 1, 'same minute: nothing re-sent');
+  now = new Date(2026, 9, 1, 15, 13, 2);
+  h2.s._onMessage(JSON.stringify({ type: 'response.created', response: { id: 'r1' } }));
+  h2.pump();
+  ok(ups().length === 1, 'a new minute while she is answering waits — no update mid-response');
+  h2.s._onMessage(JSON.stringify({ type: 'response.done', response: { id: 'r1', status: 'cancelled' } }));
+  h2.pump();
+  ok(ups().length === 2 && /3:13 PM/.test(ups()[1].session.instructions)
+     && Object.keys(ups()[1].session).join() === 'instructions',
+     'then an instructions-only update with the new minute');
+}
+
+// ---------------------------------------------------------------------------
 section('output_audio_buffer.clear is local, because the wire refuses it');
 // ---------------------------------------------------------------------------
 {

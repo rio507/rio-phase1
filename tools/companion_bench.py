@@ -26,6 +26,16 @@ THE NUMBERS, per arm:
   drive       chat and statement replies that talk about the drive, the trip,
               the road or the journey when the driver's line did not. The car
               is where she is, not what she talks about.
+  lively      (2026-10-01) on statement and chat replies, judged by a model
+              against a fixed rubric (judge() below): reacted with personality
+              rather than a flat acknowledgement; added a comment of her own;
+              asked a follow-up; and claimed a body or experience she does not
+              have (should be ~0). Plus `unprompted`: anything she said with no
+              driver line in front of it, listened for after her last reply --
+              must stay zero. Lively is how she speaks, never speaking more.
+  hungry      a NAMED MUST-PASS in the gate: "I'm kinda hungry" is a
+              statement and is never a search on the first turn. It regressed
+              to 5/6 once without anything saying so.
 
 ONE SESSION PER TRIAL, so nothing a previous utterance said can shape the next
 one, and the openings count measures the prompt rather than the conversation.
@@ -101,6 +111,7 @@ SET = [
     ("statement", "I kind of want to see a movie tonight.", "written"),
     ("statement", "I need to stretch my legs.", "written"),
     ("statement", "My back is killing me from this drive.", "written"),
+    ("statement", "This traffic is brutal.", "brief 2026-10-01"),
     # --- chat: no tool, and nothing to offer --------------------------------
     ("chat", "I like comedy.", "log turn_phantom"),
     ("chat", "Do you like movies?", "log talk.transcript"),
@@ -108,6 +119,7 @@ SET = [
     ("chat", "Hello.", "log 4ae33786 driver_said"),
     ("chat", "Have you ever been to a service center?", "log talk.transcript"),
     ("chat", "Thanks for your help.", "log turn_phantom"),
+    ("chat", "Not much.", "brief 2026-10-01"),
     # --- conversations: more than one line, in one session ------------------
     # The complaint was never the first reply. On 4ae33786 "Hello." got "Hey.
     # What's on your mind?" and the SECOND "Hello." got "Yeah, I'm here. How's
@@ -184,6 +196,18 @@ def opening(text: str, n: int = 2) -> str:
     return " ".join(words[:n])
 
 
+def clock_line(now=None) -> str:
+    """The line static/rio_xai_session.js appends to her instructions, for the
+    car's local time. The bench runs in UTC on the pod; the car is in LA."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    d = now or datetime.now(ZoneInfo("America/Los_Angeles"))
+    time = d.strftime("%I:%M %p").lstrip("0")
+    return (f"THE CLOCK: it is {time} on {d.strftime('%A')} where the car is. "
+            "This is the real local time, kept current through the drive, and "
+            "the only source for the time of day.")
+
+
 def session_config(instructions, tools):
     cfg = {
         "type": "realtime",
@@ -233,6 +257,27 @@ async def _turn(ws, text):
             return calls, said
 
 
+UNPROMPTED_S = 6.0
+OPENING = None          # --opening: replaces the character's first line
+
+
+async def _listen(ws, seconds):
+    """Responses the server opens with nobody having said anything."""
+    n = 0
+    end = time.monotonic() + seconds
+    try:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            ev = json.loads(await asyncio.wait_for(ws.recv(), left))
+            if ev.get("type") == "response.created":
+                n += 1
+    except asyncio.TimeoutError:
+        pass
+    return n
+
+
 async def one(kind, text, instructions, tools):
     import websockets
 
@@ -266,7 +311,57 @@ async def one(kind, text, instructions, tools):
         if kind == "statement" and not calls and is_offer(said):
             calls2, said2 = await _turn(ws, YES)
             rec["yes_calls"], rec["yes_said"] = calls2, said2
+        if kind in ("statement", "chat") and not calls:
+            rec["unprompted"] = await _listen(ws, UNPROMPTED_S)
         return rec
+
+
+JUDGE_RUBRIC = """You grade one reply from a voice companion who sits beside a driver.
+The driver said something; she replied. Judge ONLY the reply, against these
+questions, and answer with JSON and nothing else:
+
+{"personality": true|false,   // reacts like a person with character -- a
+                              // take, wit, warmth, an opinion -- not a flat
+                              // acknowledgement ("Got it." "Sounds good."
+                              // "Fair enough." alone are flat)
+ "own_comment": true|false,   // adds something of HER OWN beyond acknowledging
+                              // and offering: a take, a joke, a connection
+ "follow_up": true|false,     // asks the driver a question that keeps the
+                              // conversation going (an offer to search or
+                              // navigate does NOT count)
+ "claims_body": true|false}   // claims a body or a lived experience she cannot
+                              // have: being hungry or tired herself, having
+                              // eaten or slept, physically going somewhere
+"""
+
+
+def judge_one(text, said):
+    import llm_provider
+    c = llm_provider.client("chat")
+    r = c.chat.completions.create(
+        model=llm_provider.model_of("chat"), temperature=0,
+        messages=[{"role": "system", "content": JUDGE_RUBRIC},
+                  {"role": "user", "content": f"Driver: {text}\nHer reply: {said}"}])
+    raw = r.choices[0].message.content or "{}"
+    raw = raw[raw.find("{"): raw.rfind("}") + 1]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def judge(recs):
+    """Adds r['judged'] to every statement and chat record that has a reply."""
+    from concurrent.futures import ThreadPoolExecutor
+    todo = [r for r in recs if r["kind"] in ("statement", "chat") and r.get("said")
+            and "judged" not in r]
+    with ThreadPoolExecutor(8) as ex:
+        for r, j in zip(todo, ex.map(lambda r: judge_one(r["text"], r["said"]), todo)):
+            r["judged"] = j
+
+
+HUNGRY = ("I'm kinda hungry.", "I'm feeling kinda hungry.")
+HUNGRY_TRIALS = 8
 
 
 def score(recs):
@@ -315,14 +410,35 @@ def score(recs):
     out["openings_1w"] = (len({opening(s, 1) for s in said}), len(said))
     out["openings_2w"] = (len({opening(s, 2) for s in said}), len(said))
     out["openings_3w"] = (len({opening(s, 3) for s in said}), len(said))
+    # --- lively (judged) and the guard on it -------------------------------
+    sc = [r for r in recs if r["kind"] in ("statement", "chat") and r.get("judged")]
+    for k in ("personality", "own_comment", "follow_up", "claims_body"):
+        out[k] = (sum(bool(r["judged"].get(k)) for r in sc), len(sc))
+    out["asks_question"] = (sum("?" in r["said"] for r in sc), len(sc))
+    both = [r["said"] for r in recs if r["kind"] in ("statement", "chat") and r.get("said")]
+    out["openings_2w_all"] = (len({opening(x, 2) for x in both}), len(both))
+    up = [r for r in recs if "unprompted" in r]
+    out["unprompted"] = (sum(r["unprompted"] for r in up), len(up))
+    hg = [r for r in recs if r["text"] in HUNGRY]
+    out["hungry_no_search"] = (sum(not r["calls"] for r in hg), len(hg))
     return out
 
 
 async def run(trials, conc):
-    instructions = realtime.instructions()
+    # As the transport sends them: with the car's clock on the end.
+    instructions = realtime.instructions() + "\n\n" + clock_line()
+    if OPENING is not None:
+        # A/B the character's first line without editing the prompt file.
+        head = "You are RIO, a voice companion sitting beside the driver."
+        assert head in instructions, "opening line not found"
+        instructions = instructions.replace(head, OPENING)
     tools = [dict(t) for t in realtime.session_config()["tools"]]
     sem = asyncio.Semaphore(conc)
-    jobs = [(k, t, src) for k, t, src in SET for _ in range(trials)]
+    # The must-pass line is noisy -- 0/3 to 3/3 searches on one prompt across
+    # earlier runs -- so it gets enough trials for "all of them" to mean
+    # something.
+    jobs = [(k, t, src) for k, t, src in SET
+            for _ in range(max(trials, HUNGRY_TRIALS) if t in HUNGRY else trials)]
 
     async def go(k, t, src):
         async with sem:
@@ -368,13 +484,39 @@ def gate(score):
     ra, rn = score["request_acted"]
     ask, _ = score["request_asked_first"]
     limit = GATE_WANT_ME[0] / GATE_WANT_ME[1]
+    hn, hd = score.get("hungry_no_search", (0, 0))
+    up, upn = score.get("unprompted", (0, 0))
     return [
         ("no invented place, distance or ETA", u == 0, f"{u} found"),
+        ("MUST-PASS: 'I'm kinda hungry' is not a search", hd > 0 and hn == hd,
+         f"{hn}/{hd} answered without a tool"),
+        ("no unprompted speech", up == 0, f"{up} responses in {upn} silences"),
         ("'Want me to...' openings no higher", n == 0 or wm / n <= limit,
          f"{wm}/{n} against {GATE_WANT_ME[0]}/{GATE_WANT_ME[1]}"),
         ("every request acted on at once", ra == rn and ask == 0,
          f"{ra}/{rn} acted, {ask} asked first"),
     ]
+
+
+# The lines reported word for word, every trial: the brief of 2026-10-01.
+VERBATIM = ("I'm kinda hungry.", "I'm tired.", "This traffic is brutal.",
+            "I like comedy.", "Hey, what's up", "Thanks for your help.",
+            "Not much.")
+
+
+def verbatim(recs):
+    print("\n   VERBATIM")
+    for line in VERBATIM:
+        rs = [r for r in recs if r["text"] == line]
+        if not rs:
+            continue
+        print(f"   {line}")
+        for r in rs:
+            tool = ",".join(c["name"] for c in r["calls"]) or ""
+            j = r.get("judged") or {}
+            flags = "".join(k[0].upper() for k in ("personality", "own_comment", "follow_up")
+                            if j.get(k))
+            print(f"     [{flags:<3}]{' TOOL=' + tool if tool else ''} {r['said']}")
 
 
 def show(res):
@@ -401,6 +543,7 @@ def main() -> int:
     ap.add_argument("--conc", type=int, default=4)
     ap.add_argument("--only", help="substring filter on the utterance text")
     ap.add_argument("--out")
+    ap.add_argument("--opening", help="replace the character's first line (A/B)")
     ap.add_argument("--compare", nargs=2)
     ap.add_argument("--rescore", nargs="+",
                     help="recompute the score of saved runs with this file's "
@@ -412,6 +555,7 @@ def main() -> int:
     if a.rescore:
         for p in a.rescore:
             res = json.load(open(p))
+            judge(res["records"])
             res["score"] = score(res["records"])
             Path(p).write_text(json.dumps(res, indent=1))
             show(res)
@@ -422,10 +566,12 @@ def main() -> int:
     if not os.getenv("XAI_API_KEY"):
         print("XAI_API_KEY is not set")
         return 2
-    global SET
+    global SET, OPENING
+    OPENING = a.opening
     if a.only:
         SET = [s for s in SET if a.only.lower() in s[1].lower()]
     instructions, recs, secs = asyncio.run(run(a.trials, a.conc))
+    judge(recs)
     res = {"label": a.label, "model": config.XAI_VOICE_MODEL,
            "effort": config.XAI_VOICE_EFFORT,
            "instructions_sha": hashlib.sha1(
@@ -440,6 +586,7 @@ def main() -> int:
         print(f"[{r['kind'][:4]}] {r['text'][:44]!r:<48} tool={tool:<18} "
               f"{(r.get('error') or r['said'])[:110]!r}{yes}")
     show(res)
+    verbatim(res["records"])
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1))
         print(f"   wrote {a.out}")
