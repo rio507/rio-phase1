@@ -45,6 +45,9 @@ SPEECH_SPOKEN = "NAV_SPEECH_SPOKEN"
 # A line held before it reached the session, checked again at release:
 # kept, regenerated (a far call re-read for the car's position) or dropped.
 SPEECH_REVALIDATED = "NAV_SPEECH_REVALIDATED"
+# Who spoke first when she started a route by voice -- her confirmation, or
+# (first maneuver already inside its near call) the turn -- and why.
+ROUTE_START_ORDER = "NAV_ROUTE_START_ORDER"
 ARRIVED = "NAV_ARRIVED"
 
 ALL = tuple(v for k, v in sorted(globals().items())

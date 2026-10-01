@@ -327,18 +327,27 @@
      * with the rating and the four-minute drive, and would be taken somewhere
      * else with the right name.
      */
+    /* HELD: her confirmation goes out before the first turn call -- see
+       RIO.navplan.routeStartOrder, and routeConfirm in the controller, which
+       releases it when the confirmation has finished playing. */
+    /* ...ONLY WHEN SOMEONE WILL CONFIRM IT. With no live session there is no
+       confirmation to wait for, and a held start would hold until the bound. */
+    var live = root.RIO && root.RIO.realtime && root.RIO.realtime.active
+      ? root.RIO.realtime.active() : null;
+    var holdStart = !!live;
     var started = (placeId && typeof nav.setRoute === 'function')
-      ? Promise.resolve(nav.setRoute({ place_id: placeId, label: text }))
+      ? Promise.resolve(nav.setRoute({ place_id: placeId, label: text,
+                                       holdStart: holdStart }))
           .then(function (res) {
             if (res && res.ok) {
               return { status: 'routed',
                        destination: (res.route && res.route.destination) || null,
-                       route: res.route };
+                       route: res.route, start_held: !!res.start_held };
             }
             return { status: 'failed',
                      error: (res && res.error) || 'could not build a route' };
           })
-      : Promise.resolve(nav.routeToQuery(text));
+      : Promise.resolve(nav.routeToQuery(text, { holdStart: holdStart }));
 
     return started.then(function (out) {
       out = out || {};
@@ -381,6 +390,8 @@
          * every turn goes out on the route engine's cadence, and a driver who
          * wants one ASKS -- nav_status, nav_directions -- which is answering. */
         return {
+          // Internal, stripped before the result reaches the model.
+          route_start_held: !!out.start_held,
           ok: true, routing: true, status: 'routed',
           // The provider's own spelling of the place, not the driver's and
           // not the transcriber's. This is the word she repeats back.
@@ -690,6 +701,23 @@
        when it was taken back: nothing was sent, nothing is coming, there is
        nothing to cancel and no orphan to claim. */
     var withdrawCreate = cfg.withdraw || function () { return false; };
+    /* HER ROUTE CONFIRMATION, WHICH THE FIRST TURN CALL WAITS FOR.
+       Armed when a start_navigation result comes back with the route start
+       held; bound to the response that answers it (by its create's name);
+       released at that response's AUDIO END -- utteranceEnded, which waits
+       for the sound, not response.done -- or by a bound, if no confirmation
+       ever plays. */
+    var routeConfirm = null;      // {tag, responseId, timer}
+    var ROUTE_CONFIRM_MAX_MS = cfg.routeConfirmMaxMs || 15000;
+    function releaseRouteStart(why) {
+      var rc = routeConfirm;
+      if (!rc) return;
+      routeConfirm = null;
+      if (rc.timer) clearTimeout(rc.timer);
+      var nav = (cfg.nav) || (root.RIO && root.RIO.nav) || null;
+      try { if (nav && nav.releaseStart) nav.releaseStart(why); } catch (e) {}
+      emit('LIVE_ROUTE_START_RELEASED', { why: why, response_id: rc.responseId });
+    }
     /* WHICH TIER A DICTATED LINE IS -- read off the arbiter item that is
        speaking it, never named here. This file must not be able to name a
        safety tier at all (the firewall in tools/realtime_selftest.js), and it
@@ -897,6 +925,9 @@
       var early = ended !== 'completed' || frac < 0.98;
       if (early) counters.utterances_early++;
       var sink = sinkSummary(u);
+      if (routeConfirm && routeConfirm.responseId === rid) {
+        setTimeout(function () { releaseRouteStart('confirmation_done'); }, 0);
+      }
       emit('LIVE_UTTERANCE_END', {
         response_id: rid, turn_kind: u.turn_kind,
         generated_chars: u.generated_chars, status: u.status,
@@ -1126,6 +1157,11 @@
     var pendingBarge = null;    // { responseId, cancelled, timer, confirm, said }
     var pendingResume = null;   // { cause, said }
     var resumeChain = 0;        // resumes spent on THIS answer
+    /* Everything of this answer the driver has heard so far, across resumes.
+       A resumed part that is cut off again is resumed from the WHOLE answer,
+       not from the fragment the resume managed to say -- otherwise the second
+       "as I was saying" picks up from the middle of a middle. */
+    var resumeHeard = '';
     /* One retry of a refused response per driver turn. See responseFailed:
        the ceiling this exists for is per-minute, so a second attempt inside
        one turn is asking the same question of the same empty budget. */
@@ -1958,7 +1994,7 @@
        whether there is still something going on to decide about. */
     var speechActive = false;
     var maxResumes = (cfg.maxResumes === undefined || cfg.maxResumes === null)
-      ? 1 : cfg.maxResumes;
+      ? 2 : cfg.maxResumes;          // config.REALTIME_MAX_RESUMES
     var resumeInstruction = cfg.resumeInstruction ||
       'You were cut off part-way through an answer by noise, not by the ' +
       'driver. Finish it in one or two short sentences, beginning with ' +
@@ -2309,9 +2345,11 @@
       if (!said) return;
       if (resumeChain >= maxResumes) {
         counters.resume_skipped++;
-        emit('LIVE_RESUME_SKIPPED', { cause: cause, reason: 'budget' });
+        emit('LIVE_RESUME_SKIPPED', { cause: cause, reason: 'budget',
+                                      resumes: resumeChain });
         return;
       }
+      if (resumeChain > 0 && resumeHeard) said = resumeHeard + ' ' + said;
       pendingResume = { cause: cause, said: said };
     }
 
@@ -2324,12 +2362,14 @@
       var r = pendingResume;
       pendingResume = null;
       resumeChain++;
+      resumeHeard = r.said;
       counters.resumed++;
       /* The next response to open is this resume. Consumed in beginResponse
          so the latency of a resumed half-answer is not read as the latency of
          an answer to a question nobody asked twice. */
       resumeExpected = true;
-      emit('LIVE_RESUME', { cause: r.cause, said: r.said });
+      emit('LIVE_RESUME', { cause: r.cause, said: r.said, resume: resumeChain,
+                            of: maxResumes });
       try {
         send({
           type: 'response.create',
@@ -2384,6 +2424,11 @@
       if (stopped) return;
       opts = opts || {};
       var tag = opts.tag || null;
+      if (routeConfirm && !routeConfirm.responseId && isCreate(tag, routeConfirm.tag)
+          && String(responseId || '').indexOf('direct:') !== 0
+          && !(dictation && !dictation.responseId && isCreate(tag, dictation.tag) && tag)) {
+        routeConfirm.responseId = responseId;
+      }
       /* The first response after a dictation was sent IS that dictation. It
          gets bound here rather than claiming the mouth: a warning arriving as
          a conversation-priority item would be a warning that yields to
@@ -3452,6 +3497,7 @@
         // the one retry a refused response gets.
         pendingResume = null;
         resumeChain = 0;
+        resumeHeard = '';
         retryArmed = true;
 
         if (cont) {
@@ -3816,8 +3862,16 @@
         .then(function (result) {
           delete inflightTools[callId];
           result = result || { ok: false, note: 'no result' };
+          var heldStart = !!result.route_start_held;
+          delete result.route_start_held;
+          /* No confirmation is coming on these two paths, so the route start
+             is let go now rather than at the bound. */
+          var letGo = function (why) {
+            var nav = cfg.nav || (root.RIO && root.RIO.nav) || null;
+            try { if (heldStart && nav && nav.releaseStart) nav.releaseStart(why); } catch (e) {}
+          };
           if (!result.ok && !entry.aborted) counters.tool_failures++;
-          if (stopped) return result;
+          if (stopped) { letGo('session_stopped'); return result; }
 
           /* THE ANSWER TO A QUESTION NOBODY IS WAITING FOR.
            *
@@ -3827,6 +3881,7 @@
            * requested. This is the line that stops a forty-second-old answer
            * arriving on top of the question the driver actually asked. */
           if (entry.turn !== turnSeq) {
+            letGo('tool_result_discarded');
             counters.tool_results_discarded++;
             emit('LIVE_TOOL_RESULT_DISCARDED', {
               tool: name, call_id: callId, turn: entry.turn, now_turn: turnSeq,
@@ -3949,6 +4004,14 @@
           }
           var asked = true;
           try { send(ask); } catch (e) { asked = false; }
+          if (heldStart) {
+            if (routeConfirm) releaseRouteStart('superseded');
+            routeConfirm = { tag: asked ? createTag(ask) : null, responseId: null,
+                             timer: setTimeout(function () {
+                               releaseRouteStart('confirmation_timeout');
+                             }, ROUTE_CONFIRM_MAX_MS) };
+            if (!asked) releaseRouteStart('not_asked');
+          }
           emit('LIVE_TOOL_RESULT', { tool: name, call_id: callId,
                                      ok: !!result.ok, path: result.path || null,
                                      took_ms: result.took_ms || null,
@@ -4144,6 +4207,7 @@
                 // A whole answer got out. Whatever chain of interruptions led
                 // here is over, and the next one starts with a full budget.
                 resumeChain = 0;
+                resumeHeard = '';
               }
               if (ev.response.status === 'incomplete'
                   && det.reason === 'max_output_tokens') {

@@ -210,6 +210,15 @@
     var lastProgress = null;
     var stopped = false;
     var started = false;          // has the route-start line gone out?
+    /* HELD AT ROUTE START, when she is about to confirm the route out loud.
+       A route started by voice locks inside the start_navigation tool call,
+       before the tool result has even gone back -- so the depart line used to
+       take the mouth first and her confirmation came second, which is
+       backwards. Held, nothing this planner says goes out (the depart line and
+       every tier) until releaseStart(); progress is still followed, so the
+       first tick after release fires whatever is due. See routeStartOrder. */
+    var holding = !!cfg.holdStart;
+    var startPending = false;
     var counters = { candidates: 0, spoken: 0, invalidated: 0, expired: 0,
                      anchors_verified: 0, anchors_rejected: 0 };
 
@@ -714,6 +723,7 @@
      * junction. The only gate is "once".
      */
     function onRouteStart() {
+      if (holding) { startPending = true; return false; }
       if (started || stopped) return false;
       started = true;
       var text = route.depart_speech || '';
@@ -751,6 +761,7 @@
       };
       var dist = ev.to_maneuver_m;
       lastProgress = { maneuver_id: man.id, dist: dist, t: clock };
+      if (holding) return;                // followed, not spoken: see `holding`
       var speedMs = Math.max(0, ev.speed_ms || 0);
       var extra = biasM(speedMs);
       var stationary = speedMs < opt.stationary_speed_ms;
@@ -979,6 +990,15 @@
          waiting for one is how the driver ends up hearing a turn call before
          they have been told what road they are on. */
       onRouteStart: onRouteStart,
+      /* Let a held route start speak: the depart line now, the tiers from the
+         next tick. Idempotent. */
+      releaseStart: function () {
+        if (!holding) return false;
+        holding = false;
+        if (startPending) { startPending = false; onRouteStart(); }
+        return true;
+      },
+      holding: function () { return holding; },
       started: function () { return started; },
       stop: function () { stopped = true; },
       contextState: function (maneuverId) {
@@ -1013,7 +1033,38 @@
   }
 
   root.RIO = root.RIO || {};
-  root.RIO.navplan = { create: create, CALL: CALL, CTX: CTX, EVENTS: EV, DEFAULTS: DEFAULTS };
+  /* WHO SPEAKS FIRST WHEN SHE STARTS A ROUTE BY VOICE.
+   *
+   * Her confirmation ("taking you to ..., about four minutes"), then the first
+   * turn -- the order a person uses, and the general tier priority (a nav line
+   * outranks a conversational answer) would reverse it. So this is a rule for
+   * this one moment, not a change to priority.
+   *
+   * THE ONE EXCEPTION: the first maneuver is already inside its near-call
+   * distance when the route locks -- out of a driveway straight into a turn.
+   * Then there is no time for a confirmation first, and the turn goes first.
+   * Pure, so the glue and the tests decide it the same way. */
+  function routeStartOrder(route) {
+    var list = (route && route.maneuvers) || [];
+    var first = null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].type !== 'DEPART' && list[i].type !== 'ARRIVE') { first = list[i]; break; }
+    }
+    if (!first) first = list[0] || null;
+    var firstM = first ? Number(first.route_distance_position || 0) : null;
+    var nearAt = null;
+    var tiers = (first && first.speech && first.speech.tiers) || DEFAULTS.fallback_tiers || [];
+    for (var t = 0; t < tiers.length; t++) if (tiers[t].call === CALL.NEAR) nearAt = tiers[t].at_m;
+    if (first && nearAt !== null && firstM <= nearAt) {
+      return { hold: false, order: 'turn_first', why: 'first_maneuver_inside_near_call',
+               first_maneuver_m: Math.round(firstM), near_at_m: nearAt };
+    }
+    return { hold: true, order: 'confirmation_first', why: 'voice_route_start',
+             first_maneuver_m: firstM === null ? null : Math.round(firstM),
+             near_at_m: nearAt };
+  }
+
+  root.RIO.navplan = { create: create, routeStartOrder: routeStartOrder, CALL: CALL, CTX: CTX, EVENTS: EV, DEFAULTS: DEFAULTS };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = root.RIO.navplan;
 })(typeof window !== 'undefined' ? window : globalThis);

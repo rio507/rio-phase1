@@ -1140,10 +1140,15 @@ REALTIME_BARGE_ECHO_FLOOR_DB = -50
 # a driver who really was talking is the one failure worse than the original.
 REALTIME_BARGE_CONFIRM_MS = 1500
 
-# How many times one answer may be resumed. One: an answer that is cut off,
-# resumed, and cut off again is in an argument with the cabin, and repeating
-# "as I was saying" is worse than stopping.
-REALTIME_MAX_RESUMES = 1
+# How many times one answer may be resumed. TWO, capped there. It was one, on
+# the grounds that an answer cut off, resumed and cut off again is in an
+# argument with the cabin -- true of a driver talking over her, and not of the
+# commonest cause on a route: a run of callouts, each one taking the mouth for
+# a second. Then a resumed answer cut by the next turn call was simply lost.
+# Two lets it finish after that; the cap stops a busy stretch of callouts
+# looping her through "as I was saying" for ever. A completed answer or a new
+# turn from the driver resets the count.
+REALTIME_MAX_RESUMES = 2
 
 # ---------------------------------------------------------------------------
 # A CANCEL IS A SUPERSEDE ONLY WHEN A REAL NEW QUESTION EXISTS

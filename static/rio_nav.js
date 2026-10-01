@@ -563,8 +563,20 @@
       if (tracker.state().gps_state !== before) paintStates();
     }, 500);
 
-    function attach(r) {
+    var startHold = null;         // {at, order} while a voice route start waits for her
+
+    function attach(r, opts) {
+      opts = opts || {};
       route = r;
+      /* A ROUTE SHE STARTED BY VOICE: her confirmation goes first, then the
+         first turn -- unless the first turn is already inside its near-call
+         distance, when it goes first. RIO.navplan.routeStartOrder decides;
+         RIO.nav.releaseStart (called when her confirmation has finished
+         playing) lets the held planner speak. Logged either way. */
+      var order = opts.holdStart && RIO.navplan.routeStartOrder
+        ? RIO.navplan.routeStartOrder(r) : null;
+      var hold = !!(order && order.hold);
+      startHold = null;
       // Decode the junction calls NOW, not at the junction. A route is minutes
       // of notice that these four sentences are coming, and decoding an MP3
       // the first time it is played is exactly the delay the file exists to
@@ -579,7 +591,25 @@
         // left in the arbiter's queue must fail validity on its own rather
         // than relying on the queue having been cleared.
         activeGeneration: function () { return route ? route.generation_id : -1; },
+        holdStart: hold,
       });
+      if (order && !hold) {
+        RIO.bus.emit('NAV_ROUTE_START_ORDER', {
+          route_id: r.route_id, generation_id: r.generation_id,
+          order: order.order, why: order.why,
+          first_maneuver_m: order.first_maneuver_m, near_at_m: order.near_at_m,
+          waited_ms: 0 });
+      }
+      if (hold) {
+        startHold = { at: Date.now(), order: order, route: r };
+        /* THE BACKSTOP. The controller releases this at the end of her
+           confirmation, and bounds its own wait; this bounds the hold
+           whoever started it, so a lost confirmation can never leave a route
+           with its turn calls switched off. */
+        setTimeout(function () {
+          if (startHold && startHold.route === r) RIO.nav.releaseStart('hold_backstop');
+        }, 20000);
+      }
       tracker.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
       planner.onEvent(function (ev) { RIO.bus.emit(ev.type, ev); });
       /* THE ROUTE-START LINE, HERE, because here is where a route becomes the
@@ -698,8 +728,9 @@
       }).then(function (r) { return r.json(); })
         .then(function (j) {
           if (j.error) throw new Error(j.error);
-          attach(j);
-          return { ok: true, route: j };
+          attach(j, { holdStart: !!opts.holdStart });
+          return { ok: true, route: j,
+                   start_held: !!(planner && planner.holding && planner.holding()) };
         })
         .catch(function (e) {
           status('No route · ' + (e && e.message ? e.message : e));
@@ -726,7 +757,8 @@
          { status: 'not_found', query }
          { status: 'failed',    error }
        The panel ignores it and reads the page. RIO has to say it out loud. */
-    function routeToQuery(text) {
+    function routeToQuery(text, ropts) {
+      ropts = ropts || {};
       status('Finding …');
       // The fallback path, and the one that has to keep working when
       // autocomplete does not: whatever is in the box is resolved through the
@@ -756,10 +788,12 @@
           var d = j.destination;
           return setRoute({ place_id: d.provider_place_id || '',
                             destination: d.provider_place_id ? '' : d.formatted_address,
-                            label: d.display_name || d.formatted_address })
+                            label: d.display_name || d.formatted_address,
+                            holdStart: !!ropts.holdStart })
             .then(function (res) {
               if (res && res.ok) {
-                return { status: 'routed', destination: d, route: res.route };
+                return { status: 'routed', destination: d, route: res.route,
+                         start_held: !!res.start_held };
               }
               // Resolved to a real place and still could not be routed to:
               // no fix to start from, or the provider refused. Not the same
@@ -1070,6 +1104,20 @@
     RIO.nav = {
       setRoute: setRoute,
       routeToQuery: routeToQuery,
+      /* Her confirmation has finished (or will not come): the held route
+         start may speak. `why` goes in the log beside how long it waited. */
+      releaseStart: function (why) {
+        var h = startHold;
+        if (!h || !planner || h.route !== route) return false;
+        startHold = null;
+        RIO.bus.emit('NAV_ROUTE_START_ORDER', {
+          route_id: route.route_id, generation_id: route.generation_id,
+          order: h.order.order, why: h.order.why, released_by: why || null,
+          first_maneuver_m: h.order.first_maneuver_m,
+          near_at_m: h.order.near_at_m,
+          waited_ms: Date.now() - h.at });
+        return planner.releaseStart();
+      },
       offerDestinations: offerDestinations,
       clearRoute: clearRoute,
       stopRoute: stopRoute,

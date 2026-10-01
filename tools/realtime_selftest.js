@@ -540,6 +540,32 @@ section('a warning does not yield to a cough');
 section('resuming is bounded, and real speech ends it');
 // ---------------------------------------------------------------------------
 {
+  const h = harness({ maxResumes: 2 });
+  // Cut off, resumed, cut off again, resumed, cut off a THIRD time: the
+  // third is not resumed. Two resumes let an answer survive a run of turn
+  // calls; the cap stops a busy stretch of them looping her through "as I was
+  // saying" for ever.
+  const cut = async (id, words) => {
+    h.controller.handle({ type: 'response.created', response: { id: id } });
+    h.controller.handle({ type: 'response.output_audio_transcript.delta',
+                          response_id: id, delta: words });
+    await tick();
+    h.controller.handle({ type: 'input_audio_buffer.speech_started' });
+    await new Promise(r => setTimeout(r, 6));
+    h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
+    await settle();
+  };
+  await cut('r1', 'first part');
+  ok(h.resumeSent().length === 1, 'first cut-off resumes');
+  await cut('r2', 'second part');
+  ok(h.resumeSent().length === 2, 'the resumed part, cut off again, resumes a second time');
+  ok(/first part second part/.test(h.resumeSent()[1].response.instructions || ''),
+     'from EVERYTHING heard so far, not just the fragment the first resume said');
+  await cut('r3', 'third part');
+  ok(h.resumeSent().length === 2, 'a third cut-off does not — capped at two');
+  ok(h.controller.state().counters.resume_skipped === 1, 'and says it declined');
+}
+{
   const h = harness();
   // Cut off, resumed, cut off again: the second one is not resumed. An answer
   // in an argument with the cabin should stop, not keep saying "as I was
@@ -562,8 +588,7 @@ section('resuming is bounded, and real speech ends it');
   await new Promise(r => setTimeout(r, 6));
   h.controller.handle({ type: 'input_audio_buffer.speech_stopped' });
   await settle();
-  ok(h.resumeSent().length === 1, 'the second does not — one resume per answer');
-  ok(h.controller.state().counters.resume_skipped === 1, 'and says it declined');
+  ok(h.resumeSent().length === 2, 'with no cap given, the default is two as well');
 }
 {
   const h = harness();
@@ -2337,6 +2362,13 @@ section('navigation by voice — stopping, rerouting, and who the tracker '
     if (process.env.RT_DEBUG) console.log('    byVoice:', JSON.stringify(byVoice));
     ok(byVoice.ok === true && byVoice.routing === true,
        'a spoken destination routes (' + byVoice.destination + ')');
+    /* HELD FOR HER CONFIRMATION, which the controller's tool path releases
+       when it has finished playing (tools/route_start_order_selftest.js).
+       Called directly here, so released the way the controller would. */
+    ok(byVoice.route_start_held === true,
+       'with a live session, the first turn call waits for her confirmation');
+    nav.releaseStart('confirmation_done');
+    await new Promise((r) => setTimeout(r, 30));   // the depart line, at release
     const voiceDrive = await driveToEnd('voice');
     const voiceSeq = sequence(voiceDrive);
     ok(voiceSeq.length > 0,
