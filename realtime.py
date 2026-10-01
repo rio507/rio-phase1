@@ -431,8 +431,11 @@ NAVIGATE_SCHEMA = {
         "LAX', 'let's go to Ralphs'. It resolves the destination and makes "
         "the route live — the same thing that happens when one is typed into "
         "the panel — so you never tell the driver to set it themselves. Call "
-        "it as soon as they ask; do not ask permission first.\n"
-        "If they are choosing one of the places find_places just gave you, "
+        "it as soon as they ASK TO GO somewhere; do not ask permission then.\n"
+        "Liking or approving a place you suggested is not asking to go: it "
+        "starts a route and turn calls, so ask whether they want to head "
+        "there and call this on their yes.\n"
+        "When they ask to go to one of the places find_places just gave you, "
         "pass that result's place_id with the name — it is already resolved.\n"
         "It can come back asking WHICH ONE: more than one place answers to "
         "what they said. Put that to the driver in your own words and call "
@@ -854,11 +857,21 @@ you could not pull it up right now. Neither is a cue to remember a place. If
 it does not know where the car is, ask which area to search — one short
 question — and call it again with that area.
 
-WHEN THEY PICK ONE
+WHEN THEY WANT TO GO TO ONE
 
-"Take me to the second one." "Let's go to the Blue Bottle." That is
-start_navigation, with the place_id the result you already have carries for
-every place you read out — the same place, already resolved.
+"Take me to the second one." "Let's go to the Blue Bottle." Asking to go to a
+place you read out is start_navigation, at once, with the place_id the result
+you already have carries for it — the same place, already resolved.
+
+LIKING ONE IS NOT ASKING TO GO. Approving an option, sounding keen on it, or
+naming it on its own is them telling you what they think of it — the same rule
+as being told something, applied to the one action that changes their screen
+and starts calling turns. So it waits for a real yes: react to their pick, ask
+in your own words whether they want to head there, and start the route the
+moment they say yes. Choosing one — even in answer to your own question or
+offer — is still a pick, not a go-ahead: confirm it's that one and start on
+their yes. And when you offer, offer the going itself, plainly, so their yes
+can only mean one thing.
 
 WHEN THEY ASK WHAT'S GOING ON
 

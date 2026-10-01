@@ -80,6 +80,31 @@ _last = {}                    # session_key -> {"t", "query", "results"}
 _last_lock = threading.Lock()
 
 
+# What every find_places result tells her, in the result itself.
+#
+# IT USED TO SAY "If the driver picks one, call start_navigation", and on drive
+# bf2b6978 (2026-10-01) that is what she did: "Ooh, Pizzana sounds..." started a
+# route. Liking a place is not asking to go there, and a route is the one
+# consequential thing this tool chains into -- it changes the screen and starts
+# calling turns -- so it waits for a real yes. companion_bench `navpick` holds
+# it to that, against this exact text.
+RESULT_RULES = (
+    "Answer ONLY from this list. Every name, rating, price and opening "
+    "state you say must be in it, and if it is not here you do not know "
+    "it. Say the best two or three, not all of them: name, what makes "
+    "it worth picking (the rating, how close it is, whether it is open "
+    "now), and offer the rest if they want more. Ratings are out of "
+    "five and spoken as such. `drive_minutes_est` is an ESTIMATE from "
+    "distance, so say 'about four minutes', never 'four minutes'. "
+    "If the driver ASKS TO GO to one, call start_navigation with that "
+    "result's place_id AND its name — the place is already resolved, so "
+    "passing the id skips looking it up again and cannot land on a different "
+    "branch of the same chain. If they only like one, pick one or sound keen, "
+    "that is not asking to go: ask whether they want to head there, and start "
+    "the route on their yes."
+)
+
+
 def _api_key() -> str:
     """The same key navigation uses, read the same way.
 
@@ -588,17 +613,5 @@ def find_places(query: str, near: str = "", open_now: bool = False,
         "results": results,
         "took_ms": round((time.time() - t0) * 1000, 1),
         "attribution": "Powered by Google",
-        "rules": (
-            "Answer ONLY from this list. Every name, rating, price and opening "
-            "state you say must be in it, and if it is not here you do not know "
-            "it. Say the best two or three, not all of them: name, what makes "
-            "it worth picking (the rating, how close it is, whether it is open "
-            "now), and offer the rest if they want more. Ratings are out of "
-            "five and spoken as such. `drive_minutes_est` is an ESTIMATE from "
-            "distance, so say 'about four minutes', never 'four minutes'. "
-            "If the driver picks one, call start_navigation with that result's "
-            "place_id AND its name — the place is already resolved, so passing "
-            "the id skips looking it up again and cannot land on a different "
-            "branch of the same chain."
-        ),
+        "rules": RESULT_RULES,
     }

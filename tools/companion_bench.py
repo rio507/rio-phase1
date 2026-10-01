@@ -42,6 +42,11 @@ THE NUMBERS, per arm:
   edgy        `edgy_uncalled`: profanity, sarcasm or edginess on a turn that
               did not call for it -- performing a trait rather than having it.
               Judged, plus a profanity count on every reply.
+  navpick     (2026-10-01, drive bf2b6978: "Ooh, Pizzana sounds..." started a
+              route.) She suggests places -- find_places answered with a fixed
+              stub -- and the driver reacts. Two NAMED MUST-PASSES: approving a
+              place never starts a route on that turn, and asking to go there
+              starts it at once. Her yes is scored too.
   hungry      a NAMED MUST-PASS in the gate: "I'm kinda hungry" is a
               statement and is never a search on the first turn. It regressed
               to 5/6 once without anything saying so.
@@ -147,6 +152,15 @@ SET = [
     # sign-off rather than how she takes thanks in a real drive.
     ("convo", "Why do they call it a sandwich? | Thanks for your help.",
      "written 2026-10-01"),
+    # --- navpick: her suggestions, then the driver's reaction -------------
+    ("navpick", "Find me a good pizza place. | Ooh, Pizzana sounds good. | Yeah, let's go.",
+     "log bf2b6978 driver_said"),
+    ("navpick", "Find me a good pizza place. | That one sounds good. | Yeah, let's go.",
+     "brief 2026-10-01"),
+    ("navpick", "Find me a good pizza place. | Ooh nice, Pizzana. | Yeah, let's go.",
+     "brief 2026-10-01"),
+    ("navpick", "Find me a good pizza place. | Take me to Pizzana.", "brief 2026-10-01"),
+    ("navpick", "Find me a good pizza place. | Let's go to Pizzana.", "brief 2026-10-01"),
 ]
 
 YES = "Yeah."
@@ -302,6 +316,59 @@ async def _listen(ws, seconds):
     return n
 
 
+# What find_places and start_navigation hand back, fixed, so the turn after her
+# suggestion is the thing measured. Shaped like the real results.
+PLACES_STUB = {
+    "ok": True, "query": "pizza", "results": [
+        {"name": "Pizzana", "place_id": "p_pizzana", "rating": 4.4,
+         "user_rating_count": 1100, "price_level": "moderate", "open_now": True,
+         "drive_minutes": 23, "address": "11712 San Vicente Blvd"},
+        {"name": "ALL ROADS Pinseria + Enoteca", "place_id": "p_allroads",
+         "rating": 4.5, "user_rating_count": 240, "price_level": "moderate",
+         "open_now": True, "drive_minutes": 22, "address": "2716 Main St"}],
+    # The production result's own rules, verbatim -- the stub without them
+    # passed while the real result was telling her to route on a pick.
+    "rules": __import__("places").RESULT_RULES}
+ROUTE_STUB = {"ok": True, "routing": True, "status": "routed",
+              "destination": "Pizzana", "minutes": 23, "distance_km": 15.3}
+
+
+async def _turn_tools(ws, text, rounds=3):
+    """A driver line, with her tool calls ANSWERED, until she stops calling."""
+    calls, said = await _turn(ws, text)
+    all_calls, all_said = list(calls), said
+    for _ in range(rounds):
+        if not calls:
+            break
+        for c in calls:
+            out = (PLACES_STUB if c["name"] == "find_places" else
+                   dict(ROUTE_STUB, destination=(json.loads(c["args"] or "{}")
+                                                 .get("destination") or "Pizzana"))
+                   if c["name"] == "start_navigation" else {"ok": False})
+            await ws.send(json.dumps({"type": "conversation.item.create", "item": {
+                "type": "function_call_output", "call_id": c["call_id"],
+                "output": json.dumps(out)}}))
+        await ws.send(json.dumps({"type": "response.create"}))
+        calls, said = [], ""
+        while True:
+            ev = json.loads(await asyncio.wait_for(ws.recv(), 60))
+            t = ev.get("type", "")
+            if t == "response.output_item.done":
+                it = ev.get("item") or {}
+                if it.get("type") in ("function_call", "function"):
+                    calls.append({"name": it.get("name"), "args": it.get("arguments"),
+                                  "call_id": it.get("call_id")})
+            elif t == "response.output_audio_transcript.done":
+                said = (said + " " + (ev.get("transcript") or "")).strip()
+            elif t == "error":
+                raise RuntimeError(str(ev.get("error"))[:300])
+            elif t == "response.done":
+                break
+        all_calls += calls
+        all_said = (all_said + " " + said).strip()
+    return all_calls, all_said
+
+
 async def one(kind, text, instructions, tools):
     import websockets
 
@@ -324,6 +391,14 @@ async def one(kind, text, instructions, tools):
             if ev.get("type") == "error":
                 raise RuntimeError("session refused: " + str(ev.get("error"))[:300])
 
+        if kind == "navpick":
+            turns = []
+            for line in [x.strip() for x in text.split("|")]:
+                c, s_ = await _turn_tools(ws, line)
+                turns.append({"text": line, "calls": c, "said": s_})
+            return {"kind": kind, "text": text, "turns": turns,
+                    "calls": [c for t in turns for c in t["calls"]],
+                    "said": " / ".join(t["said"] for t in turns)}
         if kind == "convo":
             lines = [x.strip() for x in text.split("|")]
             turns = []
@@ -431,6 +506,7 @@ def judge(recs):
 
 HUNGRY = ("I'm kinda hungry.", "I'm feeling kinda hungry.")
 HUNGRY_TRIALS = 8
+NAVPICK_TRIALS = 4
 
 
 def score(recs):
@@ -451,8 +527,9 @@ def score(recs):
         sum((not r["calls"]) and bool(_CONFIRM.search(r["said"])) for r in rq),
         len(rq))
     out["chat_no_tool"] = (sum(not r["calls"] for r in ch), len(ch))
-    out["unsourced_claims"] = (sum(is_unsourced(r["said"]) for r in recs),
-                               len(recs))
+    # navpick replies read out a stubbed search result -- sourced by design.
+    src = [r for r in recs if r["kind"] != "navpick"]
+    out["unsourced_claims"] = (sum(is_unsourced(r["said"]) for r in src), len(src))
     unprompted = [r for r in st + ch
                   if r["said"] and not mentions_drive(r["text"])]
     out["drive_mentions"] = (sum(mentions_drive(r["said"]) for r in unprompted),
@@ -503,6 +580,15 @@ def score(recs):
             i_d += k; i_n += len(rs)
     out["sessions_distinct_openings"] = (o_d, o_n)
     out["sessions_distinct_ideas"] = (i_d, i_n)
+    nav = lambda t: any(c["name"] == "start_navigation" for c in t["calls"])
+    npk = [r for r in recs if r["kind"] == "navpick" and len(r.get("turns") or []) >= 2]
+    appr = [r for r in npk if len(r["turns"]) == 3]
+    reqs = [r for r in npk if len(r["turns"]) == 2]
+    out["navpick_approval_no_start"] = (sum(not nav(r["turns"][1]) for r in appr), len(appr))
+    out["navpick_yes_starts"] = (sum(nav(r["turns"][2]) for r in appr
+                                     if not nav(r["turns"][1])),
+                                 sum(not nav(r["turns"][1]) for r in appr))
+    out["navpick_request_starts"] = (sum(nav(r["turns"][1]) for r in reqs), len(reqs))
     hg = [r for r in recs if r["text"] in HUNGRY]
     out["hungry_no_search"] = (sum(not r["calls"] for r in hg), len(hg))
     return out
@@ -523,6 +609,7 @@ async def run(trials, conc):
     # something.
     jobs = [(k, t, src) for k, t, src in SET
             for _ in range(max(trials, HUNGRY_TRIALS) if t in HUNGRY
+                           else max(trials, NAVPICK_TRIALS) if k == "navpick"
                            else max(trials, VARIETY_TRIALS) if t in VERBATIM
                            else trials)]
 
@@ -577,6 +664,15 @@ def gate(score):
         ("MUST-PASS: 'I'm kinda hungry' is not a search", hd > 0 and hn == hd,
          f"{hn}/{hd} answered without a tool"),
         ("no unprompted speech", up == 0, f"{up} responses in {upn} silences"),
+        ("MUST-PASS: liking a place is not a route",
+         score.get("navpick_approval_no_start", (0, 0))[1] > 0
+         and score["navpick_approval_no_start"][0] == score["navpick_approval_no_start"][1],
+         "{}/{} approvals answered without start_navigation".format(
+             *score.get("navpick_approval_no_start", (0, 0)))),
+        ("MUST-PASS: 'take me there' starts at once",
+         score.get("navpick_request_starts", (0, 0))[1] > 0
+         and score["navpick_request_starts"][0] == score["navpick_request_starts"][1],
+         "{}/{} requests started a route".format(*score.get("navpick_request_starts", (0, 0)))),
         ("no performative edge", score.get("edgy_uncalled", (0, 1))[0]
          <= max(1, score.get("edgy_uncalled", (0, 1))[1] // 30),
          f"{score.get('edgy_uncalled', (0, 0))[0]}/{score.get('edgy_uncalled', (0, 0))[1]} uncalled-for"),
@@ -596,6 +692,11 @@ VERBATIM = ("I'm kinda hungry.", "I'm tired.", "This traffic is brutal.",
 
 def verbatim(recs):
     print("\n   VERBATIM")
+    for r in [r for r in recs if r["kind"] == "navpick"]:
+        t = r["turns"]
+        tail = "  ||  ".join(f"[{','.join(c['name'] for c in x['calls']) or '-'}] {x['said']}"
+                             for x in t[1:])
+        print(f"   {t[1]['text']!r}: {tail}")
     rs = [r for r in recs if r["text"].endswith("| Thanks for your help.")]
     if rs:
         print("   Thanks for your help. (after she has answered something)")
@@ -674,7 +775,8 @@ def main() -> int:
     OPENING_SEED = not a.no_opening_seed
     TEMPERATURE = a.temperature
     if a.variety_only:
-        SET = [x for x in SET if x[1] in VERBATIM or x[1] in HUNGRY]
+        SET = [x for x in SET if x[1] in VERBATIM or x[1] in HUNGRY
+               or x[0] == "navpick"]
     if a.only:
         SET = [s for s in SET if a.only.lower() in s[1].lower()]
     instructions, recs, secs = asyncio.run(run(a.trials, a.conc))

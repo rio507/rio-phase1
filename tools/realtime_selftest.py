@@ -1499,7 +1499,8 @@ def run_awareness():
        "the honest failure line is given to her as words, not as a principle")
     ok("ask which area to search" in flat_instr,
        "and a no-location answer is a question, not a guess")
-    ok("WHEN THEY PICK ONE" in instr and "place_id" in instr,
+    ok("WHEN THEY WANT TO GO TO ONE" in instr and "place_id" in instr
+       and "LIKING ONE IS NOT ASKING TO GO." in instr,
        "picking one of the results chains into start_navigation by place_id")
 
     ok("WHEN THE DRIVER ASKS FOR THE DIRECTIONS" in instr,
