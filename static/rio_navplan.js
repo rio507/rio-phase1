@@ -1040,11 +1040,24 @@
    * outranks a conversational answer) would reverse it. So this is a rule for
    * this one moment, not a change to priority.
    *
-   * THE ONE EXCEPTION: the first maneuver is already inside its near-call
-   * distance when the route locks -- out of a driveway straight into a turn.
-   * Then there is no time for a confirmation first, and the turn goes first.
+   * THE ONE EXCEPTION: the car is MOVING and would reach the first turn
+   * before a confirmation could finish -- out of a driveway straight into a
+   * turn, rolling. Then the turn goes first.
+   *
+   * IT USED TO BE DISTANCE ALONE ("inside the near call"), and on drive
+   * bf2b6978 (2026-10-01) that fired for a car sitting still: the route began
+   * with a turn 10 m away, under the 150 m near call, so the turn went first
+   * and her confirmation came after it. Ten metres is no time at all at
+   * thirty miles an hour and all the time in the world parked. So the
+   * question is TIME: inside the near call AND moving AND at the turn within
+   * CONFIRM_LEAD_S. Speed unknown is not moving -- nothing has shown it is.
    * Pure, so the glue and the tests decide it the same way. */
-  function routeStartOrder(route) {
+  var MOVING_MS = 2.0;            // below this the car is not going anywhere yet
+  var CONFIRM_LEAD_S = 6.0;       // a confirmation is ~4 s; a little margin
+  function routeStartOrder(route, ctx) {
+    ctx = ctx || {};
+    var speed = (typeof ctx.speed_ms === 'number' && isFinite(ctx.speed_ms))
+      ? ctx.speed_ms : null;
     var list = (route && route.maneuvers) || [];
     var first = null;
     for (var i = 0; i < list.length; i++) {
@@ -1055,13 +1068,21 @@
     var nearAt = null;
     var tiers = (first && first.speech && first.speech.tiers) || DEFAULTS.fallback_tiers || [];
     for (var t = 0; t < tiers.length; t++) if (tiers[t].call === CALL.NEAR) nearAt = tiers[t].at_m;
-    if (first && nearAt !== null && firstM <= nearAt) {
-      return { hold: false, order: 'turn_first', why: 'first_maneuver_inside_near_call',
-               first_maneuver_m: Math.round(firstM), near_at_m: nearAt };
+    var inside = !!(first && nearAt !== null && firstM <= nearAt);
+    var tta = (speed !== null && speed > 0 && firstM !== null) ? firstM / speed : null;
+    var base = { first_maneuver_m: firstM === null ? null : Math.round(firstM),
+                 near_at_m: nearAt,
+                 speed_ms: speed === null ? null : Math.round(speed * 10) / 10,
+                 tta_s: tta === null ? null : Math.round(tta * 10) / 10 };
+    if (inside && speed !== null && speed >= MOVING_MS && tta <= CONFIRM_LEAD_S) {
+      return Object.assign({ hold: false, order: 'turn_first',
+                             why: 'moving_into_first_turn' }, base);
     }
-    return { hold: true, order: 'confirmation_first', why: 'voice_route_start',
-             first_maneuver_m: firstM === null ? null : Math.round(firstM),
-             near_at_m: nearAt };
+    return Object.assign({ hold: true, order: 'confirmation_first',
+                           why: !inside ? 'route_start'
+                                : (speed === null ? 'near_turn_speed_unknown'
+                                   : (speed < MOVING_MS ? 'near_turn_not_moving'
+                                      : 'near_turn_time_to_confirm')) }, base);
   }
 
   root.RIO.navplan = { create: create, routeStartOrder: routeStartOrder, CALL: CALL, CTX: CTX, EVENTS: EV, DEFAULTS: DEFAULTS };

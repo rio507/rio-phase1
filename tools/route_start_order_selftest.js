@@ -95,7 +95,7 @@ function fakeCtx() {
   };
 }
 
-async function rig(firstAtM) {
+async function rig(firstAtM, carSpeed) {
   const WS = fakeWS();
   const ctx = fakeCtx();
   const arbiter = speech.makeArbiter();
@@ -118,11 +118,10 @@ async function rig(firstAtM) {
      planner is created held or not, the order is logged, releaseStart lets a
      held one speak. */
   let planner = null, hold = null;
-  const nav = {
-    unlock() {},
-    routeToQuery(text, ropts) {
+  const attach = (ropts) => {
       const r = route(firstAtM);
-      const order = ropts && ropts.holdStart && navplan.routeStartOrder ? navplan.routeStartOrder(r) : null;
+      const order = ropts && ropts.holdStart && navplan.routeStartOrder
+        ? navplan.routeStartOrder(r, { speed_ms: carSpeed }) : null;
       const held = !!(order && order.hold);
       planner = navplan.create({
         tracker: { route: r, maneuver: () => r.maneuvers[0], isPassed: () => false,
@@ -136,8 +135,23 @@ async function rig(firstAtM) {
       if (order && !held) navEvents.push(Object.assign({ type: 'NAV_ROUTE_START_ORDER' }, order));
       if (held) hold = order;
       planner.onRouteStart();
+      return { r, held };
+  };
+  const nav = {
+    unlock() {},
+    via: null,
+    // Spoken destination: resolved, then routed.
+    routeToQuery(text, ropts) {
+      nav.via = 'routeToQuery';
+      const { r, held } = attach(ropts);
       return Promise.resolve({ status: 'routed', destination: r.destination,
                                route: r, start_held: held });
+    },
+    // A find_places pick: routed straight from its place_id.
+    setRoute(opts) {
+      nav.via = 'setRoute';
+      const { r, held } = attach(opts);
+      return Promise.resolve({ ok: true, route: r, start_held: held });
     },
     releaseStart(why) {
       if (!hold) return false;
@@ -167,7 +181,7 @@ async function rig(firstAtM) {
   const creates = () => WS.sent.filter(e => e.type === 'response.create');
   const msg = (o) => s._onMessage(JSON.stringify(o));
   return {
-    s, ctx, creates, cevents, navEvents, msg,
+    s, ctx, creates, cevents, navEvents, msg, nav,
     // The server answers create `c` with `sec` seconds of audio, all generated.
     answer(c, id, words, sec) {
       msg({ type: 'response.created', response: { id, metadata: c.response.metadata } });
@@ -178,10 +192,12 @@ async function rig(firstAtM) {
     },
     // Time passes for the sound: the playout drains and the gate ticks.
     play(sec) { ctx._advance(sec); s._tick(); },
-    startNav() {
+    startNav(placeId) {
       controller.handle({ type: 'response.function_call_arguments.done',
         name: 'start_navigation', call_id: 'nav1',
-        arguments: JSON.stringify({ destination: 'Laemmle Monica Film Center' }) });
+        arguments: JSON.stringify(placeId
+          ? { destination: 'Pizzana', place_id: placeId }
+          : { destination: 'Laemmle Monica Film Center' }) });
     },
     isDepart: (c) => /Head north on Lincoln/.test((c.response && c.response.instructions) || ''),
   };
@@ -220,16 +236,16 @@ async function rig(firstAtM) {
 
   section('an immediate first turn: the TURN first');
   {
-    const h = await rig(90);                  // out of a driveway: 90 m to the turn
+    const h = await rig(60, 11);              // rolling out at 11 m/s, 60 m to the turn
     h.startNav();
     await sleep(20);
     const c = h.creates();
     ok(c.length >= 1 && h.isDepart(c[0]),
-       'the depart line goes first — the first turn is inside its 150 m near call');
+       'the depart line goes first — moving, and at the turn in ~5.5 s, before a confirmation could finish');
     ok(c.length === 1, 'and the confirmation waits behind it (one response at a time)');
     const order = h.navEvents.find(e => e.type === 'NAV_ROUTE_START_ORDER');
     ok(order && order.order === 'turn_first'
-       && order.why === 'first_maneuver_inside_near_call' && order.first_maneuver_m === 90,
+       && order.why === 'moving_into_first_turn' && order.first_maneuver_m === 60,
        `logged: ${order && order.order}, ${order && order.why}, `
        + `${order && order.first_maneuver_m} m`);
     h.answer(c[0], 'r_depart', DEPART, 3);
@@ -240,6 +256,42 @@ async function rig(firstAtM) {
     await sleep(20);
     const c2 = h.creates();
     ok(c2.length === 2 && !h.isDepart(c2[1]), 'then her confirmation');
+  }
+
+  section('drive bf2b6978: a route from a places result, the turn 10 m away, the car parked');
+  {
+    /* The drive: "Pizzana" picked from find_places, routed by place_id, first
+       turn 10 m from where the car sat. Distance alone called that imminent and
+       the turn went first. Parked, there is all the time in the world. */
+    const h = await rig(10, 0);
+    h.startNav('p_pizzana');
+    await sleep(20);
+    ok(h.nav.via === 'setRoute', 'routed the way a places pick is — by place_id, through setRoute');
+    const c = h.creates();
+    ok(c.length === 1 && !h.isDepart(c[0]), 'her confirmation is asked for first');
+    const order = h.navEvents.find(e => e.type === 'NAV_ROUTE_START_ORDER') || {};
+    h.answer(c[0], 'r_confirm', 'Taking you to Pizzana, about nineteen minutes.', 3);
+    await sleep(5); h.play(3.2); await sleep(20); h.play(2.1); await sleep(20);
+    const c2 = h.creates();
+    ok(c2.length === 2 && h.isDepart(c2[1]), 'and the first turn after it has finished playing');
+    const o2 = h.navEvents.filter(e => e.type === 'NAV_ROUTE_START_ORDER').pop() || {};
+    ok(o2.order === 'confirmation_first' && o2.why === 'near_turn_not_moving'
+       && o2.first_maneuver_m === 10 && o2.speed_ms === 0,
+       `logged: ${o2.order}, ${o2.why}, ${o2.first_maneuver_m} m at ${o2.speed_ms} m/s`);
+  }
+  {
+    const h = await rig(10, null);            // a desk, or iOS: no speed at all
+    h.startNav('p_pizzana');
+    await sleep(20);
+    const c = h.creates();
+    ok(c.length === 1 && !h.isDepart(c[0]),
+       'speed unknown is not moving: confirmation first');
+    h.answer(c[0], 'r_confirm', 'Taking you to Pizzana, about nineteen minutes.', 3);
+    await sleep(5); h.play(3.2); await sleep(20); h.play(2.1); await sleep(20);
+    const o = h.navEvents.filter(e => e.type === 'NAV_ROUTE_START_ORDER').pop() || {};
+    ok(o.order === 'confirmation_first' && o.why === 'near_turn_speed_unknown'
+       && h.creates().some(h.isDepart),
+       `logged ${o.order}, ${o.why}, and the turn followed her confirmation`);
   }
 
   section('a confirmation that never plays does not hold the turn for ever');

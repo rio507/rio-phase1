@@ -517,7 +517,25 @@
     /* ---------------------------------------------------------------------
        Position in, events out
        --------------------------------------------------------------------- */
+    var prevFix = null;
+    /* HOW FAST THE CAR IS GOING NOW, for the route-start order: the fix's own
+       speed if it is fresh, else derived from the last two fixes, else null
+       (iOS and a desk routinely report none). */
+    function speedNow() {
+      var f = lastFix;
+      if (!f || (nowS() - (f.t || 0)) > 5) return null;
+      if (typeof f.speed === 'number' && isFinite(f.speed)) return f.speed;
+      var p = prevFix;
+      if (!p || !(f.t > p.t) || (f.t - p.t) > 5) return null;
+      var R = 6371000, toR = Math.PI / 180;
+      var dLat = (f.lat - p.lat) * toR, dLng = (f.lng - p.lng) * toR;
+      var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(p.lat * toR)
+        * Math.cos(f.lat * toR) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+      return (2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))) / (f.t - p.t);
+    }
+
     function onPosition(fix) {
+      prevFix = lastFix;
       lastFix = fix;
       clockS = fix.t;
       moveHost(fix.lat, fix.lng);
@@ -574,7 +592,7 @@
          RIO.nav.releaseStart (called when her confirmation has finished
          playing) lets the held planner speak. Logged either way. */
       var order = opts.holdStart && RIO.navplan.routeStartOrder
-        ? RIO.navplan.routeStartOrder(r) : null;
+        ? RIO.navplan.routeStartOrder(r, { speed_ms: speedNow() }) : null;
       var hold = !!(order && order.hold);
       startHold = null;
       // Decode the junction calls NOW, not at the junction. A route is minutes
@@ -598,6 +616,7 @@
           route_id: r.route_id, generation_id: r.generation_id,
           order: order.order, why: order.why,
           first_maneuver_m: order.first_maneuver_m, near_at_m: order.near_at_m,
+          speed_ms: order.speed_ms, tta_s: order.tta_s,
           waited_ms: 0 });
       }
       if (hold) {
@@ -1115,6 +1134,7 @@
           order: h.order.order, why: h.order.why, released_by: why || null,
           first_maneuver_m: h.order.first_maneuver_m,
           near_at_m: h.order.near_at_m,
+          speed_ms: h.order.speed_ms, tta_s: h.order.tta_s,
           waited_ms: Date.now() - h.at });
         return planner.releaseStart();
       },
