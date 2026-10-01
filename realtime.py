@@ -1516,6 +1516,103 @@ lean on the camera and the measured state instead.
 """
 
 
+# ---------------------------------------------------------------------------
+# A DIFFERENT DAY FOR HER, PER SESSION
+# ---------------------------------------------------------------------------
+# Her lines repeated across sessions -- "Hungry's a good problem to have" 7 of
+# 8, one comedy opener 3 of 3, one "been thinking about how cities..." for
+# every "what's up". Not copied from the prompt: the model settling on its own
+# favourites, and every drive is a fresh session, so a driver would hear the
+# same favourite on every drive. Prompt wording cannot fix that -- the prompt
+# is the same every time, so the favourite is too.
+#
+# So each session gets a seed: a couple of things on her mind TODAY, and which
+# way her humour leans. Material and a register, never lines -- nothing here is
+# a sentence she could say. Drawn when the session is minted (both backends),
+# so a drive is consistent within itself and different from the last one.
+# Topics are things to wonder about, not facts or news: she knows nothing new
+# about any of them, and politics, religion and the news stay off as ever.
+_SEED_THOUGHTS = (
+    "how bridges carry their own weight", "why some cities age well",
+    "deep-sea creatures that make their own light", "the history of maps",
+    "how perfume is put together", "jazz records nobody remembers",
+    "the strange laws that never got repealed", "how taste and smell trick each other",
+    "old Hollywood stunt work", "space probes still flying out past the planets",
+    "birds that copy other sounds", "why queues make people miserable",
+    "how old typewriters were built", "volcanoes that sleep for centuries",
+    "how airports make their money", "what medieval people actually ate",
+    "where common words came from", "the physics of a good wave",
+    "how bees decide where to live", "chess openings with ridiculous names",
+    "why some songs get stuck in your head", "the engineering of roller coasters",
+    "unsolved mysteries that never got an answer", "how sleep cleans the brain",
+    "lost cities that turned up again", "the economics of a food truck",
+    "how octopuses solve puzzles", "the oldest restaurants still open",
+    "why cats knock things off tables", "how fireworks get their colours",
+    "the people who name hurricanes", "ghost towns and why they emptied",
+    "how cheese is aged in caves", "the worst inventions that sold anyway",
+    "the science of a perfect fry", "trains that ran on time and ones that didn't",
+    "how film scores make a scene", "the history of the sandwich",
+    "why some jokes age badly", "how mountains get measured",
+)
+_SEED_HUMOUR = (
+    "Your humour today runs understated: one dry line, left to land on its own.",
+    "Your humour today runs quick and playful: you riff, and you enjoy a tangent.",
+    "Your humour today runs warm and teasing: a friendly jab, never a mean one.",
+    "Your humour today runs observational: you notice the absurd detail in things.",
+    "Your humour today runs curious and nerdy: you light up at a strange fact.",
+    "Your humour today runs wry: you see the irony and say it plainly.",
+)
+
+
+# THE LENS, which is what reaches the reactive lines. A topic "if conversation
+# drifts" changed "what's up" (1-2 ideas in 6 sessions -> 5-6) and left "I like
+# comedy" and "I'm hungry" on their favourites (2-4 ideas in 6-8): their topic
+# is handed to them. What differs between two friends' replies to the same
+# line is what each of them is into, so the seed gives her one area she is
+# especially into today, and her own comment tends to come from there.
+_SEED_LENS = (
+    "food and cooking", "film and television", "music", "engineering and how "
+    "things are built", "history", "animals and the natural world",
+    "language and where words come from", "space and astronomy", "cities and "
+    "architecture", "sport", "art and design", "science and odd experiments",
+    "games and puzzles", "the ocean", "inventions and inventors",
+)
+
+# ...and how she tends to come in. MEASURED AND NOT USED: as a seed it moved
+# distinct openings 20 -> 18 of 56, within noise, so `openings` defaults off
+# and the pool stays for the next attempt. Because a topic seed reaches only the
+# open-ended lines ("what's up", "not much"). A reply to "I'm hungry" has its
+# topic handed to it, and converged on one favourite whatever was on her mind;
+# what differs between two people's replies is HOW they come in. A habit for
+# the day, described, never a line.
+_SEED_OPENINGS = (
+    "Today you tend to come straight in with your own take.",
+    "Today you tend to come in with a question that turns it back on them.",
+    "Today you tend to come in sideways, with a comparison or an odd angle.",
+    "Today you tend to come in with a quick, honest reaction, then build on it.",
+    "Today you tend to come in with a little tease before anything else.",
+    "Today you tend to come in with the funny part first.",
+)
+
+
+def session_seed(rng=None, openings: bool = False) -> str:
+    """This session's day: what is on her mind, how she comes in, and how her
+    humour runs."""
+    import random
+    rng = rng or random.Random()
+    a, b = rng.sample(_SEED_THOUGHTS, 2)
+    habit = (rng.choice(_SEED_OPENINGS) + " ") if openings else ""
+    lens = rng.choice(_SEED_LENS)
+    return ("# Today\n\n"
+            f"Today you're especially into {lens}: when you add something of "
+            "your own to what they say, the connection you reach for tends to "
+            "come from there — lightly, and only where it genuinely fits. "
+            f"Also on your mind, if conversation drifts: {a}, and {b}. "
+            "Things you wonder about, not things you know new facts about. "
+            f"{habit}{rng.choice(_SEED_HUMOUR)} It is the same you; this is "
+            "just what today sounds like.")
+
+
 def instructions() -> str:
     """RIO's personality, plus what is only true when she is being heard.
 
@@ -1827,6 +1924,8 @@ def mint_client_secret() -> dict:
     anything but draw a map.
     """
     cfg = session_config()
+    # A different day for her, per session -- see session_seed.
+    cfg["instructions"] = cfg["instructions"] + "\n\n" + session_seed()
     secret = client().realtime.client_secrets.create(session=cfg)
     data = secret.model_dump()
     return {

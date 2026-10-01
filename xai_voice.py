@@ -245,7 +245,9 @@ def session_policy() -> dict:
         "type": "realtime",
         # 1. WITHOUT THIS THE SESSION PRODUCES NOTHING AT ALL.
         "output_modalities": ["audio"],
-        "instructions": cfg["instructions"],
+        # ...plus this session's seed: a different day for her on every
+        # drive, so her favourite lines are not every drive's lines.
+        "instructions": cfg["instructions"] + "\n\n" + realtime.session_seed(),
         "tools": [dict(t) for t in cfg["tools"]],
         "tool_choice": "auto",
         "audio": {

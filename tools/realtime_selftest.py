@@ -3539,6 +3539,35 @@ def run_holding_line():
 
 
 # ---------------------------------------------------------------------------
+# B1c. A different day for her, per session
+# ---------------------------------------------------------------------------
+# Her favourite lines came back on every drive, because every drive is a fresh
+# session with the same prompt. companion_bench, 6 sessions per line, 2026-10-01:
+# distinct ideas 26/56 -> 38/56 with the seed (openings 13 -> 18). This pins the
+# mechanism: each mint draws its own, and it is material, not lines.
+def run_session_seed():
+    section("each session gets its own day: a lens, things on her mind, a humour")
+    import random
+    import xai_voice
+    seeds = {realtime.session_seed(random.Random(i)) for i in range(40)}
+    ok(len(seeds) >= 35, f"seeds differ from session to session ({len(seeds)}/40 distinct)")
+    one = realtime.session_seed(random.Random(1))
+    ok(one.startswith("# Today") and "especially into" in one,
+       "a lens her own comments draw on, which is what reaches the reactive lines")
+    ok('"' not in one, "no quoted line in it — nothing she could say verbatim")
+    banned = ("politic", "religio", "election", "news")
+    ok(not any(b in " ".join(realtime._SEED_THOUGHTS + realtime._SEED_LENS).lower()
+               for b in banned),
+       "no topic the hard boundaries keep her off")
+    a = xai_voice.session_policy()["instructions"]
+    b = xai_voice.session_policy()["instructions"]
+    ok("# Today" in a and a.split("# Today")[0] == b.split("# Today")[0],
+       "the xAI mint carries one, after the unchanged character")
+    ok(realtime.session_config()["instructions"] == realtime.session_config()["instructions"],
+       "session_config itself stays deterministic — the seed is added at the mint")
+
+
+# ---------------------------------------------------------------------------
 # B2. The backend flip — one voice, everywhere, and where it came from
 # ---------------------------------------------------------------------------
 def run_backend(live: bool = False):
@@ -4071,6 +4100,7 @@ def main():
     run_fast_path()
     run_two_tier()
     run_holding_line()
+    run_session_seed()
     if args.live:
         run_live()
         run_verbatim()

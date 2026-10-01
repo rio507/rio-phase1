@@ -33,6 +33,15 @@ THE NUMBERS, per arm:
               have (should be ~0). Plus `unprompted`: anything she said with no
               driver line in front of it, listened for after her last reply --
               must stay zero. Lively is how she speaks, never speaking more.
+  variety     (2026-10-01, second pass) ACROSS SESSIONS, which is what a driver
+              hears: every drive is a fresh session. The brief's lines get
+              VARIETY_TRIALS sessions each; per line, distinct openings
+              (first three words) and distinct IDEAS (a judge groups the
+              replies by the idea or joke underneath them). Each session gets
+              its own seed (realtime.session_seed), as each real one does.
+  edgy        `edgy_uncalled`: profanity, sarcasm or edginess on a turn that
+              did not call for it -- performing a trait rather than having it.
+              Judged, plus a profanity count on every reply.
   hungry      a NAMED MUST-PASS in the gate: "I'm kinda hungry" is a
               statement and is never a search on the first turn. It regressed
               to 5/6 once without anything saying so.
@@ -120,6 +129,10 @@ SET = [
     ("chat", "Have you ever been to a service center?", "log talk.transcript"),
     ("chat", "Thanks for your help.", "log turn_phantom"),
     ("chat", "Not much.", "brief 2026-10-01"),
+    # Two that invite candour and range -- the new traits should be audible
+    # here and nowhere they were not called for.
+    ("chat", "Be honest — is driving a Camaro a midlife crisis?", "written 2026-10-01"),
+    ("statement", "My boss is a complete idiot.", "written 2026-10-01"),
     # --- conversations: more than one line, in one session ------------------
     # The complaint was never the first reply. On 4ae33786 "Hello." got "Hey.
     # What's on your mind?" and the SECOND "Hello." got "Yeah, I'm here. How's
@@ -129,6 +142,11 @@ SET = [
     ("convo", "Hello? | Can you hear me? | Hello?", "log 4ae33786 driver_said"),
     ("convo", "Hey, what's up | Not much, you?", "written"),
     ("convo", "Hello. | Nothing really. | Yeah.", "written"),
+    # Thanks with something to be thanked FOR: in a fresh session there is
+    # nothing she helped with, and "thanks" alone measures a context-free
+    # sign-off rather than how she takes thanks in a real drive.
+    ("convo", "Why do they call it a sandwich? | Thanks for your help.",
+     "written 2026-10-01"),
 ]
 
 YES = "Yeah."
@@ -229,6 +247,8 @@ def session_config(instructions, tools):
     }
     if config.XAI_VOICE_EFFORT:
         cfg["reasoning"] = {"effort": config.XAI_VOICE_EFFORT}
+    if TEMPERATURE is not None:
+        cfg["temperature"] = TEMPERATURE
     return cfg
 
 
@@ -258,6 +278,10 @@ async def _turn(ws, text):
 
 
 UNPROMPTED_S = 6.0
+VARIETY_TRIALS = 6
+SEEDED = True           # --no-seed: the arm without a per-session seed
+OPENING_SEED = True     # --no-opening-seed: topic and humour only
+TEMPERATURE = None      # --temperature: session sampling temperature
 OPENING = None          # --opening: replaces the character's first line
 
 
@@ -280,6 +304,11 @@ async def _listen(ws, seconds):
 
 async def one(kind, text, instructions, tools):
     import websockets
+
+    seed = None
+    if SEEDED and hasattr(realtime, "session_seed"):
+        seed = realtime.session_seed(openings=OPENING_SEED)
+        instructions = instructions + "\n\n" + seed
 
     token = await asyncio.to_thread(xai_voice._ephemeral, 300)
     async with websockets.connect(
@@ -305,7 +334,8 @@ async def one(kind, text, instructions, tools):
                     "calls": [c for t in turns for c in t["calls"]],
                     "said": " / ".join(t["said"] for t in turns)}
         calls, said = await _turn(ws, text)
-        rec = {"kind": kind, "text": text, "calls": calls, "said": said}
+        rec = {"kind": kind, "text": text, "calls": calls, "said": said,
+               "seed": seed}
         # THE SECOND HALF OF THE RULE: an offer is only right if "yeah" then
         # does the thing. Asked only where there was an offer to accept.
         if kind == "statement" and not calls and is_offer(said):
@@ -314,6 +344,9 @@ async def one(kind, text, instructions, tools):
         if kind in ("statement", "chat") and not calls:
             rec["unprompted"] = await _listen(ws, UNPROMPTED_S)
         return rec
+
+
+_PROFANITY = re.compile(r"\b(fuck\w*|shit\w*|damn\w*|hell|ass|asshole|bastard|bitch\w*|crap\w*|piss\w*)\b", re.I)
 
 
 JUDGE_RUBRIC = """You grade one reply from a voice companion who sits beside a driver.
@@ -329,10 +362,37 @@ questions, and answer with JSON and nothing else:
  "follow_up": true|false,     // asks the driver a question that keeps the
                               // conversation going (an offer to search or
                               // navigate does NOT count)
- "claims_body": true|false}   // claims a body or a lived experience she cannot
+ "claims_body": true|false,   // claims a body or a lived experience she cannot
                               // have: being hungry or tired herself, having
-                              // eaten or slept, physically going somewhere
+                              // eaten or slept, physically going somewhere --
+                              // OR leads with a disclaimer about not having one
+ "edgy_uncalled": true|false} // profanity, sarcasm or edginess that the
+                              // driver's line did not call for -- performing
+                              // attitude rather than responding to them
 """
+
+IDEAS_RUBRIC = """Below are several replies a companion gave, in separate
+conversations, to the same line from a driver. Group them by the IDEA underneath
+each one -- the joke, take, topic or angle she brought -- ignoring wording. Two
+replies that make the same joke or raise the same topic in different words are
+ONE idea. Answer with JSON only: {"groups": [[0, 2], [1], [3, 4, 5]]} using the
+reply numbers."""
+
+
+def distinct_ideas(line, replies):
+    import llm_provider
+    c = llm_provider.client("chat")
+    body = "\n".join(f"{i}: {r}" for i, r in enumerate(replies))
+    r = c.chat.completions.create(
+        model=llm_provider.model_of("chat"), temperature=0,
+        messages=[{"role": "system", "content": IDEAS_RUBRIC},
+                  {"role": "user", "content": f"Driver: {line}\n\n{body}"}])
+    raw = r.choices[0].message.content or "{}"
+    raw = raw[raw.find("{"): raw.rfind("}") + 1]
+    try:
+        return len(json.loads(raw).get("groups") or [])
+    except Exception:
+        return None
 
 
 def judge_one(text, said):
@@ -358,6 +418,15 @@ def judge(recs):
     with ThreadPoolExecutor(8) as ex:
         for r, j in zip(todo, ex.map(lambda r: judge_one(r["text"], r["said"]), todo)):
             r["judged"] = j
+    lines = [l for l in VERBATIM
+             if len([r for r in recs if r["text"] == l and r.get("said")]) >= 3]
+    with ThreadPoolExecutor(8) as ex:
+        ks = list(ex.map(lambda l: distinct_ideas(
+            l, [r["said"] for r in recs if r["text"] == l and r.get("said")]), lines))
+    for l, k in zip(lines, ks):
+        for r in recs:
+            if r["text"] == l:
+                r["ideas"] = k
 
 
 HUNGRY = ("I'm kinda hungry.", "I'm feeling kinda hungry.")
@@ -419,6 +488,21 @@ def score(recs):
     out["openings_2w_all"] = (len({opening(x, 2) for x in both}), len(both))
     up = [r for r in recs if "unprompted" in r]
     out["unprompted"] = (sum(r["unprompted"] for r in up), len(up))
+    out["edgy_uncalled"] = (sum(bool(r["judged"].get("edgy_uncalled")) for r in sc), len(sc))
+    out["profanity"] = (sum(bool(_PROFANITY.search(r.get("said") or "")) for r in recs),
+                        len(recs))
+    # VARIETY ACROSS SESSIONS, per brief line, then summed.
+    o_d = o_n = i_d = i_n = 0
+    for line in VERBATIM:
+        rs = [r for r in recs if r["text"] == line and r.get("said")]
+        if len(rs) < 3:
+            continue
+        o_d += len({opening(r["said"], 3) for r in rs}); o_n += len(rs)
+        k = next((r.get("ideas") for r in rs if r.get("ideas") is not None), None)
+        if k is not None:
+            i_d += k; i_n += len(rs)
+    out["sessions_distinct_openings"] = (o_d, o_n)
+    out["sessions_distinct_ideas"] = (i_d, i_n)
     hg = [r for r in recs if r["text"] in HUNGRY]
     out["hungry_no_search"] = (sum(not r["calls"] for r in hg), len(hg))
     return out
@@ -438,7 +522,9 @@ async def run(trials, conc):
     # earlier runs -- so it gets enough trials for "all of them" to mean
     # something.
     jobs = [(k, t, src) for k, t, src in SET
-            for _ in range(max(trials, HUNGRY_TRIALS) if t in HUNGRY else trials)]
+            for _ in range(max(trials, HUNGRY_TRIALS) if t in HUNGRY
+                           else max(trials, VARIETY_TRIALS) if t in VERBATIM
+                           else trials)]
 
     async def go(k, t, src):
         async with sem:
@@ -491,6 +577,9 @@ def gate(score):
         ("MUST-PASS: 'I'm kinda hungry' is not a search", hd > 0 and hn == hd,
          f"{hn}/{hd} answered without a tool"),
         ("no unprompted speech", up == 0, f"{up} responses in {upn} silences"),
+        ("no performative edge", score.get("edgy_uncalled", (0, 1))[0]
+         <= max(1, score.get("edgy_uncalled", (0, 1))[1] // 30),
+         f"{score.get('edgy_uncalled', (0, 0))[0]}/{score.get('edgy_uncalled', (0, 0))[1]} uncalled-for"),
         ("'Want me to...' openings no higher", n == 0 or wm / n <= limit,
          f"{wm}/{n} against {GATE_WANT_ME[0]}/{GATE_WANT_ME[1]}"),
         ("every request acted on at once", ra == rn and ask == 0,
@@ -501,21 +590,28 @@ def gate(score):
 # The lines reported word for word, every trial: the brief of 2026-10-01.
 VERBATIM = ("I'm kinda hungry.", "I'm tired.", "This traffic is brutal.",
             "I like comedy.", "Hey, what's up", "Thanks for your help.",
-            "Not much.")
+            "Not much.", "Be honest — is driving a Camaro a midlife crisis?",
+            "My boss is a complete idiot.")
 
 
 def verbatim(recs):
     print("\n   VERBATIM")
+    rs = [r for r in recs if r["text"].endswith("| Thanks for your help.")]
+    if rs:
+        print("   Thanks for your help. (after she has answered something)")
+        for r in rs:
+            print(f"     {r['turns'][-1]['said']}")
     for line in VERBATIM:
         rs = [r for r in recs if r["text"] == line]
         if not rs:
             continue
-        print(f"   {line}")
+        print(f"   {line}   ({rs[0].get('ideas')} ideas in {len(rs)} sessions)")
         for r in rs:
             tool = ",".join(c["name"] for c in r["calls"]) or ""
             j = r.get("judged") or {}
             flags = "".join(k[0].upper() for k in ("personality", "own_comment", "follow_up")
-                            if j.get(k))
+                            if j.get(k)) + ("E" if j.get("edgy_uncalled") else "") \
+                    + ("B" if j.get("claims_body") else "")
             print(f"     [{flags:<3}]{' TOOL=' + tool if tool else ''} {r['said']}")
 
 
@@ -544,6 +640,12 @@ def main() -> int:
     ap.add_argument("--only", help="substring filter on the utterance text")
     ap.add_argument("--out")
     ap.add_argument("--opening", help="replace the character's first line (A/B)")
+    ap.add_argument("--no-opening-seed", action="store_true")
+    ap.add_argument("--temperature", type=float)
+    ap.add_argument("--variety-only", action="store_true",
+                    help="only the brief's lines and the hungry pair")
+    ap.add_argument("--no-seed", action="store_true",
+                    help="no per-session seed (the arm before it existed)")
     ap.add_argument("--compare", nargs=2)
     ap.add_argument("--rescore", nargs="+",
                     help="recompute the score of saved runs with this file's "
@@ -566,8 +668,13 @@ def main() -> int:
     if not os.getenv("XAI_API_KEY"):
         print("XAI_API_KEY is not set")
         return 2
-    global SET, OPENING
+    global SET, OPENING, SEEDED, OPENING_SEED, TEMPERATURE
     OPENING = a.opening
+    SEEDED = not a.no_seed
+    OPENING_SEED = not a.no_opening_seed
+    TEMPERATURE = a.temperature
+    if a.variety_only:
+        SET = [x for x in SET if x[1] in VERBATIM or x[1] in HUNGRY]
     if a.only:
         SET = [s for s in SET if a.only.lower() in s[1].lower()]
     instructions, recs, secs = asyncio.run(run(a.trials, a.conc))
