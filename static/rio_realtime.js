@@ -683,6 +683,28 @@
       }
       return rawSend(obj);
     };
+    /* TAKE BACK A CREATE THE TRANSPORT IS STILL HOLDING. On xAI creates are
+       serialised in the transport (rio_xai_session.js, the gate), so a line
+       given up on may never have left the page -- and then a bare
+       response.cancel would cancel the response it was queued behind. True
+       when it was taken back: nothing was sent, nothing is coming, there is
+       nothing to cancel and no orphan to claim. */
+    var withdrawCreate = cfg.withdraw || function () { return false; };
+    /* WHICH TIER A DICTATED LINE IS -- read off the arbiter item that is
+       speaking it, never named here. This file must not be able to name a
+       safety tier at all (the firewall in tools/realtime_selftest.js), and it
+       does not need to: the arbiter announces `start` with the item's priority
+       immediately before calling its play(), and a dictation is spoken from
+       inside that play(). So the item that just started, carrying this line,
+       IS the line, and its number is what a held create is ranked by on xAI.
+       Anything else -- every conversational create -- ranks as conversation. */
+    function createTier(line) {
+      var it = lastArbiterStart;
+      if (it && typeof it.priority === 'number' && it.text
+          && String(it.text).trim() === line) return it.priority;
+      return (arbiter && arbiter.P && arbiter.P.CONVO) || 5;
+    }
+
     /* DOES THIS SERVER ECHO THE NAME? Declared by the provider where it was
        measured, and LEARNED from the first response.created that carries one
        otherwise. Until it is known, an unnamed response might still be one of
@@ -2236,12 +2258,16 @@
            response that lands belongs to nobody. Marked so it is silenced on
            sight rather than claiming the mouth. The claim itself is armed
            by finish() below, which owns that bookkeeping. */
-        if (oob && !oobId) oob.silence = true;
-        try {
-          send(oobId ? { type: 'response.cancel', response_id: oobId }
-                     : { type: 'response.cancel' });
-        } catch (e) {}
-        try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        if (oob && !oobId && withdrawCreate(oob.tag)) {
+          oob.withdrawn = true;
+        } else {
+          if (oob && !oobId) oob.silence = true;
+          try {
+            send(oobId ? { type: 'response.cancel', response_id: oobId }
+                       : { type: 'response.cancel' });
+          } catch (e) {}
+          try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        }
         /* Told it was pre-empted rather than merely failed, because the two
            want opposite things: a line that never started is worth asking for
            again, and one that was outranked by a turn call is not. */
@@ -3637,7 +3663,7 @@
             // Given up on before it was ever bound to a response? Then the
             // response is still on its way and is nobody's. See
             // armOrphan.
-            if (!d.realId) armOrphan(!!d.silence, d.tag);
+            if (!d.realId && !d.withdrawn) armOrphan(!!d.silence, d.tag);
             counters.direct_speech_failures++;
             emit('LIVE_DIRECT_SPEECH_FAILED', { text: line, reason: why });
             /* A LAST TRY, rather than a silent turn. The tool result is
@@ -3670,7 +3696,8 @@
            a line that then spoke perfectly well. See
            config.REALTIME_DIRECT_SPEECH_TIMEOUT_MS. */
         d.timer = setTimeout(function () {
-          try { send({ type: 'response.cancel' }); } catch (e) {}
+          if (!d.realId && withdrawCreate(d.tag)) d.withdrawn = true;
+          else { try { send({ type: 'response.cancel' }); } catch (e) {} }
           d.finish(false, 'timeout');
         }, directSpeechTimeoutMs);
         try {
@@ -4385,8 +4412,11 @@
              * unclaimed response is recorded as this one's, cancelled by id
              * the moment it exists, and muted until it is gone. Exactly one
              * mouth per utterance, and it is the one that got there. */
-            if (dictation && !dictation.responseId) armOrphan(true, dictation.tag);
-            try { send({ type: 'response.cancel' }); } catch (e) {}
+            if (!(dictation && !dictation.responseId
+                  && withdrawCreate(dictation.tag))) {
+              if (dictation && !dictation.responseId) armOrphan(true, dictation.tag);
+              try { send({ type: 'response.cancel' }); } catch (e) {}
+            }
             finishDictation('timeout');
           }, opts.timeoutMs || speakTimeoutMs);
           try {
@@ -4397,7 +4427,8 @@
                 conversation: 'none',
                 output_modalities: ['audio'],
                 instructions: verbatimInstruction + line,
-                metadata: { rio_create: tag },
+                metadata: { rio_create: tag,
+                            rio_priority: String(createTier(line)) },
               },
             });
           } catch (e) {
@@ -4440,12 +4471,16 @@
         if (!dictation) return false;
         if (token && dictation.token !== token) return false;
         var rid = dictation.responseId;
-        if (!rid) armOrphan(true, dictation.tag);
-        try {
-          send(rid ? { type: 'response.cancel', response_id: rid }
-                   : { type: 'response.cancel' });
-        } catch (e) {}
-        try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        if (!rid && withdrawCreate(dictation.tag)) {
+          // Never left the page: nothing to cancel, nothing to disown.
+        } else {
+          if (!rid) armOrphan(true, dictation.tag);
+          try {
+            send(rid ? { type: 'response.cancel', response_id: rid }
+                     : { type: 'response.cancel' });
+          } catch (e) {}
+          try { send({ type: 'output_audio_buffer.clear' }); } catch (e) {}
+        }
         counters.dictation_cancelled++;
         finishDictation(reason || 'cancelled');
         return true;
@@ -4909,6 +4944,8 @@
           lookAnswerMaxTokens: session.look_answer_max_tokens,
           // How much of her the wire still has queued; see armTail.
           audioRemainingMs: w.audioRemainingMs || null,
+          // Taking back a create the wire is still holding (xAI's gate).
+          withdraw: w.withdraw || null,
           // Interruption policy, decided in config.py and carried here with
           // the session exactly as the dictation policy is. The browser holds
           // no numbers of its own to drift from the ones the tests check.

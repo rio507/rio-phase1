@@ -298,6 +298,48 @@
     var transcriptSeen = Object.create(null);
     /* PENDING TOOL RESULTS, held until the sound is over. See flushToolResults. */
     var pending = [];
+    /* ONE RESPONSE AT A TIME, because that is all this server runs -- and it
+     * says nothing when it refuses a second. Measured 2026-10-01
+     * (tools/xai_single_response_probe.py; undocumented by xAI):
+     *
+     *   create while one is generating, no new item    DROPPED, silently: the
+     *                                                  first completes, the
+     *                                                  second is never created
+     *   conversation item + create while generating   the FIRST is cancelled,
+     *                                                  silently, and the second
+     *                                                  runs (route start: the
+     *                                                  depart dictation, then
+     *                                                  the tool answer)
+     *   create with no new item < ~1.3 s after a       DROPPED (8/8 at +500 ms,
+     *   response COMPLETED                             3/4 at +1100, 0/4 at
+     *                                                  +1300) -- no event marks
+     *                                                  the end of the window
+     *   create right after a response was CANCELLED    accepted, 16/16
+     *   item + create right after one completed        accepted
+     *
+     * OpenAI runs an out-of-band response beside an in-conversation one, so
+     * none of this exists there; this is the xAI wire's own fact.
+     *
+     * So the gate below is not only "wait for the sound": a create also waits
+     * for the response in flight to be DONE (`inFlight`), and an item-less one
+     * waits out the window after a completed response (`settleUntil`). Held
+     * creates go ONE AT A TIME, best tier first -- the arbiter's P, carried on
+     * response.metadata.rio_priority -- because releasing them together is the
+     * first row of that table. */
+    var inFlight = null;          // {since, tag, rid}
+    var settleUntil = 0;          // seconds, on now()'s clock
+    var itemSinceDone = false;    // a conversation item went out since the last response opened
+    var createArrivals = 0;       // arrival order, for `passed_over`
+    /* Two seconds: measured drops ran out by ~1.3 s, but +1500 ms was still
+       dropped once in four. */
+    var settleS = (opts.settleMs === undefined ? 2000 : opts.settleMs) / 1000;
+    /* A create the server never answers (dropped despite all this) must not
+       wedge the queue; nor may a response whose done never comes. */
+    var unansweredS = (opts.unansweredMs || 3000) / 1000;
+    /* Thirty seconds: xAI generates at about five times real time, so even a
+       two-minute answer is done generating in ~25 s. A shorter ceiling would
+       release a create into a response still generating -- which drops it. */
+    var inFlightMaxS = (opts.inFlightMaxMs || 30000) / 1000;
     var stats = {
       audio_in_frames: 0, audio_out_bytes: 0, transcripts: 0,
       /* WHAT THE MICROPHONE IS ACTUALLY AT, and what had to be done about it.
@@ -308,6 +350,7 @@
       audio_in_rate: null, audio_in_ratio: null,
       transcript_repeats_dropped: 0, local_flushes: 0, gated_requests: 0,
       responses: 0, spoke: 0, silent_responses: 0, gate_timeouts: 0,
+      creates_waited: 0, creates_withdrawn: 0, creates_unanswered: 0,
       /* Cancelled, failed or incomplete responses that made no sound. Counted
          apart from silent_responses because they are not a fault -- a noise reply
          cancelled on sight is the noise gate working -- and because a drive log
@@ -338,17 +381,79 @@
         handleLocal(out.local);
         return;
       }
-      /* A REQUEST FOR SPEECH WAITS FOR SILENCE. Everything else goes at once:
-         a cancel that waited would be a barge-in that did not work. */
-      if (out.type === 'response.create' && playout && !playout.idle()) {
-        stats.gated_requests++;
-        var wait = playout.untilIdle();
-        emit({ type: 'XAI_REQUEST_GATED',
-               wait_s: wait === Infinity ? null : wait });
-        pending.push({ ev: out, at: now() });
+      if (out.type === 'conversation.item.create') itemSinceDone = true;
+      /* A REQUEST FOR SPEECH WAITS FOR SILENCE, AND FOR THE SERVER. Everything
+         else goes at once: a cancel that waited would be a barge-in that did
+         not work. */
+      if (out.type === 'response.create') {
+        var entry = { ev: out, at: now(), seq: ++createArrivals,
+                      afterItem: itemSinceDone,
+                      tag: createMeta(out, 'rio_create'),
+                      prio: Number(createMeta(out, 'rio_priority')) || 5,
+                      reasons: {} };
+        var why = blockedBy(entry);
+        if (why || pending.length) {
+          stats.gated_requests++;
+          entry.reasons[why || 'queue'] = 1;
+          var wait = playout ? playout.untilIdle() : 0;
+          emit({ type: 'XAI_REQUEST_GATED', create_tag: entry.tag,
+                 priority: entry.prio, reason: why || 'queue',
+                 wait_s: wait === Infinity ? null : wait });
+          pending.push(entry);
+          return;
+        }
+        launch(entry);
         return;
       }
       try { ws.send(JSON.stringify(out)); } catch (e) {}
+    }
+
+    function createMeta(ev, key) {
+      var m = ev && ev.response && ev.response.metadata;
+      return (m && m[key] !== undefined) ? m[key] : null;
+    }
+
+    /* Why this create may not go yet, or null. */
+    function blockedBy(entry) {
+      if (inFlight) return 'in_flight';
+      if (playout && !playout.idle()) return 'audio';
+      if (!entry.afterItem && now() < settleUntil) return 'settle';
+      return null;
+    }
+
+    function launch(entry) {
+      inFlight = { since: now(), tag: entry.tag, rid: null };
+      try { ws.send(JSON.stringify(entry.ev)); } catch (e) {}
+    }
+
+    /* The best held create: lowest tier, then the one that has waited longest. */
+    function bestPending() {
+      var best = 0;
+      for (var i = 1; i < pending.length; i++) {
+        if (pending[i].prio < pending[best].prio) best = i;
+      }
+      return best;
+    }
+
+    /* TAKE BACK A CREATE THAT HAS NOT GONE YET. The controller gives up on a
+       dictation or a direct line on its own budget; if that create is still
+       held here, sending a bare response.cancel would cancel the response it
+       is queued BEHIND -- usually her answer. Withdrawn instead, and nothing
+       reaches the server at all. */
+    function withdraw(tag) {
+      if (!tag) return false;
+      for (var i = 0; i < pending.length; i++) {
+        if (pending[i].tag === tag) {
+          var e = pending.splice(i, 1)[0];
+          stats.creates_withdrawn++;
+          emit({ type: 'XAI_REQUEST_WITHDRAWN', create_tag: tag,
+                 priority: e.prio,
+                 waited_ms: Math.round((now() - e.at) * 1000),
+                 wait_reasons: Object.keys(e.reasons).join(',') });
+          return true;
+        }
+      }
+      return false;
     }
 
     function handleLocal(what) {
@@ -378,20 +483,57 @@
        audio is two seconds of mess, and silence is the whole drive. So the hold
        has a ceiling, and passing it is reported rather than quietly survived. */
     function flushPending() {
-      if (!pending.length) return;
-      var overdue = pending[0] && (now() - pending[0].at) * 1000 > gateMaxHoldMs;
-      if (playout && !playout.idle() && !overdue) return;
-      if (overdue) {
-        stats.gate_timeouts++;
-        emit({ type: 'XAI_GATE_TIMEOUT',
-               held_ms: Math.round((now() - pending[0].at) * 1000),
-               playout: playout ? playout.state() : null });
+      var forced = false;
+      /* The housekeeping first: a create the server never answered, or a
+         response whose done never came, stops being in flight. */
+      if (inFlight) {
+        var age = now() - inFlight.since;
+        if (!inFlight.rid && age > unansweredS) {
+          stats.creates_unanswered++;
+          emit({ type: 'XAI_CREATE_UNANSWERED', create_tag: inFlight.tag,
+                 after_ms: Math.round(age * 1000) });
+          inFlight = null;
+        } else if (age > inFlightMaxS) {
+          stats.gate_timeouts++;
+          emit({ type: 'XAI_GATE_TIMEOUT', reason: 'in_flight',
+                 held_ms: Math.round(age * 1000),
+                 waited_ms: Math.round(age * 1000),
+                 playout: playout ? playout.state() : null });
+          inFlight = null;
+          forced = true;
+        }
       }
-      var go = pending.slice();
-      pending.length = 0;
-      go.forEach(function (o) {
-        try { ws.send(JSON.stringify(o.ev)); } catch (e) {}
-      });
+      if (!pending.length) return;
+      var i = bestPending();
+      var entry = pending[i];
+      var why = blockedBy(entry);
+      if (why) {
+        entry.reasons[why] = 1;
+        /* The sound-only ceiling, as before: a playout that never goes idle
+           must not mute her for the drive. In flight and settle are bounded by
+           the housekeeping above and by their own clock. */
+        var overdue = forced
+          || (why === 'audio' && !inFlight
+              && (now() - entry.at) * 1000 > gateMaxHoldMs);
+        if (!overdue) return;
+        if (!forced) {
+        stats.gate_timeouts++;
+        emit({ type: 'XAI_GATE_TIMEOUT', reason: 'audio',
+               held_ms: Math.round((now() - entry.at) * 1000),
+               waited_ms: Math.round((now() - entry.at) * 1000),
+               playout: playout ? playout.state() : null });
+        }
+      }
+      pending.splice(i, 1);
+      var passed = 0;
+      for (var k = 0; k < pending.length; k++) if (pending[k].seq < entry.seq) passed++;
+      stats.creates_waited++;
+      emit({ type: 'XAI_REQUEST_RELEASED', create_tag: entry.tag,
+             priority: entry.prio,
+             waited_ms: Math.round((now() - entry.at) * 1000),
+             wait_reasons: Object.keys(entry.reasons).join(','),
+             passed_over: passed, queue_depth: pending.length });
+      launch(entry);
     }
 
     function deliver(ev) {
@@ -485,6 +627,12 @@
       }
 
       if (t === 'response.created') {
+        var cid = (ev.response && ev.response.id) || ev.response_id || null;
+        /* Ours, answered -- or the server's own (its VAD turn), which is just
+           as much in flight. */
+        if (inFlight && !inFlight.rid) inFlight.rid = cid;
+        else if (!inFlight) inFlight = { since: now(), tag: null, rid: cid };
+        itemSinceDone = false;
         stats.responses++;
         expecting = (ev.response && ev.response.id) || ev.response_id || 'r';
         silence.since = now();
@@ -550,7 +698,16 @@
         stats.tool_this_response = true;
       }
 
+      if (t === 'input_audio_buffer.committed') itemSinceDone = true;
+
       if (t === 'response.done') {
+        var did = (ev.response && ev.response.id) || ev.response_id || null;
+        if (inFlight && (!inFlight.rid || inFlight.rid === did)) inFlight = null;
+        /* Only a COMPLETED response leaves the server busy afterwards; a
+           cancelled one does not (measured, 16/16). */
+        if (ev.response && ev.response.status === 'completed') {
+          settleUntil = now() + settleS;
+        }
         /* GENERATION IS OVER; THE SOUND MAY NOT BE. The queue is told, and the
            controller's holdTail is what waits. */
         if (playout) playout.generationDone(expecting);
@@ -753,6 +910,7 @@
     var api = {
       connect: connect,
       send: send,
+      withdraw: withdraw,
       playout: playout,
       /* For the controller's cfg.send: everything it emits comes through here. */
       stats: function () {
@@ -914,6 +1072,7 @@
         return (left === null || !isFinite(left)) ? null : left * 1000;
       },
       send: function (obj) { sess.send(obj); },
+      withdraw: function (tag) { return sess.withdraw(tag); },
       url: o.url || function (p) { return p; },
       transcript: function () {
         try { return controller.state().spoken_this_turn || ''; }

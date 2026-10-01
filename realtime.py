@@ -1177,7 +1177,14 @@ _TURN_KINDS = ("turn_superseded", "turn_coalesced", "tool_aborted",
                # canceller for being heard; these say when that trade was made,
                # why, and what the barge gate did while it lasted.
                "bus_fallback", "bus_restored", "bus_restore_failed",
-               "bus_loopback_failed")
+               "bus_loopback_failed",
+               # ONE RESPONSE AT A TIME ON xAI. A second create while one is
+               # generating is dropped or cancels the first, silently, so the
+               # transport holds it: every create that waited (how long, for
+               # what, and what it jumped), every one taken back before it went,
+               # every one the server never answered, and a hold that ran out.
+               "create_waited", "create_withdrawn", "create_unanswered",
+               "gate_timeout")
 _CUTOFF_RECENT_MAX = 50
 
 
@@ -1345,6 +1352,11 @@ def record_cutoff(kind: str, cause: str, detail: dict) -> dict:
                              # the response was matched to it by that name or
                              # only by order (drive 3d69ebaa could say neither).
                              "create_tag", "bound_by",
+                             # ...and how long a create was held, for what
+                             # (in_flight | audio | settle | queue), at which
+                             # tier, past how many that were there first.
+                             "waited_ms", "wait_reasons", "priority",
+                             "passed_over", "queue_depth",
                              # Peer / element / microphone state, and whether
                              # the page was hidden when it changed.
                              "state", "ice", "was", "grace_ms", "expired",

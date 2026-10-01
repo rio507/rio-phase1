@@ -149,6 +149,11 @@
         // self-supersede fix binds on; see rio_realtime.js ~1002 and ~2742,
         // and the drive of 2026-09-17 for what its absence costs.
         transcriptionItemId: true,
+        // response.created echoes the create's response.metadata (measured
+        // 2026-10-01, tools/xai_single_response_probe.py --openai). Unlike
+        // xAI it runs an out-of-band response BESIDE an in-flight one, so its
+        // transport needs no serialising gate.
+        responseMetadataEcho: true,
         // .failed is emitted: the branch that classifies a barge-in when the
         // transcriber could not make words out of the audio.
         transcriptionFailed: true,

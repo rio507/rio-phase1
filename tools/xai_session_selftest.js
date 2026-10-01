@@ -107,9 +107,12 @@ function harness(opts) {
   const prov = provider.create('xai_voice');
   const controllerSent = [];
   const bus = [];
+  const arbiter = speech.makeArbiter();
   const controller = rt.createController({
-    arbiter: speech.makeArbiter(),
+    arbiter: arbiter,
     send: (o) => { controllerSent.push(o); s.send(o); },
+    // As attach() wires it: a held create is taken back, not cancelled.
+    withdraw: (tag) => s.withdraw(tag),
     tool: () => Promise.resolve({ ok: true, answer: 'forty-two' }),
     audio: { mute: () => {}, unmute: () => {} },
     onEvent: (e) => bus.push(e),
@@ -136,6 +139,7 @@ function harness(opts) {
     onEvent: (e) => events.push(e),
   }));
   return { s, WS, ctx, p: s.playout, events, bus, controller, controllerSent,
+           arbiter,
            armed,
            advance: (sec) => { ctx._advance(sec); },
            pump: () => armed.forEach((a) => a.fn()),
@@ -243,7 +247,7 @@ section('THE GATE HAS A CEILING — it must not be able to mute her for a drive'
      idle() is false forever and every request for speech queues behind it. The
      gate exists to stop two seconds of overlapping audio; holding forever costs
      the rest of the drive, and that is the worse of the two. */
-  const h = harness({ gateMaxHoldMs: 1000 });
+  const h = harness({ gateMaxHoldMs: 1000, inFlightMaxMs: 1000 });
   await h.s.connect();
   h.s._onMessage(JSON.stringify({ type: 'response.created',
                                   response: { id: 'r1' } }));
@@ -268,6 +272,164 @@ section('THE GATE HAS A CEILING — it must not be able to mute her for a drive'
      '...and it is REPORTED, because a release this path takes is evidence that '
      + 'a response never closed');
   ok(h.s.health().gate_timeouts === 1, 'and counted in health');
+}
+
+// ---------------------------------------------------------------------------
+section('ONE RESPONSE AT A TIME — xAI drops or cancels a second, silently');
+// ---------------------------------------------------------------------------
+/* Measured 2026-10-01, tools/xai_single_response_probe.py: a create sent while
+   one is generating is DROPPED (or, behind a conversation item, CANCELS the
+   first); an item-less create within ~1.3 s of a COMPLETED response is dropped;
+   after a cancel there is no such window. The gate used to hold creates only
+   for the SOUND -- so between a create and its first audio the queue was idle
+   and a second create went straight out. That is a route start: the depart
+   dictation, then the tool answer. */
+{
+  const creates = (h) => h.WS.sent.filter(e => e.type === 'response.create');
+  const tagOf = (e) => e.response && e.response.metadata && e.response.metadata.rio_create;
+  const created = (h, c, id) => h.s._onMessage(JSON.stringify({ type: 'response.created',
+    response: { id: id, metadata: c.response.metadata } }));
+  const audio = (h, id, sec) => h.s._onMessage(JSON.stringify({
+    type: 'response.output_audio.delta', response_id: id,
+    delta: b64Audio(Math.round(ONE_SECOND * sec)) }));
+  const done = (h, id, status) => h.s._onMessage(JSON.stringify({ type: 'response.done',
+    response: { id: id, status: status || 'completed' } }));
+
+  // 1. The route-start shape: a dictation on the wire, then a tool answer.
+  {
+    const h = harness();
+    await h.s.connect();
+    h.controller.speak('Head northwest, then turn right.',
+                       { channel: 'nav', callType: 'depart', timeoutMs: 60000 })
+      .catch(() => {});
+    ok(creates(h).length === 1, 'the depart dictation goes out — nothing is ahead of it');
+    h.s.send({ type: 'conversation.item.create',
+               item: { type: 'function_call_output', call_id: 'c1', output: '{}' } });
+    h.s.send({ type: 'response.create' });
+    ok(creates(h).length === 1,
+       'THE TOOL ANSWER IS HELD while the dictation is in flight, before it has '
+       + 'made a sound — sent now, xAI cancels the dictation without a word');
+    created(h, creates(h)[0], 'r_depart');
+    audio(h, 'r_depart', 1.0);
+    done(h, 'r_depart');
+    h.pump();
+    ok(creates(h).length === 1, '...and while its sound is still playing');
+    h.advance(1.1);
+    h.pump();
+    ok(creates(h).length === 2,
+       'released once it is done and heard — no settle, because a conversation '
+       + 'item went out ahead of it');
+    const rel = h.events.filter(e => e.type === 'XAI_REQUEST_RELEASED');
+    ok(rel.length === 1 && rel[0].waited_ms >= 1000
+       && /in_flight/.test(rel[0].wait_reasons),
+       `and the wait is logged: ${rel[0] && rel[0].waited_ms} ms, `
+       + `${rel[0] && rel[0].wait_reasons}`);
+  }
+
+  // 2. Priority, not arrival: a held answer and a held turn call.
+  {
+    const h = harness();
+    await h.s.connect();
+    h.s._onMessage(JSON.stringify({ type: 'response.created', response: { id: 'r_vad' } }));
+    ok(true, 'a response the SERVER made (its own VAD turn) is in flight too');
+    h.s.send({ type: 'conversation.item.create',
+               item: { type: 'function_call_output', call_id: 'c2', output: '{}' } });
+    h.s.send({ type: 'response.create' });
+    // The junction call as rio_navplan raises it: an arbiter item at
+    // TURN_NEAR whose play() dictates the line.
+    h.arbiter.say({ priority: h.arbiter.P.TURN_NEAR, group: 'nav:m0',
+      id: 'nav:m0:junction', text: 'Turn right.', ttlMs: 12000,
+      play: () => h.controller.speak('Turn right.', { channel: 'nav',
+        callType: 'junction', timeoutMs: 60000 }).catch(() => {}),
+      stop: () => {} });
+    ok(creates(h).length === 0, 'both held behind it');
+    done(h, 'r_vad', 'cancelled');
+    h.pump();
+    const first = creates(h);
+    ok(first.length === 1 && /^dictation:/.test(tagOf(first[0]))
+       && first[0].response.metadata.rio_priority === '3',
+       'the turn call goes first, though it arrived second — TURN_NEAR (3) '
+       + 'outranks CONVO (5)');
+    const rel = h.events.filter(e => e.type === 'XAI_REQUEST_RELEASED');
+    ok(rel[0] && rel[0].passed_over === 1 && rel[0].priority === 3,
+       'logged as having jumped the one that was there first');
+    h.pump();
+    ok(creates(h).length === 1, 'one at a time: the answer waits for the turn call');
+    created(h, first[0], 'r_turn');
+    done(h, 'r_turn', 'cancelled');
+    h.pump();
+    ok(creates(h).length === 2, '...and goes when it is done');
+  }
+
+  // 3. The window after a COMPLETED response, and none after a cancelled one.
+  {
+    const h = harness();
+    await h.s.connect();
+    h.s._onMessage(JSON.stringify({ type: 'response.created', response: { id: 'r1' } }));
+    done(h, 'r1', 'completed');
+    h.controller.speak('Keep left.', { channel: 'nav', callType: 'near',
+                                       timeoutMs: 60000 }).catch(() => {});
+    h.pump();
+    ok(creates(h).length === 0,
+       'an item-less create right after a completed response is held — sent, '
+       + 'xAI drops it (8/8 at 500 ms)');
+    h.advance(1.6);
+    h.pump();
+    ok(creates(h).length === 0, 'still held at 1.6 s — +1500 ms was dropped 1 in 4');
+    h.advance(0.5);
+    h.pump();
+    ok(creates(h).length === 1, 'and goes once the 2 s window has passed');
+    ok(/settle/.test((h.events.find(e => e.type === 'XAI_REQUEST_RELEASED') || {})
+                     .wait_reasons || ''), 'logged as a settle wait');
+
+    const h2 = harness();
+    await h2.s.connect();
+    h2.s._onMessage(JSON.stringify({ type: 'response.created', response: { id: 'r1' } }));
+    done(h2, 'r1', 'cancelled');
+    h2.controller.speak('Turn left.', { channel: 'nav', callType: 'junction',
+                                        timeoutMs: 60000 }).catch(() => {});
+    ok(creates(h2).length === 1,
+       'after a CANCELLED response there is no window: a turn call that '
+       + 'pre-empts her answer goes at once (16/16 accepted)');
+  }
+
+  // 4. A held dictation given up on is withdrawn, not cancelled.
+  {
+    const h = harness();
+    await h.s.connect();
+    h.s._onMessage(JSON.stringify({ type: 'response.created', response: { id: 'r_answer' } }));
+    let token = null;
+    h.controller.speak('Head east.', { channel: 'nav', callType: 'depart',
+      timeoutMs: 60000, onToken: (t) => { token = t; } }).catch(() => {});
+    h.controller.cancelSpeak(token, 'superseded');
+    ok(!h.WS.sent.some(e => e.type === 'response.cancel'),
+       'NO bare response.cancel — it would have cancelled her answer, the '
+       + 'response it was queued behind');
+    done(h, 'r_answer', 'completed');
+    h.advance(3);
+    h.pump();
+    ok(creates(h).length === 0, 'and the withdrawn line is never sent');
+    ok(h.events.some(e => e.type === 'XAI_REQUEST_WITHDRAWN'), 'logged as withdrawn');
+    ok(!h.bus.some(e => e.type === 'LIVE_ORPHAN_CLAIM_EXPIRED'),
+       'with no orphan claim left behind for a response that is never coming');
+  }
+
+  // 5. A create the server never answers does not wedge the queue.
+  {
+    const h = harness();
+    await h.s.connect();
+    h.s.send({ type: 'response.create' });
+    h.s.send({ type: 'conversation.item.create',
+               item: { type: 'function_call_output', call_id: 'c5', output: '{}' } });
+    h.s.send({ type: 'response.create' });
+    ok(creates(h).length === 1, 'the second waits for the first to be answered');
+    h.advance(3.2);
+    h.pump();
+    ok(h.events.some(e => e.type === 'XAI_CREATE_UNANSWERED'),
+       'a create with no response.created in 3 s is reported as unanswered');
+    h.pump();
+    ok(creates(h).length === 2, 'and the queue moves on');
+  }
 }
 
 // ---------------------------------------------------------------------------
